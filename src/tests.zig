@@ -6,6 +6,7 @@ const rijndael = @import("rijndael.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
+const rate_limit = @import("rate_limit.zig");
 
 test "packet framing round trip" {
     var w = protocol.Writer.init(std.testing.allocator);
@@ -122,4 +123,49 @@ test "safe names match osu convention" {
 test "standard accuracy" {
     const s: domain.Score = .{ .user_id = 1, .map_md5 = "x", .mode = .osu, .mods = 0, .score = 1, .accuracy = 0, .max_combo = 1, .n300 = 9, .n100 = 1, .n50 = 0, .nmiss = 0, .ngeki = 0, .nkatu = 0, .perfect = false, .passed = true };
     try std.testing.expectApproxEqAbs(@as(f64, 93.333333), domain.accuracy(s), 0.0001);
+}
+
+test "client rate limit keys prefer Cloudflare and reject junk" {
+    try std.testing.expectEqualStrings("203.0.113.7", rate_limit.clientKey("203.0.113.7", "198.51.100.1", "127.0.0.1"));
+    try std.testing.expectEqualStrings("2001:db8::1", rate_limit.clientKey(null, " 2001:db8::1, 10.0.0.1 ", null));
+    try std.testing.expectEqualStrings("proxy", rate_limit.clientKey("not an ip", "also/bad", null));
+}
+
+test "fixed window rate limiter returns a real retry boundary" {
+    var limiter = rate_limit.Limiter.init(std.testing.allocator, std.testing.io);
+    defer limiter.deinit();
+    const rule: rate_limit.Rule = .{ .name = "test", .limit = 2, .window_seconds = 10 };
+    const first = try limiter.checkAt("203.0.113.8", rule, 100);
+    const second = try limiter.checkAt("203.0.113.8", rule, 101);
+    const denied = try limiter.checkAt("203.0.113.8", rule, 102);
+    try std.testing.expect(first.allowed);
+    try std.testing.expectEqual(@as(u32, 1), first.remaining);
+    try std.testing.expect(second.allowed);
+    try std.testing.expectEqual(@as(u32, 0), second.remaining);
+    try std.testing.expect(!denied.allowed);
+    try std.testing.expectEqual(@as(u32, 8), denied.retry_after);
+    const reset = try limiter.checkAt("203.0.113.8", rule, 110);
+    try std.testing.expect(reset.allowed);
+    try std.testing.expectEqual(@as(u32, 1), reset.remaining);
+}
+
+test "rate limit classes do not consume each other" {
+    var limiter = rate_limit.Limiter.init(std.testing.allocator, std.testing.io);
+    defer limiter.deinit();
+    const strict: rate_limit.Rule = .{ .name = "strict", .limit = 1, .window_seconds = 60 };
+    const other: rate_limit.Rule = .{ .name = "other", .limit = 1, .window_seconds = 60 };
+    try std.testing.expect((try limiter.checkAt("203.0.113.9", strict, 50)).allowed);
+    try std.testing.expect(!(try limiter.checkAt("203.0.113.9", strict, 51)).allowed);
+    try std.testing.expect((try limiter.checkAt("203.0.113.9", other, 51)).allowed);
+}
+
+test "rate limiter stays bounded and only evicts expired clients" {
+    var limiter = rate_limit.Limiter.init(std.testing.allocator, std.testing.io);
+    defer limiter.deinit();
+    limiter.max_entries = 1;
+    const rule: rate_limit.Rule = .{ .name = "bounded", .limit = 2, .window_seconds = 10 };
+    try std.testing.expect((try limiter.checkAt("203.0.113.20", rule, 100)).allowed);
+    try std.testing.expectError(error.RateLimitCapacity, limiter.checkAt("203.0.113.21", rule, 101));
+    try std.testing.expect((try limiter.checkAt("203.0.113.21", rule, 110)).allowed);
+    try std.testing.expectEqual(@as(usize, 1), limiter.entries.count());
 }

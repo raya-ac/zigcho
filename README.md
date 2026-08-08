@@ -16,6 +16,8 @@ Stable leaderboards return the normal client response with map data, a personal-
 
 The lazer side has local bearer authentication, `/api/v2/me`, mod discovery, and JSON score submission. Tokens are random, stored by hash, scoped, expiring, and revocable. Password credentials are stored with Argon2id. Older development databases using the original hash format upgrade themselves after the next successful login.
 
+Account registration, token requests, Bancho logins, authenticated reads, and score uploads have separate per-client limits. The limits use Cloudflare's client address when the server is behind the production proxy. They are synchronized, bounded in memory, and return `429` with a real retry time. Small account and token requests are capped at 8 KiB instead of getting the replay upload budget. OAuth token responses are explicitly marked `no-store`.
+
 Relax uses `RX`. Unknown valid lazer mod acronyms are allowed as custom mods with their settings left intact. Those scores do not quietly leak into the normal leaderboard:
 
 - normal supported mods use `vanilla`
@@ -84,13 +86,13 @@ This is the actual production list, not a wishlist:
 - stable multiplayer needs full slot state, host transfer, freemod, team modes, match completion, invites, tournament control, and reconnect behavior
 - lazer needs rooms, event streams, multiplayer spectating, and a client build pointed at this server
 - PP needs a pinned calculator with test fixtures for every supported ruleset and scoring version
-- public operation needs request limits, moderation tools, structured logs, backups, real migrations, metrics, deployment files, and rolling restart behavior
+- public operation still needs moderation tools, structured logs, backups, migration tooling, metrics, and rolling restart behavior
 - both clients need to be tested against a TLS deployment, not just synthetic requests
 
 The stable score cipher is Rijndael with a 32-byte block. AES-256 still has a 16-byte block and is not a compatible shortcut. There is a fixture for this because it is exactly the sort of almost-correct replacement that makes a private server look alive while every real score submission fails.
 
 ## current checks
 
-The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation.
+The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, bounded rate-limit windows, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation.
 
 The protocol work is being checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho wiki page](https://osu.ppy.sh/wiki/en/Bancho_%28server%29), and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation.

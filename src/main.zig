@@ -6,11 +6,13 @@ const lazer = @import("lazer.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
+const rate_limit = @import("rate_limit.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
     store: storage.Store,
     sessions: sessions_mod.Sessions,
+    limiter: rate_limit.Limiter,
 
     fn header(req: *const std.http.Server.Request, wanted: []const u8) ?[]const u8 {
         var it = req.iterateHeaders();
@@ -40,10 +42,46 @@ const App = struct {
         return field(target[query_start + 1 ..], key);
     }
 
+    fn requestRule(req: *const std.http.Server.Request, path: []const u8) ?rate_limit.Rule {
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/users")) return rate_limit.registration;
+        if (req.head.method == .POST and (std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke"))) return rate_limit.token;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
+            return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
+        }
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php")) return rate_limit.authenticated;
+        return null;
+    }
+
+    fn bodyLimit(path: []const u8) usize {
+        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke")) return 8 * 1024;
+        if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
+        if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return 20 * 1024 * 1024;
+        if (std.mem.eql(u8, path, "/")) return 1024 * 1024;
+        return 64 * 1024;
+    }
+
     fn serve(self: *App, req: *std.http.Server.Request) !void {
         const target = try self.allocator.dupe(u8, req.head.target);
         defer self.allocator.free(target);
         const path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
+        if (requestRule(req, path)) |rule| {
+            const client = rate_limit.clientKey(header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"));
+            const decision = self.limiter.check(client, rule) catch return respond(req, .service_unavailable, "application/json", "{\"error\":\"rate limiter unavailable\"}", &.{});
+            if (!decision.allowed) {
+                var retry_buf: [16]u8 = undefined;
+                var limit_buf: [16]u8 = undefined;
+                const retry = try std.fmt.bufPrint(&retry_buf, "{d}", .{decision.retry_after});
+                const limit = try std.fmt.bufPrint(&limit_buf, "{d}", .{decision.limit});
+                const headers = [_]std.http.Header{
+                    .{ .name = "retry-after", .value = retry },
+                    .{ .name = "x-ratelimit-limit", .value = limit },
+                    .{ .name = "x-ratelimit-remaining", .value = "0" },
+                };
+                return respond(req, .too_many_requests, "application/json", "{\"error\":\"rate limit exceeded\"}", &headers);
+            }
+        }
         const auth_owned: ?[]u8 = if (header(req, "authorization")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (auth_owned) |v| self.allocator.free(v);
         const osu_token_owned: ?[]u8 = if (header(req, "osu-token")) |v| try self.allocator.dupe(u8, v) else null;
@@ -54,7 +92,10 @@ const App = struct {
         defer if (content_type_owned) |v| self.allocator.free(v);
         const body: []u8 = if (req.head.method.requestHasBody()) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
-            break :b try r.allocRemaining(self.allocator, .limited(20 * 1024 * 1024));
+            break :b r.allocRemaining(self.allocator, .limited(bodyLimit(path))) catch |err| switch (err) {
+                error.StreamTooLong => return respond(req, .payload_too_large, "application/json", "{\"error\":\"request body too large\"}", &.{}),
+                else => return err,
+            };
         } else &.{};
         defer if (body.len > 0) self.allocator.free(body);
 
@@ -86,7 +127,11 @@ const App = struct {
             const token = try self.store.issueToken(user.id, "identify scores:write", 3600);
             var out: [256]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"token_type\":\"Bearer\",\"expires_in\":3600,\"scope\":\"identify scores:write\",\"access_token\":\"{s}\"}}", .{token});
-            return respond(req, .ok, "application/json", json, &.{});
+            const token_headers = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            return respond(req, .ok, "application/json", json, &token_headers);
         }
         if (std.mem.eql(u8, path, "/oauth/revoke") and req.head.method == .POST) {
             const token = field(body, "token") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
@@ -242,7 +287,13 @@ pub fn main(init: std.process.Init) !void {
     var store = try storage.Store.open(allocator, init.io, db_path);
     defer store.close();
     try store.migrate();
-    var app: App = .{ .allocator = allocator, .store = store, .sessions = sessions_mod.Sessions.init(allocator, init.io) };
+    var app: App = .{
+        .allocator = allocator,
+        .store = store,
+        .sessions = sessions_mod.Sessions.init(allocator, init.io),
+        .limiter = rate_limit.Limiter.init(allocator, init.io),
+    };
+    defer app.limiter.deinit();
     defer app.sessions.deinit();
     const address = try std.Io.net.IpAddress.parse(bind, port);
     var listener = try address.listen(init.io, .{ .reuse_address = true });

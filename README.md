@@ -36,6 +36,12 @@ zig build -Doptimize=ReleaseSafe
 
 The arguments are bind address, port, and database path. Public deployments need TLS in front of the server, with the usual `c.`, `osu.`, `b.`, and `a.` hosts routed to it. Do not send stable login credentials over plain HTTP.
 
+## where it is running
+
+The current build is live at `https://kai.ovh`. Layerline terminates TLS and sends the traffic to zigcho on `127.0.0.1:27180`. The process runs as its own system user and keeps the SQLite database in `/var/lib/zigcho`.
+
+The systemd and Layerline files are in `deploy/`. A release is built from a pinned commit under `/opt/zigcho/releases`, then `/opt/zigcho/current` is moved to it. That gives me a boring rollback path instead of replacing the live binary in place.
+
 ## trying the lazer API
 
 Register a local account. Stable sends an MD5 password credential, which is still a reusable secret and is wrapped with Argon2id before it reaches the database.

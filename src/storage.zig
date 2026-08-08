@@ -35,6 +35,7 @@ pub const Store = struct {
         _ = c.sqlite3_finalize(stmt);
         if (version < 2) try self.exec(@embedFile("migration_002.sql"));
         if (version < 3) try self.exec(@embedFile("migration_003.sql"));
+        if (version < 4) try self.exec(@embedFile("migration_004.sql"));
     }
 
     pub fn register(self: *Store, name: []const u8, email: []const u8, password_md5: []const u8) !i32 {
@@ -246,7 +247,23 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
-        const sql = "INSERT INTO scores(user_id,map_md5,mode,mods,score,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)";
+        const namespace = score.rankNamespace();
+        var previous_best_id: i64 = 0;
+        var previous_best_score: i64 = 0;
+        const best_sql = "SELECT id,score FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND rank_namespace=?4 AND best=1 LIMIT 1";
+        var best_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, best_sql, -1, &best_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        _ = c.sqlite3_bind_int(best_stmt, 1, user_id);
+        _ = c.sqlite3_bind_text(best_stmt, 2, score.map_md5.ptr, @intCast(score.map_md5.len), null);
+        _ = c.sqlite3_bind_int(best_stmt, 3, score.mode);
+        _ = c.sqlite3_bind_text(best_stmt, 4, namespace.ptr, @intCast(namespace.len), null);
+        if (c.sqlite3_step(best_stmt) == c.SQLITE_ROW) {
+            previous_best_id = c.sqlite3_column_int64(best_stmt, 0);
+            previous_best_score = c.sqlite3_column_int64(best_stmt, 1);
+        }
+        _ = c.sqlite3_finalize(best_stmt);
+        const is_best = score.passed and score.total_score > previous_best_score;
+        const sql = "INSERT INTO scores(user_id,map_md5,mode,mods,score,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -267,9 +284,31 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 15, @intFromBool(score.passed));
         _ = c.sqlite3_bind_blob(stmt, 16, replay_data.ptr, @intCast(replay_data.len), null);
         _ = c.sqlite3_bind_text(stmt, 17, score.online_checksum.ptr, @intCast(score.online_checksum.len), null);
+        _ = c.sqlite3_bind_text(stmt, 18, namespace.ptr, @intCast(namespace.len), null);
+        _ = c.sqlite3_bind_int(stmt, 19, @intFromBool(is_best));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return if (c.sqlite3_extended_errcode(self.db) == c.SQLITE_CONSTRAINT_UNIQUE) error.DuplicateScore else error.DatabaseQueryFailed;
         const id = c.sqlite3_last_insert_rowid(self.db);
-        const update_stats = "UPDATE stats SET total_score=total_score+?1,plays=plays+1,accuracy=((accuracy*plays)+?2)/(plays+1),max_combo=max(max_combo,?3) WHERE user_id=?4 AND mode=?5";
+        if (is_best and previous_best_id != 0) {
+            const unset = "UPDATE scores SET best=0 WHERE id=?1";
+            var unset_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, unset, -1, &unset_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_bind_int64(unset_stmt, 1, previous_best_id);
+            if (c.sqlite3_step(unset_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_finalize(unset_stmt);
+        }
+        var ranked_delta: i64 = 0;
+        if (is_best and std.mem.eql(u8, namespace, "vanilla")) {
+            const status_sql = "SELECT status FROM beatmaps WHERE md5=?1";
+            var status_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, status_sql, -1, &status_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_bind_text(status_stmt, 1, score.map_md5.ptr, @intCast(score.map_md5.len), null);
+            if (c.sqlite3_step(status_stmt) == c.SQLITE_ROW) {
+                const status = c.sqlite3_column_int(status_stmt, 0);
+                if (status == 3 or status == 4) ranked_delta = score.total_score - previous_best_score;
+            }
+            _ = c.sqlite3_finalize(status_stmt);
+        }
+        const update_stats = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?6,plays=plays+1,accuracy=((accuracy*plays)+?2)/(plays+1),max_combo=max(max_combo,?3) WHERE user_id=?4 AND mode=?5";
         var stats_stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, update_stats, -1, &stats_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stats_stmt);
@@ -278,6 +317,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stats_stmt, 3, score.max_combo);
         _ = c.sqlite3_bind_int(stats_stmt, 4, user_id);
         _ = c.sqlite3_bind_int(stats_stmt, 5, score.mode);
+        _ = c.sqlite3_bind_int64(stats_stmt, 6, ranked_delta);
         if (c.sqlite3_step(stats_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         const update_map = "UPDATE beatmaps SET plays=plays+1,passes=passes+?1 WHERE md5=?2";
         var map_stmt: ?*c.sqlite3_stmt = null;
@@ -303,4 +343,101 @@ pub const Store = struct {
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         return @as(?[]u8, try allocator.dupe(u8, ptr[0..len]));
     }
+
+    pub fn stableLeaderboard(self: *Store, allocator: std.mem.Allocator, viewer: domain.User, map_md5: []const u8, mode: u8, board_type: u8, requested_mods: i32) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        const w = &output.writer;
+        const map_sql = "SELECT id,set_id,status,artist,title,version FROM beatmaps WHERE md5=?1";
+        var map_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, map_sql, -1, &map_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(map_stmt);
+        _ = c.sqlite3_bind_text(map_stmt, 1, map_md5.ptr, @intCast(map_md5.len), null);
+        if (c.sqlite3_step(map_stmt) != c.SQLITE_ROW) {
+            try w.writeAll("-1|false");
+            var missing = output.toArrayList();
+            return missing.toOwnedSlice(allocator);
+        }
+        const map_id = c.sqlite3_column_int(map_stmt, 0);
+        const set_id = c.sqlite3_column_int(map_stmt, 1);
+        const status = c.sqlite3_column_int(map_stmt, 2);
+        const artist = std.mem.span(c.sqlite3_column_text(map_stmt, 3));
+        const title = std.mem.span(c.sqlite3_column_text(map_stmt, 4));
+        const version = std.mem.span(c.sqlite3_column_text(map_stmt, 5));
+        if (status < 3) {
+            try w.print("{d}|false", .{status});
+            var unavailable = output.toArrayList();
+            return unavailable.toOwnedSlice(allocator);
+        }
+        const namespace = if (requested_mods & ((1 << 7) | (1 << 13)) != 0) "relax" else "vanilla";
+        const filter = " FROM scores s JOIN users u ON u.id=s.user_id WHERE s.map_md5=?1 AND s.mode=?2 AND s.passed=1 AND s.best=1 AND s.rank_namespace=?3 AND (?4!=2 OR s.mods=?5) AND (?4!=3 OR s.user_id=?6 OR EXISTS(SELECT 1 FROM friends f WHERE f.user_id=?6 AND f.friend_id=s.user_id)) AND (?4!=4 OR u.country=?7)";
+        const count_sql = "SELECT min(count(*),50)" ++ filter;
+        var count_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, count_sql, -1, &count_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(count_stmt);
+        bindBoard(count_stmt.?, map_md5, mode, namespace, board_type, requested_mods, viewer);
+        if (c.sqlite3_step(count_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        const row_count = c.sqlite3_column_int(count_stmt, 0);
+        try w.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n0\n", .{ status, map_id, set_id, row_count, artist, title, version });
+
+        const personal_id_sql = "SELECT s.id,s.score" ++ filter ++ " AND s.user_id=?6 ORDER BY s.score DESC,s.id ASC LIMIT 1";
+        var personal_id_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, personal_id_sql, -1, &personal_id_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        bindBoard(personal_id_stmt.?, map_md5, mode, namespace, board_type, requested_mods, viewer);
+        var personal_id: i64 = 0;
+        var personal_score: i64 = 0;
+        if (c.sqlite3_step(personal_id_stmt) == c.SQLITE_ROW) {
+            personal_id = c.sqlite3_column_int64(personal_id_stmt, 0);
+            personal_score = c.sqlite3_column_int64(personal_id_stmt, 1);
+        }
+        _ = c.sqlite3_finalize(personal_id_stmt);
+        if (personal_id != 0) {
+            const rank_sql = "SELECT count(*)+1" ++ filter ++ " AND (s.score>?8 OR (s.score=?8 AND s.id<?9))";
+            var rank_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, rank_sql, -1, &rank_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            bindBoard(rank_stmt.?, map_md5, mode, namespace, board_type, requested_mods, viewer);
+            _ = c.sqlite3_bind_int64(rank_stmt, 8, personal_score);
+            _ = c.sqlite3_bind_int64(rank_stmt, 9, personal_id);
+            if (c.sqlite3_step(rank_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+            const personal_rank = c.sqlite3_column_int(rank_stmt, 0);
+            _ = c.sqlite3_finalize(rank_stmt);
+            const row_sql = "SELECT s.id,u.name,s.score,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,datetime(s.submitted_at,'unixepoch'),length(s.replay)>0 FROM scores s JOIN users u ON u.id=s.user_id WHERE s.id=?1";
+            var row_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, row_sql, -1, &row_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_bind_int64(row_stmt, 1, personal_id);
+            if (c.sqlite3_step(row_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+            try writeBoardRow(w, row_stmt.?, personal_rank);
+            _ = c.sqlite3_finalize(row_stmt);
+        }
+        try w.writeByte('\n');
+        const rows_sql = "SELECT s.id,u.name,s.score,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,datetime(s.submitted_at,'unixepoch'),length(s.replay)>0" ++ filter ++ " ORDER BY s.score DESC,s.id ASC LIMIT 50";
+        var rows_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, rows_sql, -1, &rows_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(rows_stmt);
+        bindBoard(rows_stmt.?, map_md5, mode, namespace, board_type, requested_mods, viewer);
+        var rank: i32 = 1;
+        while (c.sqlite3_step(rows_stmt) == c.SQLITE_ROW) {
+            if (rank > 1) try w.writeByte('\n');
+            try writeBoardRow(w, rows_stmt.?, rank);
+            rank += 1;
+        }
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
 };
+
+fn bindBoard(stmt: *c.sqlite3_stmt, map_md5: []const u8, mode: u8, namespace: []const u8, board_type: u8, mods: i32, viewer: domain.User) void {
+    _ = c.sqlite3_bind_text(stmt, 1, map_md5.ptr, @intCast(map_md5.len), null);
+    _ = c.sqlite3_bind_int(stmt, 2, mode);
+    _ = c.sqlite3_bind_text(stmt, 3, namespace.ptr, @intCast(namespace.len), null);
+    _ = c.sqlite3_bind_int(stmt, 4, board_type);
+    _ = c.sqlite3_bind_int(stmt, 5, mods);
+    _ = c.sqlite3_bind_int(stmt, 6, viewer.id);
+    _ = c.sqlite3_bind_text(stmt, 7, &viewer.country, 2, null);
+}
+
+fn writeBoardRow(w: *std.Io.Writer, stmt: *c.sqlite3_stmt, rank: i32) !void {
+    try w.print("{d}|{s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{s}|{d}", .{ c.sqlite3_column_int64(stmt, 0), std.mem.span(c.sqlite3_column_text(stmt, 1)), c.sqlite3_column_int64(stmt, 2), c.sqlite3_column_int(stmt, 3), c.sqlite3_column_int(stmt, 4), c.sqlite3_column_int(stmt, 5), c.sqlite3_column_int(stmt, 6), c.sqlite3_column_int(stmt, 7), c.sqlite3_column_int(stmt, 8), c.sqlite3_column_int(stmt, 9), c.sqlite3_column_int(stmt, 10), c.sqlite3_column_int(stmt, 11), c.sqlite3_column_int(stmt, 12), rank, std.mem.span(c.sqlite3_column_text(stmt, 13)), c.sqlite3_column_int(stmt, 14) });
+}

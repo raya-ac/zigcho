@@ -97,6 +97,17 @@ test "stable online score checksum matches the client formula" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.97258), score.accuracy(), 0.0001);
 }
 
+test "stable relax and autopilot scores cannot enter vanilla rankings" {
+    const base = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:";
+    const suffix = ":True:0:260808235959:20260808";
+    const nomod = try stable_score.parse(base ++ "0" ++ suffix);
+    const relax = try stable_score.parse(base ++ "128" ++ suffix);
+    const autopilot = try stable_score.parse(base ++ "8192" ++ suffix);
+    try std.testing.expectEqualStrings("vanilla", nomod.rankNamespace());
+    try std.testing.expectEqualStrings("relax", relax.rankNamespace());
+    try std.testing.expectEqualStrings("relax", autopilot.rankNamespace());
+}
+
 test "client packet reader rejects truncation" {
     var reader: protocol.Reader = .{ .data = &.{ 1, 0, 0, 10, 0, 0, 0, 1 } };
     try std.testing.expectError(error.TruncatedPacket, reader.next());

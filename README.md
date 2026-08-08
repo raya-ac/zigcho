@@ -12,6 +12,8 @@ The Bancho side can parse protocol 19 packets, log stable clients in, issue toke
 
 Stable score submission uses the actual Rijndael cipher with a 32-byte block. The server parses both multipart `score` fields, decrypts the score and client hash, checks the online checksum, verifies the active session and password, stores the replay, and updates player and beatmap counters in one transaction. Replays can be downloaded again through the stable endpoint. Duplicate checksums are rejected without touching stats.
 
+Stable leaderboards return the normal client response with map data, a personal-best row, and the top 50. Global, exact-mod, friends, and country filters are handled in SQL. Only one best score per player/map/mode/namespace is listed. A worse play still counts toward total score and plays, but it does not inflate ranked score. Relax and autopilot stay on the relax board.
+
 The lazer side has local bearer authentication, `/api/v2/me`, mod discovery, and JSON score submission. Tokens are random, stored by hash, scoped, expiring, and revocable. Password credentials are stored with Argon2id. Older development databases using the original hash format upgrade themselves after the next successful login.
 
 Relax uses `RX`. Unknown valid lazer mod acronyms are allowed as custom mods with their settings left intact. Those scores do not quietly leak into the normal leaderboard:
@@ -71,7 +73,7 @@ Custom acronyms are two to eight uppercase ASCII characters. They are unranked a
 
 This is the actual production list, not a wishlist:
 
-- stable leaderboards still need personal-best placement, ranked-score rules, PP, and the full response data around the score path that now works
+- PP is still zero until a pinned calculator is added; score and ranked-score placement work without making up performance values
 - beatmap search, metadata syncing, downloads, favourites, ratings, and screenshot storage need their backing services
 - stable multiplayer needs full slot state, host transfer, freemod, team modes, match completion, invites, tournament control, and reconnect behavior
 - lazer needs rooms, event streams, multiplayer spectating, and a client build pointed at this server
@@ -83,6 +85,6 @@ The stable score cipher is Rijndael with a 32-byte block. AES-256 still has a 16
 
 ## current checks
 
-The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. A full stable score and replay round trip has been checked against a fresh migrated database in `ReleaseSafe`.
+The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation.
 
 The protocol work is being checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho wiki page](https://osu.ppy.sh/wiki/en/Bancho_%28server%29), and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation.

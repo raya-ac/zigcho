@@ -41,7 +41,8 @@ const App = struct {
     }
 
     fn serve(self: *App, req: *std.http.Server.Request) !void {
-        const target = req.head.target;
+        const target = try self.allocator.dupe(u8, req.head.target);
+        defer self.allocator.free(target);
         const path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
         const auth_owned: ?[]u8 = if (header(req, "authorization")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (auth_owned) |v| self.allocator.free(v);
@@ -137,6 +138,30 @@ const App = struct {
         if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
         if (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php")) return respond(req, .ok, "text/plain", "", &.{});
         if (std.mem.eql(u8, path, "/web/osu-search.php")) return respond(req, .ok, "text/plain", "0", &.{});
+        if (std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") and req.head.method == .GET) {
+            const encoded_name = queryField(target, "us") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "ha") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const map_md5 = queryField(target, "c") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const mode_text = queryField(target, "m") orelse "0";
+            const board_text = queryField(target, "v") orelse "1";
+            const mods_text = queryField(target, "mods") orelse "0";
+            const mode = std.fmt.parseInt(u8, mode_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const board_type = std.fmt.parseInt(u8, board_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const mods = std.fmt.parseInt(i32, mods_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            if (mode > 3 or board_type > 4 or map_md5.len != 32) return respond(req, .bad_request, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| {
+                if (char.* == '+') char.* = ' ';
+            }
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const listing = try self.store.stableLeaderboard(self.allocator, user, map_md5, mode, board_type, mods);
+            defer self.allocator.free(listing);
+            return respond(req, .ok, "text/plain", listing, &.{});
+        }
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") and req.head.method == .POST) {
             const content_type = content_type_owned orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
             const boundary = multipart.boundaryFromContentType(content_type) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});

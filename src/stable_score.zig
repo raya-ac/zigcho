@@ -38,6 +38,12 @@ pub const Submission = struct {
         return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(300 * @as(i64, total)));
     }
 
+    pub fn rankNamespace(self: Submission) []const u8 {
+        const relax: i32 = 1 << 7;
+        const autopilot: i32 = 1 << 13;
+        return if (self.mods & (relax | autopilot) != 0) "relax" else "vanilla";
+    }
+
     pub fn verifyChecksum(self: Submission, osu_version: []const u8, client_hash: []const u8, storyboard_md5: []const u8) bool {
         var input_buffer: [2048]u8 = undefined;
         const perfect = if (self.perfect) "True" else "False";

@@ -1,0 +1,6 @@
+/.zig-cache/
+/zig-out/
+/*.db
+/*.db-shm
+/*.db-wal
+/work/

@@ -2,6 +2,10 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const domain = @import("domain.zig");
 const lazer = @import("lazer.zig");
+const rijndael = @import("rijndael.zig");
+const multipart = @import("multipart.zig");
+const score_crypto = @import("score_crypto.zig");
+const stable_score = @import("stable_score.zig");
 
 test "packet framing round trip" {
     var w = protocol.Writer.init(std.testing.allocator);
@@ -30,6 +34,67 @@ test "unknown lazer mods enter custom namespace" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"total_score\":10,\"mods\":[{\"acronym\":\"WIGGLE\",\"settings\":{\"strength\":1.2}}]}", .{});
     defer parsed.deinit();
     try std.testing.expectEqual(lazer.Namespace.custom, try lazer.validateScore(parsed.value));
+}
+
+test "Rijndael-256 matches the py3rijndael block fixture" {
+    var key: [32]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&key, "qBS8uRhEIBsr8jr8vuY9uUpGFefYRL2HSTtrKhaI1tk=");
+    var expected: [32]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&expected, "Kc8C3vjf+EpLRmgTZ5ckWTzJ/6n7WBHW8pkByDscI/E=");
+    var input: [32]u8 = [_]u8{0x1b} ** 32;
+    @memcpy(input[0..5], "Mahdi");
+    const cipher = rijndael.Rijndael256.init(key);
+    const encrypted = cipher.encryptBlock(input);
+    try std.testing.expectEqualSlices(u8, &expected, &encrypted);
+    try std.testing.expectEqual(input, cipher.decryptBlock(encrypted));
+}
+
+test "Rijndael-256 CBC rejects bad PKCS7 padding" {
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 32;
+    const invalid = [_]u8{0} ** 32;
+    try std.testing.expectError(error.InvalidPadding, rijndael.decryptCbcPkcs7(std.testing.allocator, key, iv, &invalid));
+}
+
+test "multipart keeps both stable score fields" {
+    const body = "--zigcho\r\n" ++
+        "Content-Disposition: form-data; name=\"score\"\r\n\r\n" ++
+        "encrypted\r\n--zigcho\r\n" ++
+        "Content-Disposition: form-data; name=\"score\"; filename=\"replay.osr\"\r\n" ++
+        "Content-Type: application/octet-stream\r\n\r\n" ++
+        "replay-bytes\r\n--zigcho--\r\n";
+    var form = try multipart.parse(std.testing.allocator, body, "zigcho");
+    defer form.deinit();
+    try std.testing.expectEqualStrings("encrypted", form.nth("score", 0).?.data);
+    try std.testing.expectEqualStrings("replay.osr", form.nth("score", 1).?.filename.?);
+    try std.testing.expectEqualStrings("replay-bytes", form.nth("score", 1).?.data);
+}
+
+test "multipart rejects a missing closing boundary" {
+    const body = "--zigcho\r\nContent-Disposition: form-data; name=\"score\"\r\n\r\ndata";
+    try std.testing.expectError(error.IncompleteMultipart, multipart.parse(std.testing.allocator, body, "zigcho"));
+}
+
+test "stable score payload decrypts from an independent client fixture" {
+    var decrypted = try score_crypto.decrypt(
+        std.testing.allocator,
+        "ifQK7y+1eudaaKysIeS9146KPNtMuLwpB/gxFQdN1o34zAMqcheINZybLuB/09guF5NLyBLwXg7TXXfxYZAymPOYAE6a7eI96qaU9nnW5vpwaKVnWNFkUj5foS/x0xYQ5tETgLEzW404hW0j+HL7fMK3R+xu3gg26KCM6F9yK8JtJC4naSKhTZkBh2FexMMlz6OPLebgHuTp+dML18MiFA==",
+        "l+IW3EOOGO3GQ0A9/d6ASDKTLMMBSvK5lxsGDDlvoQc=",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        "20260808",
+    );
+    defer decrypted.deinit();
+    try std.testing.expectEqualStrings("client-hash-fixture", decrypted.client_hash);
+    try std.testing.expect(std.mem.startsWith(u8, decrypted.score_data, "0123456789abcdef0123456789abcdef:Ari:"));
+    try std.testing.expectEqual(@as(usize, 17), std.mem.count(u8, decrypted.score_data, ":"));
+}
+
+test "stable online score checksum matches the client formula" {
+    const data = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:0:True:0:260808235959:20260808";
+    const score = try stable_score.parse(data);
+    try std.testing.expect(score.verifyChecksum("20260808", "client-hash-fixture", ""));
+    try std.testing.expect(!score.verifyChecksum("20260808", "wrong-client", ""));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.97258), score.accuracy(), 0.0001);
 }
 
 test "client packet reader rejects truncation" {

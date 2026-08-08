@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const stable_score = @import("stable_score.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -27,6 +28,13 @@ pub const Store = struct {
     }
     pub fn migrate(self: *Store) !void {
         try self.exec(@embedFile("schema.sql"));
+        var version: i32 = 0;
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA user_version", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) version = c.sqlite3_column_int(stmt, 0);
+        _ = c.sqlite3_finalize(stmt);
+        if (version < 2) try self.exec(@embedFile("migration_002.sql"));
+        if (version < 3) try self.exec(@embedFile("migration_003.sql"));
     }
 
     pub fn register(self: *Store, name: []const u8, email: []const u8, password_md5: []const u8) !i32 {
@@ -217,5 +225,82 @@ pub const Store = struct {
         } else _ = c.sqlite3_bind_null(stmt, 12);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         return c.sqlite3_last_insert_rowid(self.db);
+    }
+
+    pub const BeatmapForScore = struct { id: i32, set_id: i32, status: i8, plays: i32, passes: i32 };
+
+    pub fn beatmapForScore(self: *Store, md5: []const u8) !?BeatmapForScore {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT id,set_id,status,plays,passes FROM beatmaps WHERE md5=?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4) };
+    }
+
+    pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, replay_data: []const u8) !i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        const sql = "INSERT INTO scores(user_id,map_md5,mode,mods,score,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        _ = c.sqlite3_bind_text(stmt, 2, score.map_md5.ptr, @intCast(score.map_md5.len), null);
+        _ = c.sqlite3_bind_int(stmt, 3, score.mode);
+        _ = c.sqlite3_bind_int(stmt, 4, score.mods);
+        _ = c.sqlite3_bind_int64(stmt, 5, score.total_score);
+        _ = c.sqlite3_bind_double(stmt, 6, score.accuracy());
+        _ = c.sqlite3_bind_int(stmt, 7, score.max_combo);
+        _ = c.sqlite3_bind_int(stmt, 8, score.n300);
+        _ = c.sqlite3_bind_int(stmt, 9, score.n100);
+        _ = c.sqlite3_bind_int(stmt, 10, score.n50);
+        _ = c.sqlite3_bind_int(stmt, 11, score.nmiss);
+        _ = c.sqlite3_bind_int(stmt, 12, score.ngeki);
+        _ = c.sqlite3_bind_int(stmt, 13, score.nkatu);
+        _ = c.sqlite3_bind_int(stmt, 14, @intFromBool(score.perfect));
+        _ = c.sqlite3_bind_int(stmt, 15, @intFromBool(score.passed));
+        _ = c.sqlite3_bind_blob(stmt, 16, replay_data.ptr, @intCast(replay_data.len), null);
+        _ = c.sqlite3_bind_text(stmt, 17, score.online_checksum.ptr, @intCast(score.online_checksum.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return if (c.sqlite3_extended_errcode(self.db) == c.SQLITE_CONSTRAINT_UNIQUE) error.DuplicateScore else error.DatabaseQueryFailed;
+        const id = c.sqlite3_last_insert_rowid(self.db);
+        const update_stats = "UPDATE stats SET total_score=total_score+?1,plays=plays+1,accuracy=((accuracy*plays)+?2)/(plays+1),max_combo=max(max_combo,?3) WHERE user_id=?4 AND mode=?5";
+        var stats_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, update_stats, -1, &stats_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stats_stmt);
+        _ = c.sqlite3_bind_int64(stats_stmt, 1, score.total_score);
+        _ = c.sqlite3_bind_double(stats_stmt, 2, score.accuracy());
+        _ = c.sqlite3_bind_int(stats_stmt, 3, score.max_combo);
+        _ = c.sqlite3_bind_int(stats_stmt, 4, user_id);
+        _ = c.sqlite3_bind_int(stats_stmt, 5, score.mode);
+        if (c.sqlite3_step(stats_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        const update_map = "UPDATE beatmaps SET plays=plays+1,passes=passes+?1 WHERE md5=?2";
+        var map_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, update_map, -1, &map_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(map_stmt);
+        _ = c.sqlite3_bind_int(map_stmt, 1, @intFromBool(score.passed));
+        _ = c.sqlite3_bind_text(map_stmt, 2, score.map_md5.ptr, @intCast(score.map_md5.len), null);
+        if (c.sqlite3_step(map_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        try self.exec("COMMIT");
+        return id;
+    }
+
+    pub fn replay(self: *Store, allocator: std.mem.Allocator, score_id: i64) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT replay FROM scores WHERE id=?1 AND replay IS NOT NULL";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, score_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        return @as(?[]u8, try allocator.dupe(u8, ptr[0..len]));
     }
 };

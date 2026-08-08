@@ -3,6 +3,9 @@ const storage = @import("storage.zig");
 const sessions_mod = @import("sessions.zig");
 const bancho = @import("bancho.zig");
 const lazer = @import("lazer.zig");
+const multipart = @import("multipart.zig");
+const score_crypto = @import("score_crypto.zig");
+const stable_score = @import("stable_score.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -32,6 +35,11 @@ const App = struct {
         return null;
     }
 
+    fn queryField(target: []const u8, key: []const u8) ?[]const u8 {
+        const query_start = std.mem.findScalar(u8, target, '?') orelse return null;
+        return field(target[query_start + 1 ..], key);
+    }
+
     fn serve(self: *App, req: *std.http.Server.Request) !void {
         const target = req.head.target;
         const path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
@@ -39,10 +47,13 @@ const App = struct {
         defer if (auth_owned) |v| self.allocator.free(v);
         const osu_token_owned: ?[]u8 = if (header(req, "osu-token")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (osu_token_owned) |v| self.allocator.free(v);
-        var body_buf: [2 * 1024 * 1024]u8 = undefined;
+        const score_token_owned: ?[]u8 = if (header(req, "token")) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (score_token_owned) |v| self.allocator.free(v);
+        const content_type_owned: ?[]u8 = if (req.head.content_type) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (content_type_owned) |v| self.allocator.free(v);
         const body: []u8 = if (req.head.method.requestHasBody()) b: {
-            const r = req.readerExpectContinue(&body_buf) catch return error.BadBody;
-            break :b try r.allocRemaining(self.allocator, .limited(body_buf.len));
+            const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
+            break :b try r.allocRemaining(self.allocator, .limited(20 * 1024 * 1024));
         } else &.{};
         defer if (body.len > 0) self.allocator.free(body);
 
@@ -126,8 +137,58 @@ const App = struct {
         if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
         if (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php")) return respond(req, .ok, "text/plain", "", &.{});
         if (std.mem.eql(u8, path, "/web/osu-search.php")) return respond(req, .ok, "text/plain", "0", &.{});
-        if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return respond(req, .not_implemented, "text/plain", "error: score submission crypto adapter not configured", &.{});
-        if (std.mem.eql(u8, path, "/web/osu-getreplay.php")) return respond(req, .not_found, "text/plain", "", &.{});
+        if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") and req.head.method == .POST) {
+            const content_type = content_type_owned orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            const boundary = multipart.boundaryFromContentType(content_type) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            var form = multipart.parse(self.allocator, body, boundary) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            defer form.deinit();
+            const encrypted = form.nth("score", 0) orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            const replay = form.nth("score", 1) orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            if (encrypted.filename != null or replay.filename == null or replay.data.len == 0 or replay.data.len > 16 * 1024 * 1024) return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            const iv = (form.first("iv") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
+            const client_hash_encrypted = (form.first("s") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
+            const password = (form.first("pass") orelse return respond(req, .unauthorized, "text/plain", "", &.{})).data;
+            const osu_version = (form.first("osuver") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
+            const updated_map_hash = (form.first("bmk") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
+            const storyboard_hash = if (form.first("sbk")) |part| part.data else "";
+            var decrypted = score_crypto.decrypt(self.allocator, encrypted.data, client_hash_encrypted, iv, osu_version) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            defer decrypted.deinit();
+            const score = stable_score.parse(decrypted.score_data) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            if (!std.mem.eql(u8, score.map_md5, updated_map_hash)) return respond(req, .bad_request, "text/plain", "error: beatmap", &.{});
+            const user = (try self.store.authenticate(self.allocator, score.username, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const session_token = score_token_owned orelse osu_token_owned orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            self.sessions.mutex.lockUncancelable(self.sessions.io);
+            const active = if (self.sessions.byToken(session_token)) |session| session.user.id == user.id else false;
+            self.sessions.mutex.unlock(self.sessions.io);
+            if (!active) return respond(req, .unauthorized, "text/plain", "", &.{});
+            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            const beatmap = (try self.store.beatmapForScore(score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
+            const score_id = self.store.insertStableScore(user.id, score, replay.data) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
+            if (!score.passed) return respond(req, .ok, "text/plain", "error: no", &.{});
+            var result_buf: [1024]u8 = undefined;
+            const result = try std.fmt.bufPrint(&result_buf, "beatmapId:{d}|beatmapSetId:{d}|beatmapPlaycount:{d}|beatmapPasscount:{d}|approvedDate:|\n|chartId:beatmap|chartUrl:|chartName:Beatmap Ranking|rankBefore:|rankAfter:|rankedScoreBefore:|rankedScoreAfter:{d}|totalScoreBefore:|totalScoreAfter:{d}|maxComboBefore:|maxComboAfter:{d}|accuracyBefore:|accuracyAfter:{d:.2}|ppBefore:|ppAfter:|onlineScoreId:{d}|\n|chartId:overall|chartUrl:|chartName:Overall Ranking|achievements-new:", .{ beatmap.id, beatmap.set_id, beatmap.plays + 1, beatmap.passes + 1, score.total_score, score.total_score, score.max_combo, score.accuracy() * 100.0, score_id });
+            return respond(req, .ok, "text/plain", result, &.{});
+        }
+        if (std.mem.eql(u8, path, "/web/osu-getreplay.php") and req.head.method == .GET) {
+            const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "h") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const score_id_text = queryField(target, "c") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const score_id = std.fmt.parseInt(i64, score_id_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*c| {
+                if (c.* == '+') c.* = ' ';
+            }
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const replay = (try self.store.replay(self.allocator, score_id)) orelse return respond(req, .not_found, "text/plain", "", &.{});
+            defer self.allocator.free(replay);
+            return respond(req, .ok, "application/octet-stream", replay, &.{});
+        }
         if (std.mem.eql(u8, path, "/")) return respond(req, .ok, "application/json", "{\"name\":\"zigcho\",\"docs\":\"/README.md\",\"health\":\"/health\"}", &.{});
         return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
     }

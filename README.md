@@ -10,6 +10,8 @@ This is not ready to put in front of players yet. I would rather leave that sent
 
 The Bancho side can parse protocol 19 packets, log stable clients in, issue tokens, track presence and status, handle public and private messages, join channels, answer presence/stat requests, and relay spectator frames. Live requests run concurrently and access to sessions, outgoing queues, and SQLite is synchronized.
 
+Stable score submission uses the actual Rijndael cipher with a 32-byte block. The server parses both multipart `score` fields, decrypts the score and client hash, checks the online checksum, verifies the active session and password, stores the replay, and updates player and beatmap counters in one transaction. Replays can be downloaded again through the stable endpoint. Duplicate checksums are rejected without touching stats.
+
 The lazer side has local bearer authentication, `/api/v2/me`, mod discovery, and JSON score submission. Tokens are random, stored by hash, scoped, expiring, and revocable. Password credentials are stored with Argon2id. Older development databases using the original hash format upgrade themselves after the next successful login.
 
 Relax uses `RX`. Unknown valid lazer mod acronyms are allowed as custom mods with their settings left intact. Those scores do not quietly leak into the normal leaderboard:
@@ -69,7 +71,7 @@ Custom acronyms are two to eight uppercase ASCII characters. They are unranked a
 
 This is the actual production list, not a wishlist:
 
-- stable score uploads need the real Rijndael-CBC cipher with 256-bit blocks, the versioned `osu!-scoreburgr` key, multipart parsing, checksum checks, replay storage, and stat updates
+- stable leaderboards still need personal-best placement, ranked-score rules, PP, and the full response data around the score path that now works
 - beatmap search, metadata syncing, downloads, favourites, ratings, and screenshot storage need their backing services
 - stable multiplayer needs full slot state, host transfer, freemod, team modes, match completion, invites, tournament control, and reconnect behavior
 - lazer needs rooms, event streams, multiplayer spectating, and a client build pointed at this server
@@ -77,10 +79,10 @@ This is the actual production list, not a wishlist:
 - public operation needs request limits, moderation tools, structured logs, backups, real migrations, metrics, deployment files, and rolling restart behavior
 - both clients need to be tested against a TLS deployment, not just synthetic requests
 
-The stable score cipher is Rijndael with a 32-byte block. AES-256 still has a 16-byte block and is not a compatible shortcut. I am calling that out because it is exactly the sort of almost-correct replacement that makes a private server look alive while every real score submission fails.
+The stable score cipher is Rijndael with a 32-byte block. AES-256 still has a 16-byte block and is not a compatible shortcut. There is a fixture for this because it is exactly the sort of almost-correct replacement that makes a private server look alive while every real score submission fails.
 
 ## current checks
 
-The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests.
+The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. A full stable score and replay round trip has been checked against a fresh migrated database in `ReleaseSafe`.
 
 The protocol work is being checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho wiki page](https://osu.ppy.sh/wiki/en/Bancho_%28server%29), and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation.

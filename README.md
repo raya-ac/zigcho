@@ -38,7 +38,7 @@ The arguments are bind address, port, and database path. Public deployments need
 
 ## where it is running
 
-The current build is live at `https://kai.ovh`. Layerline terminates TLS and sends the traffic to zigcho on `127.0.0.1:27180`. The process runs as its own system user and keeps the SQLite database in `/var/lib/zigcho`.
+The current build is live at `https://kai.ovh`. The stable client hosts `c.kai.ovh`, `osu.kai.ovh`, `b.kai.ovh`, and `a.kai.ovh` go to the same process. Layerline terminates TLS and sends the traffic to zigcho on `127.0.0.1:27180`. The process runs as its own system user and keeps the SQLite database in `/var/lib/zigcho`.
 
 The systemd and Layerline files are in `deploy/`. A release is built from a pinned commit under `/opt/zigcho/releases`, then `/opt/zigcho/current` is moved to it. That gives me a boring rollback path instead of replacing the live binary in place.
 

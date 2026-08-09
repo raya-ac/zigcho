@@ -13,6 +13,26 @@ const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const webhook = @import("webhook.zig");
+const protocol = @import("protocol.zig");
+
+fn watchdogThread(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions) void {
+    var mask = std.posix.sigemptyset();
+    std.posix.sigaddset(&mask, std.posix.SIG.TERM);
+    std.posix.sigaddset(&mask, std.posix.SIG.INT);
+    var sig: c_int = undefined;
+    _ = std.c.sigwait(&mask, &sig);
+    std.log.info("shutdown: sending restart to all clients", .{});
+    var w = protocol.Writer.init(allocator);
+    defer w.deinit();
+    const start = w.begin(.restart) catch return;
+    w.finish(start);
+    sessions.broadcast(w.bytes(), null) catch {};
+    var ts = std.posix.timespec{ .sec = 0, .nsec = 200_000_000 };
+    _ = std.c.nanosleep(&ts, null);
+    var empty = std.posix.sigemptyset();
+    std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &empty, null);
+    _ = std.c.raise(@enumFromInt(sig));
+}
 const country = @import("country.zig");
 const log = @import("logutil.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
@@ -710,7 +730,8 @@ pub fn main(init: std.process.Init) !void {
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .geo_client = .{ .allocator = allocator, .io = init.io },
     };
-    const kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
+    var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
+    kai.country = .{ 'I', 'S' };
     const kai_session = try app.sessions.createBot(kai);
     kai_session.longitude = -21.9426; // reykjavik
     kai_session.latitude = 64.1466;
@@ -724,6 +745,12 @@ pub fn main(init: std.process.Init) !void {
     defer listener.deinit(init.io);
     var connections: std.Io.Group = .init;
     defer connections.cancel(init.io);
+    var sig_mask = std.posix.sigemptyset();
+    std.posix.sigaddset(&sig_mask, std.posix.SIG.TERM);
+    std.posix.sigaddset(&sig_mask, std.posix.SIG.INT);
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &sig_mask, null);
+    const watcher = try std.Thread.spawn(.{}, watchdogThread, .{ allocator, &app.sessions });
+    watcher.detach();
     std.log.info("zigcho listening on http://{s}:{d}", .{ bind, port });
     while (true) {
         const stream = listener.accept(init.io) catch |err| {

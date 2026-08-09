@@ -12,6 +12,94 @@ const beatmap = @import("beatmap.zig");
 const storage = @import("storage.zig");
 const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
+const beatmap_sync = @import("beatmap_sync.zig");
+const sessions_mod = @import("sessions.zig");
+
+fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    const crc = std.hash.Crc32.hash(contents);
+    try writer.writeAll(&std.zip.local_file_header_sig);
+    try writer.writeInt(u16, 20, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u32, crc, .little);
+    try writer.writeInt(u32, @intCast(contents.len), .little);
+    try writer.writeInt(u32, @intCast(contents.len), .little);
+    try writer.writeInt(u16, @intCast(filename.len), .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeAll(filename);
+    try writer.writeAll(contents);
+    const central_offset: u32 = @intCast(output.written().len);
+    try writer.writeAll(&std.zip.central_file_header_sig);
+    try writer.writeInt(u16, 20, .little);
+    try writer.writeInt(u16, 20, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u32, crc, .little);
+    try writer.writeInt(u32, @intCast(contents.len), .little);
+    try writer.writeInt(u32, @intCast(contents.len), .little);
+    try writer.writeInt(u16, @intCast(filename.len), .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u32, 0, .little);
+    try writer.writeInt(u32, 0, .little);
+    try writer.writeAll(filename);
+    const central_size: u32 = @intCast(output.written().len - central_offset);
+    try writer.writeAll(&std.zip.end_record_sig);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 1, .little);
+    try writer.writeInt(u16, 1, .little);
+    try writer.writeInt(u32, central_size, .little);
+    try writer.writeInt(u32, central_offset, .little);
+    try writer.writeInt(u16, 0, .little);
+    return output.toOwnedSlice();
+}
+
+test "Nerinyan ranks map into local leaderboard states" {
+    try std.testing.expectEqual(@as(i8, 3), beatmap_sync.localStatus("1"));
+    try std.testing.expectEqual(@as(i8, 4), beatmap_sync.localStatus("2"));
+    try std.testing.expectEqual(@as(i8, 5), beatmap_sync.localStatus("3"));
+    try std.testing.expectEqual(@as(i8, 6), beatmap_sync.localStatus("4"));
+    try std.testing.expectEqual(@as(i8, 2), beatmap_sync.localStatus("-2"));
+}
+
+test "Nerinyan archives only yield the exact MD5 map" {
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
+    defer std.testing.allocator.free(archive);
+    const hash = beatmap.md5(map);
+    const extracted = (try beatmap_sync.extractMatchingOsu(std.testing.allocator, archive, &hash)).?;
+    defer std.testing.allocator.free(extracted);
+    try std.testing.expectEqualStrings(map, extracted);
+    try std.testing.expect((try beatmap_sync.extractMatchingOsu(std.testing.allocator, archive, "00000000000000000000000000000000")) == null);
+}
+
+test "public chat does not echo through the server to its sender" {
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const sender = try sessions.create(.{
+        .id = 1,
+        .name = try std.testing.allocator.dupe(u8, "ari"),
+        .safe_name = try std.testing.allocator.dupe(u8, "ari"),
+    }, 0);
+    const other = try sessions.create(.{
+        .id = 2,
+        .name = try std.testing.allocator.dupe(u8, "other"),
+        .safe_name = try std.testing.allocator.dupe(u8, "other"),
+    }, 0);
+    try sessions.broadcast("one message", sender);
+    try std.testing.expectEqual(@as(usize, 0), sender.queue.items.len);
+    try std.testing.expectEqualStrings("one message", other.queue.items);
+}
 
 test "lazer trailing slashes use the same API route" {
     try std.testing.expectEqualStrings("/api/v2/me", routing.canonicalPath("/api/v2/me/"));

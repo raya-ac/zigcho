@@ -128,7 +128,7 @@ pub fn poll(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sess
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
             if (packet.id == .send_private_message) {
                 if (sessions.byName(target_name)) |target| try queuePacket(target, allocator, message.bytes());
-            } else try sessions.broadcast(message.bytes(), null);
+            } else try sessions.broadcast(message.bytes(), session);
         },
         .channel_join => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };

@@ -1,0 +1,197 @@
+const std = @import("std");
+const beatmap = @import("beatmap.zig");
+const pp = @import("pp.zig");
+const storage = @import("storage.zig");
+
+const metadata_limit = 256 * 1024;
+const archive_limit = 128 * 1024 * 1024;
+const map_limit = 16 * 1024 * 1024;
+const entry_limit = 4096;
+
+const NeriMap = struct {
+    approved: []const u8,
+    beatmap_id: []const u8,
+    beatmapset_id: []const u8,
+    file_md5: []const u8,
+};
+
+pub const Sync = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: std.http.Client,
+    mutex: std.Io.Mutex = .init,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Sync {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .client = .{ .allocator = allocator, .io = io },
+        };
+    }
+
+    pub fn deinit(self: *Sync) void {
+        self.client.deinit();
+    }
+
+    pub fn ensure(self: *Sync, store: *storage.Store, wanted_md5: []const u8, expected_set_id: ?i32) !bool {
+        if (!validMd5(wanted_md5)) return false;
+        if (try store.beatmapForScore(wanted_md5) != null) return true;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (try store.beatmapForScore(wanted_md5) != null) return true;
+
+        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/v1/get_beatmaps?h={s}&limit=1", .{wanted_md5});
+        defer self.allocator.free(metadata_url);
+        const metadata_json = try self.fetch(metadata_url, metadata_limit);
+        defer self.allocator.free(metadata_json);
+        const parsed = try std.json.parseFromSlice([]NeriMap, self.allocator, metadata_json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.len != 1) return false;
+        const remote = parsed.value[0];
+        if (!std.ascii.eqlIgnoreCase(remote.file_md5, wanted_md5)) return false;
+        const map_id = std.fmt.parseInt(i32, remote.beatmap_id, 10) catch return false;
+        const set_id = std.fmt.parseInt(i32, remote.beatmapset_id, 10) catch return false;
+        if (map_id <= 0 or set_id <= 0) return false;
+        if (expected_set_id) |expected| if (expected > 0 and expected != set_id) return false;
+
+        const archive_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/d/{d}?nv=1", .{set_id});
+        defer self.allocator.free(archive_url);
+        const archive = try self.fetch(archive_url, archive_limit);
+        defer self.allocator.free(archive);
+        const osu_file = (try extractMatchingOsu(self.allocator, archive, wanted_md5)) orelse return false;
+        defer self.allocator.free(osu_file);
+
+        const metadata = try beatmap.parse(osu_file);
+        if (metadata.id != map_id or metadata.set_id != set_id) return false;
+        const attributes = try pp.calculate(osu_file, .{
+            .mode = metadata.mode,
+            .lazer = 0,
+            .mods = 0,
+            .max_combo = metadata.object_count,
+            .n_geki = if (metadata.mode == 3) metadata.object_count else 0,
+            .n_katu = 0,
+            .n300 = metadata.object_count,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        try store.upsertBeatmap(metadata, wanted_md5, localStatus(remote.approved), attributes.stars, attributes.max_combo, osu_file);
+
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
+        var encoded: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&encoded, "{x}", .{digest}) catch unreachable;
+        try store.upsertBeatmapArchive(set_id, &encoded, archive);
+        std.log.info("hydrated Nerinyan beatmap {d} in set {d} ({s})", .{ map_id, set_id, wanted_md5 });
+        return true;
+    }
+
+    fn fetch(self: *Sync, url: []const u8, limit: usize) ![]u8 {
+        const buffer = try self.allocator.alloc(u8, limit);
+        errdefer self.allocator.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
+        const result = self.client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &writer,
+            .headers = .{
+                .accept_encoding = .{ .override = "identity" },
+                .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/raya-ac/zigcho)" },
+            },
+        }) catch return error.UpstreamUnavailable;
+        if (result.status != .ok) return error.UpstreamUnavailable;
+        return try self.allocator.realloc(buffer, writer.end);
+    }
+};
+
+pub fn localStatus(approved: []const u8) i8 {
+    const upstream = std.fmt.parseInt(i8, approved, 10) catch return 2;
+    return switch (upstream) {
+        1 => 3,
+        2 => 4,
+        3 => 5,
+        4 => 6,
+        else => 2,
+    };
+}
+
+fn validMd5(value: []const u8) bool {
+    if (value.len != 32) return false;
+    for (value) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
+}
+
+fn range(bytes: []const u8, start: usize, len: usize) ![]const u8 {
+    const end = std.math.add(usize, start, len) catch return error.InvalidBeatmapArchive;
+    if (end > bytes.len) return error.InvalidBeatmapArchive;
+    return bytes[start..end];
+}
+
+fn unzipEntry(allocator: std.mem.Allocator, archive: []const u8, central: []const u8) ![]u8 {
+    const method = std.mem.readInt(u16, central[10..12], .little);
+    const crc = std.mem.readInt(u32, central[16..20], .little);
+    const compressed_len: usize = std.mem.readInt(u32, central[20..24], .little);
+    const output_len: usize = std.mem.readInt(u32, central[24..28], .little);
+    const local_offset: usize = std.mem.readInt(u32, central[42..46], .little);
+    if (output_len == 0 or output_len > map_limit or compressed_len > archive_limit) return error.InvalidBeatmapArchive;
+    const local = try range(archive, local_offset, 30);
+    if (!std.mem.eql(u8, local[0..4], &std.zip.local_file_header_sig)) return error.InvalidBeatmapArchive;
+    if (std.mem.readInt(u16, local[8..10], .little) != method) return error.InvalidBeatmapArchive;
+    const name_len: usize = std.mem.readInt(u16, local[26..28], .little);
+    const extra_len: usize = std.mem.readInt(u16, local[28..30], .little);
+    const local_header_end = std.math.add(usize, local_offset, 30) catch return error.InvalidBeatmapArchive;
+    const local_variable_len = std.math.add(usize, name_len, extra_len) catch return error.InvalidBeatmapArchive;
+    const data_offset = std.math.add(usize, local_header_end, local_variable_len) catch return error.InvalidBeatmapArchive;
+    const compressed = try range(archive, data_offset, compressed_len);
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+    switch (method) {
+        0 => {
+            if (compressed.len != output.len) return error.InvalidBeatmapArchive;
+            @memcpy(output, compressed);
+        },
+        8 => {
+            var input = std.Io.Reader.fixed(compressed);
+            var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompress: std.compress.flate.Decompress = .init(&input, .raw, &flate_buffer);
+            decompress.reader.readSliceAll(output) catch return error.InvalidBeatmapArchive;
+        },
+        else => return error.UnsupportedCompressionMethod,
+    }
+    if (std.hash.Crc32.hash(output) != crc) return error.InvalidBeatmapArchive;
+    return output;
+}
+
+pub fn extractMatchingOsu(allocator: std.mem.Allocator, archive: []const u8, wanted_md5: []const u8) !?[]u8 {
+    if (!validMd5(wanted_md5)) return null;
+    const end_offset = std.mem.lastIndexOf(u8, archive, &std.zip.end_record_sig) orelse return error.InvalidBeatmapArchive;
+    const end = try range(archive, end_offset, 22);
+    const entry_count: usize = std.mem.readInt(u16, end[10..12], .little);
+    const central_size: usize = std.mem.readInt(u32, end[12..16], .little);
+    const central_offset: usize = std.mem.readInt(u32, end[16..20], .little);
+    const comment_len: usize = std.mem.readInt(u16, end[20..22], .little);
+    if (entry_count == 0 or entry_count > entry_limit or end_offset + 22 + comment_len != archive.len) return error.InvalidBeatmapArchive;
+    _ = try range(archive, central_offset, central_size);
+    const central_end = std.math.add(usize, central_offset, central_size) catch return error.InvalidBeatmapArchive;
+
+    var offset = central_offset;
+    for (0..entry_count) |_| {
+        const central = try range(archive, offset, 46);
+        if (!std.mem.eql(u8, central[0..4], &std.zip.central_file_header_sig)) return error.InvalidBeatmapArchive;
+        const name_len: usize = std.mem.readInt(u16, central[28..30], .little);
+        const extra_len: usize = std.mem.readInt(u16, central[30..32], .little);
+        const comment_entry_len: usize = std.mem.readInt(u16, central[32..34], .little);
+        const filename = try range(archive, offset + 46, name_len);
+        const record_len = std.math.add(usize, 46 + name_len, extra_len + comment_entry_len) catch return error.InvalidBeatmapArchive;
+        offset = std.math.add(usize, offset, record_len) catch return error.InvalidBeatmapArchive;
+        if (std.ascii.endsWithIgnoreCase(filename, ".osu")) {
+            const contents = try unzipEntry(allocator, archive, central);
+            const digest = beatmap.md5(contents);
+            if (std.ascii.eqlIgnoreCase(&digest, wanted_md5)) return contents;
+            allocator.free(contents);
+        }
+    }
+    if (offset != central_end) return error.InvalidBeatmapArchive;
+    return null;
+}

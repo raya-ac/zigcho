@@ -2,6 +2,16 @@
 
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 
+## 2026-08-09 — maps stop being unsubmitted when stable opens them
+
+Stable now fills a missing map from Nerinyan on the first leaderboard request. Zigcho looks up the exact MD5, downloads that set, opens only bounded `.osu` entries, verifies the ZIP CRC and the file MD5, checks the map and set IDs again, calculates stars and max combo, then stores the map and archive together. A bad mirror response stays unsubmitted instead of becoming trusted data. No osu! API key is in the repo or the server.
+
+I ran the whole path from a fresh database against Nerinyan's real map 75. The old response was unsubmitted. The new response was ranked, the exact 4,931-byte map landed under its expected MD5, and the set archive was cached for stable Direct and lazer downloads.
+
+Public chat no longer comes back through Bancho to its sender, which removes the second copy beside the client's own local message. Stable's seasonal and menu-content startup requests also have proper empty responses now instead of 404s.
+
+This moves the real invite-only alpha estimate to about 44%. Stable can create an account, log in, chat, resolve a ranked map, show a leaderboard, and has the score/replay path behind it. I still need the installed client to prove this exact public build, upstream timeout/retry and cache controls, wider mode scoring fixtures, moderation and backups, complete multiplayer, and the rest of lazer's signed-in flow.
+
 ## 2026-08-09 — the real lazer client can speak our account format
 
 I built the official osu! source at one pinned commit with zigcho's production and development endpoints. The client reached `api.kai.ovh` over TLS and gave us a useful failure instead of a synthetic guess: its registration body uses nested `user[...]` fields, while zigcho only understood the short curl fields.

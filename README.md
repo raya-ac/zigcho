@@ -14,9 +14,9 @@ Stable score submission uses the actual Rijndael cipher with a 32-byte block. Th
 
 PP is calculated from the exact `.osu` file stored with the beatmap. The calculator is `rosu-pp` 4.0.1 behind a small C boundary, with Cargo's complete dependency lock checked in. A calculation error rejects the score instead of writing a believable-looking zero. Normal ranked scores update the player's weighted PP total; relax PP is stored on the score but stays out of normal stats.
 
-Beatmaps are imported with a separate command instead of an unauthenticated admin endpoint. The importer parses the map IDs, mode, metadata, difficulty settings, timing, and real circle, slider, and spinner counts, calculates its stars and maximum combo, and stores the original file and its MD5 in SQLite. Imports default to pending. A status has to be chosen deliberately before a map can affect ranked score or PP.
+Beatmaps can still be imported with the local operator command, but stable no longer needs somebody to seed every map by hand. The first leaderboard request asks Nerinyan for metadata by MD5, downloads the matching set, extracts the exact `.osu` file, and checks its CRC, MD5, map ID, and set ID before it reaches SQLite. Nerinyan's ranked and approved states are allowed into normal scoring; qualified and loved maps get a board without changing ranked score or PP. Failed or mismatched downloads stay unsubmitted.
 
-Stable Direct search and set lookup use that local catalog. A second operator command imports the matching `.osz` archive after checking its ZIP structure and SHA-256. Stable `/d/{set}` and lazer's authenticated download route return the same stored bytes. A map without its archive is not advertised as downloadable just because its metadata exists.
+Stable Direct search and set lookup use that local catalog. On-demand hydration caches the matching `.osz` archive with its SHA-256; the separate operator command can still seed one deliberately. Stable `/d/{set}` and lazer's authenticated download route return the same stored bytes. A map without its archive is not advertised as downloadable just because its metadata exists.
 
 Stable leaderboards return the normal client response with map data, a personal-best row, and the top 50. Global, exact-mod, friends, and country filters are handled in SQL. Only one best score per player/map/mode/namespace is listed. A worse play still counts toward total score and plays, but it does not inflate ranked score. Relax and autopilot stay on the relax board.
 
@@ -105,7 +105,8 @@ Custom acronyms are two to eight uppercase ASCII characters. They are unranked a
 
 This is the actual production list, not a wishlist:
 
-- upstream beatmap syncing, covers, previews, favourites, ratings, and screenshot storage still need their backing services
+- covers, previews, favourites, ratings, and screenshot storage still need their backing services
+- Nerinyan hydration fails closed and caches successful sets, but still needs explicit upstream timeout, retry, cache-pruning, and failure metrics before an open launch
 - stable multiplayer needs full slot state, host transfer, freemod, team modes, match completion, invites, tournament control, and reconnect behavior
 - lazer still needs a complete signed-in client run, rooms, event streams, multiplayer spectating, and a properly signed public client release
 - PP now has a pinned stable standard fixture; taiko, catch, mania, and lazer scoring fixtures still need to be locked before those paths can award PP
@@ -116,6 +117,6 @@ The stable score cipher is Rijndael with a 32-byte block. AES-256 still has a 16
 
 ## current checks
 
-The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, lazer form decoding and password compatibility, Argon2id authentication, scoped token access, revocation, bounded rate-limit windows, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, beatmap parsing and MD5s, object-type counts, archive storage, stable Direct results, lazer beatmapset JSON, a pinned PP result, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation.
+The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, public-chat sender exclusion, relax/custom mod isolation, lazer form decoding and password compatibility, Argon2id authentication, scoped token access, revocation, bounded rate-limit windows, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, beatmap parsing and MD5s, bounded ZIP extraction, archive CRCs, archive storage, stable Direct results, lazer beatmapset JSON, a pinned PP result, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation. A live Nerinyan integration check hydrated ranked map 75 from an empty database and returned its stable leaderboard.
 
 The protocol work is being checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho wiki page](https://osu.ppy.sh/wiki/en/Bancho_%28server%29), and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation.

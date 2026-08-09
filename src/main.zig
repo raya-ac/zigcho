@@ -11,12 +11,14 @@ const pp = @import("pp.zig");
 const status_page = @embedFile("status.html");
 const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
+const beatmap_sync = @import("beatmap_sync.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
     store: storage.Store,
     sessions: sessions_mod.Sessions,
     limiter: rate_limit.Limiter,
+    map_sync: beatmap_sync.Sync,
 
     fn header(req: *const std.http.Server.Request, wanted: []const u8) ?[]const u8 {
         var it = req.iterateHeaders();
@@ -195,6 +197,8 @@ const App = struct {
         }
         if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"Server-side cursor relax\",\"ranked\":false,\"score_multiplier\":0.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":false}}", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/seasonal-backgrounds")) return respond(req, .ok, "application/json", "{\"backgrounds\":[]}", &.{});
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/web/osu-getseasonal.php")) return respond(req, .ok, "application/json", "[]", &.{});
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/menu-content.json")) return respond(req, .ok, "application/json", "{\"images\":[]}", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) {
             const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -311,12 +315,14 @@ const App = struct {
             const encoded_name = queryField(target, "us") orelse return respond(req, .bad_request, "text/plain", "", &.{});
             const password = queryField(target, "ha") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
             const map_md5 = queryField(target, "c") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const set_id_text = queryField(target, "i") orelse "0";
             const mode_text = queryField(target, "m") orelse "0";
             const board_text = queryField(target, "v") orelse "1";
             const mods_text = queryField(target, "mods") orelse "0";
             const mode = std.fmt.parseInt(u8, mode_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
             const board_type = std.fmt.parseInt(u8, board_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
             const mods = std.fmt.parseInt(i32, mods_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const set_id = std.fmt.parseInt(i32, set_id_text, 10) catch 0;
             if (mode > 3 or board_type > 4 or map_md5.len != 32) return respond(req, .bad_request, "text/plain", "", &.{});
             const name_buf = try self.allocator.dupe(u8, encoded_name);
             defer self.allocator.free(name_buf);
@@ -327,6 +333,12 @@ const App = struct {
             const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
+            if (try self.store.beatmapForScore(map_md5) == null) {
+                _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| failed: {
+                    std.log.warn("Nerinyan beatmap hydration failed for {s}: {t}", .{ map_md5, err });
+                    break :failed false;
+                };
+            }
             const listing = try self.store.stableLeaderboard(self.allocator, user, map_md5, mode, board_type, mods);
             defer self.allocator.free(listing);
             return respond(req, .ok, "text/plain", listing, &.{});
@@ -438,7 +450,9 @@ pub fn main(init: std.process.Init) !void {
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
+        .map_sync = beatmap_sync.Sync.init(allocator, init.io),
     };
+    defer app.map_sync.deinit();
     defer app.limiter.deinit();
     defer app.sessions.deinit();
     const address = try std.Io.net.IpAddress.parse(bind, port);

@@ -31,10 +31,9 @@ pub fn field(allocator: std.mem.Allocator, body: []const u8, keys: []const []con
 }
 
 pub fn credentialMd5(input: []const u8) ![32]u8 {
-    if (input.len == 32) {
+    if (input.len == 32 and isHex(input)) {
         var normalized: [32]u8 = undefined;
         for (input, 0..) |char, index| {
-            if (!std.ascii.isHex(char)) return error.InvalidCredential;
             normalized[index] = std.ascii.toLower(char);
         }
         return normalized;
@@ -43,6 +42,11 @@ pub fn credentialMd5(input: []const u8) ![32]u8 {
     var digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
     std.crypto.hash.Md5.hash(input, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn isHex(input: []const u8) bool {
+    for (input) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
 }
 
 fn replacePlus(buffer: []u8) void {

@@ -8,6 +8,8 @@ I built the official osu! source at one pinned commit with zigcho's production a
 
 The server now decodes the exact form shape lazer sends, including spaces and escaped characters, and accepts its raw password without creating a second account system. Stable's MD5 credential and lazer's raw password land on the same stored secret, still wrapped with Argon2id. The harmless but noisy seasonal-background startup request has a real empty response now too.
 
+The first public registration check found one narrow password edge case: a 32-character raw password was being treated as stable's 32-character MD5 shape before its contents were checked. Only an all-hex value is treated as a stable credential now. A 32-character lazer password stays a raw password like it should.
+
 The endpoint overrides, pinned upstream revision, and apply script are checked in. The macOS app I used is still an ad-hoc signed QA build. The next proof is registration and sign-in through the deployed server, then following the client's next authenticated request instead of pretending this one fix means lazer is finished.
 
 ## 2026-08-09 — beatmaps and real PP

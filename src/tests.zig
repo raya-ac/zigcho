@@ -30,6 +30,8 @@ test "stable md5 and raw lazer passwords normalize to the same secret" {
     const stable = try form_urlencoded.credentialMd5("5F4DCC3B5AA765D61D8327DEB882CF99");
     try std.testing.expectEqualStrings("5f4dcc3b5aa765d61d8327deb882cf99", &raw);
     try std.testing.expectEqual(raw, stable);
+    const raw_32 = try form_urlencoded.credentialMd5("not-an-md5-but-exactly-32-chars!");
+    try std.testing.expect(!std.mem.eql(u8, "not-an-md5-but-exactly-32-chars!", &raw_32));
     try std.testing.expectError(error.InvalidCredential, form_urlencoded.credentialMd5("short"));
 }
 

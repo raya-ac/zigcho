@@ -44,12 +44,13 @@ pub const Webhook = struct {
         var buf: [4096]u8 = undefined;
         var mod_buf: [32]u8 = undefined;
         const json = buildJson(&buf, &mod_buf, data) catch return;
-        self.doPost(json) catch {};
+        self.doPost(json) catch |err| std.log.warn("webhook post failed: {t}", .{err});
     }
 
     fn doPost(self: *Webhook, json: []const u8) !void {
-        var writer = std.Io.Writer.fixed(&.{});
-        _ = self.client.fetch(.{
+        var response_buf: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&response_buf);
+        const result = self.client.fetch(.{
             .location = .{ .url = self.url },
             .method = .POST,
             .payload = json,
@@ -58,7 +59,10 @@ pub const Webhook = struct {
                 .content_type = .{ .override = "application/json" },
                 .user_agent = .{ .override = "zigcho/0.1" },
             },
-        }) catch {};
+        }) catch |err| return err;
+        if (@intFromEnum(result.status) >= 400) {
+            std.log.warn("webhook returned status {d}", .{@intFromEnum(result.status)});
+        }
     }
 
     fn buildJson(buf: *[4096]u8, mod_buf: *[32]u8, data: ScoreData) ![]const u8 {

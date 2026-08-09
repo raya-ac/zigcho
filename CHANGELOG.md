@@ -2,6 +2,14 @@
 
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 
+## 2026-08-09 — the real lazer client can speak our account format
+
+I built the official osu! source at one pinned commit with zigcho's production and development endpoints. The client reached `api.kai.ovh` over TLS and gave us a useful failure instead of a synthetic guess: its registration body uses nested `user[...]` fields, while zigcho only understood the short curl fields.
+
+The server now decodes the exact form shape lazer sends, including spaces and escaped characters, and accepts its raw password without creating a second account system. Stable's MD5 credential and lazer's raw password land on the same stored secret, still wrapped with Argon2id. The harmless but noisy seasonal-background startup request has a real empty response now too.
+
+The endpoint overrides, pinned upstream revision, and apply script are checked in. The macOS app I used is still an ad-hoc signed QA build. The next proof is registration and sign-in through the deployed server, then following the client's next authenticated request instead of pretending this one fix means lazer is finished.
+
 ## 2026-08-09 — beatmaps and real PP
 
 I added the first real performance path. Stable standard scores are calculated from the exact `.osu` file we have stored, using `rosu-pp` 4.0.1 with the full Rust dependency lock checked in. If the file is missing, malformed, suspicious, or the calculation fails, the score is rejected. It does not get a made-up value and it does not quietly land with zero PP.

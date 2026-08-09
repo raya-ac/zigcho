@@ -9,6 +9,7 @@ const stable_score = @import("stable_score.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
 const status_page = @embedFile("status.html");
+const form_urlencoded = @import("form_urlencoded.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -150,21 +151,29 @@ const App = struct {
             return respond(req, .ok, "application/x-osu-beatmap", map_file, &headers);
         }
         if (std.mem.eql(u8, path, "/users") and req.head.method == .POST) {
-            const name = field(body, "name") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"name required\"}", &.{});
-            const email = field(body, "email") orelse "";
-            const password = field(body, "password_md5") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password_md5 required\"}", &.{});
-            if (name.len < 2 or name.len > 32 or password.len != 32) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
-            const id = self.store.register(name, email, password) catch |err| return respond(req, if (err == error.UserExists) .conflict else .internal_server_error, "application/json", "{\"error\":\"registration failed\"}", &.{});
+            const name = (try form_urlencoded.field(self.allocator, body, &.{ "name", "user[username]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"name required\"}", &.{});
+            defer self.allocator.free(name);
+            const email = (try form_urlencoded.field(self.allocator, body, &.{ "email", "user[user_email]" })) orelse try self.allocator.dupe(u8, "");
+            defer self.allocator.free(email);
+            const password = (try form_urlencoded.field(self.allocator, body, &.{ "password_md5", "user[password]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &.{});
+            defer self.allocator.free(password);
+            const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
+            if (name.len < 2 or name.len > 32 or email.len > 254) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
+            const id = self.store.register(name, email, &password_md5) catch |err| return respond(req, if (err == error.UserExists) .conflict else .internal_server_error, "application/json", "{\"error\":\"registration failed\"}", &.{});
             var out: [96]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"name\":\"{s}\"}}", .{ id, name });
             return respond(req, .created, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/oauth/token") and req.head.method == .POST) {
-            const grant = field(body, "grant_type") orelse "password";
+            const grant = (try form_urlencoded.field(self.allocator, body, &.{"grant_type"})) orelse try self.allocator.dupe(u8, "password");
+            defer self.allocator.free(grant);
             if (!std.mem.eql(u8, grant, "password")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported_grant_type\"}", &.{});
-            const name = field(body, "username") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
-            const password = field(body, "password_md5") orelse field(body, "password") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
-            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
+            const name = (try form_urlencoded.field(self.allocator, body, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+            defer self.allocator.free(name);
+            const password = (try form_urlencoded.field(self.allocator, body, &.{ "password_md5", "password" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+            defer self.allocator.free(password);
+            const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
+            const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
             const token = try self.store.issueToken(user.id, "identify scores:write", 3600);
@@ -182,6 +191,7 @@ const App = struct {
             return respond(req, .ok, "application/json", "{}", &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"Server-side cursor relax\",\"ranked\":false,\"score_multiplier\":0.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":false}}", &.{});
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/seasonal-backgrounds")) return respond(req, .ok, "application/json", "{\"backgrounds\":[]}", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) {
             const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});

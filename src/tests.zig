@@ -10,6 +10,28 @@ const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
 const storage = @import("storage.zig");
+const form_urlencoded = @import("form_urlencoded.zig");
+
+test "lazer registration fields are form decoded" {
+    const body = "user%5Busername%5D=zigcho+lazer&user%5Buser_email%5D=qa%2Bzigcho%40example.invalid&user%5Bpassword%5D=long%26safe%3Dpassword";
+    const name = (try form_urlencoded.field(std.testing.allocator, body, &.{ "name", "user[username]" })).?;
+    defer std.testing.allocator.free(name);
+    const email = (try form_urlencoded.field(std.testing.allocator, body, &.{ "email", "user[user_email]" })).?;
+    defer std.testing.allocator.free(email);
+    const password = (try form_urlencoded.field(std.testing.allocator, body, &.{ "password_md5", "user[password]" })).?;
+    defer std.testing.allocator.free(password);
+    try std.testing.expectEqualStrings("zigcho lazer", name);
+    try std.testing.expectEqualStrings("qa+zigcho@example.invalid", email);
+    try std.testing.expectEqualStrings("long&safe=password", password);
+}
+
+test "stable md5 and raw lazer passwords normalize to the same secret" {
+    const raw = try form_urlencoded.credentialMd5("password");
+    const stable = try form_urlencoded.credentialMd5("5F4DCC3B5AA765D61D8327DEB882CF99");
+    try std.testing.expectEqualStrings("5f4dcc3b5aa765d61d8327deb882cf99", &raw);
+    try std.testing.expectEqual(raw, stable);
+    try std.testing.expectError(error.InvalidCredential, form_urlencoded.credentialMd5("short"));
+}
 
 test "packet framing round trip" {
     var w = protocol.Writer.init(std.testing.allocator);

@@ -2,6 +2,14 @@
 
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 
+## 2026-08-09 — leaderboards stop showing the current time
+
+Every leaderboard row was sending the play date as a formatted string (`datetime(...,'unixepoch')` → `2026-08-09 03:42:38`). The osu! stable client wants a raw unix timestamp in that slot — the same shape bancho.py sends as `unix_timestamp(play_time)`. The client could not parse the string, so it fell back to showing now, and every score looked like it was just set.
+
+The stored value was never wrong. Production still holds the nine real scores raya set earlier on 2026-08-09 with the correct `submitted_at`. The fix is only in the wire response: both leaderboard selects now read `s.submitted_at` directly, and the row formatter writes it as an integer instead of a string. `zig build test` passes. Not deployed.
+
+This does not reopen score submission. The checksum mismatch that rejects every attempt is still unresolved, so the timestamp only shows on the scores already in the database until that is fixed.
+
 ## 2026-08-09 — map ranks stop lying and failed plays get through
 
 Zigcho's map table uses an internal status enum, while stable leaderboards, stable Direct and lazer all want different values. I was returning the database number directly to stable and had the Direct conversion wrong too. Pending became ranked. Ranked became approved. There are explicit conversions now for pending, ranked, approved, qualified and loved on every client surface. The Nerinyan data and cached rows were already correct; this fixes the wire response instead of rewriting good data to compensate for a protocol bug.

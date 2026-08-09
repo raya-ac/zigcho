@@ -12,7 +12,7 @@ rosu-pp = "=4.0.1"
 rosu-map = "=0.2.1"
 
 [profile.release]
-codegen-units = 1
-lto = "thin"
+codegen-units = 16
+lto = "off"
 panic = "unwind"
 strip = "debuginfo"

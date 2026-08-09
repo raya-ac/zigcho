@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM rust@sha256:4ec71e955e6c08aeb238885083222ddff79d82eb87654a96c76e38e94da1a53b
 
 ARG ZIG_VERSION=0.16.0
@@ -19,7 +20,9 @@ RUN curl --fail --location --silent --show-error \
 WORKDIR /src
 COPY . .
 
-RUN zig build test \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/pp/target \
+    zig build test \
     && zig build -Doptimize=ReleaseSafe \
     && mkdir /out \
     && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive /out/

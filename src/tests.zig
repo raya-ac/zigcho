@@ -11,6 +11,12 @@ const pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
 const storage = @import("storage.zig");
 const form_urlencoded = @import("form_urlencoded.zig");
+const routing = @import("routing.zig");
+
+test "lazer trailing slashes use the same API route" {
+    try std.testing.expectEqualStrings("/api/v2/me", routing.canonicalPath("/api/v2/me/"));
+    try std.testing.expectEqualStrings("/", routing.canonicalPath("/"));
+}
 
 test "lazer registration fields are form decoded" {
     const body = "user%5Busername%5D=zigcho+lazer&user%5Buser_email%5D=qa%2Bzigcho%40example.invalid&user%5Bpassword%5D=long%26safe%3Dpassword";

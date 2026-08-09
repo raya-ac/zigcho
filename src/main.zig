@@ -10,6 +10,7 @@ const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
 const status_page = @embedFile("status.html");
 const form_urlencoded = @import("form_urlencoded.zig");
+const routing = @import("routing.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -70,7 +71,8 @@ const App = struct {
     fn serve(self: *App, req: *std.http.Server.Request) !void {
         const target = try self.allocator.dupe(u8, req.head.target);
         defer self.allocator.free(target);
-        const path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
+        const raw_path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
+        const path = routing.canonicalPath(raw_path);
         if (requestRule(req, path)) |rule| {
             const client = rate_limit.clientKey(header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"));
             const decision = self.limiter.check(client, rule) catch return respond(req, .service_unavailable, "application/json", "{\"error\":\"rate limiter unavailable\"}", &.{});

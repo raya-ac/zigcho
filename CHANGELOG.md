@@ -12,6 +12,8 @@ The first public registration check found one narrow password edge case: a 32-ch
 
 The first real token login found the next contract difference. The official framework sends `AddParameter()` bodies as multipart form data, including registration and OAuth. Zigcho now accepts both that real client body and the URL-encoded operator/curl body. The regression fixture uses the framework's exact boundary and the local integration run covers multipart registration, token issue, and `/me` together.
 
+Registration through the deployed custom client now succeeds. Its first post-token request is `/api/v2/me/` with a trailing slash, while zigcho only matched `/api/v2/me`. API routes now canonicalize one trailing slash without turning the root page into an empty path.
+
 The endpoint overrides, pinned upstream revision, and apply script are checked in. The macOS app I used is still an ad-hoc signed QA build. The next proof is registration and sign-in through the deployed server, then following the client's next authenticated request instead of pretending this one fix means lazer is finished.
 
 ## 2026-08-09 — beatmaps and real PP

@@ -201,8 +201,10 @@ pub const Sync = struct {
             .string => |s| s,
             else => return error.DownloadUrlNotString,
         };
-        std.log.info("{s}  │  ✓ redirect → {s}{s}", .{ c_green, c_reset, url_str });
-        const archive = fetchFn(&client, self.allocator, url_str, archive_limit) catch |err| {
+        const fetch_url = try std.fmt.allocPrint(self.allocator, "{s}?noVideo=true", .{url_str});
+        defer self.allocator.free(fetch_url);
+        std.log.info("{s}  │  ✓ redirect → {s}{s}", .{ c_green, c_reset, fetch_url });
+        const archive = fetchFn(&client, self.allocator, fetch_url, archive_limit) catch |err| {
             std.log.warn("{s}  │  ✗ archive fetch failed: {t}{s}", .{ c_red, err, c_reset });
             return err;
         };

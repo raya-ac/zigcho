@@ -16,6 +16,28 @@ const country = @import("country.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
+const Config = struct {
+    osu_api_key: []const u8 = "",
+};
+
+fn parseConfig(io: std.Io) Config {
+    var result: Config = .{};
+    var buf: [4096]u8 = undefined;
+    const bytes = std.Io.Dir.cwd().readFile(io, "config.ini", &buf) catch return result;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        const eq = std.mem.findScalar(u8, trimmed, '=') orelse continue;
+        const key = std.mem.trim(u8, trimmed[0..eq], " \t");
+        const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        if (std.mem.eql(u8, key, "osu_api_key")) {
+            result.osu_api_key = value;
+        }
+    }
+    return result;
+}
+
 const App = struct {
     allocator: std.mem.Allocator,
     store: storage.Store,
@@ -589,12 +611,13 @@ pub fn main(init: std.process.Init) !void {
     var store = try storage.Store.open(allocator, init.io, db_path);
     defer store.close();
     try store.migrate();
+    const config = parseConfig(init.io);
     var app: App = .{
         .allocator = allocator,
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
-        .map_sync = beatmap_sync.Sync.init(allocator, init.io),
+        .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key),
     };
     const kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
     _ = try app.sessions.createBot(kai);

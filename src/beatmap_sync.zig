@@ -8,16 +8,11 @@ const archive_limit = 128 * 1024 * 1024;
 const map_limit = 16 * 1024 * 1024;
 const entry_limit = 4096;
 
-const AkatsukiMap = struct {
-    BeatmapID: i32,
-    ParentSetID: i32,
-    FileMD5: []const u8,
-};
-
-const AkatsukiSet = struct {
-    SetID: i32,
-    ChildrenBeatmaps: []AkatsukiMap,
-    RankedStatus: i8,
+const OsuV1Map = struct {
+    beatmap_id: i32,
+    beatmapset_id: i32,
+    approved: i32,
+    file_md5: []const u8,
 };
 
 pub const Sync = struct {
@@ -25,12 +20,14 @@ pub const Sync = struct {
     io: std.Io,
     client: std.http.Client,
     mutex: std.Io.Mutex = .init,
+    api_key: []const u8 = "",
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) Sync {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8) Sync {
         return .{
             .allocator = allocator,
             .io = io,
             .client = .{ .allocator = allocator, .io = io },
+            .api_key = api_key,
         };
     }
 
@@ -48,25 +45,25 @@ pub const Sync = struct {
         const set_id = expected_set_id orelse return false;
         if (set_id <= 0) return false;
 
-        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://beatmaps.akatsuki.gg/api/s/{d}", .{set_id});
+        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh/api/get_beatmaps?s={d}&k={s}", .{ set_id, self.api_key });
         defer self.allocator.free(metadata_url);
         const metadata_json = try self.fetch(metadata_url, metadata_limit);
         defer self.allocator.free(metadata_json);
-        const parsed = try std.json.parseFromSlice(AkatsukiSet, self.allocator, metadata_json, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSlice([]OsuV1Map, self.allocator, metadata_json, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (parsed.value.SetID != set_id) return false;
-        var remote: ?AkatsukiMap = null;
-        for (parsed.value.ChildrenBeatmaps) |candidate| {
-            if (std.ascii.eqlIgnoreCase(candidate.FileMD5, wanted_md5)) {
+        if (parsed.value.len == 0) return false;
+        var remote: ?OsuV1Map = null;
+        for (parsed.value) |candidate| {
+            if (std.ascii.eqlIgnoreCase(candidate.file_md5, wanted_md5)) {
                 remote = candidate;
                 break;
             }
         }
         const map_info = remote orelse return false;
-        const map_id = map_info.BeatmapID;
-        if (map_id <= 0 or map_info.ParentSetID != set_id) return false;
+        const map_id = map_info.beatmap_id;
+        if (map_id <= 0 or map_info.beatmapset_id != set_id) return false;
 
-        const archive_url = try std.fmt.allocPrint(self.allocator, "https://beatmaps.akatsuki.gg/api/d/{d}", .{set_id});
+        const archive_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/d/{d}", .{set_id});
         defer self.allocator.free(archive_url);
         const archive = try self.fetch(archive_url, archive_limit);
         defer self.allocator.free(archive);
@@ -88,14 +85,14 @@ pub const Sync = struct {
             .misses = 0,
             .legacy_total_score = 1_000_000,
         });
-        try store.upsertBeatmap(metadata, wanted_md5, localStatus(parsed.value.RankedStatus), attributes.stars, attributes.max_combo, osu_file);
+        try store.upsertBeatmap(metadata, wanted_md5, localStatus(map_info.approved), attributes.stars, attributes.max_combo, osu_file);
 
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
         var encoded: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&encoded, "{x}", .{digest}) catch unreachable;
         try store.upsertBeatmapArchive(set_id, &encoded, archive);
-        std.log.info("hydrated Akatsuki beatmap {d} in set {d} ({s})", .{ map_id, set_id, wanted_md5 });
+        std.log.info("hydrated beatmap {d} in set {d} ({s})", .{ map_id, set_id, wanted_md5 });
         return true;
     }
 
@@ -116,12 +113,13 @@ pub const Sync = struct {
     }
 };
 
-pub fn localStatus(upstream: i8) i8 {
+pub fn localStatus(upstream: i32) i8 {
     return switch (upstream) {
         1 => 3,
         2 => 4,
         3 => 5,
         4 => 6,
+        -2 => 6,
         else => 2,
     };
 }

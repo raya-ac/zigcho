@@ -8,6 +8,8 @@ Zigcho's map table uses an internal status enum, while stable leaderboards, stab
 
 The first live score rejection reason also found that stable sends an empty replay file for a failed play. Zigcho checked for replay bytes before decrypting the score, so it rejected the request before it knew the play had failed. Replay validation now happens after parsing: failed scores may have an empty replay, passed scores may not, and the size cap still applies to both.
 
+The next live trace found the 2026 stable client sends one trailing score field beyond the older 18-field shape. The established server parser already ignores trailing values after validating the original score fields; Zigcho required exactly 18. It now accepts one bounded trailing client field, still validates the original map, user, counts, checksum, mode, time and flags, and rejects a second extension instead of turning the payload into an open-ended format.
+
 All 31 tests and the ReleaseSafe build pass locally. The next public proof is the corrected map state in stable followed by a passed score, replay download, leaderboard row and player-stat update. Until those are visible in the installed client, this is a fixed build waiting for acceptance—not a finished score path.
 
 ## 2026-08-09 — maps stop being unsubmitted when stable opens them

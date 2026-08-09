@@ -8,6 +8,6 @@ Replay validation now happens after the score is parsed. A failed play can carry
 
 I added the complete pending/ranked/approved/qualified/loved conversion matrix and the failed, passed and oversized replay cases to the tests. The old Direct test caught itself expecting the broken ranked value, which is fixed too. All 31 tests and the full ReleaseSafe build pass.
 
-The passed 2026 client submission decrypts but has a different field shape from the old fixture. This build records only its field count and plaintext size when parsing fails, never the field contents. That gives us the exact compatibility boundary on the next play without dumping a score or account detail into a log.
+The passed 2026 client submission decrypts to 19 fields instead of the older 18-field fixture. The established server parser reads the original fields and ignores trailing values. Zigcho now accepts one bounded trailing client field while keeping the original validation and checksum intact, and rejects anything beyond it.
 
 We are about 46% of the way to an invite-only alpha. This closes the real failed-score compatibility bug. The next proof is a passed installed-client score showing up in SQLite, the leaderboard, replay download and player stats before I call the stable score path working.

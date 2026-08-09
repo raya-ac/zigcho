@@ -253,6 +253,12 @@ test "stable online score checksum matches the client formula" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.97258), score.accuracy(), 0.0001);
 }
 
+test "current stable score payload accepts one trailing client field" {
+    const base = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:0:True:0:260808235959:20260808";
+    _ = try stable_score.parse(base ++ ":0");
+    try std.testing.expectError(error.InvalidFieldCount, stable_score.parse(base ++ ":0:extra"));
+}
+
 test "failed stable scores may submit an empty replay" {
     try std.testing.expect(stable_score.replayLengthAccepted(false, 0));
     try std.testing.expect(!stable_score.replayLengthAccepted(true, 0));

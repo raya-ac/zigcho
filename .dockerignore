@@ -1,0 +1,8 @@
+.git
+.zig-cache
+zig-out
+pp/target
+work
+*.db
+*.db-shm
+*.db-wal

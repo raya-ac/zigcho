@@ -12,6 +12,10 @@ The Bancho side can parse protocol 19 packets, log stable clients in, issue toke
 
 Stable score submission uses the actual Rijndael cipher with a 32-byte block. The server parses both multipart `score` fields, decrypts the score and client hash, checks the online checksum, verifies the active session and password, stores the replay, and updates player and beatmap counters in one transaction. Replays can be downloaded again through the stable endpoint. Duplicate checksums are rejected without touching stats.
 
+PP is calculated from the exact `.osu` file stored with the beatmap. The calculator is `rosu-pp` 4.0.1 behind a small C boundary, with Cargo's complete dependency lock checked in. A calculation error rejects the score instead of writing a believable-looking zero. Normal ranked scores update the player's weighted PP total; relax PP is stored on the score but stays out of normal stats.
+
+Beatmaps are imported with a separate command instead of an unauthenticated admin endpoint. The importer parses the map IDs, mode, metadata, difficulty settings, timing, and object count, calculates its stars and maximum combo, and stores the original file and its MD5 in SQLite. Imports default to pending. A status has to be chosen deliberately before a map can affect ranked score or PP.
+
 Stable leaderboards return the normal client response with map data, a personal-best row, and the top 50. Global, exact-mod, friends, and country filters are handled in SQL. Only one best score per player/map/mode/namespace is listed. A worse play still counts toward total score and plays, but it does not inflate ranked score. Relax and autopilot stay on the relax board.
 
 The lazer side has local bearer authentication, `/api/v2/me`, mod discovery, and JSON score submission. Tokens are random, stored by hash, scoped, expiring, and revocable. Password credentials are stored with Argon2id. Older development databases using the original hash format upgrade themselves after the next successful login.
@@ -28,7 +32,7 @@ That namespace is stored with the score. It is a database boundary, not a fronte
 
 ## building it
 
-You need Zig 0.16.0 and SQLite 3.
+You need Zig 0.16.0, Rust 1.94 or newer, and SQLite 3. The Rust toolchain only builds the pinned PP library; the server and storage code are still Zig.
 
 ```sh
 zig build test
@@ -37,6 +41,14 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 The arguments are bind address, port, and database path. Public deployments need TLS in front of the server, with the usual `c.`, `osu.`, `b.`, and `a.` hosts routed to it. Do not send stable login credentials over plain HTTP.
+
+Import a map as pending while checking it:
+
+```sh
+./zig-out/bin/zigcho-import zigcho.db map.osu
+```
+
+Pass the status as the last argument when the map is ready. `3` is ranked and `4` is approved. This is a local operator command; it is not exposed over HTTP.
 
 ## where it is running
 
@@ -81,11 +93,10 @@ Custom acronyms are two to eight uppercase ASCII characters. They are unranked a
 
 This is the actual production list, not a wishlist:
 
-- PP is still zero until a pinned calculator is added; score and ranked-score placement work without making up performance values
 - beatmap search, metadata syncing, downloads, favourites, ratings, and screenshot storage need their backing services
 - stable multiplayer needs full slot state, host transfer, freemod, team modes, match completion, invites, tournament control, and reconnect behavior
 - lazer needs rooms, event streams, multiplayer spectating, and a client build pointed at this server
-- PP needs a pinned calculator with test fixtures for every supported ruleset and scoring version
+- PP now has a pinned stable standard fixture; taiko, catch, mania, and lazer scoring fixtures still need to be locked before those paths can award PP
 - public operation still needs moderation tools, structured logs, backups, migration tooling, metrics, and rolling restart behavior
 - both clients need to be tested against a TLS deployment, not just synthetic requests
 
@@ -93,6 +104,6 @@ The stable score cipher is Rijndael with a 32-byte block. AES-256 still has a 16
 
 ## current checks
 
-The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, bounded rate-limit windows, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation.
+The repository currently checks packet framing, malformed packets, safe-name handling, accuracy, relax/custom mod isolation, Argon2id authentication, scoped token access, revocation, bounded rate-limit windows, Rijndael block output, CBC padding, multipart duplicate fields, stable score decryption, online checksums, beatmap parsing and MD5s, a pinned PP result, and JSON score validation. The concurrent server has also been exercised with parallel health, authenticated lazer, and Bancho poll requests. Full score/replay and leaderboard runs use fresh migrated databases in `ReleaseSafe`, including repeated mixed-size uploads, personal ranks, displaced best scores, exact-mod boards, friends boards, and Relax separation.
 
 The protocol work is being checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho wiki page](https://osu.ppy.sh/wiki/en/Bancho_%28server%29), and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation.

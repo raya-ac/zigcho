@@ -7,6 +7,7 @@ const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
 const rate_limit = @import("rate_limit.zig");
+const pp = @import("pp.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -235,10 +236,25 @@ const App = struct {
             if (!active) return respond(req, .unauthorized, "text/plain", "", &.{});
             if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return respond(req, .bad_request, "text/plain", "error: no", &.{});
             const beatmap = (try self.store.beatmapForScore(score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
-            const score_id = self.store.insertStableScore(user.id, score, replay.data) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
+            const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
+            defer self.allocator.free(map_file);
+            const performance = pp.calculate(map_file, .{
+                .mode = score.mode,
+                .lazer = 0,
+                .mods = @intCast(score.mods),
+                .max_combo = @intCast(score.max_combo),
+                .n_geki = @intCast(score.ngeki),
+                .n_katu = @intCast(score.nkatu),
+                .n300 = @intCast(score.n300),
+                .n100 = @intCast(score.n100),
+                .n50 = @intCast(score.n50),
+                .misses = @intCast(score.nmiss),
+                .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
+            }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
+            const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
             if (!score.passed) return respond(req, .ok, "text/plain", "error: no", &.{});
             var result_buf: [1024]u8 = undefined;
-            const result = try std.fmt.bufPrint(&result_buf, "beatmapId:{d}|beatmapSetId:{d}|beatmapPlaycount:{d}|beatmapPasscount:{d}|approvedDate:|\n|chartId:beatmap|chartUrl:|chartName:Beatmap Ranking|rankBefore:|rankAfter:|rankedScoreBefore:|rankedScoreAfter:{d}|totalScoreBefore:|totalScoreAfter:{d}|maxComboBefore:|maxComboAfter:{d}|accuracyBefore:|accuracyAfter:{d:.2}|ppBefore:|ppAfter:|onlineScoreId:{d}|\n|chartId:overall|chartUrl:|chartName:Overall Ranking|achievements-new:", .{ beatmap.id, beatmap.set_id, beatmap.plays + 1, beatmap.passes + 1, score.total_score, score.total_score, score.max_combo, score.accuracy() * 100.0, score_id });
+            const result = try std.fmt.bufPrint(&result_buf, "beatmapId:{d}|beatmapSetId:{d}|beatmapPlaycount:{d}|beatmapPasscount:{d}|approvedDate:|\n|chartId:beatmap|chartUrl:|chartName:Beatmap Ranking|rankBefore:|rankAfter:|rankedScoreBefore:|rankedScoreAfter:{d}|totalScoreBefore:|totalScoreAfter:{d}|maxComboBefore:|maxComboAfter:{d}|accuracyBefore:|accuracyAfter:{d:.2}|ppBefore:|ppAfter:{d:.2}|onlineScoreId:{d}|\n|chartId:overall|chartUrl:|chartName:Overall Ranking|achievements-new:", .{ beatmap.id, beatmap.set_id, beatmap.plays + 1, beatmap.passes + 1, score.total_score, score.total_score, score.max_combo, score.accuracy() * 100.0, performance.pp, score_id });
             return respond(req, .ok, "text/plain", result, &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-getreplay.php") and req.head.method == .GET) {

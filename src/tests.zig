@@ -7,6 +7,9 @@ const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
 const rate_limit = @import("rate_limit.zig");
+const pp = @import("pp.zig");
+const beatmap = @import("beatmap.zig");
+const storage = @import("storage.zig");
 
 test "packet framing round trip" {
     var w = protocol.Writer.init(std.testing.allocator);
@@ -168,4 +171,92 @@ test "rate limiter stays bounded and only evicts expired clients" {
     try std.testing.expectError(error.RateLimitCapacity, limiter.checkAt("203.0.113.21", rule, 101));
     try std.testing.expect((try limiter.checkAt("203.0.113.21", rule, 110)).allowed);
     try std.testing.expectEqual(@as(usize, 1), limiter.entries.count());
+}
+
+test "pinned performance engine calculates the synthetic stable fixture" {
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const result = try pp.calculate(map, .{
+        .mode = 0,
+        .lazer = 0,
+        .mods = 0,
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    });
+    try std.testing.expectApproxEqAbs(@as(f64, 26.80), result.pp, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.7931), result.stars, 0.0001);
+    try std.testing.expectEqual(@as(u32, 10), result.max_combo);
+}
+
+test "beatmap metadata parser owns the import contract" {
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    try std.testing.expectEqual(@as(i32, 900000001), metadata.id);
+    try std.testing.expectEqual(@as(i32, 900000000), metadata.set_id);
+    try std.testing.expectEqualStrings("Zigcho", metadata.artist);
+    try std.testing.expectEqualStrings("Zigcho Fixture", metadata.title);
+    try std.testing.expectEqual(@as(u32, 10), metadata.object_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 120), metadata.bpm, 0.001);
+    try std.testing.expectEqualStrings("f981bd174d2fc7bdbefa557e85877e5a", &beatmap.md5(map));
+}
+
+test "performance engine rejects unsupported modes" {
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    try std.testing.expectError(error.PerformanceCalculationFailed, pp.calculate(map, .{
+        .mode = 4,
+        .lazer = 0,
+        .mods = 0,
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    }));
+}
+
+test "ranked stable PP is stored and updates normal player stats" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/pp.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(1,0)");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    const score: stable_score.Submission = .{
+        .map_md5 = &hash,
+        .username = "ari",
+        .online_checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260809000000",
+        .client_flags = "0",
+    };
+    const score_id = try store.insertStableScore(1, score, 26.80, "replay");
+    const snapshot = (try store.ppSnapshot(score_id)).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 26.80), snapshot.score, 0.001);
+    try std.testing.expectEqual(@as(i64, 27), snapshot.player);
 }

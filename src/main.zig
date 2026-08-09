@@ -12,12 +12,14 @@ const status_page = @embedFile("status.html");
 const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
+const webhook = @import("webhook.zig");
 const country = @import("country.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
 const Config = struct {
     osu_api_key: []const u8 = "",
+    score_webhook: []const u8 = "",
 };
 
 fn parseConfig(io: std.Io) Config {
@@ -33,6 +35,8 @@ fn parseConfig(io: std.Io) Config {
         const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
         if (std.mem.eql(u8, key, "osu_api_key")) {
             result.osu_api_key = value;
+        } else if (std.mem.eql(u8, key, "score_webhook")) {
+            result.score_webhook = value;
         }
     }
     return result;
@@ -44,6 +48,7 @@ const App = struct {
     sessions: sessions_mod.Sessions,
     limiter: rate_limit.Limiter,
     map_sync: beatmap_sync.Sync,
+    score_webhook: webhook.Webhook,
 
     fn header(req: *const std.http.Server.Request, wanted: []const u8) ?[]const u8 {
         var it = req.iterateHeaders();
@@ -553,6 +558,36 @@ const App = struct {
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, if (score.passed) score_time else fail_time) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
             try bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods);
+            if (score.passed) {
+                const rank = self.store.scoreRankOnMap(score.map_md5, score.mode, score.rankNamespace(), score.total_score, performance.pp);
+                if (rank < 10 or performance.pp >= 500.0) {
+                    if (self.store.beatmapInfo(self.allocator, score.map_md5) catch null) |info| {
+                        defer self.allocator.free(info.artist);
+                        defer self.allocator.free(info.title);
+                        defer self.allocator.free(info.version);
+                        self.score_webhook.postScore(.{
+                            .username = user.name,
+                            .user_id = user.id,
+                            .grade = score.grade,
+                            .mods = score.mods,
+                            .total_score = score.total_score,
+                            .max_combo = score.max_combo,
+                            .accuracy = score.accuracy(),
+                            .pp = performance.pp,
+                            .stars = info.star_rating,
+                            .n300 = score.n300,
+                            .n100 = score.n100,
+                            .n50 = score.n50,
+                            .nmiss = score.nmiss,
+                            .perfect = score.perfect,
+                            .artist = info.artist,
+                            .title = info.title,
+                            .version = info.version,
+                            .set_id = info.set_id,
+                        });
+                    }
+                }
+            }
             if (!score.passed) return respond(req, .ok, "text/plain", "error: no", &.{});
             var result_buf: [1024]u8 = undefined;
             const result = try std.fmt.bufPrint(&result_buf, "beatmapId:{d}|beatmapSetId:{d}|beatmapPlaycount:{d}|beatmapPasscount:{d}|approvedDate:|\n|chartId:beatmap|chartUrl:|chartName:Beatmap Ranking|rankBefore:|rankAfter:|rankedScoreBefore:|rankedScoreAfter:{d}|totalScoreBefore:|totalScoreAfter:{d}|maxComboBefore:|maxComboAfter:{d}|accuracyBefore:|accuracyAfter:{d:.2}|ppBefore:|ppAfter:{d:.2}|onlineScoreId:{d}|\n|chartId:overall|chartUrl:|chartName:Overall Ranking|achievements-new:", .{ beatmap.id, beatmap.set_id, beatmap.plays + 1, beatmap.passes + 1, score.total_score, score.total_score, score.max_combo, score.accuracy() * 100.0, performance.pp, score_id });
@@ -618,9 +653,11 @@ pub fn main(init: std.process.Init) !void {
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key),
+        .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
     };
     const kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
     _ = try app.sessions.createBot(kai);
+    defer app.score_webhook.deinit();
     defer app.map_sync.deinit();
     defer app.limiter.deinit();
     defer app.sessions.deinit();

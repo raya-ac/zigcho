@@ -596,6 +596,49 @@ pub const Store = struct {
         return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4) };
     }
 
+    pub const BeatmapInfo = struct { id: i32, set_id: i32, artist: []const u8, title: []const u8, version: []const u8, star_rating: f64 };
+
+    pub fn scoreRankOnMap(self: *Store, md5: []const u8, mode: u8, namespace: []const u8, score_val: i64, pp_val: f64) i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const is_vanilla = std.mem.eql(u8, namespace, "vanilla");
+        const sql = if (is_vanilla)
+            "SELECT count(*) FROM scores WHERE map_md5=?1 AND mode=?2 AND rank_namespace=?3 AND passed=1 AND score>?4"
+        else
+            "SELECT count(*) FROM scores WHERE map_md5=?1 AND mode=?2 AND rank_namespace=?3 AND passed=1 AND pp>?4";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return 999;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        _ = c.sqlite3_bind_int(stmt, 2, mode);
+        _ = c.sqlite3_bind_text(stmt, 3, namespace.ptr, @intCast(namespace.len), null);
+        if (is_vanilla)
+            _ = c.sqlite3_bind_int64(stmt, 4, score_val)
+        else
+            _ = c.sqlite3_bind_double(stmt, 4, pp_val);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 999;
+        return c.sqlite3_column_int(stmt, 0);
+    }
+
+    pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT id,set_id,artist,title,version,star_rating FROM beatmaps WHERE md5=?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{
+            .id = c.sqlite3_column_int(stmt, 0),
+            .set_id = c.sqlite3_column_int(stmt, 1),
+            .artist = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2))),
+            .title = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3))),
+            .version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4))),
+            .star_rating = c.sqlite3_column_double(stmt, 5),
+        };
+    }
+
     pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

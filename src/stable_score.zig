@@ -41,8 +41,10 @@ pub const Submission = struct {
     pub fn rankNamespace(self: Submission) []const u8 {
         const relax: i32 = 1 << 7;
         const autopilot: i32 = 1 << 13;
+        const scorev2: i32 = 1 << 27;
         if (self.mods & autopilot != 0) return "autopilot";
         if (self.mods & relax != 0) return "relax";
+        if (self.mods & scorev2 != 0) return "scorev2";
         return "vanilla";
     }
 

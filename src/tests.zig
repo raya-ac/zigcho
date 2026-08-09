@@ -110,7 +110,7 @@ test "Akatsuki ranks map into local leaderboard states" {
     try std.testing.expectEqual(@as(i8, 4), beatmap_sync.localStatus(2));
     try std.testing.expectEqual(@as(i8, 5), beatmap_sync.localStatus(3));
     try std.testing.expectEqual(@as(i8, 6), beatmap_sync.localStatus(4));
-    try std.testing.expectEqual(@as(i8, 6), beatmap_sync.localStatus(-2));
+    try std.testing.expectEqual(@as(i8, 2), beatmap_sync.localStatus(-2));
 }
 
 test "beatmap statuses use each client protocol's values" {

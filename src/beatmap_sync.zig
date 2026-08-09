@@ -256,7 +256,7 @@ pub fn localStatus(upstream: i32) i8 {
         2 => 4,
         3 => 5,
         4 => 6,
-        -2 => 6,
+        -2 => 2,
         else => 2,
     };
 }

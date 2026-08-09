@@ -485,11 +485,25 @@ pub const Store = struct {
         });
     }
 
-    fn directStatus(db_status: i32) i32 {
+    pub fn directStatus(db_status: i32) i32 {
         return switch (db_status) {
+            2 => 2,
+            3, 4 => 0,
+            5 => 3,
+            6 => 8,
+            else => 2,
+        };
+    }
+
+    pub fn stableStatus(db_status: i32) i32 {
+        return switch (db_status) {
+            1 => -1,
+            2 => 0,
             3 => 2,
             4 => 3,
-            else => 0,
+            5 => 4,
+            6 => 5,
+            else => 1,
         };
     }
 
@@ -529,7 +543,7 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        const sql = "SELECT set_id FROM beatmaps WHERE EXISTS(SELECT 1 FROM beatmap_archives a WHERE a.set_id=beatmaps.set_id) AND (?1=-1 OR mode=?1) AND (?2='' OR instr(lower(artist||' '||title||' '||creator||' '||source||' '||tags),lower(?2))>0) AND ((?3=4 AND status IN(3,4)) OR (?3 IN(0,7) AND status=3) OR (?3 IN(2,5) AND status=2)) GROUP BY set_id ORDER BY max(last_update) DESC,set_id DESC LIMIT 100 OFFSET ?4";
+        const sql = "SELECT set_id FROM beatmaps WHERE EXISTS(SELECT 1 FROM beatmap_archives a WHERE a.set_id=beatmaps.set_id) AND (?1=-1 OR mode=?1) AND (?2='' OR instr(lower(artist||' '||title||' '||creator||' '||source||' '||tags),lower(?2))>0) AND ((?3=4 AND status IN(3,4,5,6)) OR (?3 IN(0,7) AND status IN(3,4)) OR (?3 IN(2,5) AND status=2) OR (?3=3 AND status=5) OR (?3=8 AND status=6)) GROUP BY set_id ORDER BY max(last_update) DESC,set_id DESC LIMIT 100 OFFSET ?4";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -572,10 +586,12 @@ pub const Store = struct {
         try std.json.Stringify.value(value, .{}, writer);
     }
 
-    fn lazerStatus(db_status: i32) []const u8 {
+    pub fn lazerStatus(db_status: i32) []const u8 {
         return switch (db_status) {
             3 => "ranked",
             4 => "approved",
+            5 => "qualified",
+            6 => "loved",
             else => "pending",
         };
     }
@@ -692,11 +708,12 @@ pub const Store = struct {
         const map_id = c.sqlite3_column_int(map_stmt, 0);
         const set_id = c.sqlite3_column_int(map_stmt, 1);
         const status = c.sqlite3_column_int(map_stmt, 2);
+        const client_status = stableStatus(status);
         const artist = std.mem.span(c.sqlite3_column_text(map_stmt, 3));
         const title = std.mem.span(c.sqlite3_column_text(map_stmt, 4));
         const version = std.mem.span(c.sqlite3_column_text(map_stmt, 5));
         if (status < 3) {
-            try w.print("{d}|false", .{status});
+            try w.print("{d}|false", .{client_status});
             var unavailable = output.toArrayList();
             return unavailable.toOwnedSlice(allocator);
         }
@@ -709,7 +726,7 @@ pub const Store = struct {
         bindBoard(count_stmt.?, map_md5, mode, namespace, board_type, requested_mods, viewer);
         if (c.sqlite3_step(count_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
         const row_count = c.sqlite3_column_int(count_stmt, 0);
-        try w.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n0\n", .{ status, map_id, set_id, row_count, artist, title, version });
+        try w.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n0\n", .{ client_status, map_id, set_id, row_count, artist, title, version });
 
         const personal_id_sql = "SELECT s.id,s.score" ++ filter ++ " AND s.user_id=?6 ORDER BY s.score DESC,s.id ASC LIMIT 1";
         var personal_id_stmt: ?*c.sqlite3_stmt = null;

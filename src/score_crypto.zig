@@ -35,7 +35,6 @@ pub fn decrypt(
     errdefer allocator.free(score);
     const client_hash = try rijndael.decryptCbcPkcs7(allocator, key, iv, encrypted_hash);
     errdefer allocator.free(client_hash);
-    if (std.mem.count(u8, score, ":") != 17) return error.InvalidScoreFieldCount;
     if (!std.unicode.utf8ValidateSlice(score) or !std.unicode.utf8ValidateSlice(client_hash)) return error.InvalidText;
     return .{ .allocator = allocator, .score_data = score, .client_hash = client_hash };
 }

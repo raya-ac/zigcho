@@ -72,6 +72,22 @@ test "Nerinyan ranks map into local leaderboard states" {
     try std.testing.expectEqual(@as(i8, 2), beatmap_sync.localStatus("-2"));
 }
 
+test "beatmap statuses use each client protocol's values" {
+    try std.testing.expectEqual(@as(i32, 0), storage.Store.stableStatus(2));
+    try std.testing.expectEqual(@as(i32, 2), storage.Store.stableStatus(3));
+    try std.testing.expectEqual(@as(i32, 3), storage.Store.stableStatus(4));
+    try std.testing.expectEqual(@as(i32, 4), storage.Store.stableStatus(5));
+    try std.testing.expectEqual(@as(i32, 5), storage.Store.stableStatus(6));
+    try std.testing.expectEqual(@as(i32, 2), storage.Store.directStatus(2));
+    try std.testing.expectEqual(@as(i32, 0), storage.Store.directStatus(3));
+    try std.testing.expectEqual(@as(i32, 3), storage.Store.directStatus(5));
+    try std.testing.expectEqual(@as(i32, 8), storage.Store.directStatus(6));
+    try std.testing.expectEqualStrings("ranked", storage.Store.lazerStatus(3));
+    try std.testing.expectEqualStrings("approved", storage.Store.lazerStatus(4));
+    try std.testing.expectEqualStrings("qualified", storage.Store.lazerStatus(5));
+    try std.testing.expectEqualStrings("loved", storage.Store.lazerStatus(6));
+}
+
 test "Nerinyan archives only yield the exact MD5 map" {
     const map = @embedFile("testdata/synthetic-standard.osu");
     const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
@@ -237,6 +253,13 @@ test "stable online score checksum matches the client formula" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.97258), score.accuracy(), 0.0001);
 }
 
+test "failed stable scores may submit an empty replay" {
+    try std.testing.expect(stable_score.replayLengthAccepted(false, 0));
+    try std.testing.expect(!stable_score.replayLengthAccepted(true, 0));
+    try std.testing.expect(stable_score.replayLengthAccepted(true, 1));
+    try std.testing.expect(!stable_score.replayLengthAccepted(false, 16 * 1024 * 1024 + 1));
+}
+
 test "stable relax and autopilot scores cannot enter vanilla rankings" {
     const base = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:";
     const suffix = ":True:0:260808235959:20260808";
@@ -394,11 +417,11 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i64, 1), parsed_search.value.object.get("total").?.integer);
     const search = try store.stableSearch(std.testing.allocator, "Fixture", -1, 4, 0);
     defer std.testing.allocator.free(search);
-    try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|2|10.0|"));
+    try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|0|10.0|"));
     try std.testing.expect(std.mem.indexOf(u8, search, "[1.79⭐] Tests {cs: 4") != null);
     const set_lookup = try store.stableSearchSet(std.testing.allocator, null, null, &hash);
     defer std.testing.allocator.free(set_lookup);
-    try std.testing.expect(std.mem.startsWith(u8, set_lookup, "900000000.osz|Zigcho|Zigcho Fixture|Ari|2|10.0|"));
+    try std.testing.expect(std.mem.startsWith(u8, set_lookup, "900000000.osz|Zigcho|Zigcho Fixture|Ari|0|10.0|"));
     const no_pending = try store.stableSearch(std.testing.allocator, "Fixture", -1, 2, 0);
     defer std.testing.allocator.free(no_pending);
     try std.testing.expectEqualStrings("0", no_pending);

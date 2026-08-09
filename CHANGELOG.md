@@ -2,6 +2,14 @@
 
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 
+## 2026-08-09 — map ranks stop lying and failed plays get through
+
+Zigcho's map table uses an internal status enum, while stable leaderboards, stable Direct and lazer all want different values. I was returning the database number directly to stable and had the Direct conversion wrong too. Pending became ranked. Ranked became approved. There are explicit conversions now for pending, ranked, approved, qualified and loved on every client surface. The Nerinyan data and cached rows were already correct; this fixes the wire response instead of rewriting good data to compensate for a protocol bug.
+
+The first live score rejection reason also found that stable sends an empty replay file for a failed play. Zigcho checked for replay bytes before decrypting the score, so it rejected the request before it knew the play had failed. Replay validation now happens after parsing: failed scores may have an empty replay, passed scores may not, and the size cap still applies to both.
+
+All 31 tests and the ReleaseSafe build pass locally. The next public proof is the corrected map state in stable followed by a passed score, replay download, leaderboard row and player-stat update. Until those are visible in the installed client, this is a fixed build waiting for acceptance—not a finished score path.
+
 ## 2026-08-09 — maps stop being unsubmitted when stable opens them
 
 Stable now fills a missing map from Nerinyan on the first leaderboard request. Zigcho looks up the exact MD5, downloads that set, opens only bounded `.osu` entries, verifies the ZIP CRC and the file MD5, checks the map and set IDs again, calculates stars and max combo, then stores the map and archive together. A bad mirror response stays unsubmitted instead of becoming trusted data. No osu! API key is in the repo or the server.

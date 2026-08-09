@@ -61,6 +61,11 @@ pub const Submission = struct {
     }
 };
 
+pub fn replayLengthAccepted(passed: bool, replay_len: usize) bool {
+    const max_replay_size = 16 * 1024 * 1024;
+    return replay_len <= max_replay_size and (!passed or replay_len != 0);
+}
+
 pub fn parse(data: []const u8) !Submission {
     var fields: [18][]const u8 = undefined;
     var it = std.mem.splitScalar(u8, data, ':');

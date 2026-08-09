@@ -362,8 +362,6 @@ const App = struct {
             const replay = form.nth("score", 1) orelse return rejectStableScore(req, "missing_replay", body.len);
             if (encrypted.filename != null) return rejectStableScore(req, "encrypted_score_is_file", body.len);
             if (replay.filename == null) return rejectStableScore(req, "replay_is_not_file", body.len);
-            if (replay.data.len == 0) return rejectStableScore(req, "empty_replay", body.len);
-            if (replay.data.len > 16 * 1024 * 1024) return rejectStableScore(req, "replay_too_large", body.len);
             const iv = (form.first("iv") orelse return rejectStableScore(req, "missing_iv", body.len)).data;
             const client_hash_encrypted = (form.first("s") orelse return rejectStableScore(req, "missing_client_hash", body.len)).data;
             const password = (form.first("pass") orelse return respond(req, .unauthorized, "text/plain", "", &.{})).data;
@@ -372,7 +370,13 @@ const App = struct {
             const storyboard_hash = if (form.first("sbk")) |part| part.data else "";
             var decrypted = score_crypto.decrypt(self.allocator, encrypted.data, client_hash_encrypted, iv, osu_version) catch |err| return rejectStableScoreError(req, "decrypt_failed", err, body.len);
             defer decrypted.deinit();
-            const score = stable_score.parse(decrypted.score_data) catch |err| return rejectStableScoreError(req, "score_parse_failed", err, body.len);
+            const score = stable_score.parse(decrypted.score_data) catch |err| {
+                std.log.warn("stable score rejected: reason=score_parse_failed error={t} fields={d} plaintext_bytes={d} body_bytes={d}", .{ err, std.mem.count(u8, decrypted.score_data, ":") + 1, decrypted.score_data.len, body.len });
+                return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            };
+            if (!stable_score.replayLengthAccepted(score.passed, replay.data.len)) {
+                return rejectStableScore(req, if (replay.data.len == 0) "passed_score_missing_replay" else "replay_too_large", body.len);
+            }
             if (!std.mem.eql(u8, score.map_md5, updated_map_hash)) {
                 std.log.warn("stable score rejected: reason=beatmap_hash_mismatch body_bytes={d}", .{body.len});
                 return respond(req, .bad_request, "text/plain", "error: beatmap", &.{});

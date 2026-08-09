@@ -86,9 +86,9 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     var detail_it = std.mem.splitScalar(u8, details, '|');
     _ = detail_it.next();
     if (detail_it.next()) |offset| utc = std.fmt.parseInt(i8, offset, 10) catch 0;
-    std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ log.magenta ++ log.bold, "", log.reset });
-    std.log.info("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
-    std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ log.magenta ++ log.bold, "", log.reset });
+    std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
+    std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
+    std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.log.info("{s}  ► user_id  :{s} {d}", .{ log.dim, log.reset, user.id });
     const country_display: []const u8 = if (login_country) |c| &c else "??";
     std.log.info("{s}  ► country  :{s} {s}", .{ log.dim, log.reset, country_display });

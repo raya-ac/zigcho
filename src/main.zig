@@ -89,10 +89,10 @@ const App = struct {
         const lon_str = std.mem.trim(u8, lines.next() orelse "0", "\r ");
         const lat = std.fmt.parseFloat(f32, lat_str) catch 0;
         const lon = std.fmt.parseFloat(f32, lon_str) catch 0;
-        std.log.info("{s}  ┌─ GEOLOCATION ──────────────────────────────────{s}", .{ log.blue, log.reset });
-        std.log.info("{s}  │ {s}►{s} ip  : {s}{s}", .{ log.blue, log.dim, log.reset, ip, log.reset });
-        std.log.info("{s}  │ {s}✓{s} lat : {d:.4}  lon : {d:.4}{s}", .{ log.blue, log.green, log.reset, lat, lon, log.reset });
-        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ log.blue, log.reset });
+        std.debug.print("{s}  ┌─ GEOLOCATION ──────────────────────────────────{s}\n", .{ log.blue, log.reset });
+        std.debug.print("{s}  │ {s}►{s} ip  : {s}{s}\n", .{ log.blue, log.dim, log.reset, ip, log.reset });
+        std.debug.print("{s}  │ {s}✓{s} lat : {d:.4}  lon : {d:.4}{s}\n", .{ log.blue, log.green, log.reset, lat, lon, log.reset });
+        std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ log.blue, log.reset });
         return .{ .lon = lon, .lat = lat };
     }
 
@@ -519,10 +519,10 @@ const App = struct {
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
             if (try self.store.beatmapForScore(map_md5) == null) {
-                std.log.info("{s}  ┌─ LEADERBOARD ──────────────────────────────────{s}", .{ log.cyan, log.reset });
-                std.log.info("{s}  │ {s}►{s} user : {s}{s}{s}", .{ log.cyan, log.dim, log.reset, log.green, user.name, log.reset });
-                std.log.info("{s}  │ {s}►{s} map  : {s}{s}", .{ log.cyan, log.dim, log.reset, log.dim, map_md5 });
-                std.log.info("{s}  │ {s}►{s} hydrating...{s}", .{ log.cyan, log.dim, log.reset, log.dim });
+                std.debug.print("{s}  ┌─ LEADERBOARD ──────────────────────────────────{s}\n", .{ log.cyan, log.reset });
+                std.debug.print("{s}  │ {s}►{s} user : {s}{s}{s}\n", .{ log.cyan, log.dim, log.reset, log.green, user.name, log.reset });
+                std.debug.print("{s}  │ {s}►{s} map  : {s}{s}\n", .{ log.cyan, log.dim, log.reset, log.dim, map_md5 });
+                std.debug.print("{s}  │ {s}►{s} hydrating...{s}\n", .{ log.cyan, log.dim, log.reset, log.dim });
                 _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| failed: {
                     std.log.warn("{s}  │ {s}✗ hydration failed: {t}{s}", .{ log.red, log.reset, err, log.reset });
                     break :failed false;
@@ -530,8 +530,8 @@ const App = struct {
             }
             const listing = try self.store.stableLeaderboard(self.allocator, user, map_md5, mode, board_type, mods);
             defer self.allocator.free(listing);
-            std.log.info("{s}  │ {s}✓{s} served {d} bytes{s}", .{ log.cyan, log.green, log.reset, listing.len, log.reset });
-            std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ log.cyan, log.reset });
+            std.debug.print("{s}  │ {s}✓{s} served {d} bytes{s}\n", .{ log.cyan, log.green, log.reset, listing.len, log.reset });
+            std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ log.cyan, log.reset });
             return respond(req, .ok, "text/plain", listing, &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") and req.head.method == .POST) {
@@ -606,15 +606,15 @@ const App = struct {
             try bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods);
             {
                 const grade_color = if (std.mem.eql(u8, score.grade, "XH") or std.mem.eql(u8, score.grade, "X")) log.yellow else if (std.mem.eql(u8, score.grade, "SH") or std.mem.eql(u8, score.grade, "S")) log.cyan else if (std.mem.eql(u8, score.grade, "A")) log.green else if (std.mem.eql(u8, score.grade, "B")) log.blue else log.red;
-                std.log.info("{s}  ┌─ SCORE {s} ────────────────────────────{s}", .{ if (score.passed) log.green else log.red, if (score.passed) "SUBMIT" else "FAIL", log.reset });
-                std.log.info("{s}  │ {s}►{s} user    : {s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, user.name, log.reset });
-                std.log.info("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, grade_color, score.grade, log.bold, log.reset });
-                std.log.info("{s}  │ {s}►{s} pp      : {s}{d:.2}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, performance.pp, log.reset });
-                std.log.info("{s}  │ {s}►{s} combo   : {d}x", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.max_combo });
-                std.log.info("{s}  │ {s}►{s} acc     : {d:.2}%", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.accuracy() * 100.0 });
-                std.log.info("{s}  │ {s}►{s} score   : {d}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.total_score });
-                std.log.info("{s}  │ {s}►{s} 300/100/50/miss : {d}/{d}/{d}/{d}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.n300, score.n100, score.n50, score.nmiss });
-                std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ if (score.passed) log.green else log.red, log.reset });
+                std.debug.print("{s}  ┌─ SCORE {s} ────────────────────────────{s}\n", .{ if (score.passed) log.green else log.red, if (score.passed) "SUBMIT" else "FAIL", log.reset });
+                std.debug.print("{s}  │ {s}►{s} user    : {s}{s}{s}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, user.name, log.reset });
+                std.debug.print("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, grade_color, score.grade, log.bold, log.reset });
+                std.debug.print("{s}  │ {s}►{s} pp      : {s}{d:.2}{s}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, performance.pp, log.reset });
+                std.debug.print("{s}  │ {s}►{s} combo   : {d}x\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.max_combo });
+                std.debug.print("{s}  │ {s}►{s} acc     : {d:.2}%\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.accuracy() * 100.0 });
+                std.debug.print("{s}  │ {s}►{s} score   : {d}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.total_score });
+                std.debug.print("{s}  │ {s}►{s} 300/100/50/miss : {d}/{d}/{d}/{d}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.n300, score.n100, score.n50, score.nmiss });
+                std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ if (score.passed) log.green else log.red, log.reset });
             }
             if (score.passed) {
                 const rank = self.store.scoreRankOnMap(score.map_md5, score.mode, score.rankNamespace(), score.total_score, performance.pp);

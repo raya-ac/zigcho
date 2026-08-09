@@ -109,15 +109,15 @@ pub const Sync = struct {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
-        std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ c_magenta ++ c_bold, "", c_reset });
-        std.log.info("{s}{s}║         HYDRATION SEQUENCE INITIATED            ║{s}", .{ c_magenta ++ c_bold, "", c_reset });
-        std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ c_magenta ++ c_bold, "", c_reset });
-        std.log.info("{s}  ► target md5 :{s} {s}", .{ c_dim, c_reset, wanted_md5 });
-        std.log.info("{s}  ► set_id     :{s} {d}", .{ c_dim, c_reset, set_id });
+        std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ c_magenta ++ c_bold, "", c_reset });
+        std.debug.print("{s}{s}║         HYDRATION SEQUENCE INITIATED            ║{s}\n", .{ c_magenta ++ c_bold, "", c_reset });
+        std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ c_magenta ++ c_bold, "", c_reset });
+        std.debug.print("{s}  ► target md5 :{s} {s}\n", .{ c_dim, c_reset, wanted_md5 });
+        std.debug.print("{s}  ► set_id     :{s} {d}\n", .{ c_dim, c_reset, set_id });
 
         const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh/api/get_beatmaps?s={d}&k={s}", .{ set_id, self.api_key });
         defer self.allocator.free(metadata_url);
-        std.log.info("{s}  ┌─ [1/2] METADATA FETCH ───────────────────────{s}", .{ c_cyan, c_reset });
+        std.debug.print("{s}  ┌─ [1/2] METADATA FETCH ───────────────────────{s}\n", .{ c_cyan, c_reset });
         const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
             std.log.warn("{s}  │  ✗ FAILED: {t}{s}", .{ c_red, err, c_reset });
             return err;
@@ -161,9 +161,9 @@ pub const Sync = struct {
             .object_count = map_info.count_normal + map_info.count_slider + map_info.count_spinner,
         };
         try store.upsertBeatmapMeta(meta, wanted_md5, localStatus(map_info.approved), map_info.difficultyrating, map_info.max_combo);
-        std.log.info("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}] — stars={d:.2}{s}", .{ c_green, c_bold, meta.artist, c_reset, c_yellow, meta.version, c_reset, map_info.difficultyrating, c_reset });
-        std.log.info("{s}  │  ✓ metadata stored, spawning background download{s}", .{ c_green, c_reset });
-        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
+        std.debug.print("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}] — stars={d:.2}{s}\n", .{ c_green, c_bold, meta.artist, c_reset, c_yellow, meta.version, c_reset, map_info.difficultyrating, c_reset });
+        std.debug.print("{s}  │  ✓ metadata stored, spawning background download{s}\n", .{ c_green, c_reset });
+        std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ c_cyan, c_reset });
         return map_info.approved;
     }
 
@@ -187,8 +187,8 @@ pub const Sync = struct {
 
         const mirror_json_url = try std.fmt.allocPrint(self.allocator, "https://mirror.hinamizawa.ai/d/{d}", .{set_id});
         defer self.allocator.free(mirror_json_url);
-        std.log.info("{s}  ┌─ [2/2] ARCHIVE DOWNLOAD ──────────────────────{s}", .{ c_cyan, c_reset });
-        std.log.info("{s}  │  → {s}{s}", .{ c_dim, c_reset, mirror_json_url });
+        std.debug.print("{s}  ┌─ [2/2] ARCHIVE DOWNLOAD ──────────────────────{s}\n", .{ c_cyan, c_reset });
+        std.debug.print("{s}  │  → {s}{s}\n", .{ c_dim, c_reset, mirror_json_url });
         const mirror_json = fetchFn(&client, self.allocator, mirror_json_url, 4096) catch |err| {
             std.log.warn("{s}  │  ✗ mirror fetch failed: {t}{s}", .{ c_red, err, c_reset });
             return err;
@@ -203,15 +203,15 @@ pub const Sync = struct {
         };
         const fetch_url = try std.fmt.allocPrint(self.allocator, "{s}?noVideo=true", .{url_str});
         defer self.allocator.free(fetch_url);
-        std.log.info("{s}  │  ✓ redirect → {s}{s}", .{ c_green, c_reset, fetch_url });
+        std.debug.print("{s}  │  ✓ redirect → {s}{s}\n", .{ c_green, c_reset, fetch_url });
         const archive = fetchFn(&client, self.allocator, fetch_url, archive_limit) catch |err| {
             std.log.warn("{s}  │  ✗ archive fetch failed: {t}{s}", .{ c_red, err, c_reset });
             return err;
         };
         defer self.allocator.free(archive);
-        std.log.info("{s}  │  ✓ {d} bytes ({d:.1} MB){s}", .{ c_green, archive.len, @as(f64, @floatFromInt(archive.len)) / 1048576.0, c_reset });
+        std.debug.print("{s}  │  ✓ {d} bytes ({d:.1} MB){s}\n", .{ c_green, archive.len, @as(f64, @floatFromInt(archive.len)) / 1048576.0, c_reset });
 
-        std.log.info("{s}  │  extracting .osu for {s}...{s}", .{ c_dim, wanted_md5, c_reset });
+        std.debug.print("{s}  │  extracting .osu for {s}...{s}\n", .{ c_dim, wanted_md5, c_reset });
         const osu_file = extractMatchingOsu(self.allocator, archive, wanted_md5) catch |err| {
             std.log.warn("{s}  │  ✗ extraction failed: {t}{s}", .{ c_red, err, c_reset });
             return err;
@@ -239,7 +239,7 @@ pub const Sync = struct {
             std.log.warn("{s}  │  ✗ PP calc failed: {t}{s}", .{ c_red, err, c_reset });
             return err;
         };
-        std.log.info("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}] stars={d:.2} max_combo={d}{s}", .{ c_green, c_bold, metadata.artist, c_reset, c_yellow, metadata.version, c_reset, attributes.stars, attributes.max_combo, c_reset });
+        std.debug.print("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}] stars={d:.2} max_combo={d}{s}\n", .{ c_green, c_bold, metadata.artist, c_reset, c_yellow, metadata.version, c_reset, attributes.stars, attributes.max_combo, c_reset });
         try store.upsertBeatmap(metadata, wanted_md5, localStatus(approved), attributes.stars, attributes.max_combo, osu_file.?);
 
         var digest: [32]u8 = undefined;
@@ -247,10 +247,10 @@ pub const Sync = struct {
         var encoded: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&encoded, "{x}", .{digest}) catch unreachable;
         try store.upsertBeatmapArchive(set_id, &encoded, archive);
-        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
-        std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ c_green ++ c_bold, "", c_reset });
-        std.log.info("{s}{s}║             HYDRATION COMPLETE                  ║{s}", .{ c_green ++ c_bold, "", c_reset });
-        std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ c_green ++ c_bold, "", c_reset });
+        std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ c_cyan, c_reset });
+        std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ c_green ++ c_bold, "", c_reset });
+        std.debug.print("{s}{s}║             HYDRATION COMPLETE                  ║{s}\n", .{ c_green ++ c_bold, "", c_reset });
+        std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ c_green ++ c_bold, "", c_reset });
     }
 
 };

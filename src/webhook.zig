@@ -75,13 +75,17 @@ pub const Webhook = struct {
         try std.json.Stringify.value(data.username, .{}, &w);
         try w.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"embeds\":[{{\"color\":{d},\"author\":{{\"name\":", .{ data.user_id, color });
         try std.json.Stringify.value(data.username, .{}, &w);
-        try w.print(",\"icon_url\":\"https://a.kai.ovh/{d}\"}},\"title\":\"{s}\",\"description\":\"", .{ data.user_id, display_grade });
-        try std.json.Stringify.value(data.artist, .{}, &w);
-        try w.writeAll(" - ");
-        try std.json.Stringify.value(data.title, .{}, &w);
-        try w.writeAll(" [");
-        try std.json.Stringify.value(data.version, .{}, &w);
-        try w.print("\",\"image\":{{\"url\":\"https://assets.ppy.sh/beatmaps/{d}/covers/raw.jpg\"}},\"fields\":[", .{data.set_id});
+        try w.print(",\"icon_url\":\"https://a.kai.ovh/{d}\"}},\"title\":\"{s}\",\"description\":", .{ data.user_id, display_grade });
+        var desc_buf: [512]u8 = undefined;
+        var desc_w = std.Io.Writer.fixed(&desc_buf);
+        try desc_w.writeAll(data.artist);
+        try desc_w.writeAll(" - ");
+        try desc_w.writeAll(data.title);
+        try desc_w.writeAll(" [");
+        try desc_w.writeAll(data.version);
+        try desc_w.writeAll("]");
+        try std.json.Stringify.value(desc_buf[0..desc_w.end], .{}, &w);
+        try w.print(",\"image\":{{\"url\":\"https://assets.ppy.sh/beatmaps/{d}/covers/raw.jpg\"}},\"fields\":[", .{data.set_id});
         try w.print("{{\"name\":\"★ {d:.2}\",\"value\":\"#{d} on the map\",\"inline\":false}},", .{ data.stars, data.rank });
         if (data.beatmap_max_combo > 0) {
             const pct: f64 = @as(f64, @floatFromInt(data.max_combo)) / @as(f64, @floatFromInt(data.beatmap_max_combo)) * 100.0;

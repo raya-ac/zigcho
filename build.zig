@@ -34,6 +34,16 @@ pub fn build(b: *std.Build) void {
     importer.step.dependOn(&cargo.step);
     b.installArtifact(importer);
 
+    const archive_importer_mod = b.createModule(.{
+        .root_source_file = b.path("src/import_archive.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    archive_importer_mod.linkSystemLibrary("sqlite3", .{});
+    const archive_importer = b.addExecutable(.{ .name = "zigcho-import-archive", .root_module = archive_importer_mod });
+    b.installArtifact(archive_importer);
+
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);

@@ -22,4 +22,4 @@ COPY . .
 RUN zig build test \
     && zig build -Doptimize=ReleaseSafe \
     && mkdir /out \
-    && cp zig-out/bin/zigcho zig-out/bin/zigcho-import /out/
+    && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive /out/

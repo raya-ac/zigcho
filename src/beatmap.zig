@@ -17,6 +17,9 @@ pub const Metadata = struct {
     bpm: f64 = 0,
     total_length: i32 = 0,
     object_count: u32 = 0,
+    count_circles: u32 = 0,
+    count_sliders: u32 = 0,
+    count_spinners: u32 = 0,
 };
 
 fn value(line: []const u8, key: []const u8) ?[]const u8 {
@@ -69,8 +72,12 @@ pub fn parse(bytes: []const u8) !Metadata {
             _ = fields.next() orelse continue;
             _ = fields.next() orelse continue;
             const object_time = try std.fmt.parseInt(i64, fields.next() orelse continue, 10);
+            const object_type = try std.fmt.parseInt(u16, fields.next() orelse continue, 10);
             last_object_time = @max(last_object_time, object_time);
             result.object_count += 1;
+            if (object_type & 1 != 0) result.count_circles += 1;
+            if (object_type & 2 != 0 or object_type & 128 != 0) result.count_sliders += 1;
+            if (object_type & 8 != 0) result.count_spinners += 1;
         }
     }
     if (result.id <= 0 or result.set_id <= 0 or result.artist.len == 0 or result.title.len == 0 or result.version.len == 0 or result.creator.len == 0 or result.mode > 3 or result.object_count == 0) return error.InvalidBeatmap;

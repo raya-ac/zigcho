@@ -201,6 +201,9 @@ test "beatmap metadata parser owns the import contract" {
     try std.testing.expectEqualStrings("Zigcho", metadata.artist);
     try std.testing.expectEqualStrings("Zigcho Fixture", metadata.title);
     try std.testing.expectEqual(@as(u32, 10), metadata.object_count);
+    try std.testing.expectEqual(@as(u32, 10), metadata.count_circles);
+    try std.testing.expectEqual(@as(u32, 0), metadata.count_sliders);
+    try std.testing.expectEqual(@as(u32, 0), metadata.count_spinners);
     try std.testing.expectApproxEqAbs(@as(f64, 120), metadata.bpm, 0.001);
     try std.testing.expectEqualStrings("f981bd174d2fc7bdbefa557e85877e5a", &beatmap.md5(map));
 }
@@ -235,6 +238,34 @@ test "ranked stable PP is stored and updates normal player stats" {
     const metadata = try beatmap.parse(map);
     const hash = beatmap.md5(map);
     try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    const archive_bytes = "PK\x03\x04synthetic archive fixture";
+    try store.upsertBeatmapArchive(metadata.set_id, "fixture-sha256", archive_bytes);
+    const stored_archive = (try store.beatmapArchive(std.testing.allocator, metadata.set_id)).?;
+    defer std.testing.allocator.free(stored_archive);
+    try std.testing.expectEqualStrings(archive_bytes, stored_archive);
+    const lazer_set = (try store.lazerBeatmapSet(std.testing.allocator, metadata.set_id)).?;
+    defer std.testing.allocator.free(lazer_set);
+    const parsed_set = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_set, .{});
+    defer parsed_set.deinit();
+    try std.testing.expectEqual(@as(i64, 900000000), parsed_set.value.object.get("id").?.integer);
+    try std.testing.expectEqualStrings("ranked", parsed_set.value.object.get("status").?.string);
+    try std.testing.expect(!parsed_set.value.object.get("availability").?.object.get("download_disabled").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), parsed_set.value.object.get("beatmaps").?.array.items.len);
+    const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "Fixture", 0, 0);
+    defer std.testing.allocator.free(lazer_search);
+    const parsed_search = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_search, .{});
+    defer parsed_search.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_search.value.object.get("total").?.integer);
+    const search = try store.stableSearch(std.testing.allocator, "Fixture", -1, 4, 0);
+    defer std.testing.allocator.free(search);
+    try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|2|10.0|"));
+    try std.testing.expect(std.mem.indexOf(u8, search, "[1.79⭐] Tests {cs: 4") != null);
+    const set_lookup = try store.stableSearchSet(std.testing.allocator, null, null, &hash);
+    defer std.testing.allocator.free(set_lookup);
+    try std.testing.expect(std.mem.startsWith(u8, set_lookup, "900000000.osz|Zigcho|Zigcho Fixture|Ari|2|10.0|"));
+    const no_pending = try store.stableSearch(std.testing.allocator, "Fixture", -1, 2, 0);
+    defer std.testing.allocator.free(no_pending);
+    try std.testing.expectEqualStrings("0", no_pending);
     const score: stable_score.Submission = .{
         .map_md5 = &hash,
         .username = "ari",

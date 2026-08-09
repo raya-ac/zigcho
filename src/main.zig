@@ -8,6 +8,7 @@ const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
+const status_page = @embedFile("status.html");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -48,10 +49,12 @@ const App = struct {
         if (req.head.method == .POST and (std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke"))) return rate_limit.token;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return rate_limit.authenticated;
+        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
-        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php")) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php")) return rate_limit.authenticated;
         return null;
     }
 
@@ -107,6 +110,45 @@ const App = struct {
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{self.sessions.items.items.len});
             return respond(req, .ok, "application/json", json, &.{});
         }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/d/")) {
+            const set_id = std.fmt.parseInt(i32, path[3..], 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
+            defer self.allocator.free(archive);
+            var disposition_buf: [96]u8 = undefined;
+            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
+            const headers = [_]std.http.Header{.{ .name = "content-disposition", .value = disposition }};
+            return respond(req, .ok, "application/x-osu-beatmap-archive", archive, &headers);
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") and std.mem.endsWith(u8, path, "/download")) {
+            const id_text = path["/api/v2/beatmapsets/".len .. path.len - "/download".len];
+            const set_id = std.fmt.parseInt(i32, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+            const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
+            defer self.allocator.free(archive);
+            var disposition_buf: [96]u8 = undefined;
+            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
+            const headers = [_]std.http.Header{.{ .name = "content-disposition", .value = disposition }};
+            return respond(req, .ok, "application/x-osu-beatmap-archive", archive, &headers);
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/beatmaps/") and std.mem.endsWith(u8, path, "/file")) {
+            const id_text = path["/api/v2/beatmaps/".len .. path.len - "/file".len];
+            const map_id = std.fmt.parseInt(i32, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap\"}", &.{});
+            const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const map_file = (try self.store.beatmapFileById(self.allocator, map_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap file unavailable\"}", &.{});
+            defer self.allocator.free(map_file);
+            var disposition_buf: [96]u8 = undefined;
+            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osu\"", .{map_id});
+            const headers = [_]std.http.Header{.{ .name = "content-disposition", .value = disposition }};
+            return respond(req, .ok, "application/x-osu-beatmap", map_file, &headers);
+        }
         if (std.mem.eql(u8, path, "/users") and req.head.method == .POST) {
             const name = field(body, "name") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"name required\"}", &.{});
             const email = field(body, "email") orelse "";
@@ -140,6 +182,37 @@ const App = struct {
             return respond(req, .ok, "application/json", "{}", &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"Server-side cursor relax\",\"ranked\":false,\"score_multiplier\":0.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":false}}", &.{});
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) {
+            const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const mode = std.fmt.parseInt(i8, queryField(target, "m") orelse "-1", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
+            const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+            if (mode < -1 or mode > 3 or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid search\"}", &.{});
+            const encoded_query = queryField(target, "q") orelse "";
+            const query_buf = try self.allocator.dupe(u8, encoded_query);
+            defer self.allocator.free(query_buf);
+            for (query_buf) |*char| {
+                if (char.* == '+') char.* = ' ';
+            }
+            const query = std.Uri.percentDecodeInPlace(query_buf);
+            const listing = try self.store.lazerBeatmapSearch(self.allocator, query, mode, offset);
+            defer self.allocator.free(listing);
+            return respond(req, .ok, "application/json", listing, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") and !std.mem.endsWith(u8, path, "/download")) {
+            const set_id = std.fmt.parseInt(i32, path["/api/v2/beatmapsets/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+            const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            const listing = (try self.store.lazerBeatmapSet(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
+            defer self.allocator.free(listing);
+            return respond(req, .ok, "application/json", listing, &.{});
+        }
         if (std.mem.eql(u8, path, "/api/v2/me")) {
             const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -183,7 +256,44 @@ const App = struct {
         if (std.mem.eql(u8, path, "/web/bancho_connect.php")) return respond(req, .ok, "text/plain", "ok", &.{});
         if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
         if (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php")) return respond(req, .ok, "text/plain", "", &.{});
-        if (std.mem.eql(u8, path, "/web/osu-search.php")) return respond(req, .ok, "text/plain", "0", &.{});
+        if ((std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php")) and req.head.method == .GET) {
+            const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "h") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| {
+                if (char.* == '+') char.* = ' ';
+            }
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            if (std.mem.eql(u8, path, "/web/osu-search.php")) {
+                const direct_status = std.fmt.parseInt(u8, queryField(target, "r") orelse "4", 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+                const mode = std.fmt.parseInt(i8, queryField(target, "m") orelse "-1", 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+                const page = std.fmt.parseInt(u16, queryField(target, "p") orelse "0", 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+                if (direct_status > 8 or mode < -1 or mode > 3 or page > 1000) return respond(req, .bad_request, "text/plain", "", &.{});
+                const encoded_query = queryField(target, "q") orelse "";
+                const query_buf = try self.allocator.dupe(u8, encoded_query);
+                defer self.allocator.free(query_buf);
+                for (query_buf) |*char| {
+                    if (char.* == '+') char.* = ' ';
+                }
+                const decoded_query = std.Uri.percentDecodeInPlace(query_buf);
+                const query = if (std.mem.eql(u8, decoded_query, "Newest") or std.mem.eql(u8, decoded_query, "Top Rated") or std.mem.eql(u8, decoded_query, "Most Played")) "" else decoded_query;
+                const listing = try self.store.stableSearch(self.allocator, query, mode, direct_status, page);
+                defer self.allocator.free(listing);
+                return respond(req, .ok, "text/plain", listing, &.{});
+            }
+            const set_id: ?i32 = if (queryField(target, "s")) |value| std.fmt.parseInt(i32, value, 10) catch return respond(req, .bad_request, "text/plain", "", &.{}) else null;
+            const map_id: ?i32 = if (queryField(target, "b")) |value| std.fmt.parseInt(i32, value, 10) catch return respond(req, .bad_request, "text/plain", "", &.{}) else null;
+            const checksum = queryField(target, "c");
+            if (set_id == null and map_id == null and checksum == null) return respond(req, .bad_request, "text/plain", "", &.{});
+            if (checksum) |value| if (value.len != 32) return respond(req, .bad_request, "text/plain", "", &.{});
+            const listing = try self.store.stableSearchSet(self.allocator, set_id, map_id, checksum);
+            defer self.allocator.free(listing);
+            return respond(req, .ok, "text/plain", listing, &.{});
+        }
         if (std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") and req.head.method == .GET) {
             const encoded_name = queryField(target, "us") orelse return respond(req, .bad_request, "text/plain", "", &.{});
             const password = queryField(target, "ha") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
@@ -275,7 +385,14 @@ const App = struct {
             defer self.allocator.free(replay);
             return respond(req, .ok, "application/octet-stream", replay, &.{});
         }
-        if (std.mem.eql(u8, path, "/")) return respond(req, .ok, "application/json", "{\"name\":\"zigcho\",\"docs\":\"/README.md\",\"health\":\"/health\"}", &.{});
+        if (std.mem.eql(u8, path, "/")) {
+            const headers = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-cache" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            return respond(req, .ok, "text/html; charset=utf-8", status_page, &headers);
+        }
         return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
     }
 };

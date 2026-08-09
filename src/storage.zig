@@ -38,6 +38,7 @@ pub const Store = struct {
         if (version < 3) try self.exec(@embedFile("migration_003.sql"));
         if (version < 4) try self.exec(@embedFile("migration_004.sql"));
         if (version < 5) try self.exec(@embedFile("migration_005.sql"));
+        if (version < 6) try self.exec(@embedFile("migration_006.sql"));
     }
 
     pub fn register(self: *Store, name: []const u8, email: []const u8, password_md5: []const u8) !i32 {
@@ -235,7 +236,7 @@ pub const Store = struct {
     pub fn upsertBeatmap(self: *Store, metadata: beatmap.Metadata, md5: []const u8, status: i8, stars: f64, max_combo: u32, osu_file: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,unixepoch(),?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20) ON CONFLICT(id) DO UPDATE SET set_id=excluded.set_id,md5=excluded.md5,artist=excluded.artist,title=excluded.title,version=excluded.version,creator=excluded.creator,status=excluded.status,last_update=excluded.last_update,total_length=excluded.total_length,max_combo=excluded.max_combo,mode=excluded.mode,bpm=excluded.bpm,cs=excluded.cs,ar=excluded.ar,od=excluded.od,hp=excluded.hp,star_rating=excluded.star_rating,source=excluded.source,tags=excluded.tags,osu_file=excluded.osu_file";
+        const sql = "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,unixepoch(),?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) ON CONFLICT(id) DO UPDATE SET set_id=excluded.set_id,md5=excluded.md5,artist=excluded.artist,title=excluded.title,version=excluded.version,creator=excluded.creator,status=excluded.status,last_update=excluded.last_update,total_length=excluded.total_length,max_combo=excluded.max_combo,mode=excluded.mode,bpm=excluded.bpm,cs=excluded.cs,ar=excluded.ar,od=excluded.od,hp=excluded.hp,star_rating=excluded.star_rating,source=excluded.source,tags=excluded.tags,osu_file=excluded.osu_file,count_circles=excluded.count_circles,count_sliders=excluded.count_sliders,count_spinners=excluded.count_spinners";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -259,6 +260,9 @@ pub const Store = struct {
         _ = c.sqlite3_bind_text(stmt, 18, metadata.source.ptr, @intCast(metadata.source.len), null);
         _ = c.sqlite3_bind_text(stmt, 19, metadata.tags.ptr, @intCast(metadata.tags.len), null);
         _ = c.sqlite3_bind_blob(stmt, 20, osu_file.ptr, @intCast(osu_file.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 21, metadata.count_circles);
+        _ = c.sqlite3_bind_int64(stmt, 22, metadata.count_sliders);
+        _ = c.sqlite3_bind_int64(stmt, 23, metadata.count_spinners);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
@@ -270,6 +274,52 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        return try allocator.dupe(u8, ptr[0..len]);
+    }
+
+    pub fn beatmapFileById(self: *Store, allocator: std.mem.Allocator, map_id: i32) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT osu_file FROM beatmaps WHERE id=?1 AND osu_file IS NOT NULL";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, map_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        return try allocator.dupe(u8, ptr[0..len]);
+    }
+
+    pub fn upsertBeatmapArchive(self: *Store, set_id: i32, sha256: []const u8, osz_file: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var exists_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM beatmaps WHERE set_id=?1 LIMIT 1", -1, &exists_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        _ = c.sqlite3_bind_int(exists_stmt, 1, set_id);
+        const exists = c.sqlite3_step(exists_stmt) == c.SQLITE_ROW;
+        _ = c.sqlite3_finalize(exists_stmt);
+        if (!exists) return error.UnknownBeatmapSet;
+        const sql = "INSERT INTO beatmap_archives(set_id,sha256,osz_file) VALUES(?1,?2,?3) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=unixepoch()";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        _ = c.sqlite3_bind_text(stmt, 2, sha256.ptr, @intCast(sha256.len), null);
+        _ = c.sqlite3_bind_blob(stmt, 3, osz_file.ptr, @intCast(osz_file.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn beatmapArchive(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT osz_file FROM beatmap_archives WHERE set_id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
@@ -425,6 +475,202 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int64(stmt, 1, score_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         return .{ .score = c.sqlite3_column_double(stmt, 0), .player = c.sqlite3_column_int64(stmt, 1) };
+    }
+
+    fn writeDirectText(writer: *std.Io.Writer, value: []const u8) !void {
+        for (value) |char| try writer.writeByte(switch (char) {
+            '|' => 'I',
+            '\r', '\n' => ' ',
+            else => char,
+        });
+    }
+
+    fn directStatus(db_status: i32) i32 {
+        return switch (db_status) {
+            3 => 2,
+            4 => 3,
+            else => 0,
+        };
+    }
+
+    fn appendDirectSet(self: *Store, writer: *std.Io.Writer, set_id: i32) !bool {
+        const set_sql = "SELECT artist,title,creator,status,coalesce(datetime(last_update,'unixepoch'),'1970-01-01 00:00:00') FROM beatmaps WHERE set_id=?1 ORDER BY star_rating LIMIT 1";
+        var set_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, set_sql, -1, &set_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(set_stmt);
+        _ = c.sqlite3_bind_int(set_stmt, 1, set_id);
+        if (c.sqlite3_step(set_stmt) != c.SQLITE_ROW) return false;
+        try writer.print("{d}.osz|", .{set_id});
+        try writeDirectText(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 0)));
+        try writer.writeByte('|');
+        try writeDirectText(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 1)));
+        try writer.writeByte('|');
+        try writeDirectText(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 2)));
+        try writer.print("|{d}|10.0|{s}|{d}|0|0|0|0|0|", .{ directStatus(c.sqlite3_column_int(set_stmt, 3)), std.mem.span(c.sqlite3_column_text(set_stmt, 4)), set_id });
+
+        const maps_sql = "SELECT star_rating,version,cs,od,ar,hp,mode FROM beatmaps WHERE set_id=?1 ORDER BY star_rating,id";
+        var maps_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, maps_sql, -1, &maps_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(maps_stmt);
+        _ = c.sqlite3_bind_int(maps_stmt, 1, set_id);
+        var first = true;
+        while (c.sqlite3_step(maps_stmt) == c.SQLITE_ROW) {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("[{d:.2}⭐] ", .{c.sqlite3_column_double(maps_stmt, 0)});
+            try writeDirectText(writer, std.mem.span(c.sqlite3_column_text(maps_stmt, 1)));
+            try writer.print(" {{cs: {d} / od: {d} / ar: {d} / hp: {d}}}@{d}", .{ c.sqlite3_column_double(maps_stmt, 2), c.sqlite3_column_double(maps_stmt, 3), c.sqlite3_column_double(maps_stmt, 4), c.sqlite3_column_double(maps_stmt, 5), c.sqlite3_column_int(maps_stmt, 6) });
+        }
+        return true;
+    }
+
+    pub fn stableSearch(self: *Store, allocator: std.mem.Allocator, query: []const u8, mode: i8, direct_status: u8, page: u16) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        const sql = "SELECT set_id FROM beatmaps WHERE EXISTS(SELECT 1 FROM beatmap_archives a WHERE a.set_id=beatmaps.set_id) AND (?1=-1 OR mode=?1) AND (?2='' OR instr(lower(artist||' '||title||' '||creator||' '||source||' '||tags),lower(?2))>0) AND ((?3=4 AND status IN(3,4)) OR (?3 IN(0,7) AND status=3) OR (?3 IN(2,5) AND status=2)) GROUP BY set_id ORDER BY max(last_update) DESC,set_id DESC LIMIT 100 OFFSET ?4";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, mode);
+        _ = c.sqlite3_bind_text(stmt, 2, query.ptr, @intCast(query.len), null);
+        _ = c.sqlite3_bind_int(stmt, 3, direct_status);
+        _ = c.sqlite3_bind_int64(stmt, 4, @as(i64, page) * 100);
+        var ids: [100]i32 = undefined;
+        var count: usize = 0;
+        while (count < ids.len and c.sqlite3_step(stmt) == c.SQLITE_ROW) : (count += 1) ids[count] = c.sqlite3_column_int(stmt, 0);
+        try output.writer.print("{d}", .{if (count == 100) @as(usize, 101) else count});
+        for (ids[0..count]) |set_id| {
+            try output.writer.writeByte('\n');
+            _ = try self.appendDirectSet(&output.writer, set_id);
+        }
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn stableSearchSet(self: *Store, allocator: std.mem.Allocator, set_id: ?i32, map_id: ?i32, md5: ?[]const u8) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const find_sql = "SELECT set_id FROM beatmaps WHERE (?1 IS NOT NULL AND set_id=?1) OR (?2 IS NOT NULL AND id=?2) OR (?3 IS NOT NULL AND md5=?3) LIMIT 1";
+        var find_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, find_sql, -1, &find_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(find_stmt);
+        if (set_id) |value| _ = c.sqlite3_bind_int(find_stmt, 1, value) else _ = c.sqlite3_bind_null(find_stmt, 1);
+        if (map_id) |value| _ = c.sqlite3_bind_int(find_stmt, 2, value) else _ = c.sqlite3_bind_null(find_stmt, 2);
+        if (md5) |value| _ = c.sqlite3_bind_text(find_stmt, 3, value.ptr, @intCast(value.len), null) else _ = c.sqlite3_bind_null(find_stmt, 3);
+        if (c.sqlite3_step(find_stmt) != c.SQLITE_ROW) return allocator.dupe(u8, "");
+        const found_set_id = c.sqlite3_column_int(find_stmt, 0);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        _ = try self.appendDirectSet(&output.writer, found_set_id);
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
+
+    fn jsonString(writer: *std.Io.Writer, value: []const u8) !void {
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+
+    fn lazerStatus(db_status: i32) []const u8 {
+        return switch (db_status) {
+            3 => "ranked",
+            4 => "approved",
+            else => "pending",
+        };
+    }
+
+    fn appendLazerMap(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt) !void {
+        try writer.print("{{\"id\":{d},\"beatmapset_id\":{d},\"status\":", .{ c.sqlite3_column_int(stmt, 0), c.sqlite3_column_int(stmt, 1) });
+        try jsonString(writer, lazerStatus(c.sqlite3_column_int(stmt, 2)));
+        try writer.writeAll(",\"checksum\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+        try writer.print(",\"user_id\":1,\"playcount\":{d},\"passcount\":{d},\"mode_int\":{d},\"difficulty_rating\":{d},\"drain\":{d},\"cs\":{d},\"ar\":{d},\"accuracy\":{d},\"total_length\":{d},\"hit_length\":{d},\"convert\":false,\"count_circles\":{d},\"count_sliders\":{d},\"count_spinners\":{d},\"version\":", .{ c.sqlite3_column_int(stmt, 4), c.sqlite3_column_int(stmt, 5), c.sqlite3_column_int(stmt, 6), c.sqlite3_column_double(stmt, 7), c.sqlite3_column_double(stmt, 8), c.sqlite3_column_double(stmt, 9), c.sqlite3_column_double(stmt, 10), c.sqlite3_column_double(stmt, 11), c.sqlite3_column_int(stmt, 12), c.sqlite3_column_int(stmt, 12), c.sqlite3_column_int(stmt, 17), c.sqlite3_column_int(stmt, 18), c.sqlite3_column_int(stmt, 19) });
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(stmt, 13)));
+        try writer.print(",\"max_combo\":{d},\"last_updated\":", .{c.sqlite3_column_int(stmt, 14)});
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(stmt, 15)));
+        try writer.print(",\"bpm\":{d},\"owners\":[]}}", .{c.sqlite3_column_double(stmt, 16)});
+    }
+
+    fn appendLazerSet(self: *Store, writer: *std.Io.Writer, set_id: i32) !bool {
+        const set_sql = "SELECT set_id,artist,title,creator,status,bpm,source,tags,coalesce(strftime('%Y-%m-%dT%H:%M:%SZ',last_update,'unixepoch'),'1970-01-01T00:00:00Z'),coalesce((SELECT 0 FROM beatmap_archives a WHERE a.set_id=beatmaps.set_id),1),sum(plays) FROM beatmaps WHERE set_id=?1 GROUP BY set_id";
+        var set_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, set_sql, -1, &set_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(set_stmt);
+        _ = c.sqlite3_bind_int(set_stmt, 1, set_id);
+        if (c.sqlite3_step(set_stmt) != c.SQLITE_ROW) return false;
+        try writer.print("{{\"id\":{d},\"status\":", .{set_id});
+        try jsonString(writer, lazerStatus(c.sqlite3_column_int(set_stmt, 4)));
+        try writer.writeAll(",\"title\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 2)));
+        try writer.writeAll(",\"title_unicode\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 2)));
+        try writer.writeAll(",\"artist\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 1)));
+        try writer.writeAll(",\"artist_unicode\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 1)));
+        try writer.writeAll(",\"creator\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 3)));
+        try writer.print(",\"user_id\":1,\"covers\":{{\"cover\":\"\",\"cover@2x\":\"\",\"card\":\"\",\"card@2x\":\"\",\"list\":\"\",\"list@2x\":\"\"}},\"preview_url\":\"\",\"play_count\":{d},\"favourite_count\":0,\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":false,\"storyboard\":false,\"submitted_date\":", .{ c.sqlite3_column_int(set_stmt, 10), c.sqlite3_column_double(set_stmt, 5) });
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 8)));
+        try writer.writeAll(",\"last_updated\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 8)));
+        try writer.print(",\"ranked_date\":null,\"ratings\":[],\"availability\":{{\"download_disabled\":{s},\"more_information\":\"\"}},\"genre\":{{\"id\":0,\"name\":\"Unspecified\"}},\"language\":{{\"id\":0,\"name\":\"Unspecified\"}},\"source\":", .{if (c.sqlite3_column_int(set_stmt, 9) != 0) "true" else "false"});
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 6)));
+        try writer.writeAll(",\"tags\":");
+        try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 7)));
+        try writer.writeAll(",\"beatmaps\":[");
+        const maps_sql = "SELECT id,set_id,status,md5,plays,passes,mode,star_rating,hp,cs,ar,od,total_length,version,max_combo,coalesce(strftime('%Y-%m-%dT%H:%M:%SZ',last_update,'unixepoch'),'1970-01-01T00:00:00Z'),bpm,count_circles,count_sliders,count_spinners FROM beatmaps WHERE set_id=?1 ORDER BY star_rating,id";
+        var maps_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, maps_sql, -1, &maps_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(maps_stmt);
+        _ = c.sqlite3_bind_int(maps_stmt, 1, set_id);
+        var first = true;
+        while (c.sqlite3_step(maps_stmt) == c.SQLITE_ROW) {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try appendLazerMap(writer, maps_stmt.?);
+        }
+        try writer.writeAll("]}");
+        return true;
+    }
+
+    pub fn lazerBeatmapSet(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        if (!try self.appendLazerSet(&output.writer, set_id)) {
+            output.deinit();
+            return null;
+        }
+        var list = output.toArrayList();
+        return try list.toOwnedSlice(allocator);
+    }
+
+    pub fn lazerBeatmapSearch(self: *Store, allocator: std.mem.Allocator, query: []const u8, mode: i8, offset: u16) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const ids_sql = "SELECT set_id FROM beatmaps WHERE (?1=-1 OR mode=?1) AND (?2='' OR instr(lower(artist||' '||title||' '||creator||' '||source||' '||tags),lower(?2))>0) GROUP BY set_id ORDER BY max(last_update) DESC,set_id DESC LIMIT 50 OFFSET ?3";
+        var ids_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, ids_sql, -1, &ids_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(ids_stmt);
+        _ = c.sqlite3_bind_int(ids_stmt, 1, mode);
+        _ = c.sqlite3_bind_text(ids_stmt, 2, query.ptr, @intCast(query.len), null);
+        _ = c.sqlite3_bind_int64(ids_stmt, 3, offset);
+        var ids: [50]i32 = undefined;
+        var count: usize = 0;
+        while (count < ids.len and c.sqlite3_step(ids_stmt) == c.SQLITE_ROW) : (count += 1) ids[count] = c.sqlite3_column_int(ids_stmt, 0);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll("{\"beatmapsets\":[");
+        for (ids[0..count], 0..) |set_id, index| {
+            if (index != 0) try output.writer.writeByte(',');
+            _ = try self.appendLazerSet(&output.writer, set_id);
+        }
+        try output.writer.print("],\"total\":{d},\"cursor\":null}}", .{count});
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
     }
 
     pub fn stableLeaderboard(self: *Store, allocator: std.mem.Allocator, viewer: domain.User, map_md5: []const u8, mode: u8, board_type: u8, requested_mods: i32) ![]u8 {

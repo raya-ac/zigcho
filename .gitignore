@@ -5,3 +5,4 @@
 /*.db-wal
 /work/
 /pp/target/
+.DS_Store

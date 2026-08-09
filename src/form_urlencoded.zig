@@ -1,4 +1,21 @@
 const std = @import("std");
+const multipart = @import("multipart.zig");
+
+pub fn requestField(allocator: std.mem.Allocator, body: []const u8, content_type: ?[]const u8, keys: []const []const u8) !?[]u8 {
+    if (content_type) |value| {
+        if (std.ascii.startsWithIgnoreCase(value, "multipart/form-data")) {
+            const boundary = try multipart.boundaryFromContentType(value);
+            var form = try multipart.parse(allocator, body, boundary);
+            defer form.deinit();
+            for (keys) |key| if (form.first(key)) |part| {
+                if (part.filename != null) return error.InvalidFormField;
+                return try allocator.dupe(u8, part.data);
+            };
+            return null;
+        }
+    }
+    return field(allocator, body, keys);
+}
 
 pub fn field(allocator: std.mem.Allocator, body: []const u8, keys: []const []const u8) !?[]u8 {
     var parts = std.mem.splitScalar(u8, body, '&');

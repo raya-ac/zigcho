@@ -25,6 +25,24 @@ test "lazer registration fields are form decoded" {
     try std.testing.expectEqualStrings("long&safe=password", password);
 }
 
+test "official lazer multipart fields are accepted" {
+    const boundary = "-----------------------------28947758029299";
+    const body = "--" ++ boundary ++ "\r\n" ++
+        "Content-Disposition: form-data; name=\"username\"\r\n\r\n" ++
+        "zigcho_lazer_qa\r\n" ++
+        "--" ++ boundary ++ "\r\n" ++
+        "Content-Disposition: form-data; name=\"password\"\r\n\r\n" ++
+        "raw-lazer-password\r\n" ++
+        "--" ++ boundary ++ "--\r\n";
+    const content_type = "multipart/form-data; boundary=" ++ boundary;
+    const name = (try form_urlencoded.requestField(std.testing.allocator, body, content_type, &.{"username"})).?;
+    defer std.testing.allocator.free(name);
+    const password = (try form_urlencoded.requestField(std.testing.allocator, body, content_type, &.{"password"})).?;
+    defer std.testing.allocator.free(password);
+    try std.testing.expectEqualStrings("zigcho_lazer_qa", name);
+    try std.testing.expectEqualStrings("raw-lazer-password", password);
+}
+
 test "stable md5 and raw lazer passwords normalize to the same secret" {
     const raw = try form_urlencoded.credentialMd5("password");
     const stable = try form_urlencoded.credentialMd5("5F4DCC3B5AA765D61D8327DEB882CF99");

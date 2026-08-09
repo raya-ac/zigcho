@@ -151,11 +151,11 @@ const App = struct {
             return respond(req, .ok, "application/x-osu-beatmap", map_file, &headers);
         }
         if (std.mem.eql(u8, path, "/users") and req.head.method == .POST) {
-            const name = (try form_urlencoded.field(self.allocator, body, &.{ "name", "user[username]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"name required\"}", &.{});
+            const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "name", "user[username]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"name required\"}", &.{});
             defer self.allocator.free(name);
-            const email = (try form_urlencoded.field(self.allocator, body, &.{ "email", "user[user_email]" })) orelse try self.allocator.dupe(u8, "");
+            const email = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "email", "user[user_email]" })) orelse try self.allocator.dupe(u8, "");
             defer self.allocator.free(email);
-            const password = (try form_urlencoded.field(self.allocator, body, &.{ "password_md5", "user[password]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &.{});
+            const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "password_md5", "user[password]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &.{});
             defer self.allocator.free(password);
             const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
             if (name.len < 2 or name.len > 32 or email.len > 254) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
@@ -165,12 +165,12 @@ const App = struct {
             return respond(req, .created, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/oauth/token") and req.head.method == .POST) {
-            const grant = (try form_urlencoded.field(self.allocator, body, &.{"grant_type"})) orelse try self.allocator.dupe(u8, "password");
+            const grant = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"grant_type"})) orelse try self.allocator.dupe(u8, "password");
             defer self.allocator.free(grant);
             if (!std.mem.eql(u8, grant, "password")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported_grant_type\"}", &.{});
-            const name = (try form_urlencoded.field(self.allocator, body, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+            const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
             defer self.allocator.free(name);
-            const password = (try form_urlencoded.field(self.allocator, body, &.{ "password_md5", "password" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+            const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "password_md5", "password" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
             defer self.allocator.free(password);
             const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
             const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
@@ -186,7 +186,8 @@ const App = struct {
             return respond(req, .ok, "application/json", json, &token_headers);
         }
         if (std.mem.eql(u8, path, "/oauth/revoke") and req.head.method == .POST) {
-            const token = field(body, "token") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+            const token = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"token"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+            defer self.allocator.free(token);
             _ = try self.store.revokeToken(token);
             return respond(req, .ok, "application/json", "{}", &.{});
         }

@@ -711,7 +711,9 @@ pub fn main(init: std.process.Init) !void {
         .geo_client = .{ .allocator = allocator, .io = init.io },
     };
     const kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
-    _ = try app.sessions.createBot(kai);
+    const kai_session = try app.sessions.createBot(kai);
+    kai_session.longitude = -21.9426; // reykjavik
+    kai_session.latitude = 64.1466;
     defer app.score_webhook.deinit();
     defer app.map_sync.deinit();
     defer app.geo_client.deinit();

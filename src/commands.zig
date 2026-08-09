@@ -29,7 +29,7 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sender
     return .not_command;
 }
 
-fn handleNp(allocator: std.mem.Allocator, store: *storage.Store, sender: *sessions_mod.Session) !void {
+pub fn handleNp(allocator: std.mem.Allocator, store: *storage.Store, sender: *sessions_mod.Session) !void {
     const md5 = sender.map_md5;
     if (md5[0] == 0) {
         try sendPm(allocator, sender, "do /np first so i know what map you're on");

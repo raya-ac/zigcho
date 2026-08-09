@@ -142,6 +142,9 @@ pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sess
             defer event.deinit();
             try stats(&event, store, session);
             try sessions.broadcast(event.bytes(), session);
+            if (session.action == 1 and session.map_md5[0] != 0) {
+                commands.handleNp(allocator, store, session) catch {};
+            }
         },
         .send_public_message, .send_private_message => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
@@ -154,10 +157,7 @@ pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sess
                 if (sessions.byName(target_name)) |target| {
                     if (target.is_bot) {
                         if (commands.handleCommand(allocator, store, session, text) == .handled) continue;
-                        var msg = protocol.Writer.init(allocator);
-                        defer msg.deinit();
-                        try protocol.writeMessage(&msg, "kai", "commands: !np (pp for current map) | !with mods acc% misses (custom pp)", session.user.name, 3);
-                        try session.queue.appendSlice(allocator, msg.bytes());
+                        try protocol.writeMessage(&out, "kai", "commands: !np (pp for current map) | !with mods acc% misses (custom pp)", session.user.name, 3);
                         continue;
                     }
                 }

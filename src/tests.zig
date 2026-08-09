@@ -199,7 +199,7 @@ test "joined public chat delivers once and kai answers private chat as user thre
     const bot_packet = (try bot_reader.next()).?;
     var bot_payload: protocol.PayloadReader = .{ .data = bot_packet.payload };
     try std.testing.expectEqualStrings("kai", try bot_payload.string());
-    try std.testing.expectEqualStrings("i'm here. commands come later.", try bot_payload.string());
+    try std.testing.expectEqualStrings("commands: !np (pp for current map) | !with mods acc% misses (custom pp)", try bot_payload.string());
     try std.testing.expectEqualStrings("ari", try bot_payload.string());
     try std.testing.expectEqual(@as(i32, 3), try bot_payload.int(i32));
     try std.testing.expectEqual(@as(usize, 0), sessions.byUser(3).?.queue.items.len);

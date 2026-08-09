@@ -34,6 +34,16 @@ const App = struct {
         try req.respond(body, .{ .status = status, .extra_headers = all[0 .. headers.len + 1], .keep_alive = false });
     }
 
+    fn rejectStableScore(req: *std.http.Server.Request, reason: []const u8, body_len: usize) !void {
+        std.log.warn("stable score rejected: reason={s} body_bytes={d}", .{ reason, body_len });
+        return respond(req, .bad_request, "text/plain", "error: no", &.{});
+    }
+
+    fn rejectStableScoreError(req: *std.http.Server.Request, reason: []const u8, err: anyerror, body_len: usize) !void {
+        std.log.warn("stable score rejected: reason={s} error={t} body_bytes={d}", .{ reason, err, body_len });
+        return respond(req, .bad_request, "text/plain", "error: no", &.{});
+    }
+
     fn field(body: []const u8, key: []const u8) ?[]const u8 {
         var it = std.mem.splitScalar(u8, body, '&');
         while (it.next()) |part| {
@@ -344,23 +354,29 @@ const App = struct {
             return respond(req, .ok, "text/plain", listing, &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") and req.head.method == .POST) {
-            const content_type = content_type_owned orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
-            const boundary = multipart.boundaryFromContentType(content_type) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
-            var form = multipart.parse(self.allocator, body, boundary) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            const content_type = content_type_owned orelse return rejectStableScore(req, "missing_content_type", body.len);
+            const boundary = multipart.boundaryFromContentType(content_type) catch |err| return rejectStableScoreError(req, "invalid_boundary", err, body.len);
+            var form = multipart.parse(self.allocator, body, boundary) catch |err| return rejectStableScoreError(req, "invalid_multipart", err, body.len);
             defer form.deinit();
-            const encrypted = form.nth("score", 0) orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
-            const replay = form.nth("score", 1) orelse return respond(req, .bad_request, "text/plain", "error: no", &.{});
-            if (encrypted.filename != null or replay.filename == null or replay.data.len == 0 or replay.data.len > 16 * 1024 * 1024) return respond(req, .bad_request, "text/plain", "error: no", &.{});
-            const iv = (form.first("iv") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
-            const client_hash_encrypted = (form.first("s") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
+            const encrypted = form.nth("score", 0) orelse return rejectStableScore(req, "missing_encrypted_score", body.len);
+            const replay = form.nth("score", 1) orelse return rejectStableScore(req, "missing_replay", body.len);
+            if (encrypted.filename != null) return rejectStableScore(req, "encrypted_score_is_file", body.len);
+            if (replay.filename == null) return rejectStableScore(req, "replay_is_not_file", body.len);
+            if (replay.data.len == 0) return rejectStableScore(req, "empty_replay", body.len);
+            if (replay.data.len > 16 * 1024 * 1024) return rejectStableScore(req, "replay_too_large", body.len);
+            const iv = (form.first("iv") orelse return rejectStableScore(req, "missing_iv", body.len)).data;
+            const client_hash_encrypted = (form.first("s") orelse return rejectStableScore(req, "missing_client_hash", body.len)).data;
             const password = (form.first("pass") orelse return respond(req, .unauthorized, "text/plain", "", &.{})).data;
-            const osu_version = (form.first("osuver") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
-            const updated_map_hash = (form.first("bmk") orelse return respond(req, .bad_request, "text/plain", "error: no", &.{})).data;
+            const osu_version = (form.first("osuver") orelse return rejectStableScore(req, "missing_osu_version", body.len)).data;
+            const updated_map_hash = (form.first("bmk") orelse return rejectStableScore(req, "missing_updated_map_hash", body.len)).data;
             const storyboard_hash = if (form.first("sbk")) |part| part.data else "";
-            var decrypted = score_crypto.decrypt(self.allocator, encrypted.data, client_hash_encrypted, iv, osu_version) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            var decrypted = score_crypto.decrypt(self.allocator, encrypted.data, client_hash_encrypted, iv, osu_version) catch |err| return rejectStableScoreError(req, "decrypt_failed", err, body.len);
             defer decrypted.deinit();
-            const score = stable_score.parse(decrypted.score_data) catch return respond(req, .bad_request, "text/plain", "error: no", &.{});
-            if (!std.mem.eql(u8, score.map_md5, updated_map_hash)) return respond(req, .bad_request, "text/plain", "error: beatmap", &.{});
+            const score = stable_score.parse(decrypted.score_data) catch |err| return rejectStableScoreError(req, "score_parse_failed", err, body.len);
+            if (!std.mem.eql(u8, score.map_md5, updated_map_hash)) {
+                std.log.warn("stable score rejected: reason=beatmap_hash_mismatch body_bytes={d}", .{body.len});
+                return respond(req, .bad_request, "text/plain", "error: beatmap", &.{});
+            }
             const user = (try self.store.authenticate(self.allocator, score.username, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
@@ -369,7 +385,7 @@ const App = struct {
             const active = if (self.sessions.byToken(session_token)) |session| session.user.id == user.id else false;
             self.sessions.mutex.unlock(self.sessions.io);
             if (!active) return respond(req, .unauthorized, "text/plain", "", &.{});
-            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return respond(req, .bad_request, "text/plain", "error: no", &.{});
+            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return rejectStableScore(req, "checksum_mismatch", body.len);
             const beatmap = (try self.store.beatmapForScore(score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             defer self.allocator.free(map_file);

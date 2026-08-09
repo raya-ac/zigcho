@@ -113,12 +113,38 @@ pub const Sync = struct {
         std.log.info("{s}  │  ✓ map_id={d} approved={d}{s}", .{ c_green, map_id, map_info.approved, c_reset });
         std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
 
-        const archive_url = try std.fmt.allocPrint(self.allocator, "https://mirror.hinamizawa.ai/d/{d}", .{set_id});
-        defer self.allocator.free(archive_url);
+        const mirror_json_url = try std.fmt.allocPrint(self.allocator, "https://mirror.hinamizawa.ai/d/{d}", .{set_id});
+        defer self.allocator.free(mirror_json_url);
         std.log.info("{s}  ┌─ [2/4] ARCHIVE DOWNLOAD ──────────────────────{s}", .{ c_cyan, c_reset });
-        std.log.info("{s}  │  → {s}{s}", .{ c_dim, c_reset, archive_url });
-        const archive = self.fetch(archive_url, archive_limit) catch |err| {
-            std.log.warn("{s}  │  ✗ fetch failed: {t}{s}", .{ c_red, err, c_reset });
+        std.log.info("{s}  │  → {s}{s}", .{ c_dim, c_reset, mirror_json_url });
+        const mirror_json = self.fetch(mirror_json_url, 4096) catch |err| {
+            std.log.warn("{s}  │  ✗ mirror fetch failed: {t}{s}", .{ c_red, err, c_reset });
+            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
+            return false;
+        };
+        defer self.allocator.free(mirror_json);
+        const mirror_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, mirror_json, .{}) catch {
+            std.log.warn("{s}  │  ✗ mirror returned invalid json{s}", .{ c_red, c_reset });
+            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
+            return false;
+        };
+        defer mirror_parsed.deinit();
+        const download_url = mirror_parsed.value.object.get("download_url") orelse {
+            std.log.warn("{s}  │  ✗ mirror json missing download_url{s}", .{ c_red, c_reset });
+            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
+            return false;
+        };
+        const url_str = switch (download_url) {
+            .string => |s| s,
+            else => {
+                std.log.warn("{s}  │  ✗ download_url is not a string{s}", .{ c_red, c_reset });
+                std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
+                return false;
+            },
+        };
+        std.log.info("{s}  │  ✓ redirect → {s}{s}", .{ c_green, c_reset, url_str });
+        const archive = self.fetch(url_str, archive_limit) catch |err| {
+            std.log.warn("{s}  │  ✗ archive fetch failed: {t}{s}", .{ c_red, err, c_reset });
             std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
             return false;
         };

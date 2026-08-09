@@ -90,7 +90,7 @@ const App = struct {
         const lat = std.fmt.parseFloat(f32, lat_str) catch 0;
         const lon = std.fmt.parseFloat(f32, lon_str) catch 0;
         std.log.info("{s}  ┌─ GEOLOCATION ──────────────────────────────────{s}", .{ log.blue, log.reset });
-        std.log.info("{s}  │ {s}►{s} ip  : {s}{s}", .{ log.blue, log.dim, log.reset, ip });
+        std.log.info("{s}  │ {s}►{s} ip  : {s}{s}", .{ log.blue, log.dim, log.reset, ip, log.reset });
         std.log.info("{s}  │ {s}✓{s} lat : {d:.4}  lon : {d:.4}{s}", .{ log.blue, log.green, log.reset, lat, lon, log.reset });
         std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ log.blue, log.reset });
         return .{ .lon = lon, .lat = lat };
@@ -396,7 +396,7 @@ const App = struct {
                 if (header(req, "x-real-ip")) |v| break :blk v;
                 break :blk null;
             };
-            const geo = if (client_ip) |ip| self.lookupGeo(ip) else .{ .lon = 0, .lat = 0 };
+            const geo = if (client_ip) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
             const result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer self.allocator.free(result.body);
             const token_headers = [_]std.http.Header{
@@ -613,7 +613,7 @@ const App = struct {
                 const grade_color = if (std.mem.eql(u8, score.grade, "XH") or std.mem.eql(u8, score.grade, "X")) log.yellow else if (std.mem.eql(u8, score.grade, "SH") or std.mem.eql(u8, score.grade, "S")) log.cyan else if (std.mem.eql(u8, score.grade, "A")) log.green else if (std.mem.eql(u8, score.grade, "B")) log.blue else log.red;
                 std.log.info("{s}  ┌─ SCORE {s} ────────────────────────────{s}", .{ if (score.passed) log.green else log.red, if (score.passed) "SUBMIT" else "FAIL", log.reset });
                 std.log.info("{s}  │ {s}►{s} user    : {s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, user.name, log.reset });
-                std.log.info("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, grade_color, score.grade, log.reset });
+                std.log.info("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, grade_color, score.grade, log.bold, log.reset });
                 std.log.info("{s}  │ {s}►{s} pp      : {s}{d:.2}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, performance.pp, log.reset });
                 std.log.info("{s}  │ {s}►{s} combo   : {d}x", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.max_combo });
                 std.log.info("{s}  │ {s}►{s} acc     : {d:.2}%", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.accuracy() * 100.0 });

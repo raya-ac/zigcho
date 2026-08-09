@@ -596,7 +596,7 @@ pub const Store = struct {
         return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4) };
     }
 
-    pub const BeatmapInfo = struct { id: i32, set_id: i32, artist: []const u8, title: []const u8, version: []const u8, star_rating: f64 };
+    pub const BeatmapInfo = struct { id: i32, set_id: i32, max_combo: i32, artist: []const u8, title: []const u8, version: []const u8, star_rating: f64 };
 
     pub fn scoreRankOnMap(self: *Store, md5: []const u8, mode: u8, namespace: []const u8, score_val: i64, pp_val: f64) i32 {
         self.mutex.lockUncancelable(self.io);
@@ -623,7 +623,7 @@ pub const Store = struct {
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT id,set_id,artist,title,version,star_rating FROM beatmaps WHERE md5=?1";
+        const sql = "SELECT id,set_id,max_combo,artist,title,version,star_rating FROM beatmaps WHERE md5=?1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -632,10 +632,11 @@ pub const Store = struct {
         return .{
             .id = c.sqlite3_column_int(stmt, 0),
             .set_id = c.sqlite3_column_int(stmt, 1),
-            .artist = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2))),
-            .title = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3))),
-            .version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4))),
-            .star_rating = c.sqlite3_column_double(stmt, 5),
+            .max_combo = c.sqlite3_column_int(stmt, 2),
+            .artist = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3))),
+            .title = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4))),
+            .version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5))),
+            .star_rating = c.sqlite3_column_double(stmt, 6),
         };
     }
 

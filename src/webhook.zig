@@ -24,15 +24,14 @@ pub const Webhook = struct {
         user_id: i32,
         grade: []const u8,
         mods: i32,
+        mode: u8,
+        rank: i32,
         total_score: i64,
         max_combo: i32,
+        beatmap_max_combo: i32,
         accuracy: f64,
         pp: f64,
         stars: f64,
-        n300: i32,
-        n100: i32,
-        n50: i32,
-        nmiss: i32,
         perfect: bool,
         artist: []const u8,
         title: []const u8,
@@ -43,7 +42,8 @@ pub const Webhook = struct {
     pub fn postScore(self: *Webhook, data: ScoreData) void {
         if (self.url.len == 0) return;
         var buf: [4096]u8 = undefined;
-        const json = std.fmt.bufPrint(&buf, "{s}", .{formatPayload(data)}) catch return;
+        var mod_buf: [32]u8 = undefined;
+        const json = buildJson(&buf, &mod_buf, data) catch return;
         self.doPost(json) catch {};
     }
 
@@ -61,42 +61,42 @@ pub const Webhook = struct {
         }) catch {};
     }
 
-    fn formatPayload(data: ScoreData) std.fmt.Formatter(formatPayloadFn) {
-        return .{ .data = data };
-    }
-
-    fn formatPayloadFn(data: ScoreData, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    fn buildJson(buf: *[4096]u8, mod_buf: *[32]u8, data: ScoreData) ![]const u8 {
         const display_grade = gradeDisplay(data.grade);
         const color = gradeColor(data.grade);
-        const avatar = std.fmt.allocPrint(data.allocator, "https://a.kai.ovh/{d}", .{data.user_id}) catch "";
-        defer data.allocator.free(avatar);
-        const cover = std.fmt.allocPrint(data.allocator, "https://assets.ppy.sh/beatmaps/{d}/covers/raw.jpg", .{data.set_id}) catch "";
-        defer data.allocator.free(cover);
-        const mods_str = modString(data.allocator, data.mods) catch "";
-        defer data.allocator.free(mods_str);
-
-        try writer.writeAll("{\"username\":");
-        try std.json.encodeJsonString(data.username, .{}, writer);
-        try writer.print(",\"avatar_url\":\"{s}\",\"embeds\":[{{\"color\":{d},\"author\":{{\"name\":", .{ avatar, color });
-        try std.json.encodeJsonString(data.username, .{}, writer);
-        try writer.print(",\"icon_url\":\"{s}\"}},\"title\":\"{s}\",\"description\":\"", .{avatar, display_grade});
-        try std.json.encodeJsonString(data.artist, .{}, writer);
-        try writer.writeAll(" - ");
-        try std.json.encodeJsonString(data.title, .{}, writer);
-        try writer.writeAll(" [");
-        try std.json.encodeJsonString(data.version, .{}, writer);
-        try writer.writeAll("\",\"image\":{\"url\":\"");
-        try std.json.encodeJsonString(cover, .{}, writer);
-        try writer.print("\"}},\"fields\":[{{\"name\":\"★ {d:.2}\",\"value\":\"**{d}x** combo | **{d:.2}%** acc | **{d:.2}pp**\",\"inline\":false}},{{\"name\":\"Score\",\"value\":\"{d}\",\"inline\":true}},{{\"name\":\"Mods\",\"value\":\"{s}\",\"inline\":true}}", .{ data.stars, data.max_combo, data.accuracy * 100.0, data.pp, data.total_score, mods_str });
-        if (data.perfect) try writer.writeAll(",{\"name\":\"FC\",\"value\":\"Yes\",\"inline\":true}");
-        try writer.writeAll("]}]}");
+        const mods_str = modString(mod_buf, data.mods);
+        const mode_str = modeName(data.mode);
+        var w = std.Io.Writer.fixed(buf);
+        try w.writeAll("{\"username\":");
+        try std.json.Stringify.value(data.username, .{}, &w);
+        try w.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"embeds\":[{{\"color\":{d},\"author\":{{\"name\":", .{ data.user_id, color });
+        try std.json.Stringify.value(data.username, .{}, &w);
+        try w.print(",\"icon_url\":\"https://a.kai.ovh/{d}\"}},\"title\":\"{s}\",\"description\":\"", .{ data.user_id, display_grade });
+        try std.json.Stringify.value(data.artist, .{}, &w);
+        try w.writeAll(" - ");
+        try std.json.Stringify.value(data.title, .{}, &w);
+        try w.writeAll(" [");
+        try std.json.Stringify.value(data.version, .{}, &w);
+        try w.print("\",\"image\":{{\"url\":\"https://assets.ppy.sh/beatmaps/{d}/covers/raw.jpg\"}},\"fields\":[", .{data.set_id});
+        try w.print("{{\"name\":\"★ {d:.2}\",\"value\":\"#{d} on the map\",\"inline\":false}},", .{ data.stars, data.rank });
+        if (data.beatmap_max_combo > 0) {
+            const pct: f64 = @as(f64, @floatFromInt(data.max_combo)) / @as(f64, @floatFromInt(data.beatmap_max_combo)) * 100.0;
+            try w.print("{{\"name\":\"Combo\",\"value\":\"{d}/{d} ({d:.0}%)\",\"inline\":true}},", .{ data.max_combo, data.beatmap_max_combo, pct });
+        } else {
+            try w.print("{{\"name\":\"Combo\",\"value\":\"{d}x\",\"inline\":true}},", .{data.max_combo});
+        }
+        try w.print("{{\"name\":\"Accuracy\",\"value\":\"{d:.2}%\",\"inline\":true}},", .{data.accuracy * 100.0});
+        try w.print("{{\"name\":\"PP\",\"value\":\"{d:.2}\",\"inline\":true}},", .{data.pp});
+        try w.print("{{\"name\":\"Score\",\"value\":\"{d}\",\"inline\":true}},", .{data.total_score});
+        try w.print("{{\"name\":\"Mods\",\"value\":\"{s}\",\"inline\":true}},", .{mods_str});
+        try w.print("{{\"name\":\"Mode\",\"value\":\"{s}\",\"inline\":true}}", .{mode_str});
+        if (data.perfect) try w.writeAll(",{\"name\":\"FC\",\"value\":\"Yes\",\"inline\":true}");
+        try w.writeAll("]}]}");
+        return buf[0..w.end];
     }
 
     fn gradeDisplay(grade: []const u8) []const u8 {
-        if (std.mem.eql(u8, grade, "XH")) return "SS";
-        if (std.mem.eql(u8, grade, "X")) return "SS";
+        if (std.mem.eql(u8, grade, "XH") or std.mem.eql(u8, grade, "X")) return "SS";
         if (std.mem.eql(u8, grade, "SH")) return "S";
         return grade;
     }
@@ -111,10 +111,19 @@ pub const Webhook = struct {
         return 0xFF0000;
     }
 
-    fn modString(allocator: std.mem.Allocator, mods: i32) ![]u8 {
-        if (mods == 0) return try allocator.dupe(u8, "NM");
-        var list = std.ArrayList(u8).init(allocator);
-        errdefer list.deinit();
+    fn modeName(mode: u8) []const u8 {
+        return switch (mode) {
+            0 => "osu!",
+            1 => "osu!taiko",
+            2 => "osu!catch",
+            3 => "osu!mania",
+            else => "osu!",
+        };
+    }
+
+    fn modString(buf: *[32]u8, mods: i32) []const u8 {
+        if (mods == 0) return "NM";
+        var pos: usize = 0;
         const mod_names = [_]struct { bit: i32, name: []const u8 }{
             .{ .bit = 1 << 0, .name = "NF" },
             .{ .bit = 1 << 1, .name = "EZ" },
@@ -139,10 +148,11 @@ pub const Webhook = struct {
         };
         for (mod_names) |m| {
             if (mods & m.bit != 0) {
-                try list.appendSlice(m.name);
+                @memcpy(buf[pos..][0..2], m.name);
+                pos += 2;
             }
         }
-        if (list.items.len == 0) return try allocator.dupe(u8, "NM");
-        return list.toOwnedSlice();
+        if (pos == 0) return "NM";
+        return buf[0..pos];
     }
 };

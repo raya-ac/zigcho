@@ -365,6 +365,8 @@ const App = struct {
         if (std.mem.eql(u8, path, "/web/bancho_connect.php")) return respond(req, .ok, "text/plain", "ok", &.{});
         if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
         if (std.mem.eql(u8, path, "/web/lastfm.php") and req.head.method == .GET) {
+            const query_start = std.mem.findScalar(u8, target, '?') orelse target.len;
+            std.log.info("lastfm raw: {s}", .{target[query_start..]});
             const action = queryField(target, "action") orelse return respond(req, .bad_request, "text/plain", "", &.{});
             if (!std.mem.eql(u8, action, "np") and !std.mem.eql(u8, action, "scrobble")) return respond(req, .bad_request, "text/plain", "", &.{});
             const encoded_name = queryField(target, "us") orelse return respond(req, .bad_request, "text/plain", "", &.{});
@@ -384,8 +386,8 @@ const App = struct {
             const flags = std.fmt.parseInt(u32, beatmap_or_flag[1..], 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
             if (flags != 0) {
                 try self.store.recordLastFmFlag(user.id, flags);
-                std.log.warn("stable lastfm integrity flag recorded: user_id={d} flags={d}", .{ user.id, flags });
             }
+            std.log.info("lastfm: user_id={d} action={s} flags={d} b={s}", .{ user.id, action, flags, beatmap_or_flag });
             const hq_or_registry: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18) | (@as(u32, 1) << 19);
             return respond(req, .ok, "text/plain", if (flags & hq_or_registry != 0) "-3" else "", &.{});
         }
@@ -570,15 +572,14 @@ const App = struct {
                             .user_id = user.id,
                             .grade = score.grade,
                             .mods = score.mods,
+                            .mode = score.mode,
+                            .rank = rank + 1,
                             .total_score = score.total_score,
                             .max_combo = score.max_combo,
+                            .beatmap_max_combo = info.max_combo,
                             .accuracy = score.accuracy(),
                             .pp = performance.pp,
                             .stars = info.star_rating,
-                            .n300 = score.n300,
-                            .n100 = score.n100,
-                            .n50 = score.n50,
-                            .nmiss = score.nmiss,
                             .perfect = score.perfect,
                             .artist = info.artist,
                             .title = info.title,

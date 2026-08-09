@@ -84,6 +84,7 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     var detail_it = std.mem.splitScalar(u8, details, '|');
     _ = detail_it.next();
     if (detail_it.next()) |offset| utc = std.fmt.parseInt(i8, offset, 10) catch 0;
+    std.log.info("login: user={s} details={s}", .{ name, details });
     const session = try sessions.create(user, utc);
     try out.packetInt(.protocol_version, 19);
     try out.packetInt(.user_id, user.id);

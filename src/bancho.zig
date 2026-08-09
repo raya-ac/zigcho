@@ -3,16 +3,34 @@ const protocol = @import("protocol.zig");
 const sessions_mod = @import("sessions.zig");
 const storage = @import("storage.zig");
 const domain = @import("domain.zig");
+const stable_score = @import("stable_score.zig");
+const country = @import("country.zig");
 
 pub const LoginResult = struct { token: []const u8, body: []u8 };
+
+pub fn clientPrivileges(server_privileges: u32, grant_direct: bool) u8 {
+    const unrestricted: u32 = 1 << 0;
+    const supporter: u32 = 1 << 4;
+    const premium: u32 = 1 << 5;
+    const moderator: u32 = 1 << 12;
+    const administrator: u32 = 1 << 13;
+    const developer: u32 = 1 << 14;
+    var client: u8 = 0;
+    if (server_privileges & unrestricted != 0) client |= 1 << 0;
+    if (server_privileges & (supporter | premium) != 0 or grant_direct) client |= 1 << 2;
+    if (server_privileges & moderator != 0) client |= 1 << 1;
+    if (server_privileges & administrator != 0) client |= 1 << 4;
+    if (server_privileges & developer != 0) client |= 1 << 3;
+    return client;
+}
 
 fn presence(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
     const start = try w.begin(.user_presence);
     try w.int(i32, s.user.id);
     try w.string(s.user.name);
     try w.byte(@intCast(@as(i16, s.utc_offset) + 24));
-    try w.byte(0);
-    try w.byte(@intCast(1 | (@as(u8, s.mode) << 5)));
+    try w.byte(country.numeric(&s.user.country));
+    try w.byte(clientPrivileges(s.user.privileges, false) | (@as(u8, s.mode) << 5));
     try w.float(f32, 0);
     try w.float(f32, 0);
     try w.int(i32, 0);
@@ -20,7 +38,8 @@ fn presence(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
 }
 
 fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Session) !void {
-    const current = (try store.statsForUser(s.user.id, s.mode)) orelse domain.Stats{};
+    const stats_mode = stable_score.statsMode(s.mode, s.mods) orelse s.mode;
+    const current = (try store.statsForUser(s.user.id, stats_mode)) orelse domain.Stats{};
     const start = try w.begin(.user_stats);
     try w.int(i32, s.user.id);
     try w.byte(s.action);
@@ -38,7 +57,7 @@ fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Sess
     w.finish(start);
 }
 
-pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8) !LoginResult {
+pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8) !LoginResult {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -52,11 +71,15 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         try out.packetString(.notification, "Invalid login request.");
         return .{ .token = "invalid-request", .body = try allocator.dupe(u8, out.bytes()) };
     }
-    const user = (try store.authenticate(allocator, name, password)) orelse {
+    var user = (try store.authenticate(allocator, name, password)) orelse {
         try out.packetInt(.user_id, -1);
         try out.packetString(.notification, "Incorrect credentials.");
         return .{ .token = "no", .body = try allocator.dupe(u8, out.bytes()) };
     };
+    if (login_country) |value| {
+        try store.updateCountry(user.id, value);
+        user.country = value;
+    }
     var utc: i8 = 0;
     var detail_it = std.mem.splitScalar(u8, details, '|');
     _ = detail_it.next();
@@ -64,12 +87,12 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     const session = try sessions.create(user, utc);
     try out.packetInt(.protocol_version, 19);
     try out.packetInt(.user_id, user.id);
-    try out.packetInt(.privileges, @intCast(user.privileges));
+    try out.packetInt(.privileges, clientPrivileges(user.privileges, true));
     try out.packetInt(.silence_end, @intCast(@max(0, user.silence_end - std.Io.Clock.real.now(sessions.io).toSeconds())));
     try presence(&out, session);
     try stats(&out, store, session);
-    try protocol.writeChannel(&out, "#osu", "General discussion", 1);
-    try protocol.writeChannel(&out, "#announce", "Server announcements", 1);
+    try protocol.writeChannel(&out, "#osu", "general", @intCast(sessions.channelCount("#osu")));
+    try protocol.writeChannel(&out, "#announce", "updates", @intCast(sessions.channelCount("#announce")));
     try out.packetEmpty(.channel_info_end);
     for (sessions.items.items) |other| if (other != session) {
         try presence(&out, other);
@@ -121,20 +144,32 @@ pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sess
         .send_public_message, .send_private_message => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             _ = try p.string();
-            const text = try p.string();
+            const text = std.mem.trim(u8, try p.string(), " \t\r\n");
             const target_name = try p.string();
             _ = try p.int(i32);
-            if (text.len > 2000) continue;
+            if (text.len == 0 or text.len > 2000) continue;
             var message = protocol.Writer.init(allocator);
             defer message.deinit();
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
             if (packet.id == .send_private_message) {
-                if (sessions.byName(target_name)) |target| try queuePacket(target, allocator, message.bytes());
-            } else try sessions.broadcast(message.bytes(), session);
+                if (sessions.byName(target_name)) |target| {
+                    if (target.is_bot) {
+                        try protocol.writeMessage(&out, "kai", "i'm here. commands come later.", session.user.name, 3);
+                    } else try queuePacket(target, allocator, message.bytes());
+                }
+            } else {
+                if (!session.joined(target_name) or !std.mem.eql(u8, target_name, "#osu")) continue;
+                try sessions.broadcastChannel(target_name, message.bytes(), session);
+            }
         },
         .channel_join => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
-            try out.packetString(.channel_join_success, try p.string());
+            const name = try p.string();
+            if (sessions.join(session, name)) try out.packetString(.channel_join_success, name);
+        },
+        .channel_part => {
+            var p: protocol.PayloadReader = .{ .data = packet.payload };
+            sessions.part(session, try p.string());
         },
         .user_stats_request => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };

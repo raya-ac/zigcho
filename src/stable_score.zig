@@ -41,7 +41,9 @@ pub const Submission = struct {
     pub fn rankNamespace(self: Submission) []const u8 {
         const relax: i32 = 1 << 7;
         const autopilot: i32 = 1 << 13;
-        return if (self.mods & (relax | autopilot) != 0) "relax" else "vanilla";
+        if (self.mods & autopilot != 0) return "autopilot";
+        if (self.mods & relax != 0) return "relax";
+        return "vanilla";
     }
 
     pub fn verifyChecksum(self: Submission, osu_version: []const u8, client_hash: []const u8, storyboard_md5: []const u8) bool {
@@ -60,6 +62,15 @@ pub const Submission = struct {
         return self.online_checksum.len == encoded.len and std.crypto.timing_safe.eql([32]u8, encoded, self.online_checksum[0..32].*);
     }
 };
+
+pub fn statsMode(vanilla_mode: u8, mods: i32) ?u8 {
+    if (vanilla_mode > 3) return null;
+    const relax: i32 = 1 << 7;
+    const autopilot: i32 = 1 << 13;
+    if (mods & autopilot != 0) return if (vanilla_mode == 0) 8 else null;
+    if (mods & relax != 0) return if (vanilla_mode < 3) vanilla_mode + 4 else null;
+    return vanilla_mode;
+}
 
 pub fn replayLengthAccepted(passed: bool, replay_len: usize) bool {
     const max_replay_size = 16 * 1024 * 1024;

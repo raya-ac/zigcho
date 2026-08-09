@@ -5,13 +5,19 @@ pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, r
 pub const Privileges = packed struct(u32) {
     unrestricted: bool = true,
     verified: bool = true,
+    whitelisted: bool = false,
+    _reserved_3: bool = false,
     supporter: bool = false,
+    premium: bool = false,
+    _reserved_6: bool = false,
+    alumni: bool = false,
+    _reserved_8_9: u2 = 0,
+    tournament: bool = false,
+    nominator: bool = false,
     moderator: bool = false,
     admin: bool = false,
     developer: bool = false,
-    tournament: bool = false,
-    alumni: bool = false,
-    _padding: u24 = 0,
+    _padding: u17 = 0,
 };
 
 pub const User = struct {
@@ -31,6 +37,7 @@ pub const Stats = struct {
     pp: i32 = 0,
     plays: i32 = 0,
     play_time: i32 = 0,
+    total_hits: i64 = 0,
     accuracy: f64 = 0,
     max_combo: i32 = 0,
     global_rank: i32 = 0,

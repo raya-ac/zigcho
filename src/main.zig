@@ -12,6 +12,7 @@ const status_page = @embedFile("status.html");
 const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
+const country = @import("country.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -58,6 +59,12 @@ const App = struct {
         return field(target[query_start + 1 ..], key);
     }
 
+    fn userOnline(self: *App, user_id: i32) bool {
+        self.sessions.mutex.lockUncancelable(self.sessions.io);
+        defer self.sessions.mutex.unlock(self.sessions.io);
+        return self.sessions.byUser(user_id) != null;
+    }
+
     fn requestRule(req: *const std.http.Server.Request, path: []const u8) ?rate_limit.Rule {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/users")) return rate_limit.registration;
         if (req.head.method == .POST and (std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke"))) return rate_limit.token;
@@ -68,7 +75,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
-        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php")) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php")) return rate_limit.authenticated;
         return null;
     }
 
@@ -109,6 +116,8 @@ const App = struct {
         defer if (score_token_owned) |v| self.allocator.free(v);
         const content_type_owned: ?[]u8 = if (req.head.content_type) |v| try self.allocator.dupe(u8, v) else null;
         defer if (content_type_owned) |v| self.allocator.free(v);
+        const country_owned: ?[]u8 = if (header(req, "cf-ipcountry")) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (country_owned) |v| self.allocator.free(v);
         const body: []u8 = if (req.head.method.requestHasBody()) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
             break :b r.allocRemaining(self.allocator, .limited(bodyLimit(path))) catch |err| switch (err) {
@@ -118,11 +127,20 @@ const App = struct {
         } else &.{};
         defer if (body.len > 0) self.allocator.free(body);
 
-        if (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/api/v1/status")) {
+        if (std.mem.eql(u8, path, "/health")) {
             self.sessions.mutex.lockUncancelable(self.sessions.io);
             defer self.sessions.mutex.unlock(self.sessions.io);
             var buf: [256]u8 = undefined;
-            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{self.sessions.items.items.len});
+            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{self.sessions.humanCount()});
+            return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v1/status")) {
+            self.sessions.mutex.lockUncancelable(self.sessions.io);
+            const online = self.sessions.humanCount();
+            self.sessions.mutex.unlock(self.sessions.io);
+            const counts = try self.store.serverCounts();
+            var buf: [384]u8 = undefined;
+            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"debug alpha\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/d/")) {
@@ -272,7 +290,7 @@ const App = struct {
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
-            const result = try bancho.login(self.allocator, &self.store, &self.sessions, body);
+            const result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null);
             defer self.allocator.free(result.body);
             const token_headers = [_]std.http.Header{
                 .{ .name = "cho-token", .value = result.token },
@@ -282,6 +300,59 @@ const App = struct {
         }
         if (std.mem.eql(u8, path, "/web/bancho_connect.php")) return respond(req, .ok, "text/plain", "ok", &.{});
         if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
+        if (std.mem.eql(u8, path, "/web/lastfm.php") and req.head.method == .GET) {
+            const action = queryField(target, "action") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            if (!std.mem.eql(u8, action, "np") and !std.mem.eql(u8, action, "scrobble")) return respond(req, .bad_request, "text/plain", "", &.{});
+            const encoded_name = queryField(target, "us") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "ha") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const beatmap_or_flag = queryField(target, "b") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "", &.{});
+            if (beatmap_or_flag.len == 0 or beatmap_or_flag[0] != 'a') return respond(req, .ok, "text/plain", "-3", &.{});
+            const flags = std.fmt.parseInt(u32, beatmap_or_flag[1..], 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            if (flags != 0) {
+                try self.store.recordLastFmFlag(user.id, flags);
+                std.log.warn("stable lastfm integrity flag recorded: user_id={d} flags={d}", .{ user.id, flags });
+            }
+            const hq_or_registry: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18) | (@as(u32, 1) << 19);
+            return respond(req, .ok, "text/plain", if (flags & hq_or_registry != 0) "-3" else "", &.{});
+        }
+        if (std.mem.eql(u8, path, "/web/osu-rate.php") and req.head.method == .GET) {
+            const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "p") orelse return respond(req, .unauthorized, "text/plain", "auth fail", &.{});
+            const map_md5 = queryField(target, "c") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            if (map_md5.len != 32) return respond(req, .bad_request, "text/plain", "", &.{});
+            const rating: ?u8 = if (queryField(target, "v")) |value| std.fmt.parseInt(u8, value, 10) catch return respond(req, .bad_request, "text/plain", "", &.{}) else null;
+            if (rating) |value| if (value < 1 or value > 10) return respond(req, .bad_request, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "auth fail", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "auth fail", &.{});
+            return switch (try self.store.rateBeatmap(user.id, map_md5, rating)) {
+                .no_exist => respond(req, .ok, "text/plain", "no exist", &.{}),
+                .not_ranked => respond(req, .ok, "text/plain", "not ranked", &.{}),
+                .can_rate => respond(req, .ok, "text/plain", "ok", &.{}),
+                .already_voted => |average| voted: {
+                    var rating_buf: [64]u8 = undefined;
+                    const response = try std.fmt.bufPrint(&rating_buf, "alreadyvoted\n{d}", .{average});
+                    break :voted respond(req, .ok, "text/plain", response, &.{});
+                },
+            };
+        }
         if (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php")) return respond(req, .ok, "text/plain", "", &.{});
         if ((std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php")) and req.head.method == .GET) {
             const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
@@ -345,7 +416,7 @@ const App = struct {
             defer self.allocator.free(user.safe_name);
             if (try self.store.beatmapForScore(map_md5) == null) {
                 _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| failed: {
-                    std.log.warn("Nerinyan beatmap hydration failed for {s}: {t}", .{ map_md5, err });
+                    std.log.warn("Akatsuki beatmap hydration failed for {s}: {t}", .{ map_md5, err });
                     break :failed false;
                 };
             }
@@ -371,6 +442,8 @@ const App = struct {
             const osu_version = (form.first("osuver") orelse return rejectStableScore(req, "missing_osu_version", body.len)).data;
             const updated_map_hash = (form.first("bmk") orelse return rejectStableScore(req, "missing_updated_map_hash", body.len)).data;
             const storyboard_hash = if (form.first("sbk")) |part| part.data else "";
+            const score_time = std.fmt.parseInt(u32, (form.first("st") orelse return rejectStableScore(req, "missing_score_time", body.len)).data, 10) catch return rejectStableScore(req, "invalid_score_time", body.len);
+            const fail_time = std.fmt.parseInt(u32, (form.first("ft") orelse return rejectStableScore(req, "missing_fail_time", body.len)).data, 10) catch return rejectStableScore(req, "invalid_fail_time", body.len);
             var decrypted = score_crypto.decrypt(self.allocator, encrypted.data, client_hash_encrypted, iv, osu_version) catch |err| return rejectStableScoreError(req, "decrypt_failed", err, body.len);
             defer decrypted.deinit();
             const score = stable_score.parse(decrypted.score_data) catch |err| {
@@ -419,7 +492,7 @@ const App = struct {
                 .misses = @intCast(score.nmiss),
                 .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
-            const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
+            const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, if (score.passed) score_time else fail_time) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
             try bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods);
             if (!score.passed) return respond(req, .ok, "text/plain", "error: no", &.{});
             var result_buf: [1024]u8 = undefined;
@@ -486,6 +559,8 @@ pub fn main(init: std.process.Init) !void {
         .limiter = rate_limit.Limiter.init(allocator, init.io),
         .map_sync = beatmap_sync.Sync.init(allocator, init.io),
     };
+    const kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
+    _ = try app.sessions.createBot(kai);
     defer app.map_sync.deinit();
     defer app.limiter.deinit();
     defer app.sessions.deinit();

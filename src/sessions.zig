@@ -14,9 +14,17 @@ pub const Session = struct {
     info_len: usize = 0,
     last_seen: i64,
     queue: std.ArrayList(u8) = .empty,
+    is_bot: bool = false,
+    joined_osu: bool = false,
+    joined_announce: bool = false,
 
     pub fn info(self: *const Session) []const u8 {
         return self.info_text[0..self.info_len];
+    }
+    pub fn joined(self: *const Session, name: []const u8) bool {
+        if (std.mem.eql(u8, name, "#osu")) return self.joined_osu;
+        if (std.mem.eql(u8, name, "#announce")) return self.joined_announce;
+        return false;
     }
 };
 
@@ -48,8 +56,22 @@ pub const Sessions = struct {
         try self.items.append(self.allocator, s);
         return s;
     }
+    pub fn createBot(self: *Sessions, user: domain.User) !*Session {
+        if (self.byUser(user.id)) |old| self.remove(old);
+        const s = try self.allocator.create(Session);
+        s.* = .{
+            .token = [_]u8{0} ** 64,
+            .user = user,
+            .last_seen = std.math.maxInt(i64),
+            .is_bot = true,
+            .joined_osu = true,
+            .joined_announce = true,
+        };
+        try self.items.append(self.allocator, s);
+        return s;
+    }
     pub fn byToken(self: *Sessions, token: []const u8) ?*Session {
-        for (self.items.items) |s| if (std.mem.eql(u8, &s.token, token)) return s;
+        for (self.items.items) |s| if (!s.is_bot and std.mem.eql(u8, &s.token, token)) return s;
         return null;
     }
     pub fn byUser(self: *Sessions, id: i32) ?*Session {
@@ -71,6 +93,34 @@ pub const Sessions = struct {
         };
     }
     pub fn broadcast(self: *Sessions, bytes: []const u8, except: ?*Session) !void {
-        for (self.items.items) |s| if (s != except) try s.queue.appendSlice(self.allocator, bytes);
+        for (self.items.items) |s| if (s != except and !s.is_bot) try s.queue.appendSlice(self.allocator, bytes);
+    }
+    pub fn humanCount(self: *const Sessions) usize {
+        var count: usize = 0;
+        for (self.items.items) |s| if (!s.is_bot) {
+            count += 1;
+        };
+        return count;
+    }
+    pub fn channelCount(self: *const Sessions, name: []const u8) usize {
+        var count: usize = 0;
+        for (self.items.items) |s| if (s.joined(name)) {
+            count += 1;
+        };
+        return count;
+    }
+    pub fn join(self: *Sessions, session: *Session, name: []const u8) bool {
+        _ = self;
+        if (std.mem.eql(u8, name, "#osu")) session.joined_osu = true else if (std.mem.eql(u8, name, "#announce")) session.joined_announce = true else return false;
+        return true;
+    }
+    pub fn part(self: *Sessions, session: *Session, name: []const u8) void {
+        _ = self;
+        if (std.mem.eql(u8, name, "#osu")) session.joined_osu = false else if (std.mem.eql(u8, name, "#announce")) session.joined_announce = false;
+    }
+    pub fn broadcastChannel(self: *Sessions, name: []const u8, bytes: []const u8, except: ?*Session) !void {
+        for (self.items.items) |s| if (s != except and !s.is_bot and s.joined(name)) {
+            try s.queue.appendSlice(self.allocator, bytes);
+        };
     }
 };

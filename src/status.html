@@ -4,41 +4,46 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#070707">
-  <title>zigcho / relay</title>
+  <meta name="theme-color" content="#080808">
+  <title>kai / zigcho</title>
   <style>
-    :root{--bg:#070707;--ink:#d8d4cc;--soft:#716d69;--line:#211f20;--pink:#d982ad}
-    *{box-sizing:border-box}html{background:var(--bg);color:var(--ink);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-    body{margin:0;min-width:300px}.page{width:min(980px,calc(100% - 36px));min-height:100svh;margin:auto;display:grid;grid-template-rows:58px 1fr 130px 58px}
-    a{color:inherit;text-decoration:none}a:hover{color:var(--pink)}
-    header,footer{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);color:var(--soft);font-size:9px;letter-spacing:.08em}
-    footer{border-top:1px solid var(--line);border-bottom:0}.brand{color:var(--ink);font:15px Georgia,"Times New Roman",serif}.brand i{color:var(--pink);font-style:normal}
-    .live{display:flex;align-items:center;gap:8px}.dot{width:5px;height:5px;border-radius:50%;background:var(--pink);box-shadow:0 0 10px var(--pink)}
-    main{align-self:center;padding:65px 0}.label{color:var(--soft);font-size:9px;letter-spacing:.12em}.label:before{content:"— ";color:var(--pink)}
-    h1{margin:19px 0 26px;font:400 clamp(72px,15vw,148px)/.75 Georgia,"Times New Roman",serif;letter-spacing:-.075em}h1 i{color:var(--pink);font-style:normal}
-    .copy{max-width:560px;margin:0;color:#99948e;font:15px/1.7 Georgia,"Times New Roman",serif}.copy strong{color:var(--ink);font-weight:400}
-    .meta{display:flex;gap:24px;margin-top:31px;color:var(--soft);font-size:9px}.meta span+span:before{content:"/";margin-right:24px;color:#383533}.host{color:var(--pink)}
-    .water{position:relative;overflow:hidden;border-top:1px solid var(--line)}.water:after{content:"";position:absolute;left:0;right:0;top:72px;height:1px;background:repeating-linear-gradient(90deg,transparent 0 8px,rgba(217,130,173,.25) 8px 11px)}
-    .boat-run{position:absolute;top:34px;left:0;width:100%;animation:cross 17s linear infinite}.boat{position:absolute;left:-65px;width:62px;height:40px;animation:bob 2.5s ease-in-out infinite}.mast{position:absolute;left:31px;top:0;width:1px;height:23px;background:#8a8580}.sail{position:absolute;left:15px;top:3px;width:15px;height:18px;border-right:1px solid var(--pink);border-bottom:1px solid var(--pink);transform:skewY(-28deg)}.hull{position:absolute;left:5px;top:25px;width:52px;height:10px;border-top:1px solid var(--ink);border-radius:0 0 70% 55%}.wake{position:absolute;left:-14px;top:37px;width:80px;height:1px;background:linear-gradient(90deg,transparent,var(--pink),transparent);opacity:.35}
-    @keyframes cross{to{transform:translateX(calc(100% + 65px))}}@keyframes bob{50%{transform:translateY(-3px) rotate(1deg)}}
-    @media(max-width:600px){.page{grid-template-rows:54px 1fr 110px 54px}main{padding:46px 0}.copy{font-size:14px}.meta{display:grid;gap:9px}.meta span+span:before{display:none}.desktop{display:none}}
-    @media(prefers-reduced-motion:reduce){.boat-run,.boat{animation:none}.boat-run{transform:translateX(55%)}.dot{box-shadow:none}}
+    :root{--bg:#080808;--text:#e7e3df;--muted:#88817d;--line:#282326;--pink:#ed83b6}
+    *{box-sizing:border-box}html{background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}body{margin:0}
+    main{width:min(720px,calc(100% - 32px));min-height:100svh;margin:auto;display:flex;flex-direction:column;justify-content:center;padding:48px 0}
+    header{display:flex;align-items:center;justify-content:space-between;padding-bottom:14px;border-bottom:1px solid var(--line)}
+    h1{margin:0;font:600 22px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:-.03em}h1 span,.state{color:var(--pink)}
+    .state{display:flex;align-items:center;gap:7px;font-size:11px}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+    .copy{margin:42px 0 30px;max-width:530px;color:var(--muted)}.copy strong{color:var(--text);font-weight:500}
+    dl{display:grid;grid-template-columns:repeat(5,1fr);margin:0;padding:18px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+    dl div+div{border-left:1px solid var(--line);padding-left:16px}dt{color:var(--muted);font-size:10px}dd{margin:5px 0 0;font-size:18px}
+    .water{position:relative;height:76px;margin-top:34px;overflow:hidden;border-bottom:1px dashed var(--line)}
+    .boat-run{position:absolute;left:-58px;bottom:8px;width:50px;height:38px;animation:sail 18s linear infinite}.boat{position:relative;width:50px;height:38px;animation:bob 2.4s ease-in-out infinite}
+    .mast{position:absolute;left:27px;top:1px;width:1px;height:22px;background:var(--muted)}.sail{position:absolute;left:12px;top:3px;width:14px;height:17px;border-right:1px solid var(--pink);border-bottom:1px solid var(--pink);transform:skewY(-24deg)}.hull{position:absolute;left:4px;top:25px;width:43px;height:8px;border-top:1px solid var(--text);border-radius:0 0 60% 50%}.wake{position:absolute;right:43px;top:33px;width:28px;border-top:1px dashed var(--pink);opacity:.55}
+    footer{display:flex;justify-content:space-between;margin-top:13px;color:var(--muted);font-size:10px}
+    .updating dd{opacity:.45}@keyframes sail{to{transform:translateX(778px)}}@keyframes bob{50%{transform:translateY(-3px) rotate(1deg)}}
+    @media(max-width:580px){dl{grid-template-columns:repeat(2,1fr);gap:18px 0}dl div+div{border-left:0;padding-left:0}dl div:nth-child(even){border-left:1px solid var(--line);padding-left:16px}.copy{margin-top:34px}}
+    @media(prefers-reduced-motion:reduce){.boat-run,.boat{animation:none}.boat-run{left:45%}}
   </style>
 </head>
 <body>
-  <div class="page">
-    <header><span class="brand">zigcho<i>.</i></span><div class="live"><i class="dot"></i><span id="live">checking the wire</span></div></header>
-    <main>
-      <div class="label" id="role">osu! infrastructure / edge</div>
-      <h1>zigcho<i>.</i></h1>
-      <p class="copy"><strong>you found the wire, not the game.</strong> osu! expects this address to exist, so it does. there is nothing useful to click here yet.</p>
-      <div class="meta"><span class="host" id="host">kai.ovh</span><span id="purpose">traffic enters the Zig origin here</span><span>invite-only alpha / 34%</span></div>
-    </main>
-    <div class="water" aria-label="a small animated boat crossing the relay"><div class="boat-run" aria-hidden="true"><div class="boat"><i class="mast"></i><i class="sail"></i><i class="hull"></i><i class="wake"></i></div></div></div>
-    <footer><span>zigcho / osu! infrastructure</span><a href="https://github.com/raya-ac/zigcho">source ↗</a><span class="desktop">kai.ovh / 2026</span></footer>
-  </div>
+  <main>
+    <header><h1>kai<span>.</span></h1><div class="state"><i class="dot"></i><span id="state">checking</span></div></header>
+    <p class="copy"><strong>this is the small bit that tells you if the server is alive.</strong> zigcho is still running as a Debug alpha while stable, lazer, chat and multiplayer are finished properly.</p>
+    <dl id="stats">
+      <div><dt>online</dt><dd id="online">—</dd></div>
+      <div><dt>accounts</dt><dd id="users">—</dd></div>
+      <div><dt>plays</dt><dd id="plays">—</dd></div>
+      <div><dt>passed</dt><dd id="passed">—</dd></div>
+      <div><dt>maps</dt><dd id="maps">—</dd></div>
+    </dl>
+    <div class="water" aria-label="a small boat moving across the page"><div class="boat-run" aria-hidden="true"><div class="boat"><i class="mast"></i><i class="sail"></i><i class="hull"></i><i class="wake"></i></div></div></div>
+    <footer><span id="host">kai.ovh</span><span>debug alpha / bancho protocol 19</span></footer>
+  </main>
   <script>
-  (()=>{const host=location.hostname,first=host.split('.')[0];let role='osu! infrastructure / origin gateway',purpose='traffic enters the Zig origin here';if(/^c[1-6]?$/.test(first)||first==='ce'||first==='cho'){role='osu! infrastructure / bancho relay';purpose='stable client traffic'}else if(['a','assets','i','s'].includes(first)){role='osu! infrastructure / asset relay';purpose='avatars, covers and screenshots'}else if(['b','bm6','bm10'].includes(first)){role='osu! infrastructure / beatmap relay';purpose='maps and .osz delivery'}else if(first==='spectator'){role='osu! infrastructure / realtime relay';purpose='lazer spectator traffic'}else if(first==='bss'){role='osu! infrastructure / submission relay';purpose='beatmap submission traffic'}else if(first==='api'||first==='osu'){role='osu! infrastructure / api gateway';purpose='accounts, scores and metadata'}document.getElementById('host').textContent=host;document.getElementById('role').textContent=role;document.getElementById('purpose').textContent=purpose;fetch('/health',{cache:'no-store'}).then(r=>r.ok?r.json():Promise.reject()).then(d=>document.getElementById('live').textContent=`online / ${d.online} connected`).catch(()=>document.getElementById('live').textContent='the wire did not answer')})();
+    const stats=document.getElementById('stats'),state=document.getElementById('state');
+    document.getElementById('host').textContent=location.hostname;
+    async function refresh(){stats.classList.add('updating');try{const r=await fetch('/api/v1/status',{cache:'no-store'});if(!r.ok)throw new Error();const d=await r.json();for(const key of ['online','users','plays','passed','maps'])document.getElementById(key).textContent=Number(d[key]).toLocaleString();state.textContent='live';}catch{state.textContent='not answering';}finally{stats.classList.remove('updating')}}
+    refresh();setInterval(refresh,15000);
   </script>
 </body>
 </html>

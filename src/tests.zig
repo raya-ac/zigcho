@@ -1,4 +1,5 @@
 const std = @import("std");
+const bancho = @import("bancho.zig");
 const protocol = @import("protocol.zig");
 const domain = @import("domain.zig");
 const lazer = @import("lazer.zig");
@@ -14,6 +15,21 @@ const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const sessions_mod = @import("sessions.zig");
+const country = @import("country.zig");
+
+fn clientMessagePacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, sender: []const u8, message: []const u8, target: []const u8, sender_id: i32) ![]u8 {
+    var w = protocol.Writer.init(allocator);
+    defer w.deinit();
+    try w.int(u16, @intFromEnum(id));
+    try w.byte(0);
+    try w.int(u32, 0);
+    try w.string(sender);
+    try w.string(message);
+    try w.string(target);
+    try w.int(i32, sender_id);
+    std.mem.writeInt(u32, w.list.items[3..][0..4], @intCast(w.list.items.len - 7), .little);
+    return allocator.dupe(u8, w.bytes());
+}
 
 fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -64,12 +80,12 @@ fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []con
     return output.toOwnedSlice();
 }
 
-test "Nerinyan ranks map into local leaderboard states" {
-    try std.testing.expectEqual(@as(i8, 3), beatmap_sync.localStatus("1"));
-    try std.testing.expectEqual(@as(i8, 4), beatmap_sync.localStatus("2"));
-    try std.testing.expectEqual(@as(i8, 5), beatmap_sync.localStatus("3"));
-    try std.testing.expectEqual(@as(i8, 6), beatmap_sync.localStatus("4"));
-    try std.testing.expectEqual(@as(i8, 2), beatmap_sync.localStatus("-2"));
+test "Akatsuki ranks map into local leaderboard states" {
+    try std.testing.expectEqual(@as(i8, 3), beatmap_sync.localStatus(1));
+    try std.testing.expectEqual(@as(i8, 4), beatmap_sync.localStatus(2));
+    try std.testing.expectEqual(@as(i8, 5), beatmap_sync.localStatus(3));
+    try std.testing.expectEqual(@as(i8, 6), beatmap_sync.localStatus(4));
+    try std.testing.expectEqual(@as(i8, 2), beatmap_sync.localStatus(-2));
 }
 
 test "beatmap statuses use each client protocol's values" {
@@ -88,7 +104,7 @@ test "beatmap statuses use each client protocol's values" {
     try std.testing.expectEqualStrings("loved", storage.Store.lazerStatus(6));
 }
 
-test "Nerinyan archives only yield the exact MD5 map" {
+test "Akatsuki archives only yield the exact MD5 map" {
     const map = @embedFile("testdata/synthetic-standard.osu");
     const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
     defer std.testing.allocator.free(archive);
@@ -115,6 +131,63 @@ test "public chat does not echo through the server to its sender" {
     try sessions.broadcast("one message", sender);
     try std.testing.expectEqual(@as(usize, 0), sender.queue.items.len);
     try std.testing.expectEqualStrings("one message", other.queue.items);
+}
+
+test "joined public chat delivers once and kai answers private chat as user three" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/chat.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
+    const ari = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0);
+    const raya = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0);
+    try std.testing.expect(sessions.join(ari, "#osu"));
+    try std.testing.expect(sessions.join(raya, "#osu"));
+
+    const public = try clientMessagePacket(std.testing.allocator, .send_public_message, "ari", "hello once", "#osu", 1);
+    defer std.testing.allocator.free(public);
+    const sender_reply = try bancho.poll(std.testing.allocator, &store, &sessions, ari, public);
+    defer std.testing.allocator.free(sender_reply);
+    try std.testing.expectEqual(@as(usize, 0), sender_reply.len);
+    const received = try bancho.poll(std.testing.allocator, &store, &sessions, raya, "");
+    defer std.testing.allocator.free(received);
+    var public_reader: protocol.Reader = .{ .data = received };
+    const public_packet = (try public_reader.next()).?;
+    try std.testing.expectEqual(@as(u16, 7), @intFromEnum(public_packet.id));
+    var public_payload: protocol.PayloadReader = .{ .data = public_packet.payload };
+    try std.testing.expectEqualStrings("ari", try public_payload.string());
+    try std.testing.expectEqualStrings("hello once", try public_payload.string());
+    try std.testing.expectEqualStrings("#osu", try public_payload.string());
+    try std.testing.expectEqual(@as(i32, 1), try public_payload.int(i32));
+    try std.testing.expect((try public_reader.next()) == null);
+
+    const private = try clientMessagePacket(std.testing.allocator, .send_private_message, "ari", "hello", "kai", 1);
+    defer std.testing.allocator.free(private);
+    const bot_reply = try bancho.poll(std.testing.allocator, &store, &sessions, ari, private);
+    defer std.testing.allocator.free(bot_reply);
+    var bot_reader: protocol.Reader = .{ .data = bot_reply };
+    const bot_packet = (try bot_reader.next()).?;
+    var bot_payload: protocol.PayloadReader = .{ .data = bot_packet.payload };
+    try std.testing.expectEqualStrings("kai", try bot_payload.string());
+    try std.testing.expectEqualStrings("i'm here. commands come later.", try bot_payload.string());
+    try std.testing.expectEqualStrings("ari", try bot_payload.string());
+    try std.testing.expectEqual(@as(i32, 3), try bot_payload.int(i32));
+    try std.testing.expectEqual(@as(usize, 0), sessions.byUser(3).?.queue.items.len);
+}
+
+test "server roles map to stable privileges and login always grants supporter" {
+    const normal: u32 = (1 << 0) | (1 << 1);
+    const qat: u32 = normal | (1 << 11);
+    const gmt: u32 = normal | (1 << 12);
+    try std.testing.expectEqual(@as(u8, 1), bancho.clientPrivileges(normal, false));
+    try std.testing.expectEqual(@as(u8, 5), bancho.clientPrivileges(normal, true));
+    try std.testing.expectEqual(@as(u8, 5), bancho.clientPrivileges(qat, true));
+    try std.testing.expectEqual(@as(u8, 7), bancho.clientPrivileges(gmt, true));
 }
 
 test "lazer trailing slashes use the same API route" {
@@ -272,7 +345,7 @@ test "failed stable scores may submit an empty replay" {
     try std.testing.expect(!stable_score.replayLengthAccepted(false, 16 * 1024 * 1024 + 1));
 }
 
-test "stable relax and autopilot scores cannot enter vanilla rankings" {
+test "stable mod modes select isolated ranking and stats namespaces" {
     const base = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:";
     const suffix = ":True:0:260808235959:20260808";
     const nomod = try stable_score.parse(base ++ "0" ++ suffix);
@@ -280,7 +353,14 @@ test "stable relax and autopilot scores cannot enter vanilla rankings" {
     const autopilot = try stable_score.parse(base ++ "8192" ++ suffix);
     try std.testing.expectEqualStrings("vanilla", nomod.rankNamespace());
     try std.testing.expectEqualStrings("relax", relax.rankNamespace());
-    try std.testing.expectEqualStrings("relax", autopilot.rankNamespace());
+    try std.testing.expectEqualStrings("autopilot", autopilot.rankNamespace());
+    try std.testing.expectEqual(@as(?u8, 0), stable_score.statsMode(0, 0));
+    try std.testing.expectEqual(@as(?u8, 4), stable_score.statsMode(0, 128));
+    try std.testing.expectEqual(@as(?u8, 5), stable_score.statsMode(1, 128));
+    try std.testing.expectEqual(@as(?u8, 6), stable_score.statsMode(2, 128));
+    try std.testing.expectEqual(@as(?u8, 8), stable_score.statsMode(0, 8192));
+    try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(3, 128));
+    try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(1, 8192));
 }
 
 test "client packet reader rejects truncation" {
@@ -404,7 +484,7 @@ test "ranked stable PP is stored and updates normal player stats" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
-    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(1,0)");
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(1,0),(1,4)");
     const map = @embedFile("testdata/synthetic-standard.osu");
     const metadata = try beatmap.parse(map);
     const hash = beatmap.md5(map);
@@ -457,7 +537,7 @@ test "ranked stable PP is stored and updates normal player stats" {
         .client_time = "260809000000",
         .client_flags = "0",
     };
-    const score_id = try store.insertStableScore(1, score, 26.80, "replay");
+    const score_id = try store.insertStableScore(1, score, 26.80, "replay", 12_000);
     const snapshot = (try store.ppSnapshot(score_id)).?;
     try std.testing.expectApproxEqAbs(@as(f64, 26.80), snapshot.score, 0.001);
     try std.testing.expectEqual(@as(i64, 27), snapshot.player);
@@ -466,5 +546,185 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i64, 1_000_000), mode_stats.total_score);
     try std.testing.expectEqual(@as(i32, 27), mode_stats.pp);
     try std.testing.expectEqual(@as(i32, 1), mode_stats.plays);
+    try std.testing.expectEqual(@as(i32, 12), mode_stats.play_time);
+    try std.testing.expectEqual(@as(i64, 10), mode_stats.total_hits);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), mode_stats.accuracy, 0.0001);
+    try std.testing.expectEqual(@as(i32, 10), mode_stats.max_combo);
     try std.testing.expectEqual(@as(i32, 1), mode_stats.global_rank);
+
+    var failed = score;
+    failed.online_checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    failed.total_score = 200_000;
+    failed.max_combo = 99;
+    failed.n300 = 4;
+    failed.n100 = 3;
+    failed.nmiss = 9;
+    failed.perfect = false;
+    failed.grade = "F";
+    failed.passed = false;
+    _ = try store.insertStableScore(1, failed, 999.0, "", 45_123);
+    const after_fail = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1_000_000), after_fail.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1_200_000), after_fail.total_score);
+    try std.testing.expectEqual(@as(i32, 27), after_fail.pp);
+    try std.testing.expectEqual(@as(i32, 2), after_fail.plays);
+    try std.testing.expectEqual(@as(i32, 57), after_fail.play_time);
+    try std.testing.expectEqual(@as(i64, 17), after_fail.total_hits);
+    try std.testing.expectApproxEqAbs(mode_stats.accuracy, after_fail.accuracy, 0.0001);
+    try std.testing.expectEqual(mode_stats.max_combo, after_fail.max_combo);
+    const map_after_fail = (try store.beatmapForScore(&hash)).?;
+    try std.testing.expectEqual(@as(i32, 2), map_after_fail.plays);
+    try std.testing.expectEqual(@as(i32, 1), map_after_fail.passes);
+
+    var relax = score;
+    relax.online_checksum = "cccccccccccccccccccccccccccccccc";
+    relax.total_score = 600_000;
+    relax.mods = 128;
+    _ = try store.insertStableScore(1, relax, 42.5, "relax replay", 15_000);
+    const vanilla_after_relax = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(after_fail.ranked_score, vanilla_after_relax.ranked_score);
+    try std.testing.expectEqual(after_fail.total_score, vanilla_after_relax.total_score);
+    try std.testing.expectEqual(after_fail.pp, vanilla_after_relax.pp);
+    try std.testing.expectEqual(after_fail.plays, vanilla_after_relax.plays);
+    const relax_stats = (try store.statsForUser(1, 4)).?;
+    try std.testing.expectEqual(@as(i64, 600_000), relax_stats.ranked_score);
+    try std.testing.expectEqual(@as(i64, 600_000), relax_stats.total_score);
+    try std.testing.expectEqual(@as(i32, 43), relax_stats.pp);
+    try std.testing.expectEqual(@as(i32, 1), relax_stats.plays);
+    try std.testing.expectEqual(@as(i32, 15), relax_stats.play_time);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relax_stats.accuracy, 0.0001);
+    try std.testing.expectEqual(@as(i32, 10), relax_stats.max_combo);
+}
+
+test "stable ratings persist one vote per player and keep protocol states distinct" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/ratings.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00')");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 2, 1.7931, 10, map);
+
+    try std.testing.expectEqual(storage.Store.BeatmapRating.no_exist, try store.rateBeatmap(1, "00000000000000000000000000000000", null));
+    try std.testing.expectEqual(storage.Store.BeatmapRating.not_ranked, try store.rateBeatmap(1, &hash, null));
+    try store.exec("UPDATE beatmaps SET status=3");
+    try std.testing.expectEqual(storage.Store.BeatmapRating.can_rate, try store.rateBeatmap(1, &hash, null));
+    const first = try store.rateBeatmap(1, &hash, 8);
+    try std.testing.expectApproxEqAbs(@as(f64, 8), first.already_voted, 0.0001);
+    const duplicate = try store.rateBeatmap(1, &hash, 10);
+    try std.testing.expectApproxEqAbs(@as(f64, 8), duplicate.already_voted, 0.0001);
+    const second = try store.rateBeatmap(2, &hash, 10);
+    try std.testing.expectApproxEqAbs(@as(f64, 9), second.already_voted, 0.0001);
+    const check = try store.rateBeatmap(1, &hash, null);
+    try std.testing.expectApproxEqAbs(@as(f64, 9), check.already_voted, 0.0001);
+}
+
+test "country presence numbers and country leaderboards use the stored login country" {
+    try std.testing.expectEqual(@as(u8, 16), country.numeric("AU"));
+    try std.testing.expectEqual(@as(u8, 77), country.numeric("GB"));
+    try std.testing.expectEqual(@as(u8, 225), country.numeric("us"));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/country.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt,country) VALUES(1,'ari','ari',x'00',x'00','AU'),(2,'other','other',x'00',x'00','US'); INSERT INTO stats(user_id,mode) VALUES(1,0),(2,0)");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    try store.exec(
+        "INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,checksum,rank_namespace,best,time_elapsed) VALUES" ++
+            "(1,'f981bd174d2fc7bdbefa557e85877e5a',0,0,900,10,1,10,10,0,0,0,0,0,1,1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','vanilla',1,10000)," ++
+            "(2,'f981bd174d2fc7bdbefa557e85877e5a',0,0,1000,11,1,10,10,0,0,0,0,0,1,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','vanilla',1,10000)",
+    );
+    const au = try store.stableLeaderboard(std.testing.allocator, .{ .id = 1, .name = "ari", .safe_name = "ari", .country = .{ 'A', 'U' } }, &hash, 0, 4, 0);
+    defer std.testing.allocator.free(au);
+    try std.testing.expect(std.mem.indexOf(u8, au, "|ari|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, au, "|other|") == null);
+    const us = try store.stableLeaderboard(std.testing.allocator, .{ .id = 2, .name = "other", .safe_name = "other", .country = .{ 'U', 'S' } }, &hash, 0, 4, 0);
+    defer std.testing.allocator.free(us);
+    try std.testing.expect(std.mem.indexOf(u8, us, "|other|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "|ari|") == null);
+    try store.updateCountry(1, .{ 'G', 'B' });
+    const moved = (try store.userById(std.testing.allocator, 1)).?;
+    defer std.testing.allocator.free(moved.name);
+    defer std.testing.allocator.free(moved.safe_name);
+    try std.testing.expectEqualStrings("GB", &moved.country);
+}
+
+test "kai migration preserves an account already using id three" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/kai.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "DELETE FROM stats WHERE user_id=3; DELETE FROM users WHERE id=3;" ++
+            "INSERT INTO users(id,name,safe_name,password_hash,password_salt,country) VALUES(3,'zigcho_lazer_qa2','zigcho_lazer_qa2',x'00',x'00','AU');" ++
+            "INSERT INTO stats(user_id,mode,total_score,plays) VALUES(3,0,1234,2);" ++
+            "PRAGMA user_version=8;",
+    );
+    try store.migrate();
+    const bot = (try store.userById(std.testing.allocator, 3)).?;
+    defer std.testing.allocator.free(bot.name);
+    defer std.testing.allocator.free(bot.safe_name);
+    try std.testing.expectEqualStrings("kai", bot.name);
+    const preserved = (try store.userById(std.testing.allocator, 4)).?;
+    defer std.testing.allocator.free(preserved.name);
+    defer std.testing.allocator.free(preserved.safe_name);
+    try std.testing.expectEqualStrings("zigcho_lazer_qa2", preserved.name);
+    const stats = (try store.statsForUser(4, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1234), stats.total_score);
+    try std.testing.expectEqual(@as(i32, 2), stats.plays);
+}
+
+test "migration rebuild moves historical Relax failures out of vanilla stats" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/rebuild.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(1,0),(1,4)");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    try store.exec(
+        "INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,checksum,rank_namespace,best,time_elapsed) VALUES" ++
+            "(1,'f981bd174d2fc7bdbefa557e85877e5a',0,0,1000,10,0.98,10,10,0,0,0,0,0,1,1,'11111111111111111111111111111111','vanilla',0,12000)," ++
+            "(1,'f981bd174d2fc7bdbefa557e85877e5a',0,128,200,99,0.25,99,2,1,0,8,0,0,0,0,'22222222222222222222222222222222','relax',1,45000);" ++
+            "UPDATE stats SET ranked_score=1200,total_score=1200,pp=99,plays=2,play_time=0,total_hits=0,accuracy=0.5,max_combo=99 WHERE user_id=1 AND mode=0;" ++
+            "PRAGMA user_version=7;",
+    );
+    try store.migrate();
+    const vanilla = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1000), vanilla.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1000), vanilla.total_score);
+    try std.testing.expectEqual(@as(i32, 10), vanilla.pp);
+    try std.testing.expectEqual(@as(i32, 1), vanilla.plays);
+    try std.testing.expectEqual(@as(i32, 12), vanilla.play_time);
+    try std.testing.expectEqual(@as(i64, 10), vanilla.total_hits);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.98), vanilla.accuracy, 0.0001);
+    try std.testing.expectEqual(@as(i32, 10), vanilla.max_combo);
+    const relax = (try store.statsForUser(1, 4)).?;
+    try std.testing.expectEqual(@as(i64, 0), relax.ranked_score);
+    try std.testing.expectEqual(@as(i64, 200), relax.total_score);
+    try std.testing.expectEqual(@as(i32, 0), relax.pp);
+    try std.testing.expectEqual(@as(i32, 1), relax.plays);
+    try std.testing.expectEqual(@as(i32, 45), relax.play_time);
+    try std.testing.expectEqual(@as(i64, 3), relax.total_hits);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), relax.accuracy, 0.0001);
+    try std.testing.expectEqual(@as(i32, 0), relax.max_combo);
 }

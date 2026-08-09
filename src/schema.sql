@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS scores (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id 
 CREATE INDEX IF NOT EXISTS scores_leaderboard ON scores(map_md5,mode,mods,pp DESC,score DESC);
 CREATE TABLE IF NOT EXISTS friends (user_id INTEGER REFERENCES users(id),friend_id INTEGER REFERENCES users(id),PRIMARY KEY(user_id,friend_id));
 CREATE TABLE IF NOT EXISTS favourites (user_id INTEGER REFERENCES users(id),set_id INTEGER NOT NULL,created_at INTEGER DEFAULT (unixepoch()),PRIMARY KEY(user_id,set_id));
+CREATE TABLE IF NOT EXISTS ratings (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,map_md5 TEXT NOT NULL REFERENCES beatmaps(md5) ON UPDATE CASCADE ON DELETE CASCADE,rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 10),created_at INTEGER NOT NULL DEFAULT (unixepoch()),PRIMARY KEY(user_id,map_md5));
 CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY,actor_id INTEGER,action TEXT NOT NULL,target TEXT,detail TEXT,created_at INTEGER DEFAULT (unixepoch()));
 CREATE TABLE IF NOT EXISTS lazer_scores (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(id),beatmap_id INTEGER NOT NULL,ruleset_id INTEGER NOT NULL,total_score INTEGER NOT NULL,legacy_total_score INTEGER,accuracy REAL NOT NULL,max_combo INTEGER NOT NULL,passed INTEGER NOT NULL,mods_json TEXT NOT NULL,statistics_json TEXT NOT NULL,rank_namespace TEXT NOT NULL,client_version TEXT,replay BLOB,submitted_at INTEGER NOT NULL DEFAULT (unixepoch()));
 CREATE INDEX IF NOT EXISTS lazer_scores_board ON lazer_scores(beatmap_id,ruleset_id,rank_namespace,total_score DESC);

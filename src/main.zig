@@ -482,7 +482,7 @@ const App = struct {
             defer self.allocator.free(user.safe_name);
             if (try self.store.beatmapForScore(map_md5) == null) {
                 _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| failed: {
-                    std.log.warn("Akatsuki beatmap hydration failed for {s}: {t}", .{ map_md5, err });
+                    std.log.warn("beatmap hydration failed for {s}: {t}", .{ map_md5, err });
                     break :failed false;
                 };
             }

@@ -147,12 +147,12 @@ test "public chat does not echo through the server to its sender" {
         .id = 1,
         .name = try std.testing.allocator.dupe(u8, "ari"),
         .safe_name = try std.testing.allocator.dupe(u8, "ari"),
-    }, 0);
+    }, 0, 0, 0);
     const other = try sessions.create(.{
         .id = 2,
         .name = try std.testing.allocator.dupe(u8, "other"),
         .safe_name = try std.testing.allocator.dupe(u8, "other"),
-    }, 0);
+    }, 0, 0, 0);
     try sessions.broadcast("one message", sender);
     try std.testing.expectEqual(@as(usize, 0), sender.queue.items.len);
     try std.testing.expectEqualStrings("one message", other.queue.items);
@@ -169,8 +169,8 @@ test "joined public chat delivers once and kai answers private chat as user thre
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
     _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
-    const ari = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0);
-    const raya = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0);
+    const ari = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
+    const raya = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
     try std.testing.expect(sessions.join(ari, "#osu"));
     try std.testing.expect(sessions.join(raya, "#osu"));
 

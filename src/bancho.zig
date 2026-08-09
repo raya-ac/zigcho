@@ -6,6 +6,7 @@ const domain = @import("domain.zig");
 const stable_score = @import("stable_score.zig");
 const country = @import("country.zig");
 const commands = @import("commands.zig");
+const log = @import("logutil.zig");
 
 pub const LoginResult = struct { token: []const u8, body: []u8 };
 
@@ -32,8 +33,8 @@ fn presence(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
     try w.byte(@intCast(@as(i16, s.utc_offset) + 24));
     try w.byte(country.numeric(&s.user.country));
     try w.byte(clientPrivileges(s.user.privileges, false) | (@as(u8, s.mode) << 5));
-    try w.float(f32, 0);
-    try w.float(f32, 0);
+    try w.float(f32, s.longitude);
+    try w.float(f32, s.latitude);
     try w.int(i32, 0);
     w.finish(start);
 }
@@ -58,7 +59,7 @@ fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Sess
     w.finish(start);
 }
 
-pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8) !LoginResult {
+pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !LoginResult {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -85,8 +86,13 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     var detail_it = std.mem.splitScalar(u8, details, '|');
     _ = detail_it.next();
     if (detail_it.next()) |offset| utc = std.fmt.parseInt(i8, offset, 10) catch 0;
-    std.log.info("login: user={s} details={s}", .{ name, details });
-    const session = try sessions.create(user, utc);
+    std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ log.magenta ++ log.bold, "", log.reset });
+    std.log.info("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
+    std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ log.magenta ++ log.bold, "", log.reset });
+    std.log.info("{s}  ► user_id  :{s} {d}", .{ log.dim, log.reset, user.id });
+    std.log.info("{s}  ► country  :{s} {s}", .{ log.dim, log.reset, if (login_country) |c| c else "??" });
+    std.log.info("{s}  ► utc      :{s} {d}", .{ log.dim, log.reset, utc });
+    const session = try sessions.create(user, utc, longitude, latitude);
     try out.packetInt(.protocol_version, 19);
     try out.packetInt(.user_id, user.id);
     try out.packetInt(.privileges, clientPrivileges(user.privileges, true));

@@ -14,6 +14,7 @@ const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const webhook = @import("webhook.zig");
 const country = @import("country.zig");
+const log = @import("logutil.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
@@ -49,6 +50,7 @@ const App = struct {
     limiter: rate_limit.Limiter,
     map_sync: beatmap_sync.Sync,
     score_webhook: webhook.Webhook,
+    geo_client: std.http.Client,
 
     fn header(req: *const std.http.Server.Request, wanted: []const u8) ?[]const u8 {
         var it = req.iterateHeaders();
@@ -62,6 +64,36 @@ const App = struct {
         if (headers.len > all.len - 1) return error.TooManyHeaders;
         @memcpy(all[1..][0..headers.len], headers);
         try req.respond(body, .{ .status = status, .extra_headers = all[0 .. headers.len + 1], .keep_alive = false });
+    }
+
+    const GeoResult = struct { lon: f32, lat: f32 };
+
+    fn lookupGeo(self: *App, ip: []const u8) GeoResult {
+        const url = std.fmt.allocPrint(self.allocator, "http://ip-api.com/line/{s}?fields=status,lat,lon", .{ip}) catch return .{ .lon = 0, .lat = 0 };
+        defer self.allocator.free(url);
+        var buf: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        const result = self.geo_client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &writer,
+            .headers = .{
+                .user_agent = .{ .override = "zigcho/0.1" },
+            },
+        }) catch return .{ .lon = 0, .lat = 0 };
+        if (result.status != .ok) return .{ .lon = 0, .lat = 0 };
+        const body_str = buf[0..writer.end];
+        var lines = std.mem.splitScalar(u8, body_str, '\n');
+        const status = std.mem.trim(u8, lines.next() orelse "", "\r ");
+        if (!std.mem.eql(u8, status, "success")) return .{ .lon = 0, .lat = 0 };
+        const lat_str = std.mem.trim(u8, lines.next() orelse "0", "\r ");
+        const lon_str = std.mem.trim(u8, lines.next() orelse "0", "\r ");
+        const lat = std.fmt.parseFloat(f32, lat_str) catch 0;
+        const lon = std.fmt.parseFloat(f32, lon_str) catch 0;
+        std.log.info("{s}  ┌─ GEOLOCATION ──────────────────────────────────{s}", .{ log.blue, log.reset });
+        std.log.info("{s}  │ {s}►{s} ip  : {s}{s}", .{ log.blue, log.dim, log.reset, ip });
+        std.log.info("{s}  │ {s}✓{s} lat : {d:.4}  lon : {d:.4}{s}", .{ log.blue, log.green, log.reset, lat, lon, log.reset });
+        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ log.blue, log.reset });
+        return .{ .lon = lon, .lat = lat };
     }
 
     fn rejectStableScore(req: *std.http.Server.Request, reason: []const u8, body_len: usize) !void {
@@ -354,7 +386,18 @@ const App = struct {
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
-            const result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null);
+            const client_ip = blk: {
+                if (header(req, "cf-connecting-ip")) |v| break :blk v;
+                if (header(req, "x-forwarded-for")) |v| {
+                    const trimmed = std.mem.trim(u8, v, " ");
+                    if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| break :blk std.mem.trim(u8, trimmed[0..comma], " ");
+                    break :blk trimmed;
+                }
+                if (header(req, "x-real-ip")) |v| break :blk v;
+                break :blk null;
+            };
+            const geo = if (client_ip) |ip| self.lookupGeo(ip) else .{ .lon = 0, .lat = 0 };
+            const result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer self.allocator.free(result.body);
             const token_headers = [_]std.http.Header{
                 .{ .name = "cho-token", .value = result.token },
@@ -481,13 +524,19 @@ const App = struct {
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
             if (try self.store.beatmapForScore(map_md5) == null) {
+                std.log.info("{s}  ┌─ LEADERBOARD ──────────────────────────────────{s}", .{ log.cyan, log.reset });
+                std.log.info("{s}  │ {s}►{s} user : {s}{s}{s}", .{ log.cyan, log.dim, log.reset, log.green, user.name, log.reset });
+                std.log.info("{s}  │ {s}►{s} map  : {s}{s}", .{ log.cyan, log.dim, log.reset, log.dim, map_md5 });
+                std.log.info("{s}  │ {s}►{s} hydrating...{s}", .{ log.cyan, log.dim, log.reset, log.dim });
                 _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| failed: {
-                    std.log.warn("beatmap hydration failed for {s}: {t}", .{ map_md5, err });
+                    std.log.warn("{s}  │ {s}✗ hydration failed: {t}{s}", .{ log.red, log.reset, err, log.reset });
                     break :failed false;
                 };
             }
             const listing = try self.store.stableLeaderboard(self.allocator, user, map_md5, mode, board_type, mods);
             defer self.allocator.free(listing);
+            std.log.info("{s}  │ {s}✓{s} served {d} bytes{s}", .{ log.cyan, log.green, log.reset, listing.len, log.reset });
+            std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ log.cyan, log.reset });
             return respond(req, .ok, "text/plain", listing, &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") and req.head.method == .POST) {
@@ -560,6 +609,18 @@ const App = struct {
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, if (score.passed) score_time else fail_time) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
             try bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods);
+            {
+                const grade_color = if (std.mem.eql(u8, score.grade, "XH") or std.mem.eql(u8, score.grade, "X")) log.yellow else if (std.mem.eql(u8, score.grade, "SH") or std.mem.eql(u8, score.grade, "S")) log.cyan else if (std.mem.eql(u8, score.grade, "A")) log.green else if (std.mem.eql(u8, score.grade, "B")) log.blue else log.red;
+                std.log.info("{s}  ┌─ SCORE {s} ────────────────────────────{s}", .{ if (score.passed) log.green else log.red, if (score.passed) "SUBMIT" else "FAIL", log.reset });
+                std.log.info("{s}  │ {s}►{s} user    : {s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, user.name, log.reset });
+                std.log.info("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, grade_color, score.grade, log.reset });
+                std.log.info("{s}  │ {s}►{s} pp      : {s}{d:.2}{s}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, performance.pp, log.reset });
+                std.log.info("{s}  │ {s}►{s} combo   : {d}x", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.max_combo });
+                std.log.info("{s}  │ {s}►{s} acc     : {d:.2}%", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.accuracy() * 100.0 });
+                std.log.info("{s}  │ {s}►{s} score   : {d}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.total_score });
+                std.log.info("{s}  │ {s}►{s} 300/100/50/miss : {d}/{d}/{d}/{d}", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.n300, score.n100, score.n50, score.nmiss });
+                std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ if (score.passed) log.green else log.red, log.reset });
+            }
             if (score.passed) {
                 const rank = self.store.scoreRankOnMap(score.map_md5, score.mode, score.rankNamespace(), score.total_score, performance.pp);
                 if (rank < 10 or performance.pp >= 500.0) {
@@ -655,11 +716,13 @@ pub fn main(init: std.process.Init) !void {
         .limiter = rate_limit.Limiter.init(allocator, init.io),
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
+        .geo_client = .{ .allocator = allocator, .io = init.io },
     };
     const kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
     _ = try app.sessions.createBot(kai);
     defer app.score_webhook.deinit();
     defer app.map_sync.deinit();
+    defer app.geo_client.deinit();
     defer app.limiter.deinit();
     defer app.sessions.deinit();
     const address = try std.Io.net.IpAddress.parse(bind, port);

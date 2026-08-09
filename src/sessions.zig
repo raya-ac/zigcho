@@ -17,6 +17,8 @@ pub const Session = struct {
     is_bot: bool = false,
     joined_osu: bool = false,
     joined_announce: bool = false,
+    longitude: f32 = 0,
+    latitude: f32 = 0,
 
     pub fn info(self: *const Session) []const u8 {
         return self.info_text[0..self.info_len];
@@ -46,10 +48,10 @@ pub const Sessions = struct {
         }
         self.items.deinit(self.allocator);
     }
-    pub fn create(self: *Sessions, user: domain.User, utc_offset: i8) !*Session {
+    pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
         if (self.byUser(user.id)) |old| self.remove(old);
         const s = try self.allocator.create(Session);
-        s.* = .{ .token = undefined, .user = user, .utc_offset = utc_offset, .last_seen = std.Io.Clock.real.now(self.io).toSeconds() };
+        s.* = .{ .token = undefined, .user = user, .utc_offset = utc_offset, .last_seen = std.Io.Clock.real.now(self.io).toSeconds(), .longitude = longitude, .latitude = latitude };
         var random: [32]u8 = undefined;
         try std.Io.randomSecure(self.io, &random);
         _ = std.fmt.bufPrint(&s.token, "{x}", .{random}) catch unreachable;

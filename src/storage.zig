@@ -524,6 +524,38 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
+    pub fn upsertBeatmapMeta(self: *Store, map: beatmap.Metadata, md5: []const u8, status: i8, stars: f64, max_combo: u32) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,unixepoch(),?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,NULL,?20,?21,?22) ON CONFLICT(id) DO NOTHING";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, map.id);
+        _ = c.sqlite3_bind_int(stmt, 2, map.set_id);
+        _ = c.sqlite3_bind_text(stmt, 3, md5.ptr, @intCast(md5.len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, map.artist.ptr, @intCast(map.artist.len), null);
+        _ = c.sqlite3_bind_text(stmt, 5, map.title.ptr, @intCast(map.title.len), null);
+        _ = c.sqlite3_bind_text(stmt, 6, map.version.ptr, @intCast(map.version.len), null);
+        _ = c.sqlite3_bind_text(stmt, 7, map.creator.ptr, @intCast(map.creator.len), null);
+        _ = c.sqlite3_bind_int(stmt, 8, status);
+        _ = c.sqlite3_bind_int(stmt, 9, map.total_length);
+        _ = c.sqlite3_bind_int64(stmt, 10, max_combo);
+        _ = c.sqlite3_bind_int(stmt, 11, map.mode);
+        _ = c.sqlite3_bind_double(stmt, 12, map.bpm);
+        _ = c.sqlite3_bind_double(stmt, 13, map.cs);
+        _ = c.sqlite3_bind_double(stmt, 14, map.ar);
+        _ = c.sqlite3_bind_double(stmt, 15, map.od);
+        _ = c.sqlite3_bind_double(stmt, 16, map.hp);
+        _ = c.sqlite3_bind_double(stmt, 17, stars);
+        _ = c.sqlite3_bind_text(stmt, 18, map.source.ptr, @intCast(map.source.len), null);
+        _ = c.sqlite3_bind_text(stmt, 19, map.tags.ptr, @intCast(map.tags.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 20, map.count_circles);
+        _ = c.sqlite3_bind_int64(stmt, 21, map.count_sliders);
+        _ = c.sqlite3_bind_int64(stmt, 22, map.count_spinners);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
     pub fn beatmapFile(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?[]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

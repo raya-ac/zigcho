@@ -13,6 +13,24 @@ const OsuV1Map = struct {
     beatmapset_id: i32,
     approved: i32,
     file_md5: []const u8,
+    artist: []const u8 = "",
+    title: []const u8 = "",
+    version: []const u8 = "",
+    creator: []const u8 = "",
+    source: []const u8 = "",
+    tags: []const u8 = "",
+    difficultyrating: f64 = 0,
+    diff_size: f64 = 0,
+    diff_approach: f64 = 0,
+    diff_overall: f64 = 0,
+    diff_drain: f64 = 0,
+    mode: u8 = 0,
+    bpm: f64 = 0,
+    total_length: i32 = 0,
+    count_normal: u32 = 0,
+    count_slider: u32 = 0,
+    count_spinner: u32 = 0,
+    max_combo: u32 = 0,
 };
 
 const c_reset = "\x1b[0m";
@@ -73,12 +91,80 @@ pub const Sync = struct {
             return false;
         }
 
-        const thread = std.Thread.spawn(.{}, backgroundFetch, .{ self, store, md5_owned, set_id }) catch {
+        const approved = self.fetchAndStoreMetadata(store, md5_owned, set_id) catch |err| {
+            std.log.warn("metadata fetch failed for {s}: {t}", .{ md5_owned, err });
+            self.removeFromProgress(md5_owned);
+            return false;
+        };
+
+        const thread = std.Thread.spawn(.{}, backgroundDownload, .{ self, store, md5_owned, set_id, approved }) catch {
             self.removeFromProgress(md5_owned);
             return false;
         };
         thread.detach();
         return false;
+    }
+
+    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !i32 {
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+
+        std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ c_magenta ++ c_bold, "", c_reset });
+        std.log.info("{s}{s}║         HYDRATION SEQUENCE INITIATED            ║{s}", .{ c_magenta ++ c_bold, "", c_reset });
+        std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ c_magenta ++ c_bold, "", c_reset });
+        std.log.info("{s}  ► target md5 :{s} {s}", .{ c_dim, c_reset, wanted_md5 });
+        std.log.info("{s}  ► set_id     :{s} {d}", .{ c_dim, c_reset, set_id });
+
+        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh/api/get_beatmaps?s={d}&k={s}", .{ set_id, self.api_key });
+        defer self.allocator.free(metadata_url);
+        std.log.info("{s}  ┌─ [1/2] METADATA FETCH ───────────────────────{s}", .{ c_cyan, c_reset });
+        const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
+            std.log.warn("{s}  │  ✗ FAILED: {t}{s}", .{ c_red, err, c_reset });
+            return err;
+        };
+        defer self.allocator.free(metadata_json);
+        const parsed = std.json.parseFromSlice([]OsuV1Map, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.log.warn("{s}  │  ✗ parse failed: {t}{s}", .{ c_red, err, c_reset });
+            return err;
+        };
+        defer parsed.deinit();
+        if (parsed.value.len == 0) return error.EmptySet;
+        var remote: ?OsuV1Map = null;
+        for (parsed.value) |candidate| {
+            if (std.ascii.eqlIgnoreCase(candidate.file_md5, wanted_md5)) {
+                remote = candidate;
+                break;
+            }
+        }
+        const map_info = remote orelse return error.Md5NotFound;
+        if (map_info.beatmap_id <= 0 or map_info.beatmapset_id != set_id) return error.IdMismatch;
+
+        const meta = beatmap.Metadata{
+            .id = map_info.beatmap_id,
+            .set_id = map_info.beatmapset_id,
+            .mode = map_info.mode,
+            .artist = map_info.artist,
+            .title = map_info.title,
+            .version = map_info.version,
+            .creator = map_info.creator,
+            .source = map_info.source,
+            .tags = map_info.tags,
+            .hp = map_info.diff_drain,
+            .cs = map_info.diff_size,
+            .od = map_info.diff_overall,
+            .ar = map_info.diff_approach,
+            .bpm = map_info.bpm,
+            .total_length = map_info.total_length,
+            .count_circles = map_info.count_normal,
+            .count_sliders = map_info.count_slider,
+            .count_spinners = map_info.count_spinner,
+            .object_count = map_info.count_normal + map_info.count_slider + map_info.count_spinner,
+        };
+        try store.upsertBeatmapMeta(meta, wanted_md5, localStatus(map_info.approved), map_info.difficultyrating, map_info.max_combo);
+        std.log.info("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}] — stars={d:.2}{s}", .{ c_green, c_bold, meta.artist, c_reset, c_yellow, meta.version, c_reset, map_info.difficultyrating, c_reset });
+        std.log.info("{s}  │  ✓ metadata stored, spawning background download{s}", .{ c_green, c_reset });
+        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
+        return map_info.approved;
     }
 
     fn removeFromProgress(self: *Sync, md5: []const u8) void {
@@ -88,135 +174,53 @@ pub const Sync = struct {
         self.allocator.free(md5);
     }
 
-    fn backgroundFetch(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32) void {
+    fn backgroundDownload(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32, approved: i32) void {
         defer self.removeFromProgress(md5_owned);
-        self.doHydrate(store, md5_owned, set_id) catch |err| {
-            std.log.warn("{s}═══ HYDRATE FAILED ═══{s} {s}: {t}", .{ c_red ++ c_bold, c_reset, md5_owned, err });
+        self.downloadArchive(store, md5_owned, set_id, approved) catch |err| {
+            std.log.warn("{s}═══ ARCHIVE DOWNLOAD FAILED ═══{s} {s}: {t}", .{ c_red ++ c_bold, c_reset, md5_owned, err });
         };
     }
 
-    fn doHydrate(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !void {
+    fn downloadArchive(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32, approved: i32) !void {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
-        std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ c_magenta ++ c_bold, "", c_reset });
-        std.log.info("{s}{s}║         HYDRATION SEQUENCE INITIATED            ║{s}", .{ c_magenta ++ c_bold, "", c_reset });
-        std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ c_magenta ++ c_bold, "", c_reset });
-        std.log.info("{s}  ► target md5 :{s} {s}", .{ c_dim, c_reset, wanted_md5 });
-        std.log.info("{s}  ► set_id     :{s} {d}", .{ c_dim, c_reset, set_id });
-
-        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh/api/get_beatmaps?s={d}&k={s}", .{ set_id, self.api_key });
-        defer self.allocator.free(metadata_url);
-        std.log.info("{s}  ┌─ [1/4] METADATA FETCH ─────────────────────────{s}", .{ c_cyan, c_reset });
-        std.log.info("{s}  │  → {s}{s}", .{ c_dim, c_reset, metadata_url });
-        const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
-            std.log.warn("{s}  │  ✗ FAILED: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        };
-        defer self.allocator.free(metadata_json);
-        std.log.info("{s}  │  ✓ received {d} bytes{s}", .{ c_green, metadata_json.len, c_reset });
-        const parsed = std.json.parseFromSlice([]OsuV1Map, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.warn("{s}  │  ✗ parse failed: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        };
-        defer parsed.deinit();
-        if (parsed.value.len == 0) {
-            std.log.warn("{s}  │  ✗ set {d} returned 0 diffs{s}", .{ c_red, set_id, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        }
-        std.log.info("{s}  │  ✓ {d} diffs in set{s}", .{ c_green, parsed.value.len, c_reset });
-        var remote: ?OsuV1Map = null;
-        for (parsed.value) |candidate| {
-            if (std.ascii.eqlIgnoreCase(candidate.file_md5, wanted_md5)) {
-                remote = candidate;
-                break;
-            }
-        }
-        const map_info = remote orelse {
-            std.log.warn("{s}  │  ✗ md5 not found in any diff{s}", .{ c_red, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        };
-        const map_id = map_info.beatmap_id;
-        if (map_id <= 0 or map_info.beatmapset_id != set_id) {
-            std.log.warn("{s}  │  ✗ id sanity fail: id={d} set={d} expected={d}{s}", .{ c_red, map_id, map_info.beatmapset_id, set_id, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        }
-        std.log.info("{s}  │  ✓ map_id={d} approved={d}{s}", .{ c_green, map_id, map_info.approved, c_reset });
-        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
 
         const mirror_json_url = try std.fmt.allocPrint(self.allocator, "https://mirror.hinamizawa.ai/d/{d}", .{set_id});
         defer self.allocator.free(mirror_json_url);
-        std.log.info("{s}  ┌─ [2/4] ARCHIVE DOWNLOAD ──────────────────────{s}", .{ c_cyan, c_reset });
+        std.log.info("{s}  ┌─ [2/2] ARCHIVE DOWNLOAD ──────────────────────{s}", .{ c_cyan, c_reset });
         std.log.info("{s}  │  → {s}{s}", .{ c_dim, c_reset, mirror_json_url });
         const mirror_json = fetchFn(&client, self.allocator, mirror_json_url, 4096) catch |err| {
             std.log.warn("{s}  │  ✗ mirror fetch failed: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
+            return err;
         };
         defer self.allocator.free(mirror_json);
-        const mirror_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, mirror_json, .{}) catch {
-            std.log.warn("{s}  │  ✗ mirror returned invalid json{s}", .{ c_red, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        };
+        const mirror_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, mirror_json, .{}) catch return error.InvalidMirrorJson;
         defer mirror_parsed.deinit();
-        const download_url = mirror_parsed.value.object.get("download_url") orelse {
-            std.log.warn("{s}  │  ✗ mirror json missing download_url{s}", .{ c_red, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        };
+        const download_url = mirror_parsed.value.object.get("download_url") orelse return error.NoDownloadUrl;
         const url_str = switch (download_url) {
             .string => |s| s,
-            else => {
-                std.log.warn("{s}  │  ✗ download_url is not a string{s}", .{ c_red, c_reset });
-                std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-                return error.HydrationFailed;
-            },
+            else => return error.DownloadUrlNotString,
         };
         std.log.info("{s}  │  ✓ redirect → {s}{s}", .{ c_green, c_reset, url_str });
         const archive = fetchFn(&client, self.allocator, url_str, archive_limit) catch |err| {
             std.log.warn("{s}  │  ✗ archive fetch failed: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
+            return err;
         };
         defer self.allocator.free(archive);
         std.log.info("{s}  │  ✓ {d} bytes ({d:.1} MB){s}", .{ c_green, archive.len, @as(f64, @floatFromInt(archive.len)) / 1048576.0, c_reset });
-        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
 
-        std.log.info("{s}  ┌─ [3/4] EXTRACTION & PARSE ────────────────────{s}", .{ c_cyan, c_reset });
-        std.log.info("{s}  │  searching archive for md5 match...{s}", .{ c_dim, c_reset });
+        std.log.info("{s}  │  extracting .osu for {s}...{s}", .{ c_dim, wanted_md5, c_reset });
         const osu_file = extractMatchingOsu(self.allocator, archive, wanted_md5) catch |err| {
             std.log.warn("{s}  │  ✗ extraction failed: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
+            return err;
         };
-        if (osu_file == null) {
-            std.log.warn("{s}  │  ✗ md5 not found in archive contents{s}", .{ c_red, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        }
+        if (osu_file == null) return error.Md5NotInArchive;
         defer self.allocator.free(osu_file.?);
-        std.log.info("{s}  │  ✓ extracted {d} bytes .osu{s}", .{ c_green, osu_file.?.len, c_reset });
 
         const metadata = beatmap.parse(osu_file.?) catch |err| {
             std.log.warn("{s}  │  ✗ .osu parse failed: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
+            return err;
         };
-        if (metadata.id != map_id or metadata.set_id != set_id) {
-            std.log.warn("{s}  │  ✗ mismatch: parsed id={d} set={d} vs api id={d} set={d}{s}", .{ c_red, metadata.id, metadata.set_id, map_id, set_id, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
-        }
-        std.log.info("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}]{s}", .{ c_green, c_bold, metadata.artist, c_reset, c_yellow, metadata.version, c_reset, c_reset });
-        std.log.info("{s}  │    mode={d} circles={d} sliders={d} spinners={d}{s}", .{ c_dim, metadata.mode, metadata.count_circles, metadata.count_sliders, metadata.count_spinners, c_reset });
-        std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
-
-        std.log.info("{s}  ┌─ [4/4] PP CALCULATION ────────────────────────{s}", .{ c_cyan, c_reset });
         const attributes = pp.calculate(osu_file.?, .{
             .mode = metadata.mode,
             .lazer = 0,
@@ -231,11 +235,10 @@ pub const Sync = struct {
             .legacy_total_score = 1_000_000,
         }) catch |err| {
             std.log.warn("{s}  │  ✗ PP calc failed: {t}{s}", .{ c_red, err, c_reset });
-            std.log.warn("{s}  └──────────────────────────────────────────────{s}", .{ c_red, c_reset });
-            return error.HydrationFailed;
+            return err;
         };
-        std.log.info("{s}  │  ✓ stars={d:.2} max_combo={d}{s}", .{ c_green, attributes.stars, attributes.max_combo, c_reset });
-        try store.upsertBeatmap(metadata, wanted_md5, localStatus(map_info.approved), attributes.stars, attributes.max_combo, osu_file.?);
+        std.log.info("{s}  │  ✓ {s}{s}{s} [{s}{s}{s}] stars={d:.2} max_combo={d}{s}", .{ c_green, c_bold, metadata.artist, c_reset, c_yellow, metadata.version, c_reset, attributes.stars, attributes.max_combo, c_reset });
+        try store.upsertBeatmap(metadata, wanted_md5, localStatus(approved), attributes.stars, attributes.max_combo, osu_file.?);
 
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
@@ -246,7 +249,6 @@ pub const Sync = struct {
         std.log.info("{s}{s}╔══════════════════════════════════════════════════╗{s}", .{ c_green ++ c_bold, "", c_reset });
         std.log.info("{s}{s}║             HYDRATION COMPLETE                  ║{s}", .{ c_green ++ c_bold, "", c_reset });
         std.log.info("{s}{s}╚══════════════════════════════════════════════════╝{s}", .{ c_green ++ c_bold, "", c_reset });
-        std.log.info("{s}  ► {s}{s}{s} [{s}{s}{s}] — map {d}, set {d}{s}", .{ c_bold, c_green, metadata.artist, c_reset, c_yellow, metadata.version, c_reset, map_id, set_id, c_reset });
     }
 
 };

@@ -48,6 +48,22 @@ pub const Store = struct {
             try self.exec(@embedFile("migration_008.sql"));
         }
         if (version < 9) try self.exec(@embedFile("migration_009.sql"));
+        if (version < 10) {
+            if (try self.hasAvatarColumn())
+                try self.exec("PRAGMA user_version=10")
+            else
+                try self.exec(@embedFile("migration_010.sql"));
+        }
+    }
+
+    fn hasAvatarColumn(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(users)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)), "avatar_key")) return true;
+        }
+        return false;
     }
 
     fn rebuildScoreStats(self: *Store) !void {
@@ -130,7 +146,10 @@ pub const Store = struct {
             .allocator = self.allocator,
             .params = .owasp_2id,
         }, &hash_buffer, self.io);
-        const sql = "INSERT INTO users(name,safe_name,email,password_hash,password_salt) VALUES(?1,?2,?3,?4,?5)";
+        var random_byte: [1]u8 = undefined;
+        try std.Io.randomSecure(self.io, &random_byte);
+        const avatar_key: u8 = 1 + (random_byte[0] & 1);
+        const sql = "INSERT INTO users(name,safe_name,email,password_hash,password_salt,avatar_key) VALUES(?1,?2,?3,?4,?5,?6)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -139,6 +158,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_text(stmt, 3, email.ptr, @intCast(email.len), null);
         _ = c.sqlite3_bind_blob(stmt, 4, hash.ptr, @intCast(hash.len), null);
         _ = c.sqlite3_bind_blob(stmt, 5, "argon2id".ptr, 8, null);
+        _ = c.sqlite3_bind_int(stmt, 6, avatar_key);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.UserExists;
         const id: i32 = @intCast(c.sqlite3_last_insert_rowid(self.db));
         const stat_modes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 8 };
@@ -148,6 +168,19 @@ pub const Store = struct {
             try self.exec(q);
         }
         return id;
+    }
+
+    pub fn avatarForUser(self: *Store, user_id: i32) !?u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT avatar_key FROM users WHERE id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const key = c.sqlite3_column_int(stmt, 0);
+        if (key < 1 or key > 2) return error.InvalidAvatarKey;
+        return @intCast(key);
     }
 
     pub fn authenticate(self: *Store, allocator: std.mem.Allocator, name: []const u8, password_md5: []const u8) !?domain.User {

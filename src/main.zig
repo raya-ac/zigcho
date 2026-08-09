@@ -13,6 +13,8 @@ const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const country = @import("country.zig");
+const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
+const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -57,6 +59,25 @@ const App = struct {
     fn queryField(target: []const u8, key: []const u8) ?[]const u8 {
         const query_start = std.mem.findScalar(u8, target, '?') orelse return null;
         return field(target[query_start + 1 ..], key);
+    }
+
+    fn isAvatarHost(value: ?[]const u8) bool {
+        const host = value orelse return false;
+        const end = std.mem.findScalar(u8, host, ':') orelse host.len;
+        return std.ascii.eqlIgnoreCase(host[0..end], "a.kai.ovh");
+    }
+
+    fn avatarUserId(path: []const u8) ?i32 {
+        const value = if (std.mem.startsWith(u8, path, "/avatars/"))
+            path["/avatars/".len..]
+        else if (std.mem.startsWith(u8, path, "/avatar/"))
+            path["/avatar/".len..]
+        else if (path.len > 1)
+            path[1..]
+        else
+            return null;
+        if (value.len == 0) return null;
+        return std.fmt.parseInt(i32, value, 10) catch null;
     }
 
     fn userOnline(self: *App, user_id: i32) bool {
@@ -118,6 +139,8 @@ const App = struct {
         defer if (content_type_owned) |v| self.allocator.free(v);
         const country_owned: ?[]u8 = if (header(req, "cf-ipcountry")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (country_owned) |v| self.allocator.free(v);
+        const host_owned: ?[]u8 = if (header(req, "host")) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (host_owned) |v| self.allocator.free(v);
         const body: []u8 = if (req.head.method.requestHasBody()) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
             break :b r.allocRemaining(self.allocator, .limited(bodyLimit(path))) catch |err| switch (err) {
@@ -142,6 +165,20 @@ const App = struct {
             var buf: [384]u8 = undefined;
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"debug alpha\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (req.head.method == .GET and (isAvatarHost(host_owned) or std.mem.startsWith(u8, path, "/avatars/") or std.mem.startsWith(u8, path, "/avatar/"))) {
+            if (avatarUserId(path)) |user_id| {
+                const key = (try self.store.avatarForUser(user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"avatar not found\"}", &.{});
+                const cache_headers = [_]std.http.Header{
+                    .{ .name = "cache-control", .value = "public, max-age=3600" },
+                    .{ .name = "etag", .value = if (key == 1) "\"default-avatar-1\"" else "\"default-avatar-2\"" },
+                    .{ .name = "x-content-type-options", .value = "nosniff" },
+                };
+                return if (key == 1)
+                    respond(req, .ok, "image/gif", default_avatar_1, &cache_headers)
+                else
+                    respond(req, .ok, "image/jpeg", default_avatar_2, &cache_headers);
+            }
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/d/")) {
             const set_id = std.fmt.parseInt(i32, path[3..], 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
@@ -265,7 +302,7 @@ const App = struct {
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
             var out: [512]u8 = undefined;
-            const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"username\":\"{s}\",\"country_code\":\"{s}\",\"is_active\":true,\"is_online\":true,\"statistics_rulesets\":{{}}}}", .{ user.id, user.name, user.country });
+            const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"username\":\"{s}\",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":\"{s}\",\"is_active\":true,\"is_online\":true,\"statistics_rulesets\":{{}}}}", .{ user.id, user.name, user.id, user.country });
             return respond(req, .ok, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/scores") and req.head.method == .POST) {

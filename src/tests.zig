@@ -80,6 +80,31 @@ fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []con
     return output.toOwnedSlice();
 }
 
+test "downloaded anime defaults keep their real image formats" {
+    const gif = @embedFile("assets/avatars/default-1.gif");
+    const jpeg = @embedFile("assets/avatars/default-2.jpg");
+    try std.testing.expect(std.mem.startsWith(u8, gif, "GIF89a"));
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xd8, 0xff }, jpeg[0..3]);
+}
+
+test "accounts keep one assigned default avatar" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/avatars.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const kai_avatar = (try store.avatarForUser(3)).?;
+    try std.testing.expect(kai_avatar == 1 or kai_avatar == 2);
+    try std.testing.expectEqual(kai_avatar, (try store.avatarForUser(3)).?);
+    const user_id = try store.register("avatar test", "avatar-test@example.invalid", "00000000000000000000000000000000");
+    const user_avatar = (try store.avatarForUser(user_id)).?;
+    try std.testing.expect(user_avatar == 1 or user_avatar == 2);
+    try std.testing.expectEqual(user_avatar, (try store.avatarForUser(user_id)).?);
+    try std.testing.expect((try store.avatarForUser(999_999)) == null);
+}
+
 test "Akatsuki ranks map into local leaderboard states" {
     try std.testing.expectEqual(@as(i8, 3), beatmap_sync.localStatus(1));
     try std.testing.expectEqual(@as(i8, 4), beatmap_sync.localStatus(2));

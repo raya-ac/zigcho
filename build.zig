@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.linkSystemLibrary("sqlite3", .{});
+    if (target.result.os.tag == .linux) mod.linkSystemLibrary("gcc_s", .{});
     mod.addObjectFile(pp_library);
 
     const exe = b.addExecutable(.{ .name = "zigcho", .root_module = mod });
@@ -27,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     importer_mod.linkSystemLibrary("sqlite3", .{});
+    if (target.result.os.tag == .linux) importer_mod.linkSystemLibrary("gcc_s", .{});
     importer_mod.addObjectFile(pp_library);
     const importer = b.addExecutable(.{ .name = "zigcho-import", .root_module = importer_mod });
     importer.step.dependOn(&cargo.step);
@@ -44,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     }) });
     tests.root_module.linkSystemLibrary("sqlite3", .{});
+    if (target.result.os.tag == .linux) tests.root_module.linkSystemLibrary("gcc_s", .{});
     tests.root_module.addObjectFile(pp_library);
     tests.step.dependOn(&cargo.step);
     const run_tests = b.addRunArtifact(tests);

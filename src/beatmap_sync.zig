@@ -119,12 +119,12 @@ pub const Sync = struct {
         defer self.allocator.free(metadata_url);
         std.debug.print("{s}  ┌─ [1/2] METADATA FETCH ───────────────────────{s}\n", .{ c_cyan, c_reset });
         const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
-            std.log.warn("{s}  │  ✗ FAILED: {t}{s}", .{ c_red, err, c_reset });
+            std.debug.print("{s}  │  ✗ FAILED: {t}{s}\n", .{ c_red, err, c_reset });
             return err;
         };
         defer self.allocator.free(metadata_json);
         const parsed = std.json.parseFromSlice([]OsuV1Map, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.warn("{s}  │  ✗ parse failed: {t}{s}", .{ c_red, err, c_reset });
+            std.debug.print("{s}  │  ✗ parse failed: {t}{s}\n", .{ c_red, err, c_reset });
             return err;
         };
         defer parsed.deinit();

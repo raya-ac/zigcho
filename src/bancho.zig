@@ -89,10 +89,10 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
-    std.log.info("{s}  ► user_id  :{s} {d}", .{ log.dim, log.reset, user.id });
+    std.debug.print("{s}  ► user_id  :{s} {d}\n", .{ log.dim, log.reset, user.id });
     const country_display: []const u8 = if (login_country) |c| &c else "??";
-    std.log.info("{s}  ► country  :{s} {s}", .{ log.dim, log.reset, country_display });
-    std.log.info("{s}  ► utc      :{s} {d}", .{ log.dim, log.reset, utc });
+    std.debug.print("{s}  ► country  :{s} {s}\n", .{ log.dim, log.reset, country_display });
+    std.debug.print("{s}  ► utc      :{s} {d}\n", .{ log.dim, log.reset, utc });
     const session = try sessions.create(user, utc, longitude, latitude);
     try out.packetInt(.protocol_version, 19);
     try out.packetInt(.user_id, user.id);

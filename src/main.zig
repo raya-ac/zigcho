@@ -523,15 +523,12 @@ const App = struct {
                 std.debug.print("{s}  │ {s}►{s} user : {s}{s}{s}\n", .{ log.cyan, log.dim, log.reset, log.green, user.name, log.reset });
                 std.debug.print("{s}  │ {s}►{s} map  : {s}{s}\n", .{ log.cyan, log.dim, log.reset, log.dim, map_md5 });
                 std.debug.print("{s}  │ {s}►{s} hydrating...{s}\n", .{ log.cyan, log.dim, log.reset, log.dim });
-                _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| failed: {
-                    std.log.warn("{s}  │ {s}✗ hydration failed: {t}{s}", .{ log.red, log.reset, err, log.reset });
-                    break :failed false;
+                _ = self.map_sync.ensure(&self.store, map_md5, if (set_id > 0) set_id else null) catch |err| {
+                    std.debug.print("{s}  │ {s}✗ hydration failed: {t}{s}\n", .{ log.red, log.reset, err, log.reset });
                 };
             }
             const listing = try self.store.stableLeaderboard(self.allocator, user, map_md5, mode, board_type, mods);
             defer self.allocator.free(listing);
-            std.debug.print("{s}  │ {s}✓{s} served {d} bytes{s}\n", .{ log.cyan, log.green, log.reset, listing.len, log.reset });
-            std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ log.cyan, log.reset });
             return respond(req, .ok, "text/plain", listing, &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") and req.head.method == .POST) {

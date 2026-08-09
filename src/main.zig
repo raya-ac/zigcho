@@ -200,6 +200,11 @@ const App = struct {
         defer if (country_owned) |v| self.allocator.free(v);
         const host_owned: ?[]u8 = if (header(req, "host")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (host_owned) |v| self.allocator.free(v);
+        const client_ip: ?[]const u8 = if (header(req, "cf-connecting-ip")) |v| v else if (header(req, "x-forwarded-for")) |v| blk: {
+            const trimmed = std.mem.trim(u8, v, " ");
+            if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| break :blk std.mem.trim(u8, trimmed[0..comma], " ");
+            break :blk trimmed;
+        } else if (header(req, "x-real-ip")) |v| v else null;
         const body: []u8 = if (req.head.method.requestHasBody()) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
             break :b r.allocRemaining(self.allocator, .limited(bodyLimit(path))) catch |err| switch (err) {
@@ -386,16 +391,6 @@ const App = struct {
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
-            const client_ip = blk: {
-                if (header(req, "cf-connecting-ip")) |v| break :blk v;
-                if (header(req, "x-forwarded-for")) |v| {
-                    const trimmed = std.mem.trim(u8, v, " ");
-                    if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| break :blk std.mem.trim(u8, trimmed[0..comma], " ");
-                    break :blk trimmed;
-                }
-                if (header(req, "x-real-ip")) |v| break :blk v;
-                break :blk null;
-            };
             const geo = if (client_ip) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
             const result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer self.allocator.free(result.body);

@@ -113,7 +113,7 @@ pub const Sync = struct {
         std.log.info("{s}  │  ✓ map_id={d} approved={d}{s}", .{ c_green, map_id, map_info.approved, c_reset });
         std.log.info("{s}  └──────────────────────────────────────────────{s}", .{ c_cyan, c_reset });
 
-        const archive_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/d/{d}", .{set_id});
+        const archive_url = try std.fmt.allocPrint(self.allocator, "https://mirror.hinamizawa.ai/d/{d}", .{set_id});
         defer self.allocator.free(archive_url);
         std.log.info("{s}  ┌─ [2/4] ARCHIVE DOWNLOAD ──────────────────────{s}", .{ c_cyan, c_reset });
         std.log.info("{s}  │  → {s}{s}", .{ c_dim, c_reset, archive_url });

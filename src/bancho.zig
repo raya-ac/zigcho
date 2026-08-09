@@ -5,6 +5,7 @@ const storage = @import("storage.zig");
 const domain = @import("domain.zig");
 const stable_score = @import("stable_score.zig");
 const country = @import("country.zig");
+const commands = @import("commands.zig");
 
 pub const LoginResult = struct { token: []const u8, body: []u8 };
 
@@ -149,14 +150,24 @@ pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sess
             const target_name = try p.string();
             _ = try p.int(i32);
             if (text.len == 0 or text.len > 2000) continue;
+            if (packet.id == .send_private_message) {
+                if (sessions.byName(target_name)) |target| {
+                    if (target.is_bot) {
+                        if (commands.handleCommand(allocator, store, session, text) == .handled) continue;
+                        var msg = protocol.Writer.init(allocator);
+                        defer msg.deinit();
+                        try protocol.writeMessage(&msg, "kai", "commands: !np (pp for current map) | !with mods acc% misses (custom pp)", session.user.name, 3);
+                        try session.queue.appendSlice(allocator, msg.bytes());
+                        continue;
+                    }
+                }
+            }
             var message = protocol.Writer.init(allocator);
             defer message.deinit();
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
             if (packet.id == .send_private_message) {
                 if (sessions.byName(target_name)) |target| {
-                    if (target.is_bot) {
-                        try protocol.writeMessage(&out, "kai", "i'm here. commands come later.", session.user.name, 3);
-                    } else try queuePacket(target, allocator, message.bytes());
+                    if (!target.is_bot) try queuePacket(target, allocator, message.bytes());
                 }
             } else {
                 if (!session.joined(target_name) or !std.mem.eql(u8, target_name, "#osu")) continue;

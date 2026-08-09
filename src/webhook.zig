@@ -44,14 +44,25 @@ pub const Webhook = struct {
         var buf: [4096]u8 = undefined;
         var mod_buf: [32]u8 = undefined;
         const json = buildJson(&buf, &mod_buf, data) catch return;
-        self.doPost(json) catch |err| std.log.warn("webhook post failed: {t}", .{err});
+        const json_owned = self.allocator.dupe(u8, json) catch return;
+        const url_owned = self.allocator.dupe(u8, self.url) catch {
+            self.allocator.free(json_owned);
+            return;
+        };
+        const io = self.io;
+        const thread = std.Thread.spawn(.{}, webhookThread, .{ self.allocator, io, url_owned, json_owned }) catch return;
+        thread.detach();
     }
 
-    fn doPost(self: *Webhook, json: []const u8) !void {
+    fn webhookThread(allocator: std.mem.Allocator, io: std.Io, url: []const u8, json: []const u8) void {
+        defer allocator.free(json);
+        defer allocator.free(url);
+        var client = std.http.Client{ .allocator = allocator, .io = io };
+        defer client.deinit();
         var response_buf: [256]u8 = undefined;
         var writer = std.Io.Writer.fixed(&response_buf);
-        const result = self.client.fetch(.{
-            .location = .{ .url = self.url },
+        const result = client.fetch(.{
+            .location = .{ .url = url },
             .method = .POST,
             .payload = json,
             .response_writer = &writer,
@@ -59,7 +70,10 @@ pub const Webhook = struct {
                 .content_type = .{ .override = "application/json" },
                 .user_agent = .{ .override = "zigcho/0.1" },
             },
-        }) catch |err| return err;
+        }) catch |err| {
+            std.log.warn("webhook post failed: {t}", .{err});
+            return;
+        };
         if (@intFromEnum(result.status) >= 400) {
             std.log.warn("webhook returned status {d}", .{@intFromEnum(result.status)});
         }

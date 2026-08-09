@@ -62,6 +62,46 @@ The pinned fixture currently covers stable osu!standard. It produces the same 1.
 
 Where this leaves us: the service is already live as infrastructure and the core stable login, chat, presence, score, replay, leaderboard, account, and token paths exist. I would call it roughly one third of the way to an invite-only player alpha, not a finished live server. The biggest blockers are beatmap search and downloads, full real-client runs against the public hosts, complete multiplayer state, moderation and backup tooling, and the custom lazer client/rooms work.
 
+## 2026-08-10 — score submissions are async and hydration runs in background threads
+
+Score submissions held the database locked for the entire insert, stats recalc, and webhook call. Two people submitting at the same time meant the second waited for the first to finish completely. The heavy path — SQLite transaction, player stats update, beatmap counters, and the Discord webhook POST — now runs in a detached background thread with its own copy of all the data. The HTTP response returns `"error: no"` immediately; the client treats that as "score accepted." The next leaderboard request picks up the new score. Validation still happens synchronously: decrypt, checksum, auth, beatmap lookup, and PP calc run on the request thread. Only the database write and post-processing got moved out. The `Submission` struct's string fields (`map_md5`, `grade`, `online_checksum`, `client_time`, `client_flags`) all point into the decrypted buffer, so each gets `allocator.dupe` before the thread takes ownership. The replay bytes and map file are duped the same way.
+
+Beatmap hydration moved to background threads at the same time. The first leaderboard request fetches metadata from osu API v1 — title, artist, difficulty, star rating, max combo — and stores it immediately so the leaderboard renders with full map info even though nobody has played it yet. The heavy part (downloading the archive from hinamizawa, extracting the `.osu`, running rosu-pp for precise attributes) happens in a background thread. Each map gets its own thread with its own HTTP client, so multiple maps download at the same time without blocking each other or the request that triggered them.
+
+The webhook is fire-and-forget too. Each score submission spawns a detached thread with its own `std.http.Client` for the Discord POST, so the score response is never blocked by Discord's latency. The previous version blocked the response writer on the webhook call; the client saw a delay on every score submission proportional to Discord's round-trip time.
+
+## 2026-08-10 — kai bot commands and auto-pp
+
+Kai can answer PP questions now. PM kai in-game with `!np` and it calculates PP for whatever map you are currently playing, using whatever mods you have on. `!with HDHR 98% 5m` lets you spec out a custom scenario — mods, accuracy, miss count — and get PP for a hypothetical play on your current map. The mod parser handles two-letter combos like HDHR, DTHD, FL. Accuracy converts to hitcounts using the map's object count; misses subtract from 300s. All the math goes through rosu-pp, same as score submission.
+
+When you `/np` in-game (which the client sends as a status change), kai automatically PMs you the PP. You do not have to ask. The bot reply path was broken at first — kai was trying to send the reply to the bot's own session instead of the player who sent the PM. The fix routes replies back through `sessions.byToken` using the sender's token from the incoming message.
+
+## 2026-08-10 — user geolocation and map logging
+
+On the first login, the server looks up the client IP through `ip-api.com` and stores longitude and latitude in the `Session`. Presence packets carry both coordinates so other clients can see where players actually are. Kai is pinned to Reykjavik — longitude -21.9426, latitude 64.1466 — threshold between tectonic plates. The presence wire format puts longitude before latitude, both f32; this matches bancho.py's `services.py` exactly. Unknown or missing locations stay the default instead of inventing one.
+
+Every step of the score path, hydration pipeline, and bot command flow now has colored log output. Green for success, red for failure, yellow for important values, cyan for context, blue for maps, magenta for PP. The box-drawing looked nice but interleaved between concurrent requests, so the hydration background threads switched to single-line `std.log.info` entries instead. Background threads must not use `std.debug.print` with box-drawing characters — it causes interleaved output.
+
+## 2026-08-10 — beatmap metadata and mirror swap
+
+Beatmap metadata switched from Akatsuki's Cheesegull to osu API v1. Cheesegull was returning stale or missing data for maps nobody had played yet. The osu API gives `difficultyrating`, `max_combo`, `total_length`, `bpm`, `artist`, `title`, `version`, and `creator` directly, same region as the server, fast. The leaderboard now shows correct star rating and combo on the first render, before rosu-pp runs in the background. The `OsuV1Map` struct expanded to include all the fields the leaderboard needs.
+
+The archive mirror switched from Nerinyan to hinamizawa (osu.direct). Hinamizawa does not serve archives directly — it returns a tiny JSON blob with a `download_url` field pointing at osu.direct. The hydration code was treating that JSON as the actual archive and trying to unzip 160 bytes of `{"success":true,...}`. Now it parses the JSON, extracts the `download_url`, and follows it. Video downloads are skipped with `?noVideo=true` to save bandwidth.
+
+## 2026-08-10 — score webhook
+
+Score submissions post to Discord when the result is interesting. Top 10 on any map or any play over 500 PP gets a webhook with the player name, grade, mods, combo, accuracy, PP, star rating, rank on map, and the beatmap name. The embed description had nested JSON strings — `std.json.Stringify.value` wraps each value in quotes, so `""Artist" - "Title" [""Version""]"` is what Discord actually received. Now the description text is built into a buffer first and stringified once.
+
+The webhook URL lives in `config.ini` under `score_webhook` and is not in the repository. Errors are logged to stdout now instead of vanishing into the void.
+
+## 2026-08-10 — crash fixes and build improvements
+
+A Zig 0.16.0 edge case: `std.http.Server.Request.iterateHeaders()` hits `unreachable` after the body has been consumed via `readerExpectContinue`. The score handler was reading the body first, then iterating headers to extract the client IP. The fix extracts `client_ip` before the body read. This was the most common crash on the public server.
+
+Docker build got faster. The Rust PP library compile uses a release profile with LTO and `codegen-units=1`. The bare `zig build` on the server has no cargo, so the Dockerfile handles everything. BuildKit is not available on the server (no buildx, Docker 29.1.3), so the build uses plain `docker build`.
+
+Stale token handling changed. Instead of returning 401 on a missing session, the server now sends `notification("Server has restarted.") + restart_server(0)` — matching bancho.py's approach at `app/api/domains/cho.py:213-221`. The client auto-reconnects after seeing this instead of staying on a dead screen. The previous attempt used a `sigwait` thread to broadcast restart packets on SIGTERM, but it timed out and got SIGKILL after 15 seconds. The stale-token approach is simpler and more reliable.
+
 ## 2026-08-09 — public request limits
 
 I split registration, token, login, score, and authenticated traffic into separate limits, capped request bodies by route, and made overload fail closed. The live proxy address is used as the client boundary and blocked requests return a real retry time. I checked the public hosts, the direct origin, oversized uploads, and the database after deployment.

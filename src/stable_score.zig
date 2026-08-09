@@ -50,10 +50,12 @@ pub const Submission = struct {
         var input_buffer: [2048]u8 = undefined;
         const perfect = if (self.perfect) "True" else "False";
         const passed = if (self.passed) "True" else "False";
+        var name = self.username;
+        while (name.len > 0 and name[name.len - 1] == ' ') name = name[0 .. name.len - 1];
         const input = std.fmt.bufPrint(
             &input_buffer,
             "chickenmcnuggets{d}o15{d}{d}smustard{d}{d}uu{s}{d}{s}{s}{d}{s}{d}Q{s}{d}{s}{s}{s}{s}",
-            .{ self.n100 + self.n300, self.n50, self.ngeki, self.nkatu, self.nmiss, self.map_md5, self.max_combo, perfect, self.username, self.total_score, self.grade, self.mods, passed, self.mode, osu_version, self.client_time, client_hash, storyboard_md5 },
+            .{ self.n100 + self.n300, self.n50, self.ngeki, self.nkatu, self.nmiss, self.map_md5, self.max_combo, perfect, name, self.total_score, self.grade, self.mods, passed, self.mode, osu_version, self.client_time, client_hash, storyboard_md5 },
         ) catch return false;
         var digest: [16]u8 = undefined;
         std.crypto.hash.Md5.hash(input, &digest, .{});

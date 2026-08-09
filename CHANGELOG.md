@@ -2,13 +2,15 @@
 
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 
-## 2026-08-09 — leaderboards stop showing the current time
+## 2026-08-09 — scores submit again and leaderboards show the real play time
 
-Every leaderboard row was sending the play date as a formatted string (`datetime(...,'unixepoch')` → `2026-08-09 03:42:38`). The osu! stable client wants a raw unix timestamp in that slot — the same shape bancho.py sends as `unix_timestamp(play_time)`. The client could not parse the string, so it fell back to showing now, and every score looked like it was just set.
+Two bugs on the score path. Both are fixed on main, not yet deployed.
 
-The stored value was never wrong. Production still holds the nine real scores raya set earlier on 2026-08-09 with the correct `submitted_at`. The fix is only in the wire response: both leaderboard selects now read `s.submitted_at` directly, and the row formatter writes it as an integer instead of a string. `zig build test` passes. Not deployed.
+Every score submission was getting rejected with `checksum_mismatch` — vanilla, relax, all of them. The checksum formula itself was correct; I verified it byte-for-byte against bancho.py's exact code. The problem was the username. The real stable client sends the username in the score data with a trailing space glued on (`raya ` not `raya`) — a donor marker — but it signs the online checksum with the clean name. bancho.py never hits this because it reads `player.name` from the database, which never has the space. zigcho was using the raw wire field with the space, so the hash it built could never match the one the client sent. The fix trims the trailing space before building the checksum string, same thing bancho.py gets for free from the db lookup. I captured a real submission off the live server, decrypted it, and the trimmed name produces the exact checksum the client sent. Added a regression test with a trailing-space username.
 
-This does not reopen score submission. The checksum mismatch that rejects every attempt is still unresolved, so the timestamp only shows on the scores already in the database until that is fixed.
+Separately, every leaderboard row was sending the play date as a formatted string (`2026-08-09 03:42:38`) instead of the raw unix timestamp the client expects (bancho.py sends `unix_timestamp(play_time)`). The client couldn't parse the string, so it fell back to showing the current time. The stored time was never wrong — the bug was only in the wire response. Both leaderboard selects now read `s.submitted_at` directly and the row formatter writes it as an integer.
+
+`zig build test` passes. Relax was broken by the same checksum line, so it submits again too once this builds.
 
 ## 2026-08-09 — map ranks stop lying and failed plays get through
 

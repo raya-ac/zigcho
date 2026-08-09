@@ -351,6 +351,14 @@ test "stable online score checksum matches the client formula" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.97258), score.accuracy(), 0.0001);
 }
 
+test "stable online score checksum trims the donor marker the client appends to the username" {
+    // the wire username carries a trailing space for donor accounts; the client
+    // signs the checksum with the clean name, so the server must trim it too.
+    const data = "0123456789abcdef0123456789abcdef:Ari :bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:0:True:0:260808235959:20260808";
+    const score = try stable_score.parse(data);
+    try std.testing.expect(score.verifyChecksum("20260808", "client-hash-fixture", ""));
+}
+
 test "current stable score payload accepts one trailing client field" {
     const base = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:0:True:0:260808235959:20260808";
     _ = try stable_score.parse(base ++ ":0");

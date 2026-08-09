@@ -33,6 +33,7 @@ pub const Stats = struct {
     play_time: i32 = 0,
     accuracy: f64 = 0,
     max_combo: i32 = 0,
+    global_rank: i32 = 0,
 };
 
 pub const Score = struct {

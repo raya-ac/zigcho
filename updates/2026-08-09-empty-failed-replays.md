@@ -8,6 +8,12 @@ Replay validation now happens after the score is parsed. A failed play can carry
 
 I added the complete pending/ranked/approved/qualified/loved conversion matrix and the failed, passed and oversized replay cases to the tests. The old Direct test caught itself expecting the broken ranked value, which is fixed too. All 31 tests and the full ReleaseSafe build pass.
 
-The passed 2026 client submission decrypts to 19 fields instead of the older 18-field fixture. The established server parser reads the original fields and ignores trailing values. Zigcho now accepts one bounded trailing client field while keeping the original validation and checksum intact, and rejects anything beyond it.
+The passed 2026 client submission decrypts to 19 fields instead of the older 18-field fixture. bancho.py reads the original score fields and ignores trailing client values, so Zigcho does the same while keeping the original validation, checksum and request-size limit intact.
 
-We are about 46% of the way to an invite-only alpha. This closes the real failed-score compatibility bug. The next proof is a passed installed-client score showing up in SQLite, the leaderboard, replay download and player stats before I call the stable score path working.
+The final 401 was another contract mismatch. bancho.py requires the score token header but authenticates the encrypted username and password against the online player; it does not use that header value as the identity. Zigcho demanded the exact current session token, which breaks queued retries around a restart. That check now follows bancho.py, including its one-space supporter marker handling.
+
+The installed stable client accepted the score after the fix. Score `1` landed on map `5028316` with `565,898`, `66.22pp`, `171x`, vanilla best and an `18,274`-byte replay. Map plays/passes and raya's stats updated, and SQLite still returns `ok`.
+
+The stats display needed one more real fix. Zigcho was saving every value, then sending literal zeros in Bancho's user-stats packet. Login, status requests and successful score submissions now publish the selected mode's stored ranked score, total score, accuracy, plays, max combo, PP and PP rank. The installed client visibly shows them now. At the last check raya was on three plays, `94pp`, `886,224` ranked score, `1,672,654` total score, `97.74%`, and `227x`.
+
+We are about 47% of the way to an invite-only alpha. The real stable score path now works through the installed client, but I still need replay download acceptance, more modes and mods, duplicate behavior, restore drills, moderation, multiplayer and the rest of lazer before this is live-player ready.

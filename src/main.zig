@@ -268,7 +268,7 @@ const App = struct {
         if (std.mem.eql(u8, path, "/") and req.head.method == .POST) {
             if (osu_token_owned) |token| {
                 const session = self.sessions.byToken(token) orelse return respond(req, .unauthorized, "application/octet-stream", "", &.{});
-                const bytes = try bancho.poll(self.allocator, &self.sessions, session, body);
+                const bytes = try bancho.poll(self.allocator, &self.store, &self.sessions, session, body);
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
@@ -364,7 +364,10 @@ const App = struct {
             if (replay.filename == null) return rejectStableScore(req, "replay_is_not_file", body.len);
             const iv = (form.first("iv") orelse return rejectStableScore(req, "missing_iv", body.len)).data;
             const client_hash_encrypted = (form.first("s") orelse return rejectStableScore(req, "missing_client_hash", body.len)).data;
-            const password = (form.first("pass") orelse return respond(req, .unauthorized, "text/plain", "", &.{})).data;
+            const password = (form.first("pass") orelse {
+                std.log.warn("stable score rejected: reason=missing_password body_bytes={d}", .{body.len});
+                return respond(req, .unauthorized, "text/plain", "", &.{});
+            }).data;
             const osu_version = (form.first("osuver") orelse return rejectStableScore(req, "missing_osu_version", body.len)).data;
             const updated_map_hash = (form.first("bmk") orelse return rejectStableScore(req, "missing_updated_map_hash", body.len)).data;
             const storyboard_hash = if (form.first("sbk")) |part| part.data else "";
@@ -381,14 +384,24 @@ const App = struct {
                 std.log.warn("stable score rejected: reason=beatmap_hash_mismatch body_bytes={d}", .{body.len});
                 return respond(req, .bad_request, "text/plain", "error: beatmap", &.{});
             }
-            const user = (try self.store.authenticate(self.allocator, score.username, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const auth_username = if (score.username.len > 0 and score.username[score.username.len - 1] == ' ') score.username[0 .. score.username.len - 1] else score.username;
+            const user = (try self.store.authenticate(self.allocator, auth_username, password)) orelse {
+                std.log.warn("stable score rejected: reason=invalid_credentials body_bytes={d}", .{body.len});
+                return respond(req, .ok, "text/plain", "error: no", &.{});
+            };
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            const session_token = score_token_owned orelse osu_token_owned orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            if (score_token_owned == null) {
+                std.log.warn("stable score rejected: reason=missing_session_token body_bytes={d}", .{body.len});
+                return respond(req, .unauthorized, "text/plain", "", &.{});
+            }
             self.sessions.mutex.lockUncancelable(self.sessions.io);
-            const active = if (self.sessions.byToken(session_token)) |session| session.user.id == user.id else false;
+            const active = self.sessions.byUser(user.id) != null;
             self.sessions.mutex.unlock(self.sessions.io);
-            if (!active) return respond(req, .unauthorized, "text/plain", "", &.{});
+            if (!active) {
+                std.log.warn("stable score rejected: reason=inactive_session body_bytes={d}", .{body.len});
+                return respond(req, .ok, "text/plain", "error: no", &.{});
+            }
             if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return rejectStableScore(req, "checksum_mismatch", body.len);
             const beatmap = (try self.store.beatmapForScore(score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
@@ -407,6 +420,7 @@ const App = struct {
                 .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data) catch |err| return respond(req, .ok, "text/plain", if (err == error.DuplicateScore) "error: no" else "error: no", &.{});
+            try bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods);
             if (!score.passed) return respond(req, .ok, "text/plain", "error: no", &.{});
             var result_buf: [1024]u8 = undefined;
             const result = try std.fmt.bufPrint(&result_buf, "beatmapId:{d}|beatmapSetId:{d}|beatmapPlaycount:{d}|beatmapPasscount:{d}|approvedDate:|\n|chartId:beatmap|chartUrl:|chartName:Beatmap Ranking|rankBefore:|rankAfter:|rankedScoreBefore:|rankedScoreAfter:{d}|totalScoreBefore:|totalScoreAfter:{d}|maxComboBefore:|maxComboAfter:{d}|accuracyBefore:|accuracyAfter:{d:.2}|ppBefore:|ppAfter:{d:.2}|onlineScoreId:{d}|\n|chartId:overall|chartUrl:|chartName:Overall Ranking|achievements-new:", .{ beatmap.id, beatmap.set_id, beatmap.plays + 1, beatmap.passes + 1, score.total_score, score.total_score, score.max_combo, score.accuracy() * 100.0, performance.pp, score_id });

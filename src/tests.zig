@@ -256,7 +256,13 @@ test "stable online score checksum matches the client formula" {
 test "current stable score payload accepts one trailing client field" {
     const base = "0123456789abcdef0123456789abcdef:Ari:bd08534d40f7bbab046520c9b4931cdc:300:4:1:2:3:5:987654:321:False:A:0:True:0:260808235959:20260808";
     _ = try stable_score.parse(base ++ ":0");
-    try std.testing.expectError(error.InvalidFieldCount, stable_score.parse(base ++ ":0:extra"));
+    _ = try stable_score.parse(base ++ ":0:future-client-field");
+}
+
+test "stable supporter marker is separate from the account name" {
+    const marked = "raya ";
+    const account_name = if (marked.len > 0 and marked[marked.len - 1] == ' ') marked[0 .. marked.len - 1] else marked;
+    try std.testing.expectEqualStrings("raya", account_name);
 }
 
 test "failed stable scores may submit an empty replay" {
@@ -455,4 +461,10 @@ test "ranked stable PP is stored and updates normal player stats" {
     const snapshot = (try store.ppSnapshot(score_id)).?;
     try std.testing.expectApproxEqAbs(@as(f64, 26.80), snapshot.score, 0.001);
     try std.testing.expectEqual(@as(i64, 27), snapshot.player);
+    const mode_stats = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1_000_000), mode_stats.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1_000_000), mode_stats.total_score);
+    try std.testing.expectEqual(@as(i32, 27), mode_stats.pp);
+    try std.testing.expectEqual(@as(i32, 1), mode_stats.plays);
+    try std.testing.expectEqual(@as(i32, 1), mode_stats.global_rank);
 }

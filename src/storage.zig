@@ -171,6 +171,29 @@ pub const Store = struct {
         return .{ .id = c.sqlite3_column_int(stmt, 0), .name = name, .safe_name = safe, .country = .{ cc[0], cc[1] }, .privileges = @intCast(c.sqlite3_column_int64(stmt, 4)), .silence_end = c.sqlite3_column_int64(stmt, 5), .restricted = c.sqlite3_column_int(stmt, 6) != 0 };
     }
 
+    pub fn statsForUser(self: *Store, user_id: i32, mode: u8) !?domain.Stats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.accuracy,s.max_combo,(SELECT count(1)+1 FROM stats r JOIN users u ON u.id=r.user_id WHERE r.mode=s.mode AND u.restricted=0 AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM stats s WHERE s.user_id=?1 AND s.mode=?2";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        _ = c.sqlite3_bind_int(stmt, 2, mode);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{
+            .mode = @enumFromInt(mode),
+            .ranked_score = c.sqlite3_column_int64(stmt, 0),
+            .total_score = c.sqlite3_column_int64(stmt, 1),
+            .pp = c.sqlite3_column_int(stmt, 2),
+            .plays = c.sqlite3_column_int(stmt, 3),
+            .play_time = c.sqlite3_column_int(stmt, 4),
+            .accuracy = c.sqlite3_column_double(stmt, 5),
+            .max_combo = c.sqlite3_column_int(stmt, 6),
+            .global_rank = c.sqlite3_column_int(stmt, 7),
+        };
+    }
+
     pub fn revokeToken(self: *Store, token: []const u8) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -70,9 +70,7 @@ pub fn parse(data: []const u8) !Submission {
     var fields: [18][]const u8 = undefined;
     var it = std.mem.splitScalar(u8, data, ':');
     for (&fields) |*field| field.* = it.next() orelse return error.InvalidFieldCount;
-    if (it.next()) |extension| {
-        if (extension.len > 256 or it.next() != null) return error.InvalidFieldCount;
-    }
+    while (it.next()) |_| {}
     if (!isMd5(fields[0]) or !isMd5(fields[2])) return error.InvalidChecksum;
     if (fields[1].len == 0 or fields[1].len > 32) return error.InvalidUsername;
     if (!validGrade(fields[12])) return error.InvalidGrade;

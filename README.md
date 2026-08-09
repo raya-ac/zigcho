@@ -8,9 +8,9 @@ This is not ready to put in front of players yet. I would rather leave that sent
 
 ## where it's at
 
-The Bancho side can parse protocol 19 packets, log stable clients in, issue tokens, track presence and status, handle public and private messages, join channels, answer presence/stat requests, and relay spectator frames. Live requests run concurrently and access to sessions, outgoing queues, and SQLite is synchronized.
+The Bancho side can parse protocol 19 packets, log stable clients in, issue tokens, track presence and status, handle public and private messages, join channels, answer presence/stat requests, and relay spectator frames. User-stat packets come from the selected mode's SQLite row on login, status requests, and after a submitted score instead of returning placeholder zeros. Live requests run concurrently and access to sessions, outgoing queues, and SQLite is synchronized.
 
-Stable score submission uses the actual Rijndael cipher with a 32-byte block. The server parses both multipart `score` fields, decrypts the score and client hash, checks the online checksum, verifies the active session and password, stores the replay, and updates player and beatmap counters in one transaction. Replays can be downloaded again through the stable endpoint. Duplicate checksums are rejected without touching stats.
+Stable score submission uses the actual Rijndael cipher with a 32-byte block. The server parses both multipart `score` fields, decrypts the score and client hash, checks the online checksum, verifies the online player and password using bancho.py's real contract, stores the replay, and updates player and beatmap counters in one transaction. Replays can be downloaded again through the stable endpoint. Duplicate checksums are rejected without touching stats.
 
 PP is calculated from the exact `.osu` file stored with the beatmap. The calculator is `rosu-pp` 4.0.1 behind a small C boundary, with Cargo's complete dependency lock checked in. A calculation error rejects the score instead of writing a believable-looking zero. Normal ranked scores update the player's weighted PP total; relax PP is stored on the score but stays out of normal stats.
 

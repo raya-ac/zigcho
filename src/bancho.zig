@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const sessions_mod = @import("sessions.zig");
 const storage = @import("storage.zig");
+const domain = @import("domain.zig");
 
 pub const LoginResult = struct { token: []const u8, body: []u8 };
 
@@ -18,7 +19,8 @@ fn presence(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
     w.finish(start);
 }
 
-fn stats(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
+fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Session) !void {
+    const current = (try store.statsForUser(s.user.id, s.mode)) orelse domain.Stats{};
     const start = try w.begin(.user_stats);
     try w.int(i32, s.user.id);
     try w.byte(s.action);
@@ -27,12 +29,12 @@ fn stats(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
     try w.int(i32, s.mods);
     try w.byte(s.mode);
     try w.int(i32, s.map_id);
-    try w.int(i64, 0);
-    try w.float(f32, 0);
-    try w.int(i32, 0);
-    try w.int(i64, 0);
-    try w.int(i32, 0);
-    try w.int(u16, 0);
+    try w.int(i64, if (current.pp > std.math.maxInt(u16)) current.pp else current.ranked_score);
+    try w.float(f32, @floatCast(current.accuracy));
+    try w.int(i32, current.plays);
+    try w.int(i64, current.total_score);
+    try w.int(i32, current.global_rank);
+    try w.int(u16, if (current.pp > std.math.maxInt(u16)) 0 else @intCast(current.pp));
     w.finish(start);
 }
 
@@ -65,18 +67,18 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     try out.packetInt(.privileges, @intCast(user.privileges));
     try out.packetInt(.silence_end, @intCast(@max(0, user.silence_end - std.Io.Clock.real.now(sessions.io).toSeconds())));
     try presence(&out, session);
-    try stats(&out, session);
+    try stats(&out, store, session);
     try protocol.writeChannel(&out, "#osu", "General discussion", 1);
     try protocol.writeChannel(&out, "#announce", "Server announcements", 1);
     try out.packetEmpty(.channel_info_end);
     for (sessions.items.items) |other| if (other != session) {
         try presence(&out, other);
-        try stats(&out, other);
+        try stats(&out, store, other);
     };
     var announce = protocol.Writer.init(allocator);
     defer announce.deinit();
     try presence(&announce, session);
-    try stats(&announce, session);
+    try stats(&announce, store, session);
     try sessions.broadcast(announce.bytes(), session);
     const result = try allocator.dupe(u8, out.bytes());
     out.deinit();
@@ -87,7 +89,7 @@ fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, byte
     try target.queue.appendSlice(allocator, bytes);
 }
 
-pub fn poll(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
+pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     session.last_seen = std.Io.Clock.real.now(sessions.io).toSeconds();
@@ -98,7 +100,7 @@ pub fn poll(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sess
     var reader: protocol.Reader = .{ .data = body };
     while (try reader.next()) |packet| switch (packet.id) {
         .ping => {},
-        .request_status => try stats(&out, session),
+        .request_status => try stats(&out, store, session),
         .change_action => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             session.action = try p.byte();
@@ -113,7 +115,7 @@ pub fn poll(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sess
             @memcpy(session.map_md5[0..@min(32, md5.len)], md5[0..@min(32, md5.len)]);
             var event = protocol.Writer.init(allocator);
             defer event.deinit();
-            try stats(&event, session);
+            try stats(&event, store, session);
             try sessions.broadcast(event.bytes(), session);
         },
         .send_public_message, .send_private_message => {
@@ -138,7 +140,7 @@ pub fn poll(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sess
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             const count = try p.int(u16);
             var i: usize = 0;
-            while (i < count) : (i += 1) if (sessions.byUser(try p.int(i32))) |s| try stats(&out, s);
+            while (i < count) : (i += 1) if (sessions.byUser(try p.int(i32))) |s| try stats(&out, store, s);
         },
         .user_presence_request => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
@@ -167,4 +169,16 @@ pub fn poll(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sess
         else => {},
     };
     return allocator.dupe(u8, out.bytes());
+}
+
+pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, mode: u8, mods: i32) !void {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.byUser(user_id) orelse return;
+    session.mode = mode;
+    session.mods = mods;
+    var event = protocol.Writer.init(allocator);
+    defer event.deinit();
+    try stats(&event, store, session);
+    try sessions.broadcast(event.bytes(), null);
 }

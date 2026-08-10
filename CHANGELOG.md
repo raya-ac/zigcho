@@ -1,5 +1,11 @@
 # changelog
 
+## 2026-08-11 — stop putting stable credentials in the journal
+
+the `/web/lastfm.php` debug line printed the entire query string before authentication. stable puts its reusable password credential in `ha`, so that one "temporary" log line was writing it straight into journald. removed it. the useful post-auth log already records the user ID, action, flags, and beatmap field without the password.
+
+I checked the source for other raw request, authorization, token, and password logging while I was here. this was the only line printing a credential-bearing request.
+
 ## 2026-08-11 — old maps hydrate properly
 
 some older `.osu` files don't contain `BeatmapID` or `BeatmapSetID` at all. the live server downloaded one of these sets, found the exact difficulty by md5, verified the zip and crc, then threw the map away as `InvalidBeatmap` because those two fields were missing. the archive was fine. the parser was being stricter than the file format's history allows.

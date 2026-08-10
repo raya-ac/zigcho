@@ -466,7 +466,8 @@ const App = struct {
                     try restart.int(i32, 0);
                     restart.finish(rs);
                     return respond(req, .ok, "application/octet-stream", restart.bytes(), &.{});
-                };                const bytes = try bancho.poll(self.allocator, &self.store, &self.sessions, session, body);
+                };
+                const bytes = try bancho.poll(self.allocator, &self.store, &self.sessions, session, body);
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
@@ -482,8 +483,6 @@ const App = struct {
         if (std.mem.eql(u8, path, "/web/bancho_connect.php")) return respond(req, .ok, "text/plain", "ok", &.{});
         if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
         if (std.mem.eql(u8, path, "/web/lastfm.php") and req.head.method == .GET) {
-            const query_start = std.mem.findScalar(u8, target, '?') orelse target.len;
-            std.log.info("lastfm raw: {s}", .{target[query_start..]});
             const action = queryField(target, "action") orelse return respond(req, .bad_request, "text/plain", "", &.{});
             if (!std.mem.eql(u8, action, "np") and !std.mem.eql(u8, action, "scrobble")) return respond(req, .bad_request, "text/plain", "", &.{});
             const encoded_name = queryField(target, "us") orelse return respond(req, .bad_request, "text/plain", "", &.{});

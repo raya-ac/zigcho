@@ -1,7 +1,7 @@
 use std::{panic::catch_unwind, slice};
 
 use rosu_map::section::general::GameMode;
-use rosu_pp::{Beatmap, Performance, any::ScoreState};
+use akatsuki_pp::{Beatmap, Performance, any::ScoreState};
 
 #[repr(C)]
 pub struct ZigchoPpInput {
@@ -42,13 +42,11 @@ fn game_mode(value: u8) -> Option<GameMode> {
 
 fn calculate(map_bytes: &[u8], input: &ZigchoPpInput) -> Result<ZigchoPpOutput, ()> {
     let map = Beatmap::from_bytes(map_bytes).map_err(|_| ())?;
-    map.check_suspicion().map_err(|_| ())?;
     let mode = game_mode(input.mode).ok_or(())?;
     let performance = Performance::new(&map).try_mode(mode).map_err(|_| ())?;
     let state = ScoreState {
         max_combo: input.max_combo,
         osu_large_tick_hits: input.large_tick_hits,
-        osu_small_tick_hits: input.small_tick_hits,
         slider_end_hits: input.slider_end_hits,
         n_geki: input.n_geki,
         n_katu: input.n_katu,
@@ -56,14 +54,12 @@ fn calculate(map_bytes: &[u8], input: &ZigchoPpInput) -> Result<ZigchoPpOutput, 
         n100: input.n100,
         n50: input.n50,
         misses: input.misses,
-        legacy_total_score: (input.legacy_total_score != 0).then_some(input.legacy_total_score),
     };
     let attributes = performance
         .mods(input.mods)
         .lazer(input.lazer != 0)
         .state(state)
-        .checked_calculate()
-        .map_err(|_| ())?;
+        .calculate();
     Ok(ZigchoPpOutput {
         pp: attributes.pp(),
         stars: attributes.stars(),

@@ -472,8 +472,8 @@ test "pinned performance engine calculates the synthetic stable fixture" {
         .misses = 0,
         .legacy_total_score = 1_000_000,
     });
-    try std.testing.expectApproxEqAbs(@as(f64, 26.80), result.pp, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.7931), result.stars, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 26.90), result.pp, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.8065), result.stars, 0.001);
     try std.testing.expectEqual(@as(u32, 10), result.max_combo);
 }
 

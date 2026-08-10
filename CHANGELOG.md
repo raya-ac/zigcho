@@ -105,3 +105,17 @@ Stale token handling changed. Instead of returning 401 on a missing session, the
 ## 2026-08-09 — public request limits
 
 I split registration, token, login, score, and authenticated traffic into separate limits, capped request bodies by route, and made overload fail closed. The live proxy address is used as the client boundary and blocked requests return a real retry time. I checked the public hosts, the direct origin, oversized uploads, and the database after deployment.
+
+## 2026-08-11 — akatsuki-pp for real relax/autopilot PP, full recalc
+
+The PP calculator was wrong for relax and autopilot. Vanilla `rosu-pp` 4.0.1 doesn't understand the relax (bit 7) or autopilot (bit 13) mod flags — it calculates PP as if you played the map without those mods, which gave nonsense values. Autopilot was especially broken because the calculator was running full aim calculations on scores where the player wasn't aiming at all.
+
+Swapped to `akatsuki-pp` (osuAkatsuki/akatsuki-pp-rs on GitHub), which is Akatsuki's fork of rosu-pp with proper relax and autopilot formulas. The API is almost identical but based on an older rosu-pp: no `checked_calculate` (use `calculate`), no `check_suspicion`, no `osu_small_tick_hits` or `legacy_total_score` fields in `ScoreState`. Stripped those from the Rust FFI layer. The Zig side didn't change because the C struct boundary is identical. The `rosu-map` version pinned down from 0.2.1 to 0.2.0 to match akatsuki-pp's dependency.
+
+PP values on relax and autopilot leaderboards now display as truncated integers via `@intFromFloat` in `writeBoardRow`. 18.81 PP shows as 18, not 1881 or 18.81. The deployed binary was stale from Aug 9 — it didn't have the PP leaderboard code at all, so it was reading the PP column as a raw integer through `sqlite3_column_int64` on a REAL column, which produced garbage.
+
+Added a `recalc` subcommand: `zigcho recalc <db>`. It stops the server, walks every passed score, fetches the stored `.osu` file, recalculates PP with the new library, writes it back, then rebuilds weighted stats per user/mode/namespace. The stats rebuild correctly maps stats_mode back to (vanilla_mode, namespace): mode 0→vanilla/osu, mode 4→relax/osu, mode 8→autopilot/osu, etc. This was a bug in the first recalc attempt — it was filtering scores by `s.mode = stats_mode` but the scores table stores the vanilla mode (0), not the stats mode (4 or 8), so relax and autopilot stats came out as zero.
+
+Ran it against all 27 existing scores. Vanilla PP stayed roughly the same (the formula is close). Relax and autopilot values shifted to Akatsuki's formula. User 4 mode 0 (vanilla) is now 424 PP, mode 4 (relax) is 130 PP, mode 8 (autopilot) is 338 PP.
+
+The pinned test fixture updated from 26.80 PP / 1.7931 stars to 26.90 PP / 1.8065 stars. Same synthetic map, different formula, slightly different result. Tolerance widened slightly because the Akatsuki fork's difficulty calculation diverges a bit more from vanilla rosu-pp.

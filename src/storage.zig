@@ -2,7 +2,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 

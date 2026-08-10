@@ -16,6 +16,7 @@ const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const sessions_mod = @import("sessions.zig");
 const country = @import("country.zig");
+const config_mod = @import("config.zig");
 
 fn clientMessagePacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, sender: []const u8, message: []const u8, target: []const u8, sender_id: i32) ![]u8 {
     var w = protocol.Writer.init(allocator);
@@ -78,6 +79,56 @@ fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []con
     try writer.writeInt(u32, central_offset, .little);
     try writer.writeInt(u16, 0, .little);
     return output.toOwnedSlice();
+}
+
+test "config values stay owned after the source buffer changes" {
+    const source = try std.testing.allocator.dupe(
+        u8,
+        "osu_api_key=first-key\n" ++
+            "score_webhook=https://discord.invalid/first\n" ++
+            "osu_api_key=final-key\n",
+    );
+    var config = try config_mod.parse(std.testing.allocator, source);
+    defer config.deinit();
+
+    @memset(source, 'x');
+    std.testing.allocator.free(source);
+
+    try std.testing.expectEqualStrings("final-key", config.osu_api_key);
+    try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
+}
+
+test "owned stable submissions do not borrow decrypted request memory" {
+    var source = [_]u8{'x'} ** 160;
+    const parsed: stable_score.Submission = .{
+        .map_md5 = source[0..32],
+        .username = source[32..36],
+        .online_checksum = source[36..68],
+        .n300 = 300,
+        .n100 = 10,
+        .n50 = 1,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 2,
+        .total_score = 123456,
+        .max_combo = 321,
+        .perfect = false,
+        .grade = source[68..69],
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = source[69..81],
+        .client_flags = source[81..82],
+    };
+    var owned = try stable_score.OwnedSubmission.init(std.testing.allocator, parsed);
+    defer owned.deinit();
+
+    @memset(&source, 'z');
+
+    try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", owned.value.map_md5);
+    try std.testing.expectEqualStrings("xxxx", owned.value.username);
+    try std.testing.expectEqualStrings("x", owned.value.grade);
+    try std.testing.expectEqual(@as(i64, 123456), owned.value.total_score);
 }
 
 test "downloaded anime defaults keep their real image formats" {
@@ -194,6 +245,44 @@ test "public chat does not echo through the server to its sender" {
     try sessions.broadcast("one message", sender);
     try std.testing.expectEqual(@as(usize, 0), sender.queue.items.len);
     try std.testing.expectEqualStrings("one message", other.queue.items);
+}
+
+test "poll by token survives session replacement and rejects the stale token" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/session-replace.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const first = try sessions.create(.{
+        .id = 1,
+        .name = try std.testing.allocator.dupe(u8, "ari"),
+        .safe_name = try std.testing.allocator.dupe(u8, "ari"),
+    }, 0, 0, 0);
+    const stale_token = first.token;
+    const first_poll = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &stale_token, "")).?;
+    defer std.testing.allocator.free(first_poll);
+
+    sessions.mutex.lockUncancelable(sessions.io);
+    const replacement = sessions.create(.{
+        .id = 1,
+        .name = try std.testing.allocator.dupe(u8, "ari"),
+        .safe_name = try std.testing.allocator.dupe(u8, "ari"),
+    }, 0, 0, 0) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
+    const replacement_token = replacement.token;
+    sessions.mutex.unlock(sessions.io);
+
+    try std.testing.expect((try bancho.pollByToken(std.testing.allocator, &store, &sessions, &stale_token, "")) == null);
+    const replacement_poll = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &replacement_token, "")).?;
+    defer std.testing.allocator.free(replacement_poll);
+    try std.testing.expectEqual(@as(usize, 0), replacement_poll.len);
 }
 
 test "joined public chat delivers once and kai answers private chat as user three" {

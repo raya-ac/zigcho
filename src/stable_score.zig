@@ -67,6 +67,44 @@ pub const Submission = struct {
     }
 };
 
+pub const OwnedSubmission = struct {
+    allocator: std.mem.Allocator,
+    value: Submission,
+
+    pub fn init(allocator: std.mem.Allocator, source: Submission) !OwnedSubmission {
+        const map_md5 = try allocator.dupe(u8, source.map_md5);
+        errdefer allocator.free(map_md5);
+        const username = try allocator.dupe(u8, source.username);
+        errdefer allocator.free(username);
+        const online_checksum = try allocator.dupe(u8, source.online_checksum);
+        errdefer allocator.free(online_checksum);
+        const grade = try allocator.dupe(u8, source.grade);
+        errdefer allocator.free(grade);
+        const client_time = try allocator.dupe(u8, source.client_time);
+        errdefer allocator.free(client_time);
+        const client_flags = try allocator.dupe(u8, source.client_flags);
+        errdefer allocator.free(client_flags);
+        var value = source;
+        value.map_md5 = map_md5;
+        value.username = username;
+        value.online_checksum = online_checksum;
+        value.grade = grade;
+        value.client_time = client_time;
+        value.client_flags = client_flags;
+        return .{ .allocator = allocator, .value = value };
+    }
+
+    pub fn deinit(self: *OwnedSubmission) void {
+        self.allocator.free(self.value.map_md5);
+        self.allocator.free(self.value.username);
+        self.allocator.free(self.value.online_checksum);
+        self.allocator.free(self.value.grade);
+        self.allocator.free(self.value.client_time);
+        self.allocator.free(self.value.client_flags);
+        self.* = undefined;
+    }
+};
+
 pub fn statsMode(vanilla_mode: u8, mods: i32) ?u8 {
     if (vanilla_mode > 3) return null;
     const relax: i32 = 1 << 7;

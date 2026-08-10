@@ -1,5 +1,17 @@
 # changelog
 
+## 2026-08-11 — stop letting request memory outlive the request
+
+the review found three real lifetime bugs in current main, so those came before adding another surface.
+
+`config.ini` values were slices into a 4 kb stack buffer that disappeared as soon as startup parsing returned. they are owned allocations now and stay valid for the life of the app.
+
+bancho looked up a raw session pointer without the session lock, then locked later when it started polling. a reconnect between those two steps could destroy the session while the old request still held it. token lookup and packet handling are one locked operation now. a replaced token gets the normal restart packet instead of touching freed memory.
+
+the async score worker had six borrowed or duplicated score strings with no complete owner, plus leaks when pp calculation, setup, or thread creation failed. there is one owned submission and one destructor now. the map file stays with the request until the worker has actually accepted ownership, and the worker frees every field when it finishes or fails.
+
+48 tests pass in Debug and ReleaseSafe. the new regressions overwrite the original config/request buffers and replace a live session before polling its old token. this closes the review's three P0s. it does not make zigcho public-ready: logout/expiry, queue caps, tighter lock scopes, hostile score parsing, and proxy/json hardening are the next reliability block.
+
 ## 2026-08-11 — stop putting stable credentials in the journal
 
 the `/web/lastfm.php` debug line printed the entire query string before authentication. stable puts its reusable password credential in `ha`, so that one "temporary" log line was writing it straight into journald. removed it. the useful post-auth log already records the user ID, action, flags, and beatmap field without the password.

@@ -16,13 +16,9 @@ const webhook = @import("webhook.zig");
 const protocol = @import("protocol.zig");
 const country = @import("country.zig");
 const log = @import("logutil.zig");
+const config_mod = @import("config.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
-
-const Config = struct {
-    osu_api_key: []const u8 = "",
-    score_webhook: []const u8 = "",
-};
 
 const ScoreJob = struct {
     allocator: std.mem.Allocator,
@@ -31,59 +27,86 @@ const ScoreJob = struct {
     webhook: *webhook.Webhook,
     user_id: i32,
     user_name: []u8,
-    user_safe_name: []u8,
-    score: stable_score.Submission,
+    score: stable_score.OwnedSubmission,
     replay: []u8,
     pp: f64,
     time_elapsed_ms: u32,
     map_file: []u8,
 
+    fn create(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, score_webhook: *webhook.Webhook, user_id: i32, user_name: []const u8, score: stable_score.Submission, replay: []const u8, pp_value: f64, time_elapsed_ms: u32, map_file: []u8) !*ScoreJob {
+        const job = try allocator.create(ScoreJob);
+        errdefer allocator.destroy(job);
+        var owned_score = try stable_score.OwnedSubmission.init(allocator, score);
+        errdefer owned_score.deinit();
+        const owned_user_name = try allocator.dupe(u8, user_name);
+        errdefer allocator.free(owned_user_name);
+        const owned_replay = try allocator.dupe(u8, replay);
+        errdefer allocator.free(owned_replay);
+        job.* = .{
+            .allocator = allocator,
+            .store = store,
+            .sessions = sessions,
+            .webhook = score_webhook,
+            .user_id = user_id,
+            .user_name = owned_user_name,
+            .score = owned_score,
+            .replay = owned_replay,
+            .pp = pp_value,
+            .time_elapsed_ms = time_elapsed_ms,
+            .map_file = map_file,
+        };
+        return job;
+    }
+
+    fn deinit(self: *ScoreJob) void {
+        self.score.deinit();
+        self.allocator.free(self.user_name);
+        self.allocator.free(self.replay);
+        self.allocator.free(self.map_file);
+        self.allocator.destroy(self);
+    }
+
     fn run(self: *ScoreJob) void {
-        defer {
-            self.allocator.free(self.user_name);
-            self.allocator.free(self.user_safe_name);
-            self.allocator.free(self.replay);
-            self.allocator.free(self.map_file);
-            self.allocator.destroy(self);
-        }
-        _ = self.store.insertStableScore(self.user_id, self.score, self.pp, self.replay, self.time_elapsed_ms) catch |err| {
+        defer self.deinit();
+        const score = self.score.value;
+        _ = self.store.insertStableScore(self.user_id, score, self.pp, self.replay, self.time_elapsed_ms) catch |err| {
             std.log.warn("async score insert failed: {t}", .{err});
             return;
         };
-        bancho.publishStats(self.allocator, self.store, self.sessions, self.user_id, self.score.mode, self.score.mods) catch {};
+        bancho.publishStats(self.allocator, self.store, self.sessions, self.user_id, score.mode, score.mods) catch {};
         {
-            const grade_color = if (std.mem.eql(u8, self.score.grade, "XH") or std.mem.eql(u8, self.score.grade, "X")) log.yellow else if (std.mem.eql(u8, self.score.grade, "SH") or std.mem.eql(u8, self.score.grade, "S")) log.cyan else if (std.mem.eql(u8, self.score.grade, "A")) log.green else if (std.mem.eql(u8, self.score.grade, "B")) log.blue else log.red;
-            std.debug.print("{s}  ┌─ SCORE {s} ────────────────────────────{s}\n", .{ if (self.score.passed) log.green else log.red, if (self.score.passed) "SUBMIT" else "FAIL", log.reset });
-            std.debug.print("{s}  │ {s}►{s} user    : {s}{s}{s}\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, log.bold, self.user_name, log.reset });
-            std.debug.print("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, grade_color, self.score.grade, log.bold, log.reset });
-            std.debug.print("{s}  │ {s}►{s} pp      : {s}{d:.2}{s}\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, log.bold, self.pp, log.reset });
-            std.debug.print("{s}  │ {s}►{s} combo   : {d}x\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, self.score.max_combo });
-            std.debug.print("{s}  │ {s}►{s} acc     : {d:.2}%\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, self.score.accuracy() * 100.0 });
-            std.debug.print("{s}  │ {s}►{s} score   : {d}\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, self.score.total_score });
-            std.debug.print("{s}  │ {s}►{s} 300/100/50/miss : {d}/{d}/{d}/{d}\n", .{ if (self.score.passed) log.green else log.red, log.dim, log.reset, self.score.n300, self.score.n100, self.score.n50, self.score.nmiss });
-            std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ if (self.score.passed) log.green else log.red, log.reset });
+            const grade_color = if (std.mem.eql(u8, score.grade, "XH") or std.mem.eql(u8, score.grade, "X")) log.yellow else if (std.mem.eql(u8, score.grade, "SH") or std.mem.eql(u8, score.grade, "S")) log.cyan else if (std.mem.eql(u8, score.grade, "A")) log.green else if (std.mem.eql(u8, score.grade, "B")) log.blue else log.red;
+            std.debug.print("{s}  ┌─ SCORE {s} ────────────────────────────{s}\n", .{ if (score.passed) log.green else log.red, if (score.passed) "SUBMIT" else "FAIL", log.reset });
+            std.debug.print("{s}  │ {s}►{s} user    : {s}{s}{s}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, self.user_name, log.reset });
+            std.debug.print("{s}  │ {s}►{s} grade   : {s}{s}{s}{s}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, grade_color, score.grade, log.bold, log.reset });
+            std.debug.print("{s}  │ {s}►{s} pp      : {s}{d:.2}{s}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, log.bold, self.pp, log.reset });
+            std.debug.print("{s}  │ {s}►{s} combo   : {d}x\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.max_combo });
+            std.debug.print("{s}  │ {s}►{s} acc     : {d:.2}%\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.accuracy() * 100.0 });
+            std.debug.print("{s}  │ {s}►{s} score   : {d}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.total_score });
+            std.debug.print("{s}  │ {s}►{s} 300/100/50/miss : {d}/{d}/{d}/{d}\n", .{ if (score.passed) log.green else log.red, log.dim, log.reset, score.n300, score.n100, score.n50, score.nmiss });
+            std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ if (score.passed) log.green else log.red, log.reset });
         }
-        if (self.score.passed) {
-            const rank = self.store.scoreRankOnMap(self.score.map_md5, self.score.mode, self.score.rankNamespace(), self.score.total_score, self.pp);
+        if (score.passed) {
+            const rank = self.store.scoreRankOnMap(score.map_md5, score.mode, score.rankNamespace(), score.total_score, self.pp);
             if (rank < 10 or self.pp >= 500.0) {
-                if (self.store.beatmapInfo(self.allocator, self.score.map_md5) catch null) |info| {
+                if (self.store.beatmapInfo(self.allocator, score.map_md5) catch null) |info| {
                     defer self.allocator.free(info.artist);
                     defer self.allocator.free(info.title);
                     defer self.allocator.free(info.version);
                     self.webhook.postScore(.{
                         .username = self.user_name,
                         .user_id = self.user_id,
-                        .grade = self.score.grade,
-                        .mods = self.score.mods,
-                        .mode = self.score.mode,
+                        .grade = score.grade,
+                        .mods = score.mods,
+                        .mode = score.mode,
                         .rank = rank + 1,
-                        .total_score = self.score.total_score,
-                        .max_combo = self.score.max_combo,
+                        .total_score = score.total_score,
+                        .max_combo = score.max_combo,
                         .beatmap_max_combo = info.max_combo,
-                        .accuracy = self.score.accuracy(),
+                        .accuracy = score.accuracy(),
                         .pp = self.pp,
                         .stars = info.star_rating,
-                        .perfect = self.score.perfect,
+                        .perfect = score.perfect,
                         .artist = info.artist,
                         .title = info.title,
                         .version = info.version,
@@ -94,26 +117,6 @@ const ScoreJob = struct {
         }
     }
 };
-
-fn parseConfig(io: std.Io) Config {
-    var result: Config = .{};
-    var buf: [4096]u8 = undefined;
-    const bytes = std.Io.Dir.cwd().readFile(io, "config.ini", &buf) catch return result;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        const eq = std.mem.findScalar(u8, trimmed, '=') orelse continue;
-        const key = std.mem.trim(u8, trimmed[0..eq], " \t");
-        const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "osu_api_key")) {
-            result.osu_api_key = value;
-        } else if (std.mem.eql(u8, key, "score_webhook")) {
-            result.score_webhook = value;
-        }
-    }
-    return result;
-}
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -458,7 +461,7 @@ const App = struct {
         }
         if (std.mem.eql(u8, path, "/") and req.head.method == .POST) {
             if (osu_token_owned) |token| {
-                const session = self.sessions.byToken(token) orelse {
+                const bytes = (try bancho.pollByToken(self.allocator, &self.store, &self.sessions, token, body)) orelse {
                     var restart = protocol.Writer.init(self.allocator);
                     defer restart.deinit();
                     try restart.packetString(.notification, "Server has restarted.");
@@ -467,7 +470,6 @@ const App = struct {
                     restart.finish(rs);
                     return respond(req, .ok, "application/octet-stream", restart.bytes(), &.{});
                 };
-                const bytes = try bancho.poll(self.allocator, &self.store, &self.sessions, session, body);
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
@@ -662,6 +664,8 @@ const App = struct {
             }
             if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return rejectStableScore(req, "checksum_mismatch", body.len);
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
+            var map_file_transferred = false;
+            defer if (!map_file_transferred) self.allocator.free(map_file);
             const performance = pp.calculate(map_file, .{
                 .mode = score.mode,
                 .lazer = 0,
@@ -675,29 +679,12 @@ const App = struct {
                 .misses = @intCast(score.nmiss),
                 .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
-            const job = try self.allocator.create(ScoreJob);
-            var owned_score = score;
-            owned_score.map_md5 = try self.allocator.dupe(u8, score.map_md5);
-            owned_score.username = user.name;
-            owned_score.online_checksum = try self.allocator.dupe(u8, score.online_checksum);
-            owned_score.grade = try self.allocator.dupe(u8, score.grade);
-            owned_score.client_time = try self.allocator.dupe(u8, score.client_time);
-            owned_score.client_flags = try self.allocator.dupe(u8, score.client_flags);
-            job.* = .{
-                .allocator = self.allocator,
-                .store = &self.store,
-                .sessions = &self.sessions,
-                .webhook = &self.score_webhook,
-                .user_id = user.id,
-                .user_name = try self.allocator.dupe(u8, user.name),
-                .user_safe_name = try self.allocator.dupe(u8, user.safe_name),
-                .score = owned_score,
-                .replay = try self.allocator.dupe(u8, replay.data),
-                .pp = performance.pp,
-                .time_elapsed_ms = if (score.passed) score_time else fail_time,
-                .map_file = map_file,
+            const job = ScoreJob.create(self.allocator, &self.store, &self.sessions, &self.score_webhook, user.id, user.name, score, replay.data, performance.pp, if (score.passed) score_time else fail_time, map_file) catch return respond(req, .ok, "text/plain", "error: no", &.{});
+            map_file_transferred = true;
+            const thread = std.Thread.spawn(.{}, ScoreJob.run, .{job}) catch {
+                job.deinit();
+                return respond(req, .ok, "text/plain", "error: no", &.{});
             };
-            const thread = std.Thread.spawn(.{}, ScoreJob.run, .{job}) catch return respond(req, .ok, "text/plain", "error: no", &.{});
             thread.detach();
             return respond(req, .ok, "text/plain", "error: no", &.{});
         }
@@ -879,7 +866,8 @@ pub fn main(init: std.process.Init) !void {
     var store = try storage.Store.open(allocator, init.io, db_path);
     defer store.close();
     try store.migrate();
-    const config = parseConfig(init.io);
+    var config = try config_mod.load(allocator, init.io);
+    defer config.deinit();
     var app: App = .{
         .allocator = allocator,
         .store = store,

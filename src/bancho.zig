@@ -121,9 +121,7 @@ fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, byte
     try target.queue.appendSlice(allocator, bytes);
 }
 
-pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
-    sessions.mutex.lockUncancelable(sessions.io);
-    defer sessions.mutex.unlock(sessions.io);
+fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
     session.last_seen = std.Io.Clock.real.now(sessions.io).toSeconds();
     var out = protocol.Writer.init(allocator);
     defer out.deinit();
@@ -223,6 +221,19 @@ pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sess
         else => {},
     };
     return allocator.dupe(u8, out.bytes());
+}
+
+pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    return pollLocked(allocator, store, sessions, session, body);
+}
+
+pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, token: []const u8, body: []const u8) !?[]u8 {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.byToken(token) orelse return null;
+    return try pollLocked(allocator, store, sessions, session, body);
 }
 
 pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, mode: u8, mods: i32) !void {

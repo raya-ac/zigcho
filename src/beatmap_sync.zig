@@ -33,7 +33,10 @@ const OsuV1Map = struct {
     max_combo: u32 = 0,
 };
 
-
+const RemoteMap = struct {
+    approved: i32,
+    beatmap_id: i32,
+};
 
 pub const Sync = struct {
     allocator: std.mem.Allocator,
@@ -84,13 +87,13 @@ pub const Sync = struct {
             return false;
         }
 
-        const approved = self.fetchAndStoreMetadata(store, md5_owned, set_id) catch |err| {
+        const remote = self.fetchAndStoreMetadata(store, md5_owned, set_id) catch |err| {
             std.log.warn("metadata fetch failed for {s}: {t}", .{ md5_owned, err });
             self.removeFromProgress(md5_owned);
             return false;
         };
 
-        const thread = std.Thread.spawn(.{}, backgroundDownload, .{ self, store, md5_owned, set_id, approved }) catch {
+        const thread = std.Thread.spawn(.{}, backgroundDownload, .{ self, store, md5_owned, set_id, remote }) catch {
             self.removeFromProgress(md5_owned);
             return false;
         };
@@ -98,7 +101,7 @@ pub const Sync = struct {
         return false;
     }
 
-    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !i32 {
+    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !RemoteMap {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -150,7 +153,7 @@ pub const Sync = struct {
         };
         try store.upsertBeatmapMeta(meta, wanted_md5, localStatus(map_info.approved), map_info.difficultyrating, map_info.max_combo);
         std.log.info("[hydrate] metadata ok — {s} - {s} [{s}] stars={d:.2}", .{ map_info.artist, map_info.title, map_info.version, map_info.difficultyrating });
-        return map_info.approved;
+        return .{ .approved = map_info.approved, .beatmap_id = map_info.beatmap_id };
     }
 
     fn removeFromProgress(self: *Sync, md5: []const u8) void {
@@ -160,14 +163,14 @@ pub const Sync = struct {
         self.allocator.free(md5);
     }
 
-    fn backgroundDownload(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32, approved: i32) void {
+    fn backgroundDownload(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32, remote: RemoteMap) void {
         defer self.removeFromProgress(md5_owned);
-        self.downloadArchive(store, md5_owned, set_id, approved) catch |err| {
+        self.downloadArchive(store, md5_owned, set_id, remote) catch |err| {
             std.log.warn("[hydrate] download failed md5={s}: {t}", .{ md5_owned, err });
         };
     }
 
-    fn downloadArchive(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32, approved: i32) !void {
+    fn downloadArchive(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32, remote: RemoteMap) !void {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -202,10 +205,11 @@ pub const Sync = struct {
         if (osu_file == null) return error.Md5NotInArchive;
         defer self.allocator.free(osu_file.?);
 
-        const metadata = beatmap.parse(osu_file.?) catch |err| {
+        const metadata = beatmap.parseWithIds(osu_file.?, remote.beatmap_id, set_id) catch |err| {
             std.log.warn("[hydrate] .osu parse failed: {t}", .{err});
             return err;
         };
+        if (metadata.id != remote.beatmap_id or metadata.set_id != set_id) return error.IdMismatch;
         const attributes = pp.calculate(osu_file.?, .{
             .mode = metadata.mode,
             .lazer = 0,
@@ -223,7 +227,7 @@ pub const Sync = struct {
             return err;
         };
         std.log.info("[hydrate] complete — {s} [{s}] stars={d:.2} max_combo={d}", .{ metadata.artist, metadata.version, attributes.stars, attributes.max_combo });
-        try store.upsertBeatmap(metadata, wanted_md5, localStatus(approved), attributes.stars, attributes.max_combo, osu_file.?);
+        try store.upsertBeatmap(metadata, wanted_md5, localStatus(remote.approved), attributes.stars, attributes.max_combo, osu_file.?);
 
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
@@ -231,7 +235,6 @@ pub const Sync = struct {
         _ = std.fmt.bufPrint(&encoded, "{x}", .{digest}) catch unreachable;
         try store.upsertBeatmapArchive(set_id, &encoded, archive);
     }
-
 };
 
 fn fetchFn(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, limit: usize) ![]u8 {

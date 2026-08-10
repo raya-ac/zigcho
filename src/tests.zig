@@ -140,6 +140,25 @@ test "Akatsuki archives only yield the exact MD5 map" {
     try std.testing.expect((try beatmap_sync.extractMatchingOsu(std.testing.allocator, archive, "00000000000000000000000000000000")) == null);
 }
 
+test "old beatmaps without embedded ids use trusted API ids" {
+    const legacy_map =
+        "osu file format v7\n" ++
+        "[General]\nMode:0\n" ++
+        "[Metadata]\nArtist:old artist\nTitle:old title\nCreator:old mapper\nVersion:old diff\n" ++
+        "[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:7\nApproachRate:8\n" ++
+        "[TimingPoints]\n0,500,4,2,0,100,1,0\n" ++
+        "[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n";
+
+    try std.testing.expectError(error.InvalidBeatmap, beatmap.parse(legacy_map));
+    const parsed = try beatmap.parseWithIds(legacy_map, 123, 456);
+    try std.testing.expectEqual(@as(i32, 123), parsed.id);
+    try std.testing.expectEqual(@as(i32, 456), parsed.set_id);
+
+    const current = try beatmap.parseWithIds(@embedFile("testdata/synthetic-standard.osu"), 1, 2);
+    try std.testing.expectEqual(@as(i32, 900000001), current.id);
+    try std.testing.expectEqual(@as(i32, 900000000), current.set_id);
+}
+
 test "public chat does not echo through the server to its sender" {
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();

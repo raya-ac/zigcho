@@ -33,6 +33,10 @@ fn parseFloat(text: []const u8) !f64 {
 }
 
 pub fn parse(bytes: []const u8) !Metadata {
+    return parseWithIds(bytes, 0, 0);
+}
+
+pub fn parseWithIds(bytes: []const u8, fallback_id: i32, fallback_set_id: i32) !Metadata {
     if (!std.mem.startsWith(u8, bytes, "osu file format v")) return error.InvalidBeatmap;
     var result: Metadata = .{};
     var section: []const u8 = "";
@@ -80,6 +84,8 @@ pub fn parse(bytes: []const u8) !Metadata {
             if (object_type & 8 != 0) result.count_spinners += 1;
         }
     }
+    if (result.id <= 0 and fallback_id > 0) result.id = fallback_id;
+    if (result.set_id <= 0 and fallback_set_id > 0) result.set_id = fallback_set_id;
     if (result.id <= 0 or result.set_id <= 0 or result.artist.len == 0 or result.title.len == 0 or result.version.len == 0 or result.creator.len == 0 or result.mode > 3 or result.object_count == 0) return error.InvalidBeatmap;
     result.bpm = if (first_beat_length) |length| 60_000.0 / length else 0;
     result.total_length = @intCast(@divTrunc(last_object_time, 1000));

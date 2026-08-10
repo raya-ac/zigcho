@@ -1,5 +1,13 @@
 # changelog
 
+## 2026-08-11 — old maps hydrate properly
+
+some older `.osu` files don't contain `BeatmapID` or `BeatmapSetID` at all. the live server downloaded one of these sets, found the exact difficulty by md5, verified the zip and crc, then threw the map away as `InvalidBeatmap` because those two fields were missing. the archive was fine. the parser was being stricter than the file format's history allows.
+
+hydration now carries the map and set IDs from the osu API metadata request into the archive worker. if the old file omitted those fields, it fills them from that already-verified response. if the file does contain IDs and they disagree with the API, it still gets rejected. the exact failing live set was Basshunter's `Ievan Polkka Trance Remix`, set 10406, difficulty md5 `f03510b839a01ec1a1dcc71f24d9c596`.
+
+the regression test covers both halves: a legacy map without IDs accepts trusted fallback IDs, and a modern map keeps its own IDs instead of being overwritten.
+
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 
 ## 2026-08-09 — scores submit again and leaderboards show the real play time

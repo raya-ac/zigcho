@@ -60,7 +60,7 @@ pub const Sync = struct {
 
     pub fn ensure(self: *Sync, store: *storage.Store, wanted_md5: []const u8, expected_set_id: ?i32) !bool {
         if (!validMd5(wanted_md5)) return false;
-        if (try store.beatmapForScore(wanted_md5) != null) return true;
+        if (try store.beatmapHasFile(wanted_md5)) return true;
 
         self.in_progress_mutex.lockUncancelable(self.io);
         if (self.in_progress.contains(wanted_md5)) {

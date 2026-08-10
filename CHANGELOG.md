@@ -6,7 +6,9 @@ some older `.osu` files don't contain `BeatmapID` or `BeatmapSetID` at all. the 
 
 hydration now carries the map and set IDs from the osu API metadata request into the archive worker. if the old file omitted those fields, it fills them from that already-verified response. if the file does contain IDs and they disagree with the API, it still gets rejected. the exact failing live set was Basshunter's `Ievan Polkka Trance Remix`, set 10406, difficulty md5 `f03510b839a01ec1a1dcc71f24d9c596`.
 
-the regression test covers both halves: a legacy map without IDs accepts trusted fallback IDs, and a modern map keeps its own IDs instead of being overwritten.
+there was a second bug hiding behind it. once metadata had been stored, later leaderboard requests assumed the full `.osu` file was ready and never retried a failed archive. hydration now checks for the file itself. metadata-only rows stay eligible for another attempt, while the in-progress guard still stops duplicate downloads.
+
+the regression tests cover legacy ID fallback, modern IDs not being overwritten, and metadata-only maps remaining retryable until their real file is stored.
 
 This is the honest version of what changed in zigcho. I am not calling a phase done because a health endpoint went green. Each entry says what landed, what I checked on the public server, and what is still between this build and something I would let players rely on.
 

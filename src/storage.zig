@@ -570,6 +570,16 @@ pub const Store = struct {
         return try allocator.dupe(u8, ptr[0..len]);
     }
 
+    pub fn beatmapHasFile(self: *Store, md5: []const u8) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM beatmaps WHERE md5=?1 AND osu_file IS NOT NULL", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
     pub fn beatmapFileById(self: *Store, allocator: std.mem.Allocator, map_id: i32) !?[]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

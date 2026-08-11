@@ -8,6 +8,9 @@ pub const Rule = struct {
 
 pub const registration: Rule = .{ .name = "registration", .limit = 5, .window_seconds = 3600 };
 pub const token: Rule = .{ .name = "token", .limit = 20, .window_seconds = 60 };
+pub const web_session: Rule = .{ .name = "web_session", .limit = 10, .window_seconds = 15 * 60 };
+pub const web_action: Rule = .{ .name = "web_action", .limit = 120, .window_seconds = 60 };
+pub const appeal: Rule = .{ .name = "appeal", .limit = 5, .window_seconds = 60 * 60 };
 pub const login: Rule = .{ .name = "login", .limit = 30, .window_seconds = 60 };
 pub const score: Rule = .{ .name = "score", .limit = 120, .window_seconds = 60 };
 pub const authenticated: Rule = .{ .name = "authenticated", .limit = 600, .window_seconds = 60 };

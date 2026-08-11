@@ -1,0 +1,11 @@
+[Unit]
+Description=daily zigcho PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 04:20:00 Australia/Adelaide
+RandomizedDelaySec=20m
+Persistent=true
+Unit=zigcho-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

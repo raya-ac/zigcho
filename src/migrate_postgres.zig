@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 14;
+const required_sqlite_version = 15;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -104,6 +104,11 @@ const client_hardware = [_]Column{
     .{ .name = "running_under_wine", .kind = .boolean }, .{ .name = "first_seen", .kind = .integer },      .{ .name = "last_seen", .kind = .integer },
     .{ .name = "occurrences", .kind = .integer },
 };
+const moderation_appeals = [_]Column{
+    .{ .name = "id", .kind = .integer },      .{ .name = "user_id", .kind = .integer },    .{ .name = "kind", .kind = .text },
+    .{ .name = "message", .kind = .text },    .{ .name = "status", .kind = .text },        .{ .name = "reviewer_id", .kind = .integer },
+    .{ .name = "resolution", .kind = .text }, .{ .name = "created_at", .kind = .integer }, .{ .name = "resolved_at", .kind = .integer },
+};
 
 const tables = [_]Table{
     .{ .name = "users", .columns = &users, .identity = true },
@@ -124,6 +129,7 @@ const tables = [_]Table{
     .{ .name = "oauth_tokens", .columns = &oauth_tokens },
     .{ .name = "beatmap_archives", .columns = &beatmap_archives },
     .{ .name = "client_hardware", .columns = &client_hardware },
+    .{ .name = "moderation_appeals", .columns = &moderation_appeals, .identity = true },
 };
 
 fn sqliteError(db: *sqlite.sqlite3) void {
@@ -369,7 +375,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 18), tables.len);
+    try std.testing.expectEqual(@as(usize, 19), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
-    try std.testing.expectEqualStrings("client_hardware", tables[tables.len - 1].name);
+    try std.testing.expectEqualStrings("moderation_appeals", tables[tables.len - 1].name);
 }

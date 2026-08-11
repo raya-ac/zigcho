@@ -22,5 +22,7 @@ COPY . .
 RUN zig build test \
     && zig build -Doptimize=ReleaseSafe \
     && zig build -Dpostgres=true -Doptimize=ReleaseSafe \
-    && mkdir /out \
-    && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/
+    && mkdir -p /out/tools /out/deploy/systemd \
+    && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/ \
+    && cp tools/backup-postgres.sh tools/restore-postgres-drill.sh tools/activate-release.sh /out/tools/ \
+    && cp deploy/systemd/zigcho.service deploy/systemd/zigcho-postgres-backup.service deploy/systemd/zigcho-postgres-backup.timer /out/deploy/systemd/

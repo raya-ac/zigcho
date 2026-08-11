@@ -24,11 +24,13 @@ const postgres = @import("postgres.zig");
 const migrate_postgres = @import("migrate_postgres.zig");
 const postgres_store = @import("postgres_store.zig");
 const webhook = @import("webhook.zig");
+const web_auth = @import("web_auth.zig");
 
 comptime {
     _ = postgres;
     _ = migrate_postgres;
     _ = postgres_store;
+    _ = web_auth;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -815,6 +817,47 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     const pending_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
     defer std.testing.allocator.free(pending_board);
     try std.testing.expectEqualStrings("0|false", pending_board);
+}
+
+test "staff web data keeps appeals and moderation actions auditable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/staff-web.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const player = try store.register("player", "player-staff@example.invalid", "00000000000000000000000000000000");
+    const moderator = try store.register("moderator", "moderator-staff@example.invalid", "11111111111111111111111111111111");
+    try store.exec("UPDATE users SET restricted=1 WHERE id=4; UPDATE users SET privileges=4099 WHERE id=5;");
+    const appeal_id = try store.createModerationAppeal(player, "hwid", "this exact hardware match belongs to a shared pc, please review it");
+    try std.testing.expectError(error.AppealAlreadyOpen, store.createModerationAppeal(player, "hwid", "a duplicate appeal that must not create another queue row"));
+
+    const overview = try store.staffOverviewJson(std.testing.allocator);
+    defer std.testing.allocator.free(overview);
+    try std.testing.expect(std.mem.indexOf(u8, overview, "\"open_appeals\":1") != null);
+    const appeals = try store.staffAppealsJson(std.testing.allocator);
+    defer std.testing.allocator.free(appeals);
+    try std.testing.expect(std.mem.indexOf(u8, appeals, "\"kind\":\"hwid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, appeals, "shared pc") != null);
+
+    try store.resolveModerationAppeal(moderator, appeal_id, "accepted", "exact match reviewed by a person");
+    try std.testing.expectError(error.AppealNotOpen, store.resolveModerationAppeal(moderator, appeal_id, "denied", "cannot decide twice"));
+    const decided = try store.staffAppealsJson(std.testing.allocator);
+    defer std.testing.allocator.free(decided);
+    try std.testing.expect(std.mem.indexOf(u8, decided, "\"status\":\"accepted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decided, "exact match reviewed") != null);
+
+    const player_json = (try store.staffUserJson(std.testing.allocator, player)).?;
+    defer std.testing.allocator.free(player_json);
+    try std.testing.expect(std.mem.indexOf(u8, player_json, "\"restricted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, player_json, "appeal.accept") != null);
+    const audit = try store.staffAuditJson(std.testing.allocator);
+    defer std.testing.allocator.free(audit);
+    try std.testing.expect(std.mem.indexOf(u8, audit, "\"actor\":\"moderator\"") != null);
+    const channels = try store.staffChannelsJson(std.testing.allocator);
+    defer std.testing.allocator.free(channels);
+    try std.testing.expect(std.mem.indexOf(u8, channels, "\"name\":\"#announce\"") != null);
 }
 
 test "Akatsuki archives only yield the exact MD5 map" {

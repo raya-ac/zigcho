@@ -21,8 +21,29 @@ const protocol = @import("protocol.zig");
 const country = @import("country.zig");
 const log = @import("logutil.zig");
 const config_mod = @import("config.zig");
+const web_auth = @import("web_auth.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
+
+fn freeUser(allocator: std.mem.Allocator, user: domain.User) void {
+    allocator.free(user.name);
+    allocator.free(user.safe_name);
+}
+
+fn validWebText(value: []const u8, minimum: usize, maximum: usize) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return trimmed.len >= minimum and trimmed.len <= maximum and std.unicode.utf8ValidateSlice(trimmed);
+}
+
+fn stableClientPrivileges(server: u32) u8 {
+    var client: u8 = 1 << 2;
+    if (server & 1 != 0) client |= 1 << 0;
+    if (server & ((1 << 4) | (1 << 5)) != 0) client |= 1 << 2;
+    if (server & (1 << 12) != 0) client |= 1 << 1;
+    if (server & (1 << 13) != 0) client |= 1 << 4;
+    if (server & (1 << 14) != 0) client |= 1 << 3;
+    return client;
+}
 
 fn scoreLog(user_name: []const u8, score: stable_score.Submission, pp_value: f64, placement: ?domain.ScorePlacement) void {
     const grade_color = if (std.mem.eql(u8, score.grade, "XH") or std.mem.eql(u8, score.grade, "X")) log.yellow else if (std.mem.eql(u8, score.grade, "SH") or std.mem.eql(u8, score.grade, "S")) log.cyan else if (std.mem.eql(u8, score.grade, "A")) log.green else if (std.mem.eql(u8, score.grade, "B")) log.blue else log.red;
@@ -55,6 +76,7 @@ const App = struct {
     map_sync: beatmap_sync.Sync,
     score_webhook: webhook.Webhook,
     geo_client: std.http.Client,
+    started_at: i64,
 
     fn header(req: *const std.http.Server.Request, wanted: []const u8) ?[]const u8 {
         var it = req.iterateHeaders();
@@ -134,6 +156,12 @@ const App = struct {
         return std.ascii.eqlIgnoreCase(host[0..end], "a.kai.ovh");
     }
 
+    fn isLocalMetricsHost(value: ?[]const u8) bool {
+        const raw = value orelse return false;
+        const host = if (raw.len > 0 and raw[0] == '[') raw else if (std.mem.findScalar(u8, raw, ':')) |colon| raw[0..colon] else raw;
+        return std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.startsWith(u8, host, "[::1]");
+    }
+
     fn avatarUserId(path: []const u8) ?i32 {
         const value = if (std.mem.startsWith(u8, path, "/avatars/"))
             path["/avatars/".len..]
@@ -156,6 +184,9 @@ const App = struct {
     fn requestRule(req: *const std.http.Server.Request, path: []const u8) ?rate_limit.Rule {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/users")) return rate_limit.registration;
         if (req.head.method == .POST and (std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke"))) return rate_limit.token;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/staff/session")) return rate_limit.web_session;
+        if (req.head.method == .POST and std.mem.startsWith(u8, path, "/api/v1/staff/")) return rate_limit.web_action;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/appeals")) return rate_limit.appeal;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return rate_limit.authenticated;
@@ -168,7 +199,7 @@ const App = struct {
     }
 
     fn bodyLimit(path: []const u8) usize {
-        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke")) return 8 * 1024;
+        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return 20 * 1024 * 1024;
         if (std.mem.eql(u8, path, "/")) return 1024 * 1024;
@@ -208,6 +239,12 @@ const App = struct {
         defer if (country_owned) |v| self.allocator.free(v);
         const host_owned: ?[]u8 = if (header(req, "host")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (host_owned) |v| self.allocator.free(v);
+        const cookie_owned: ?[]u8 = if (header(req, "cookie")) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (cookie_owned) |v| self.allocator.free(v);
+        const csrf_owned: ?[]u8 = if (header(req, "x-csrf-token")) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (csrf_owned) |v| self.allocator.free(v);
+        const origin_owned: ?[]u8 = if (header(req, "origin")) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (origin_owned) |v| self.allocator.free(v);
         const client_ip: ?[]const u8 = if (header(req, "cf-connecting-ip")) |v| v else if (header(req, "x-forwarded-for")) |v| blk: {
             const trimmed = std.mem.trim(u8, v, " ");
             if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| break :blk std.mem.trim(u8, trimmed[0..comma], " ");
@@ -229,6 +266,28 @@ const App = struct {
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{self.sessions.humanCount()});
             return respond(req, .ok, "application/json", json, &.{});
         }
+        if (std.mem.eql(u8, path, "/metrics")) {
+            if (req.head.method != .GET or !isLocalMetricsHost(host_owned)) return respond(req, .not_found, "text/plain", "not found\n", &.{});
+            self.sessions.mutex.lockUncancelable(self.sessions.io);
+            const online = self.sessions.humanCount();
+            self.sessions.mutex.unlock(self.sessions.io);
+            const counts = try self.store.serverCounts();
+            const uptime = @max(@as(i64, 0), std.Io.Clock.real.now(self.store.io).toSeconds() - self.started_at);
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.print(
+                "# HELP zigcho_up Whether the server can answer requests.\n" ++
+                    "# TYPE zigcho_up gauge\nzigcho_up 1\n" ++
+                    "# TYPE zigcho_online_users gauge\nzigcho_online_users {d}\n" ++
+                    "# TYPE zigcho_accounts gauge\nzigcho_accounts {d}\n" ++
+                    "# TYPE zigcho_plays gauge\nzigcho_plays {d}\n" ++
+                    "# TYPE zigcho_passed_plays gauge\nzigcho_passed_plays {d}\n" ++
+                    "# TYPE zigcho_beatmaps gauge\nzigcho_beatmaps {d}\n" ++
+                    "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
+                .{ online, counts.users, counts.plays, counts.passed, counts.maps, uptime },
+            );
+            return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
         if (std.mem.eql(u8, path, "/api/v1/status")) {
             self.sessions.mutex.lockUncancelable(self.sessions.io);
             const online = self.sessions.humanCount();
@@ -237,6 +296,298 @@ const App = struct {
             var buf: [384]u8 = undefined;
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"debug alpha\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v1/appeals")) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            if (!web_auth.sameOrigin(origin_owned, host_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid origin\"}", &no_store);
+            const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"username required\"}", &no_store);
+            defer self.allocator.free(name);
+            const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &no_store);
+            defer self.allocator.free(password);
+            const kind = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"kind"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"appeal kind required\"}", &no_store);
+            defer self.allocator.free(kind);
+            const message = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"message"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"appeal message required\"}", &no_store);
+            defer self.allocator.free(message);
+            if ((!std.mem.eql(u8, kind, "restriction") and !std.mem.eql(u8, kind, "hwid")) or !validWebText(message, 20, 2000)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid appeal\"}", &no_store);
+            const password_md5 = web_auth.passwordCredential(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+            const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+            defer freeUser(self.allocator, user);
+            if (!user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"this account is not restricted\"}", &no_store);
+            const appeal_id = self.store.createModerationAppeal(user.id, kind, std.mem.trim(u8, message, " \t\r\n")) catch |err| return respond(req, if (err == error.AppealAlreadyOpen) .conflict else .internal_server_error, "application/json", if (err == error.AppealAlreadyOpen) "{\"error\":\"an appeal of this type is already open\"}" else "{\"error\":\"appeal could not be saved\"}", &no_store);
+            std.log.info("event=appeal_submitted appeal_id={d} user_id={d} kind={s}", .{ appeal_id, user.id, kind });
+            var response_buf: [64]u8 = undefined;
+            const response_json = try std.fmt.bufPrint(&response_buf, "{{\"ok\":true,\"id\":{d}}}", .{appeal_id});
+            return respond(req, .created, "application/json", response_json, &no_store);
+        }
+        if (std.mem.eql(u8, path, "/api/v1/staff/session")) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            if (req.head.method == .POST) {
+                if (!web_auth.sameOrigin(origin_owned, host_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid origin\"}", &no_store);
+                const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"username required\"}", &no_store);
+                defer self.allocator.free(name);
+                const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &no_store);
+                defer self.allocator.free(password);
+                const password_md5 = web_auth.passwordCredential(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                defer self.allocator.free(user.name);
+                defer self.allocator.free(user.safe_name);
+                if (!web_auth.allowed(user)) return respond(req, .forbidden, "application/json", "{\"error\":\"staff access required\"}", &no_store);
+                const token = try self.store.issueToken(user.id, web_auth.scope, web_auth.lifetime_seconds);
+                std.log.info("event=staff_session_created user_id={d}", .{user.id});
+                const csrf = web_auth.csrfToken(&token);
+                const json = try web_auth.sessionJson(self.allocator, user, csrf);
+                defer self.allocator.free(json);
+                var cookie_buf: [256]u8 = undefined;
+                const cookie = try std.fmt.bufPrint(&cookie_buf, "{s}={s}; Path=/; Max-Age={d}; Secure; HttpOnly; SameSite=Strict", .{ web_auth.cookie_name, &token, web_auth.lifetime_seconds });
+                const headers = [_]std.http.Header{
+                    .{ .name = "set-cookie", .value = cookie },
+                    .{ .name = "cache-control", .value = "no-store" },
+                    .{ .name = "pragma", .value = "no-cache" },
+                };
+                return respond(req, .ok, "application/json", json, &headers);
+            }
+            const token = web_auth.sessionToken(cookie_owned) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            if (req.head.method == .GET) {
+                const user = (try self.store.authenticateToken(self.allocator, token, web_auth.scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+                defer self.allocator.free(user.name);
+                defer self.allocator.free(user.safe_name);
+                if (!web_auth.allowed(user)) {
+                    _ = try self.store.revokeToken(token);
+                    return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+                }
+                const csrf = web_auth.csrfToken(token);
+                const json = try web_auth.sessionJson(self.allocator, user, csrf);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+            if (req.head.method == .DELETE) {
+                if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+                _ = try self.store.revokeToken(token);
+                const headers = [_]std.http.Header{
+                    .{ .name = "set-cookie", .value = "__Host-kai-session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" },
+                    .{ .name = "cache-control", .value = "no-store" },
+                    .{ .name = "pragma", .value = "no-cache" },
+                };
+                return respond(req, .no_content, "application/json", "", &headers);
+            }
+            return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+        }
+        if (std.mem.startsWith(u8, path, "/api/v1/staff/")) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            const staff_token = web_auth.sessionToken(cookie_owned) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            const staff_user = (try self.store.authenticateToken(self.allocator, staff_token, web_auth.scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            defer freeUser(self.allocator, staff_user);
+            if (!web_auth.allowed(staff_user)) {
+                _ = try self.store.revokeToken(staff_token);
+                return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            }
+            if (req.head.method == .POST and (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(staff_token, csrf_owned))) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+
+            if (std.mem.eql(u8, path, "/api/v1/staff/overview") and req.head.method == .GET) {
+                const json = try self.store.staffOverviewJson(self.allocator);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+            if (std.mem.eql(u8, path, "/api/v1/staff/ranking")) {
+                if (!web_auth.canRank(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"ranking access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const json = try self.store.staffRankingJson(self.allocator);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const set_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"set_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"set required\"}", &no_store);
+                    defer self.allocator.free(set_text);
+                    const action = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"action"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"action required\"}", &no_store);
+                    defer self.allocator.free(action);
+                    const reason = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &no_store);
+                    defer self.allocator.free(reason);
+                    const set_id = std.fmt.parseInt(i32, set_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid set\"}", &no_store);
+                    if (set_id <= 0 or !validWebText(reason, 3, 1000)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid ranking action\"}", &no_store);
+                    const md5 = (try self.store.beatmapMd5ForSet(set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &no_store);
+                    const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
+                    if (std.mem.eql(u8, action, "nominate")) {
+                        _ = self.store.nominateBeatmapSet(staff_user.id, &md5, trimmed_reason) catch return respond(req, .conflict, "application/json", "{\"error\":\"nomination was not accepted\"}", &no_store);
+                    } else {
+                        const rank_action: domain.BeatmapRankAction = if (std.mem.eql(u8, action, "qualify")) .qualify else if (std.mem.eql(u8, action, "rank")) .rank else if (std.mem.eql(u8, action, "love")) .love else if (std.mem.eql(u8, action, "veto")) .veto else if (std.mem.eql(u8, action, "rollback") and web_auth.canAdmin(staff_user)) .rollback else return respond(req, .bad_request, "application/json", "{\"error\":\"invalid ranking action\"}", &no_store);
+                        _ = self.store.applyBeatmapRankAction(staff_user.id, &md5, rank_action, trimmed_reason) catch return respond(req, .conflict, "application/json", "{\"error\":\"ranking transition was not accepted\"}", &no_store);
+                    }
+                    std.log.info("event=staff_ranking_action actor_id={d} set_id={d} action={s}", .{ staff_user.id, set_id, action });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
+            if (std.mem.eql(u8, path, "/api/v1/staff/moderation")) {
+                if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const user_text = queryField(target, "user") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                    var target_id = std.fmt.parseInt(i32, user_text, 10) catch 0;
+                    if (target_id <= 0) {
+                        const encoded = try self.allocator.dupe(u8, user_text);
+                        defer self.allocator.free(encoded);
+                        for (encoded) |*char| if (char.* == '+') {
+                            char.* = ' ';
+                        };
+                        const decoded = std.Uri.percentDecodeInPlace(encoded);
+                        const found = (try self.store.userByName(self.allocator, decoded)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                        defer freeUser(self.allocator, found);
+                        target_id = found.id;
+                    }
+                    const json = (try self.store.staffUserJson(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const user_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"user_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                    defer self.allocator.free(user_text);
+                    const action = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"action"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"action required\"}", &no_store);
+                    defer self.allocator.free(action);
+                    const reason = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &no_store);
+                    defer self.allocator.free(reason);
+                    const target_id = std.fmt.parseInt(i32, user_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                    if (!validWebText(reason, 3, 1000)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid reason\"}", &no_store);
+                    const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                    defer freeUser(self.allocator, target_user);
+                    if (!web_auth.canManage(staff_user, target_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"protected player\"}", &no_store);
+                    const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
+                    if (std.mem.eql(u8, action, "note")) {
+                        try self.store.addModerationNote(staff_user.id, target_id, trimmed_reason);
+                    } else if (std.mem.eql(u8, action, "silence") or std.mem.eql(u8, action, "unsilence")) {
+                        var seconds: i64 = 0;
+                        if (std.mem.eql(u8, action, "silence")) {
+                            const duration = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"duration"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"duration required\"}", &no_store);
+                            defer self.allocator.free(duration);
+                            seconds = std.fmt.parseInt(i64, duration, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid duration\"}", &no_store);
+                            if (seconds < 60 or seconds > 365 * 86400) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid duration\"}", &no_store);
+                        }
+                        const silence_end = if (seconds == 0) @as(i64, 0) else std.Io.Clock.real.now(self.store.io).toSeconds() + seconds;
+                        try self.store.setSilence(staff_user.id, target_id, silence_end, if (seconds == 0) "account.unsilence" else "account.silence", trimmed_reason);
+                        self.sessions.mutex.lockUncancelable(self.sessions.io);
+                        defer self.sessions.mutex.unlock(self.sessions.io);
+                        if (self.sessions.byUser(target_id)) |online| {
+                            online.user.silence_end = silence_end;
+                            var packet = protocol.Writer.init(self.allocator);
+                            defer packet.deinit();
+                            try packet.packetInt(.silence_end, @intCast(@min(seconds, std.math.maxInt(i32))));
+                            try online.enqueue(self.allocator, packet.bytes());
+                            if (seconds > 0) {
+                                packet.list.clearRetainingCapacity();
+                                try packet.packetInt(.user_silenced, target_id);
+                                try self.sessions.broadcast(packet.bytes(), null);
+                            }
+                        }
+                    } else if (std.mem.eql(u8, action, "restrict") or std.mem.eql(u8, action, "unrestrict")) {
+                        if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
+                        const restricted = std.mem.eql(u8, action, "restrict");
+                        if (target_user.restricted == restricted) return respond(req, .conflict, "application/json", "{\"error\":\"player already has that state\"}", &no_store);
+                        try self.store.setRestricted(staff_user.id, target_id, restricted, trimmed_reason);
+                        self.sessions.mutex.lockUncancelable(self.sessions.io);
+                        defer self.sessions.mutex.unlock(self.sessions.io);
+                        if (self.sessions.byUser(target_id)) |online| {
+                            online.user.restricted = restricted;
+                            var packet = protocol.Writer.init(self.allocator);
+                            defer packet.deinit();
+                            if (restricted) {
+                                try packet.packetEmpty(.account_restricted);
+                                var visibility = protocol.Writer.init(self.allocator);
+                                defer visibility.deinit();
+                                const start = try visibility.begin(.user_logout);
+                                try visibility.int(i32, target_id);
+                                try visibility.byte(0);
+                                visibility.finish(start);
+                                try self.sessions.broadcast(visibility.bytes(), online);
+                            }
+                            try packet.packetInt(.restart, 0);
+                            try online.enqueue(self.allocator, packet.bytes());
+                        }
+                    } else if (std.mem.eql(u8, action, "add_privilege") or std.mem.eql(u8, action, "remove_privilege")) {
+                        if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
+                        const bits_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"bits"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"privilege bits required\"}", &no_store);
+                        defer self.allocator.free(bits_text);
+                        const bits = std.fmt.parseInt(u32, bits_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid privilege bits\"}", &no_store);
+                        const allowed_bits: u32 = 1 | 2 | (1 << 4) | (1 << 5) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14);
+                        if (bits == 0 or bits & ~allowed_bits != 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid privilege bits\"}", &no_store);
+                        const privileges = try self.store.changePrivileges(staff_user.id, target_id, bits, std.mem.eql(u8, action, "add_privilege"));
+                        self.sessions.mutex.lockUncancelable(self.sessions.io);
+                        defer self.sessions.mutex.unlock(self.sessions.io);
+                        if (self.sessions.byUser(target_id)) |online| {
+                            online.user.privileges = privileges;
+                            var packet = protocol.Writer.init(self.allocator);
+                            defer packet.deinit();
+                            try packet.packetInt(.privileges, stableClientPrivileges(privileges));
+                            try online.enqueue(self.allocator, packet.bytes());
+                        }
+                    } else return respond(req, .bad_request, "application/json", "{\"error\":\"invalid moderation action\"}", &no_store);
+                    std.log.info("event=staff_moderation_action actor_id={d} target_id={d} action={s}", .{ staff_user.id, target_id, action });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
+            if (std.mem.eql(u8, path, "/api/v1/staff/appeals")) {
+                if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const json = try self.store.staffAppealsJson(self.allocator);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const id_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"appeal_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"appeal required\"}", &no_store);
+                    defer self.allocator.free(id_text);
+                    const decision = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"decision"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"decision required\"}", &no_store);
+                    defer self.allocator.free(decision);
+                    const resolution = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"resolution"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"resolution required\"}", &no_store);
+                    defer self.allocator.free(resolution);
+                    const appeal_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid appeal\"}", &no_store);
+                    if ((!std.mem.eql(u8, decision, "accepted") and !std.mem.eql(u8, decision, "denied")) or !validWebText(resolution, 3, 2000)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid decision\"}", &no_store);
+                    self.store.resolveModerationAppeal(staff_user.id, appeal_id, decision, std.mem.trim(u8, resolution, " \t\r\n")) catch return respond(req, .conflict, "application/json", "{\"error\":\"appeal is not open\"}", &no_store);
+                    std.log.info("event=staff_appeal_decision actor_id={d} appeal_id={d} decision={s}", .{ staff_user.id, appeal_id, decision });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
+            if (std.mem.eql(u8, path, "/api/v1/staff/audit") and req.head.method == .GET) {
+                if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
+                const json = try self.store.staffAuditJson(self.allocator);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+            if (std.mem.eql(u8, path, "/api/v1/staff/channels")) {
+                if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const json = try self.store.staffChannelsJson(self.allocator);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const channel = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"channel"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"channel required\"}", &no_store);
+                    defer self.allocator.free(channel);
+                    const action = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"action"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"action required\"}", &no_store);
+                    defer self.allocator.free(action);
+                    const reason = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &no_store);
+                    defer self.allocator.free(reason);
+                    if ((!std.mem.eql(u8, action, "lock") and !std.mem.eql(u8, action, "unlock")) or !validWebText(reason, 3, 1000)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel action\"}", &no_store);
+                    self.store.setChannelLocked(staff_user.id, channel, std.mem.eql(u8, action, "lock"), std.mem.trim(u8, reason, " \t\r\n")) catch return respond(req, .bad_request, "application/json", "{\"error\":\"unknown channel\"}", &no_store);
+                    std.log.info("event=staff_channel_action actor_id={d} channel={s} action={s}", .{ staff_user.id, channel, action });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
+            const known_staff_path = std.mem.eql(u8, path, "/api/v1/staff/overview") or
+                std.mem.eql(u8, path, "/api/v1/staff/ranking") or
+                std.mem.eql(u8, path, "/api/v1/staff/moderation") or
+                std.mem.eql(u8, path, "/api/v1/staff/appeals") or
+                std.mem.eql(u8, path, "/api/v1/staff/audit") or
+                std.mem.eql(u8, path, "/api/v1/staff/channels");
+            return respond(req, if (known_staff_path) .method_not_allowed else .not_found, "application/json", if (known_staff_path) "{\"error\":\"method not allowed\"}" else "{\"error\":\"not found\"}", &no_store);
         }
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v1/rankings")) {
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
@@ -720,11 +1071,12 @@ const App = struct {
             defer self.allocator.free(replay);
             return respond(req, .ok, "application/octet-stream", replay, &.{});
         }
-        const site_page = std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/rankings") or std.mem.startsWith(u8, path, "/u/") or std.mem.startsWith(u8, path, "/beatmapsets/");
+        const site_page = std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/rankings") or std.mem.eql(u8, path, "/appeal") or std.mem.eql(u8, path, "/staff") or std.mem.startsWith(u8, path, "/u/") or std.mem.startsWith(u8, path, "/beatmapsets/");
         if (req.head.method == .GET and site_page) {
+            if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
-                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
             return respond(req, .ok, "text/html; charset=utf-8", status_page, &headers);
@@ -865,14 +1217,48 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
-    if (args.len > 1 and std.mem.eql(u8, args[1], "recalc")) {
-        if (storage.is_postgres) return error.RecalcRequiresSqliteBuild;
-        const db_path: [:0]const u8 = if (args.len > 2) try allocator.dupeZ(u8, args[2]) else "zigcho.db";
-        defer if (args.len > 2) allocator.free(db_path);
-        var store = try sqlite_storage.Store.open(allocator, init.io, db_path);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "check")) {
+        if (args.len > 2) return error.UnexpectedCheckArgument;
+        const database: [:0]const u8 = if (storage.is_postgres)
+            std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl)
+        else
+            "zigcho.db";
+        var store = try storage.Store.open(allocator, init.io, database);
         defer store.close();
         try store.migrate();
-        try recalcAllScores(allocator, &store);
+        const kai = (try store.userById(allocator, 3)) orelse return error.SystemBotMissing;
+        defer {
+            allocator.free(kai.name);
+            allocator.free(kai.safe_name);
+        }
+        if (!std.mem.eql(u8, kai.safe_name, "kai")) return error.InvalidSystemBot;
+        const counts = try store.serverCounts();
+        std.log.info("event=preflight_ok storage={s} accounts={d} plays={d} passed={d} beatmaps={d}", .{
+            if (storage.is_postgres) "postgres" else "sqlite",
+            counts.users,
+            counts.plays,
+            counts.passed,
+            counts.maps,
+        });
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "recalc")) {
+        if (storage.is_postgres) {
+            if (args.len > 2) return error.PostgresUrlMustUseEnvironment;
+            const conninfo = std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl);
+            var store = try storage.Store.open(allocator, init.io, conninfo);
+            defer store.close();
+            try store.migrate();
+            const count = try store.recalculatePerformance(allocator);
+            std.log.info("event=postgres_pp_recalc_complete scores={d}", .{count});
+        } else {
+            const db_path: [:0]const u8 = if (args.len > 2) try allocator.dupeZ(u8, args[2]) else "zigcho.db";
+            defer if (args.len > 2) allocator.free(db_path);
+            var store = try sqlite_storage.Store.open(allocator, init.io, db_path);
+            defer store.close();
+            try store.migrate();
+            try recalcAllScores(allocator, &store);
+        }
         return;
     }
     const bind = if (args.len > 1) args[1] else "127.0.0.1";
@@ -896,6 +1282,7 @@ pub fn main(init: std.process.Init) !void {
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .geo_client = .{ .allocator = allocator, .io = init.io },
+        .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
     kai.country = .{ 'I', 'S' };
@@ -912,7 +1299,7 @@ pub fn main(init: std.process.Init) !void {
     defer listener.deinit(init.io);
     var connections: std.Io.Group = .init;
     defer connections.cancel(init.io);
-    std.log.info("zigcho listening on http://{s}:{d}", .{ bind, port });
+    std.log.info("event=server_started bind={s} port={d} storage={s}", .{ bind, port, if (storage.is_postgres) "postgres" else "sqlite" });
     while (true) {
         const stream = listener.accept(init.io) catch |err| {
             std.log.err("accept: {t}", .{err});

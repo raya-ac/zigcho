@@ -11,6 +11,7 @@ WorkingDirectory=/var/lib/zigcho
 StateDirectory=zigcho
 StateDirectoryMode=0700
 Environment="ZIGCHO_POSTGRES_URL=dbname=zigcho user=zigcho host=/var/run/postgresql connect_timeout=5"
+ExecStartPre=/opt/zigcho/current/zigcho check
 ExecStart=/opt/zigcho/current/zigcho 127.0.0.1 27180
 Restart=on-failure
 RestartSec=2s

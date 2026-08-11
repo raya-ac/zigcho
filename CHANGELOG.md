@@ -1,5 +1,19 @@
 # changelog
 
+## 2026-08-11 — stop making every login wait for one password
+
+login held the global session lock, then called into SQLite, then ran Argon2 while SQLite was still locked. one slow password check could make polling, another login, and unrelated database reads line up behind it.
+
+authentication copies the user and credential bytes while SQLite is locked, then releases it before Argon2 or the old SHA compatibility check runs. registration hashes before taking the write lock too. an old credential upgrade now hashes outside the lock and only updates if the stored old hash is still the one that was checked.
+
+bancho login authenticates and updates the country before touching the session list. the locked part now prunes, replaces the session, copies its token, and takes owned snapshots of online presence. stats reads and packet building happen after unlock. the HTTP result owns both its token and body, so another login can replace that session without leaving a response header pointing at freed memory.
+
+stable score tokens got the compatibility rule we chose. the current token must belong to that user. another live player's token is a `401`. an unknown token is still allowed when the password-authenticated user is online, which keeps queued submissions working after a restart. missing stays `401`; offline stays stable's `error: no` retry response.
+
+the allocation test found one more real leak while doing this: `Sessions.create` lost its allocated session object if the session-list append failed. that constructor rolls itself back now.
+
+56 tests pass in Debug and ReleaseSafe. they cover the old credential upgrade, concurrent valid/invalid auth with database reads and Bancho polling, session replacement after login, the complete score-token matrix, and every induced allocation failure in the login path.
+
 ## 2026-08-11 — dead sessions stop staying online forever
 
 the session list tracked `last_seen` but never did anything with it. logout returned an empty response without removing the player, a client that vanished stayed online forever, and every broadcast could keep growing that dead client's queue.

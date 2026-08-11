@@ -8,8 +8,89 @@ const country = @import("country.zig");
 const commands = @import("commands.zig");
 const log = @import("logutil.zig");
 
-pub const LoginResult = struct { token: []const u8, body: []u8 };
+pub const LoginResult = struct {
+    allocator: std.mem.Allocator,
+    token: []u8,
+    body: []u8,
+
+    pub fn deinit(self: *LoginResult) void {
+        self.allocator.free(self.token);
+        self.allocator.free(self.body);
+        self.* = undefined;
+    }
+};
 pub const session_idle_seconds: i64 = 300;
+
+const SnapshotUser = struct {
+    id: i32,
+    name: []u8,
+    country: [2]u8,
+    privileges: u32,
+};
+
+const SessionSnapshot = struct {
+    allocator: std.mem.Allocator,
+    user: SnapshotUser,
+    utc_offset: i8,
+    action: u8,
+    mode: u8,
+    mods: i32,
+    map_id: i32,
+    map_md5: [32]u8,
+    info_text: [96]u8,
+    info_len: usize,
+    longitude: f32,
+    latitude: f32,
+
+    fn init(allocator: std.mem.Allocator, session: *const sessions_mod.Session) !SessionSnapshot {
+        return .{
+            .allocator = allocator,
+            .user = .{
+                .id = session.user.id,
+                .name = try allocator.dupe(u8, session.user.name),
+                .country = session.user.country,
+                .privileges = session.user.privileges,
+            },
+            .utc_offset = session.utc_offset,
+            .action = session.action,
+            .mode = session.mode,
+            .mods = session.mods,
+            .map_id = session.map_id,
+            .map_md5 = session.map_md5,
+            .info_text = session.info_text,
+            .info_len = session.info_len,
+            .longitude = session.longitude,
+            .latitude = session.latitude,
+        };
+    }
+
+    fn deinit(self: *SessionSnapshot) void {
+        self.allocator.free(self.user.name);
+        self.* = undefined;
+    }
+
+    fn info(self: *const SessionSnapshot) []const u8 {
+        return self.info_text[0..self.info_len];
+    }
+};
+
+const LoginCapture = struct {
+    allocator: std.mem.Allocator,
+    token: []u8,
+    user_id: i32,
+    silence_end: i64,
+    client_privileges: u8,
+    osu_count: i32,
+    announce_count: i32,
+    sessions: std.ArrayList(SessionSnapshot) = .empty,
+
+    fn deinit(self: *LoginCapture) void {
+        for (self.sessions.items) |*snapshot| snapshot.deinit();
+        self.sessions.deinit(self.allocator);
+        self.allocator.free(self.token);
+        self.* = undefined;
+    }
+};
 
 pub fn clientPrivileges(server_privileges: u32, grant_direct: bool) u8 {
     const unrestricted: u32 = 1 << 0;
@@ -27,7 +108,7 @@ pub fn clientPrivileges(server_privileges: u32, grant_direct: bool) u8 {
     return client;
 }
 
-fn presence(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
+fn presence(w: *protocol.Writer, s: anytype) !void {
     const start = try w.begin(.user_presence);
     try w.int(i32, s.user.id);
     try w.string(s.user.name);
@@ -40,7 +121,7 @@ fn presence(w: *protocol.Writer, s: *const sessions_mod.Session) !void {
     w.finish(start);
 }
 
-fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Session) !void {
+fn stats(w: *protocol.Writer, store: *storage.Store, s: anytype) !void {
     const stats_mode = stable_score.statsMode(s.mode, s.mods) orelse s.mode;
     const current = (try store.statsForUser(s.user.id, stats_mode)) orelse domain.Stats{};
     const start = try w.begin(.user_stats);
@@ -60,25 +141,67 @@ fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Sess
     w.finish(start);
 }
 
+fn loginFailure(allocator: std.mem.Allocator, token_text: []const u8, notification: []const u8) !LoginResult {
+    var out = protocol.Writer.init(allocator);
+    defer out.deinit();
+    try out.packetInt(.user_id, -1);
+    try out.packetString(.notification, notification);
+    const token = try allocator.dupe(u8, token_text);
+    errdefer allocator.free(token);
+    return .{ .allocator = allocator, .token = token, .body = try allocator.dupe(u8, out.bytes()) };
+}
+
+fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32) !LoginCapture {
+    var user_owned = true;
+    errdefer if (user_owned) {
+        allocator.free(user.name);
+        allocator.free(user.safe_name);
+    };
+    if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
+    const session = try sessions.create(user, utc, longitude, latitude);
+    user_owned = false;
+    errdefer sessions.remove(session);
+    const token = try allocator.dupe(u8, &session.token);
+    errdefer allocator.free(token);
+    var capture: LoginCapture = .{
+        .allocator = allocator,
+        .token = token,
+        .user_id = user.id,
+        .silence_end = user.silence_end,
+        .client_privileges = clientPrivileges(user.privileges, true),
+        .osu_count = @intCast(sessions.channelCount("#osu")),
+        .announce_count = @intCast(sessions.channelCount("#announce")),
+    };
+    errdefer {
+        for (capture.sessions.items) |*snapshot| snapshot.deinit();
+        capture.sessions.deinit(allocator);
+    }
+    for (sessions.items.items) |item| {
+        const snapshot = try SessionSnapshot.init(allocator, item);
+        errdefer {
+            var owned = snapshot;
+            owned.deinit();
+        }
+        try capture.sessions.append(allocator, snapshot);
+    }
+    return capture;
+}
+
 pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !LoginResult {
-    sessions.mutex.lockUncancelable(sessions.io);
-    defer sessions.mutex.unlock(sessions.io);
-    pruneExpiredLocked(allocator, sessions);
     var lines = std.mem.splitScalar(u8, body, '\n');
     const name = std.mem.trim(u8, lines.next() orelse "", "\r");
     const password = std.mem.trim(u8, lines.next() orelse "", "\r");
     const details = std.mem.trim(u8, lines.next() orelse "", "\r");
-    var out = protocol.Writer.init(allocator);
-    errdefer out.deinit();
     if (name.len < 2 or password.len != 32) {
-        try out.packetInt(.user_id, -1);
-        try out.packetString(.notification, "Invalid login request.");
-        return .{ .token = "invalid-request", .body = try allocator.dupe(u8, out.bytes()) };
+        return loginFailure(allocator, "invalid-request", "Invalid login request.");
     }
     var user = (try store.authenticate(allocator, name, password)) orelse {
-        try out.packetInt(.user_id, -1);
-        try out.packetString(.notification, "Incorrect credentials.");
-        return .{ .token = "no", .body = try allocator.dupe(u8, out.bytes()) };
+        return loginFailure(allocator, "no", "Incorrect credentials.");
+    };
+    var user_transferred = false;
+    defer if (!user_transferred) {
+        allocator.free(user.name);
+        allocator.free(user.safe_name);
     };
     if (login_country) |value| {
         try store.updateCountry(user.id, value);
@@ -95,29 +218,57 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     const country_display: []const u8 = if (login_country) |c| &c else "??";
     std.debug.print("{s}  ► country  :{s} {s}\n", .{ log.dim, log.reset, country_display });
     std.debug.print("{s}  ► utc      :{s} {d}\n", .{ log.dim, log.reset, utc });
-    if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
-    const session = try sessions.create(user, utc, longitude, latitude);
+    sessions.mutex.lockUncancelable(sessions.io);
+    pruneExpiredLocked(allocator, sessions);
+    user_transferred = true;
+    var capture = captureLoginLocked(allocator, sessions, user, utc, longitude, latitude) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
+    sessions.mutex.unlock(sessions.io);
+    defer capture.deinit();
+    var login_complete = false;
+    defer if (!login_complete) {
+        sessions.mutex.lockUncancelable(sessions.io);
+        defer sessions.mutex.unlock(sessions.io);
+        if (sessions.byToken(capture.token)) |failed_session| removeSessionLocked(allocator, sessions, failed_session);
+    };
+
+    var out = protocol.Writer.init(allocator);
+    defer out.deinit();
     try out.packetInt(.protocol_version, 19);
-    try out.packetInt(.user_id, user.id);
-    try out.packetInt(.privileges, clientPrivileges(user.privileges, true));
-    try out.packetInt(.silence_end, @intCast(@max(0, user.silence_end - std.Io.Clock.real.now(sessions.io).toSeconds())));
-    try presence(&out, session);
-    try stats(&out, store, session);
-    try protocol.writeChannel(&out, "#osu", "general", @intCast(sessions.channelCount("#osu")));
-    try protocol.writeChannel(&out, "#announce", "updates", @intCast(sessions.channelCount("#announce")));
+    try out.packetInt(.user_id, capture.user_id);
+    try out.packetInt(.privileges, capture.client_privileges);
+    try out.packetInt(.silence_end, @intCast(@max(0, capture.silence_end - std.Io.Clock.real.now(sessions.io).toSeconds())));
+    const own_index = for (capture.sessions.items, 0..) |*snapshot, index| {
+        if (snapshot.user.id == capture.user_id) break index;
+    } else return error.LoginSessionMissing;
+    const own = &capture.sessions.items[own_index];
+    try presence(&out, own);
+    try stats(&out, store, own);
+    try protocol.writeChannel(&out, "#osu", "general", capture.osu_count);
+    try protocol.writeChannel(&out, "#announce", "updates", capture.announce_count);
     try out.packetEmpty(.channel_info_end);
-    for (sessions.items.items) |other| if (other != session) {
+    for (capture.sessions.items, 0..) |*other, index| if (index != own_index) {
         try presence(&out, other);
         try stats(&out, store, other);
     };
     var announce = protocol.Writer.init(allocator);
     defer announce.deinit();
-    try presence(&announce, session);
-    try stats(&announce, store, session);
-    try sessions.broadcast(announce.bytes(), session);
-    const result = try allocator.dupe(u8, out.bytes());
-    out.deinit();
-    return .{ .token = &session.token, .body = result };
+    try presence(&announce, own);
+    try stats(&announce, store, own);
+    {
+        sessions.mutex.lockUncancelable(sessions.io);
+        defer sessions.mutex.unlock(sessions.io);
+        if (sessions.byToken(capture.token)) |current| {
+            if (current.user.id == capture.user_id) try sessions.broadcast(announce.bytes(), current);
+        }
+    }
+    const result_token = try allocator.dupe(u8, capture.token);
+    errdefer allocator.free(result_token);
+    const result_body = try allocator.dupe(u8, out.bytes());
+    login_complete = true;
+    return .{ .allocator = allocator, .token = result_token, .body = result_body };
 }
 
 fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, bytes: []const u8) !void {

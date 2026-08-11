@@ -2,6 +2,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 
 pub const max_queue_bytes = 1024 * 1024;
+pub const ScoreTokenAuthorization = enum { exact, stale_online, foreign_live, offline, missing };
 
 pub const Session = struct {
     token: [64]u8,
@@ -66,6 +67,7 @@ pub const Sessions = struct {
     pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
         if (self.byUser(user.id)) |old| self.remove(old);
         const s = try self.allocator.create(Session);
+        errdefer self.allocator.destroy(s);
         const now = std.Io.Clock.real.now(self.io).toSeconds();
         s.* = .{ .token = undefined, .user = user, .utc_offset = utc_offset, .login_time = now, .last_seen = now, .longitude = longitude, .latitude = latitude };
         var random: [32]u8 = undefined;
@@ -77,6 +79,7 @@ pub const Sessions = struct {
     pub fn createBot(self: *Sessions, user: domain.User) !*Session {
         if (self.byUser(user.id)) |old| self.remove(old);
         const s = try self.allocator.create(Session);
+        errdefer self.allocator.destroy(s);
         s.* = .{
             .token = [_]u8{0} ** 64,
             .user = user,
@@ -100,6 +103,15 @@ pub const Sessions = struct {
     pub fn byName(self: *Sessions, name: []const u8) ?*Session {
         for (self.items.items) |s| if (std.ascii.eqlIgnoreCase(s.user.name, name)) return s;
         return null;
+    }
+    pub fn authorizeScoreToken(self: *Sessions, token: ?[]const u8, user_id: i32) ScoreTokenAuthorization {
+        const present_token = token orelse return .missing;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.byToken(present_token)) |session| {
+            return if (session.user.id == user_id) .exact else .foreign_live;
+        }
+        return if (self.byUser(user_id) != null) .stale_online else .offline;
     }
     pub fn remove(self: *Sessions, target: *Session) void {
         for (self.items.items, 0..) |s, i| if (s == target) {

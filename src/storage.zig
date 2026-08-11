@@ -12,6 +12,29 @@ pub const Store = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
 
+    const Credential = struct {
+        allocator: std.mem.Allocator,
+        user: ?domain.User,
+        password_hash: []u8,
+        password_salt: []u8,
+
+        fn deinit(self: *Credential) void {
+            if (self.user) |user| {
+                self.allocator.free(user.name);
+                self.allocator.free(user.safe_name);
+            }
+            self.allocator.free(self.password_hash);
+            self.allocator.free(self.password_salt);
+            self.* = undefined;
+        }
+
+        fn takeUser(self: *Credential) domain.User {
+            const user = self.user.?;
+            self.user = null;
+            return user;
+        }
+    };
+
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8) !Store {
         var db: ?*c.sqlite3 = null;
         if (c.sqlite3_open(path.ptr, &db) != c.SQLITE_OK) return error.DatabaseOpenFailed;
@@ -137,8 +160,6 @@ pub const Store = struct {
     }
 
     pub fn register(self: *Store, name: []const u8, email: []const u8, password_md5: []const u8) !i32 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         const safe = try domain.safeName(self.allocator, name);
         defer self.allocator.free(safe);
         var hash_buffer: [256]u8 = undefined;
@@ -149,6 +170,8 @@ pub const Store = struct {
         var random_byte: [1]u8 = undefined;
         try std.Io.randomSecure(self.io, &random_byte);
         const avatar_key: u8 = 1 + (random_byte[0] & 1);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const sql = "INSERT INTO users(name,safe_name,email,password_hash,password_salt,avatar_key) VALUES(?1,?2,?3,?4,?5,?6)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -184,39 +207,57 @@ pub const Store = struct {
     }
 
     pub fn authenticate(self: *Store, allocator: std.mem.Allocator, name: []const u8, password_md5: []const u8) !?domain.User {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         const safe = try domain.safeName(allocator, name);
         defer allocator.free(safe);
+        var credential = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            break :blk (try self.credentialForSafeName(allocator, safe)) orelse return null;
+        };
+        defer credential.deinit();
+        var upgrade_password = false;
+        if (credential.password_hash.len > 0 and credential.password_hash[0] == '$') {
+            std.crypto.pwhash.argon2.strVerify(credential.password_hash, password_md5, .{ .allocator = allocator }, self.io) catch return null;
+        } else {
+            var actual: [32]u8 = undefined;
+            var h = std.crypto.hash.sha2.Sha256.init(.{});
+            h.update(credential.password_salt);
+            h.update(password_md5);
+            h.final(&actual);
+            if (credential.password_hash.len != 32 or !std.crypto.timing_safe.eql([32]u8, actual, credential.password_hash[0..32].*)) return null;
+            upgrade_password = true;
+        }
+        const user_id = credential.user.?.id;
+        if (upgrade_password) try self.upgradePassword(user_id, password_md5, credential.password_hash);
+        return credential.takeUser();
+    }
+
+    fn credentialForSafeName(self: *Store, allocator: std.mem.Allocator, safe: []const u8) !?Credential {
         const sql = "SELECT id,name,safe_name,country,privileges,silence_end,restricted,password_hash,password_salt FROM users WHERE safe_name=?1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_text(stmt, 1, safe.ptr, @intCast(safe.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const uname = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+        errdefer allocator.free(uname);
+        const usafe = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+        errdefer allocator.free(usafe);
+        const cc = std.mem.span(c.sqlite3_column_text(stmt, 3));
+        if (cc.len != 2) return error.InvalidCountry;
         const expected: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 7));
         const expected_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
-        var upgrade_password = false;
-        if (expected_len > 0 and expected[0] == '$') {
-            std.crypto.pwhash.argon2.strVerify(expected[0..expected_len], password_md5, .{ .allocator = allocator }, self.io) catch return null;
-        } else {
-            // One-time compatibility path for databases created before Argon2id storage.
-            const salt: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 8));
-            const salt_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 8));
-            var actual: [32]u8 = undefined;
-            var h = std.crypto.hash.sha2.Sha256.init(.{});
-            h.update(salt[0..salt_len]);
-            h.update(password_md5);
-            h.final(&actual);
-            if (expected_len != 32 or !std.crypto.timing_safe.eql([32]u8, actual, expected[0..32].*)) return null;
-            upgrade_password = true;
-        }
-        const uname = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
-        const usafe = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
-        const cc = std.mem.span(c.sqlite3_column_text(stmt, 3));
-        const user: domain.User = .{ .id = c.sqlite3_column_int(stmt, 0), .name = uname, .safe_name = usafe, .country = .{ cc[0], cc[1] }, .privileges = @intCast(c.sqlite3_column_int64(stmt, 4)), .silence_end = c.sqlite3_column_int64(stmt, 5), .restricted = c.sqlite3_column_int(stmt, 6) != 0 };
-        if (upgrade_password) try self.upgradePassword(user.id, password_md5);
-        return user;
+        const expected_copy = try allocator.dupe(u8, expected[0..expected_len]);
+        errdefer allocator.free(expected_copy);
+        const salt: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 8));
+        const salt_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 8));
+        const salt_copy = try allocator.dupe(u8, salt[0..salt_len]);
+        return .{
+            .allocator = allocator,
+            .user = .{ .id = c.sqlite3_column_int(stmt, 0), .name = uname, .safe_name = usafe, .country = .{ cc[0], cc[1] }, .privileges = @intCast(c.sqlite3_column_int64(stmt, 4)), .silence_end = c.sqlite3_column_int64(stmt, 5), .restricted = c.sqlite3_column_int(stmt, 6) != 0 },
+            .password_hash = expected_copy,
+            .password_salt = salt_copy,
+        };
     }
 
     pub fn userById(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?domain.User {
@@ -281,15 +322,18 @@ pub const Store = struct {
         };
     }
 
-    fn upgradePassword(self: *Store, user_id: i32, password_md5: []const u8) !void {
+    fn upgradePassword(self: *Store, user_id: i32, password_md5: []const u8, previous_hash: []const u8) !void {
         var hash_buffer: [256]u8 = undefined;
         const hash = try std.crypto.pwhash.argon2.strHash(password_md5, .{ .allocator = self.allocator, .params = .owasp_2id }, &hash_buffer, self.io);
-        const sql = "UPDATE users SET password_hash=?1,password_salt='argon2id' WHERE id=?2";
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "UPDATE users SET password_hash=?1,password_salt='argon2id' WHERE id=?2 AND password_hash=?3";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_blob(stmt, 1, hash.ptr, @intCast(hash.len), null);
         _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        _ = c.sqlite3_bind_blob(stmt, 3, previous_hash.ptr, @intCast(previous_hash.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 

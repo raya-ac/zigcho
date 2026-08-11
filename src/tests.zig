@@ -41,6 +41,52 @@ fn clientEmptyPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket) ![
     return allocator.dupe(u8, w.bytes());
 }
 
+const LoginAllocationContext = struct {
+    store: *storage.Store,
+    body: []const u8,
+};
+
+fn loginAllocationRun(allocator: std.mem.Allocator, context: *LoginAllocationContext) !void {
+    var sessions = sessions_mod.Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    var result = try bancho.login(allocator, context.store, &sessions, context.body, null, 0, 0);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 64), result.token.len);
+}
+
+const AuthStressContext = struct {
+    store: *storage.Store,
+    failed: *std.atomic.Value(bool),
+};
+
+fn authStress(context: *AuthStressContext) void {
+    for (0..4) |_| {
+        const user = context.store.authenticate(std.heap.smp_allocator, "ari", "00000000000000000000000000000000") catch {
+            context.failed.store(true, .release);
+            return;
+        } orelse {
+            context.failed.store(true, .release);
+            return;
+        };
+        std.heap.smp_allocator.free(user.name);
+        std.heap.smp_allocator.free(user.safe_name);
+        if ((context.store.authenticate(std.heap.smp_allocator, "ari", "11111111111111111111111111111111") catch {
+            context.failed.store(true, .release);
+            return;
+        }) != null) {
+            context.failed.store(true, .release);
+            return;
+        }
+    }
+}
+
+fn countStress(context: *AuthStressContext) void {
+    for (0..100) |_| _ = context.store.serverCounts() catch {
+        context.failed.store(true, .release);
+        return;
+    };
+}
+
 fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -105,6 +151,99 @@ test "config values stay owned after the source buffer changes" {
 
     try std.testing.expectEqualStrings("final-key", config.osu_api_key);
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
+}
+
+test "legacy credentials authenticate and upgrade outside the read lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/legacy-auth.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,country,password_hash,password_salt) VALUES(1,'ari','ari','AU',x'2fdcd03d9eaa34f2a47cac2001e876ea0fa3cd26f2bbbd5ca4d64a34739d5aee',x'73616c74')");
+
+    const user = (try store.authenticate(std.testing.allocator, "ari", "00000000000000000000000000000000")).?;
+    defer std.testing.allocator.free(user.name);
+    defer std.testing.allocator.free(user.safe_name);
+    try std.testing.expectEqualStrings("ari", user.name);
+
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT password_hash,password_salt FROM users WHERE id=1", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(stmt));
+    const hash = std.mem.span(storage.c.sqlite3_column_text(stmt, 0));
+    const salt = std.mem.span(storage.c.sqlite3_column_text(stmt, 1));
+    try std.testing.expect(std.mem.startsWith(u8, hash, "$argon2id$"));
+    try std.testing.expectEqualStrings("argon2id", salt);
+}
+
+test "authentication and database reads make progress concurrently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/auth-concurrency.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    _ = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    var failed: std.atomic.Value(bool) = .init(false);
+    var context: AuthStressContext = .{ .store = &store, .failed = &failed };
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const online = try sessions.create(.{ .id = 99, .name = try std.testing.allocator.dupe(u8, "online"), .safe_name = try std.testing.allocator.dupe(u8, "online") }, 0, 0, 0);
+    const online_token = online.token;
+    const auth_thread = try std.Thread.spawn(.{}, authStress, .{&context});
+    const count_thread = try std.Thread.spawn(.{}, countStress, .{&context});
+    for (0..100) |_| {
+        const poll = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &online_token, "")).?;
+        std.testing.allocator.free(poll);
+    }
+    auth_thread.join();
+    count_thread.join();
+    try std.testing.expect(!failed.load(.acquire));
+}
+
+test "login result owns its token after the session is replaced" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/owned-login.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    var result = try bancho.login(std.testing.allocator, &store, &sessions, "ari\n00000000000000000000000000000000\n20260811|0", .{ 'A', 'U' }, 138.6, -34.9);
+    defer result.deinit();
+    const original_token = try std.testing.allocator.dupe(u8, result.token);
+    defer std.testing.allocator.free(original_token);
+
+    sessions.mutex.lockUncancelable(sessions.io);
+    const replacement_user = (try store.userById(std.testing.allocator, user_id)).?;
+    const replacement = sessions.create(replacement_user, 0, 0, 0) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
+    sessions.mutex.unlock(sessions.io);
+
+    try std.testing.expectEqualStrings(original_token, result.token);
+    try std.testing.expect(!std.mem.eql(u8, result.token, &replacement.token));
+    try std.testing.expect(result.body.len > 7);
+}
+
+test "login ownership cleans every induced allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/login-allocation.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    _ = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    var context: LoginAllocationContext = .{ .store = &store, .body = "ari\n00000000000000000000000000000000\n20260811|0" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, loginAllocationRun, .{&context});
 }
 
 test "owned stable submissions do not borrow decrypted request memory" {
@@ -292,6 +431,21 @@ test "poll by token survives session replacement and rejects the stale token" {
     const replacement_poll = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &replacement_token, "")).?;
     defer std.testing.allocator.free(replacement_poll);
     try std.testing.expectEqual(@as(usize, 0), replacement_poll.len);
+}
+
+test "stable score token authorization keeps restart compatibility without accepting a foreign live token" {
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const ari = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
+    const raya = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
+    const ari_token = ari.token;
+    const raya_token = raya.token;
+
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.exact, sessions.authorizeScoreToken(&ari_token, 1));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.foreign_live, sessions.authorizeScoreToken(&raya_token, 1));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.stale_online, sessions.authorizeScoreToken("stale-after-restart", 1));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale-after-restart", 99));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.missing, sessions.authorizeScoreToken(null, 1));
 }
 
 test "logout removes the session and tells the remaining clients" {

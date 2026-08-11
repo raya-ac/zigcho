@@ -474,8 +474,8 @@ const App = struct {
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
             const geo = if (client_ip) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
-            const result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
-            defer self.allocator.free(result.body);
+            var result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
+            defer result.deinit();
             const token_headers = [_]std.http.Header{
                 .{ .name = "cho-token", .value = result.token },
                 .{ .name = "osu-token", .value = result.token },
@@ -651,16 +651,20 @@ const App = struct {
             };
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            if (score_token_owned == null) {
-                std.log.warn("stable score rejected: reason=missing_session_token body_bytes={d}", .{body.len});
-                return respond(req, .unauthorized, "text/plain", "", &.{});
-            }
-            self.sessions.mutex.lockUncancelable(self.sessions.io);
-            const active = self.sessions.byUser(user.id) != null;
-            self.sessions.mutex.unlock(self.sessions.io);
-            if (!active) {
-                std.log.warn("stable score rejected: reason=inactive_session body_bytes={d}", .{body.len});
-                return respond(req, .ok, "text/plain", "error: no", &.{});
+            switch (self.sessions.authorizeScoreToken(score_token_owned, user.id)) {
+                .exact, .stale_online => {},
+                .missing => {
+                    std.log.warn("stable score rejected: reason=missing_session_token body_bytes={d}", .{body.len});
+                    return respond(req, .unauthorized, "text/plain", "", &.{});
+                },
+                .foreign_live => {
+                    std.log.warn("stable score rejected: reason=foreign_session_token user_id={d} body_bytes={d}", .{ user.id, body.len });
+                    return respond(req, .unauthorized, "text/plain", "", &.{});
+                },
+                .offline => {
+                    std.log.warn("stable score rejected: reason=inactive_session body_bytes={d}", .{body.len});
+                    return respond(req, .ok, "text/plain", "error: no", &.{});
+                },
             }
             if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return rejectStableScore(req, "checksum_mismatch", body.len);
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});

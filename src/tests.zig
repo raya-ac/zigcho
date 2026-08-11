@@ -1393,6 +1393,143 @@ test "stable multiplayer invitations and supporter tournament channels follow ba
     try std.testing.expectEqual(protocol.ServerPacket.channel_kick, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try disposed_channel_reader.next()).?.id))));
 }
 
+test "stable multiplayer referees can abort and reset an active round" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-match-referees.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const host = try sessions.create(try testSessionUser(std.testing.allocator, 40, "ref_host"), 0, 0, 0);
+    const guest = try sessions.create(try testSessionUser(std.testing.allocator, 41, "ref_guest"), 0, 0, 0);
+    const outsider = try sessions.create(try testSessionUser(std.testing.allocator, 42, "ref_outsider"), 0, 0, 0);
+
+    const create = try clientMatchPacket(std.testing.allocator, .create_match, host.user.id, "ref-secret");
+    defer std.testing.allocator.free(create);
+    const created = try bancho.poll(std.testing.allocator, &store, &sessions, host, create);
+    defer std.testing.allocator.free(created);
+    const join = try clientJoinMatchPacket(std.testing.allocator, 0, "ref-secret");
+    defer std.testing.allocator.free(join);
+    const joined = try bancho.poll(std.testing.allocator, &store, &sessions, guest, join);
+    defer std.testing.allocator.free(joined);
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+    const match = sessions.matchById(0).?;
+    try std.testing.expect(match.isReferee(host.user.id));
+    try std.testing.expect(!match.isReferee(guest.user.id));
+
+    const malformed_abort = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp abort now", "#multi_0", host.user.id);
+    defer std.testing.allocator.free(malformed_abort);
+    const malformed_abort_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, malformed_abort);
+    defer std.testing.allocator.free(malformed_abort_result);
+    try std.testing.expect(!match.in_progress);
+    const malformed_abort_response = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(malformed_abort_response);
+    var malformed_abort_reader: protocol.Reader = .{ .data = malformed_abort_response };
+    var malformed_abort_message: protocol.PayloadReader = .{ .data = (try malformed_abort_reader.next()).?.payload };
+    _ = try malformed_abort_message.string();
+    try std.testing.expectEqualStrings("Invalid syntax: !mp abort", try malformed_abort_message.string());
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+
+    const outsider_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp addref ref_outsider", "#multi_0", host.user.id);
+    defer std.testing.allocator.free(outsider_ref);
+    const outsider_ref_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, outsider_ref);
+    defer std.testing.allocator.free(outsider_ref_result);
+    try std.testing.expect(!match.isReferee(outsider.user.id));
+    const outsider_response = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(outsider_response);
+    var outsider_response_reader: protocol.Reader = .{ .data = outsider_response };
+    const outsider_response_packet = (try outsider_response_reader.next()).?;
+    var outsider_response_message: protocol.PayloadReader = .{ .data = outsider_response_packet.payload };
+    _ = try outsider_response_message.string();
+    try std.testing.expectEqualStrings("User must be in the current match!", try outsider_response_message.string());
+
+    const add_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp addref ref_guest", "#multi_0", host.user.id);
+    defer std.testing.allocator.free(add_ref);
+    const add_ref_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, add_ref);
+    defer std.testing.allocator.free(add_ref_result);
+    try std.testing.expect(match.isReferee(guest.user.id));
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+
+    const start = try clientEmptyPacket(std.testing.allocator, .match_start);
+    defer std.testing.allocator.free(start);
+    const start_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, start);
+    defer std.testing.allocator.free(start_result);
+    try std.testing.expect(match.in_progress);
+    for (&match.slots) |*slot| if (slot.user_id != null) {
+        slot.loaded = true;
+        slot.skipped = true;
+    };
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+
+    const abort = try clientMessagePacket(std.testing.allocator, .send_public_message, guest.user.name, "!mp abort", "#multi_0", guest.user.id);
+    defer std.testing.allocator.free(abort);
+    const abort_result = try bancho.poll(std.testing.allocator, &store, &sessions, guest, abort);
+    defer std.testing.allocator.free(abort_result);
+    try std.testing.expect(!match.in_progress);
+    for (match.slots) |slot| {
+        try std.testing.expect(!slot.loaded);
+        try std.testing.expect(!slot.skipped);
+        if (slot.user_id != null) try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.not_ready)), slot.status);
+    }
+    const host_abort = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_abort);
+    var host_abort_reader: protocol.Reader = .{ .data = host_abort };
+    try std.testing.expectEqual(protocol.ServerPacket.match_abort, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try host_abort_reader.next()).?.id))));
+    try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try host_abort_reader.next()).?.id))));
+    const abort_message_packet = (try host_abort_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.send_message, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(abort_message_packet.id))));
+    var abort_message: protocol.PayloadReader = .{ .data = abort_message_packet.payload };
+    try std.testing.expectEqualStrings("kai", try abort_message.string());
+    try std.testing.expectEqualStrings("Match aborted.", try abort_message.string());
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+
+    const remove_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp rmref ref_guest", "#multi_0", host.user.id);
+    defer std.testing.allocator.free(remove_ref);
+    const remove_ref_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, remove_ref);
+    defer std.testing.allocator.free(remove_ref_result);
+    try std.testing.expect(!match.isReferee(guest.user.id));
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+
+    const restart_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, start);
+    defer std.testing.allocator.free(restart_result);
+    try std.testing.expect(match.in_progress);
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+    const denied_abort = try bancho.poll(std.testing.allocator, &store, &sessions, guest, abort);
+    defer std.testing.allocator.free(denied_abort);
+    try std.testing.expect(match.in_progress);
+    const host_after_denied = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_after_denied);
+    try std.testing.expectEqual(@as(usize, 0), host_after_denied.len);
+
+    const abort_alias = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp a", "#multi_0", host.user.id);
+    defer std.testing.allocator.free(abort_alias);
+    const host_abort_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, abort_alias);
+    defer std.testing.allocator.free(host_abort_result);
+    try std.testing.expect(!match.in_progress);
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+
+    const add_ref_again = try bancho.poll(std.testing.allocator, &store, &sessions, host, add_ref);
+    defer std.testing.allocator.free(add_ref_again);
+    try std.testing.expect(match.isReferee(guest.user.id));
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+    const part = try clientEmptyPacket(std.testing.allocator, .part_match);
+    defer std.testing.allocator.free(part);
+    const guest_part = try bancho.poll(std.testing.allocator, &store, &sessions, guest, part);
+    defer std.testing.allocator.free(guest_part);
+    try std.testing.expect(!match.isReferee(guest.user.id));
+}
+
 test "lazer custom mod acronyms are bounded" {
     try std.testing.expect(lazer.validAcronym("RX"));
     try std.testing.expect(lazer.validAcronym("WIGGLE"));

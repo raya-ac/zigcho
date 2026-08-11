@@ -90,6 +90,7 @@ pub const Match = struct {
     map_id: i32,
     map_md5: []u8,
     slots: [16]Slot = [_]Slot{.{}} ** 16,
+    referees: [16]?i32 = [_]?i32{null} ** 16,
     host_id: i32,
     mode: u8,
     win_condition: u8,
@@ -167,6 +168,30 @@ pub const Match = struct {
             count += 1;
         };
         return count;
+    }
+
+    pub fn isReferee(self: *const Match, user_id: i32) bool {
+        if (self.host_id == user_id) return true;
+        for (self.referees) |referee| if (referee == user_id) return true;
+        return false;
+    }
+
+    pub fn addReferee(self: *Match, user_id: i32) bool {
+        if (self.isReferee(user_id) or self.slotByUser(user_id) == null) return false;
+        for (&self.referees) |*referee| if (referee.* == null) {
+            referee.* = user_id;
+            return true;
+        };
+        return false;
+    }
+
+    pub fn removeReferee(self: *Match, user_id: i32) bool {
+        if (self.host_id == user_id) return false;
+        for (&self.referees) |*referee| if (referee.* == user_id) {
+            referee.* = null;
+            return true;
+        };
+        return false;
     }
 
     pub fn updateSettings(self: *Match, data: MatchData) !void {

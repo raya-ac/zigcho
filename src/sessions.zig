@@ -144,6 +144,7 @@ pub const Sessions = struct {
     }
     pub fn remove(self: *Sessions, target: *Session) void {
         if (target.match_id) |match_id| if (self.matchById(match_id)) |match| {
+            _ = match.removeReferee(target.user.id);
             if (match.slotByUser(target.user.id)) |slot| slot.reset(.open);
             if (match.isEmpty()) {
                 match.deinit();

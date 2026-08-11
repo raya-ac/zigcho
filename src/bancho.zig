@@ -360,6 +360,115 @@ fn broadcastMatchPacketLocked(allocator: std.mem.Allocator, sessions: *sessions_
     }
 }
 
+fn sendMatchBotLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16, text: []const u8) !void {
+    var channel_buffer: [32]u8 = undefined;
+    const channel_name = try matchChannelName(&channel_buffer, match_id);
+    var message = protocol.Writer.init(allocator);
+    defer message.deinit();
+    try protocol.writeMessage(&message, "kai", text, channel_name, 3);
+    try sessions.broadcastChannel(channel_name, message.bytes(), null);
+}
+
+fn handleMultiplayerCommandLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, target_name: []const u8, text: []const u8) !bool {
+    if (text.len < 3 or !std.ascii.eqlIgnoreCase(text[0..3], "!mp") or (text.len > 3 and text[3] != ' ')) return false;
+    var channel_buffer: [32]u8 = undefined;
+    const match_id = session.match_id orelse return true;
+    const expected_channel = try matchChannelName(&channel_buffer, match_id);
+    if (!std.mem.eql(u8, target_name, expected_channel)) return true;
+    const match = sessions.matchById(match_id) orelse return true;
+
+    var tokens = std.mem.tokenizeScalar(u8, std.mem.trim(u8, text[3..], " \t"), ' ');
+    const command = tokens.next() orelse "help";
+    const is_known = std.ascii.eqlIgnoreCase(command, "help") or
+        std.ascii.eqlIgnoreCase(command, "h") or
+        std.ascii.eqlIgnoreCase(command, "abort") or
+        std.ascii.eqlIgnoreCase(command, "a") or
+        std.ascii.eqlIgnoreCase(command, "addref") or
+        std.ascii.eqlIgnoreCase(command, "rmref") or
+        std.ascii.eqlIgnoreCase(command, "listref");
+    if (!is_known) return false;
+    const tournament_manager: u32 = 1 << 10;
+    if (!match.isReferee(session.user.id) and session.user.privileges & tournament_manager == 0) return true;
+
+    if (std.ascii.eqlIgnoreCase(command, "help") or std.ascii.eqlIgnoreCase(command, "h")) {
+        try sendMatchBotLocked(allocator, sessions, match_id, "commands: !mp abort | !mp addref <name> | !mp rmref <name> | !mp listref");
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(command, "abort") or std.ascii.eqlIgnoreCase(command, "a")) {
+        if (tokens.next() != null) {
+            try sendMatchBotLocked(allocator, sessions, match_id, "Invalid syntax: !mp abort");
+            return true;
+        }
+        if (!match.in_progress) {
+            try sendMatchBotLocked(allocator, sessions, match_id, "Abort what?");
+            return true;
+        }
+        for (&match.slots) |*slot| {
+            if (slot.status == @intFromEnum(multiplayer.SlotStatus.playing)) slot.status = @intFromEnum(multiplayer.SlotStatus.not_ready);
+            slot.loaded = false;
+            slot.skipped = false;
+        }
+        match.in_progress = false;
+        var abort_event = protocol.Writer.init(allocator);
+        defer abort_event.deinit();
+        try abort_event.packetEmpty(.match_abort);
+        try broadcastMatchPacketLocked(allocator, sessions, match_id, abort_event.bytes(), false, &.{});
+        try broadcastMatchStateLocked(allocator, sessions, match, true);
+        try sendMatchBotLocked(allocator, sessions, match_id, "Match aborted.");
+        return true;
+    }
+
+    const target_name_arg = tokens.next();
+    if (std.ascii.eqlIgnoreCase(command, "listref")) {
+        if (target_name_arg != null) {
+            try sendMatchBotLocked(allocator, sessions, match_id, "Invalid syntax: !mp listref");
+            return true;
+        }
+        var refs: std.ArrayList(u8) = .empty;
+        defer refs.deinit(allocator);
+        if (sessions.byUser(match.host_id)) |host| try refs.appendSlice(allocator, host.user.name);
+        for (match.referees) |referee_id| if (referee_id) |user_id| if (user_id != match.host_id) if (sessions.byUser(user_id)) |referee| {
+            if (refs.items.len > 0) try refs.appendSlice(allocator, ", ");
+            try refs.appendSlice(allocator, referee.user.name);
+        };
+        try refs.append(allocator, '.');
+        try sendMatchBotLocked(allocator, sessions, match_id, refs.items);
+        return true;
+    }
+
+    if (target_name_arg == null or tokens.next() != null) {
+        const syntax = if (std.ascii.eqlIgnoreCase(command, "addref")) "Invalid syntax: !mp addref <name>" else "Invalid syntax: !mp rmref <name>";
+        try sendMatchBotLocked(allocator, sessions, match_id, syntax);
+        return true;
+    }
+    const target = sessions.byName(target_name_arg.?) orelse {
+        try sendMatchBotLocked(allocator, sessions, match_id, "Could not find a user by that name.");
+        return true;
+    };
+    if (std.ascii.eqlIgnoreCase(command, "addref")) {
+        if (match.slotByUser(target.user.id) == null) {
+            try sendMatchBotLocked(allocator, sessions, match_id, "User must be in the current match!");
+        } else if (!match.addReferee(target.user.id)) {
+            var response_buffer: [128]u8 = undefined;
+            try sendMatchBotLocked(allocator, sessions, match_id, try std.fmt.bufPrint(&response_buffer, "{s} is already a match referee!", .{target.user.name}));
+        } else {
+            var response_buffer: [128]u8 = undefined;
+            try sendMatchBotLocked(allocator, sessions, match_id, try std.fmt.bufPrint(&response_buffer, "{s} added to match referees.", .{target.user.name}));
+        }
+        return true;
+    }
+    if (target.user.id == match.host_id) {
+        try sendMatchBotLocked(allocator, sessions, match_id, "The host is always a referee!");
+    } else if (!match.removeReferee(target.user.id)) {
+        var response_buffer: [128]u8 = undefined;
+        try sendMatchBotLocked(allocator, sessions, match_id, try std.fmt.bufPrint(&response_buffer, "{s} is not a match referee!", .{target.user.name}));
+    } else {
+        var response_buffer: [128]u8 = undefined;
+        try sendMatchBotLocked(allocator, sessions, match_id, try std.fmt.bufPrint(&response_buffer, "{s} removed from match referees.", .{target.user.name}));
+    }
+    return true;
+}
+
 fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
     const match_id = session.match_id orelse return;
     const match = sessions.matchById(match_id) orelse {
@@ -371,6 +480,7 @@ fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessio
         return;
     };
     const next_status: multiplayer.SlotStatus = if (slot.status == @intFromEnum(multiplayer.SlotStatus.locked)) .locked else .open;
+    _ = match.removeReferee(session.user.id);
     slot.reset(next_status);
     session.match_id = null;
     if (match.isEmpty()) {
@@ -467,6 +577,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                     }
                 }
             }
+            if (packet.id == .send_public_message and try handleMultiplayerCommandLocked(allocator, sessions, session, target_name, text)) continue;
             var message = protocol.Writer.init(allocator);
             defer message.deinit();
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
@@ -705,6 +816,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                 slot.reset(.open);
             } else {
                 if (slot.user_id) |target_id| if (sessions.byUser(target_id)) |target| {
+                    _ = match.removeReferee(target_id);
                     target.match_id = null;
                     var kicked = protocol.Writer.init(allocator);
                     defer kicked.deinit();

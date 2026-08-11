@@ -25,6 +25,7 @@ pub const Session = struct {
     joined_announce: bool = false,
     in_lobby: bool = false,
     match_id: ?u16 = null,
+    tourney_matches: u64 = 0,
     longitude: f32 = 0,
     latitude: f32 = 0,
 
@@ -36,9 +37,19 @@ pub const Session = struct {
         if (std.mem.eql(u8, name, "#announce")) return self.joined_announce;
         if (std.mem.startsWith(u8, name, "#multi_")) {
             const id = std.fmt.parseInt(u16, name[7..], 10) catch return false;
-            return self.match_id == id;
+            return self.match_id == id or self.tournamentJoined(id);
         }
         return false;
+    }
+    pub fn tournamentJoined(self: *const Session, match_id: u16) bool {
+        if (match_id >= multiplayer.max_matches) return false;
+        return self.tourney_matches & (@as(u64, 1) << @intCast(match_id)) != 0;
+    }
+    pub fn joinTournament(self: *Session, match_id: u16) void {
+        if (match_id < multiplayer.max_matches) self.tourney_matches |= @as(u64, 1) << @intCast(match_id);
+    }
+    pub fn partTournament(self: *Session, match_id: u16) void {
+        if (match_id < multiplayer.max_matches) self.tourney_matches &= ~(@as(u64, 1) << @intCast(match_id));
     }
     pub fn enqueue(self: *Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
         if (self.queue_overflowed) return;

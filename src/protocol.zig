@@ -232,7 +232,11 @@ pub const Writer = struct {
 };
 
 pub fn writeMessage(w: *Writer, sender: []const u8, text: []const u8, target: []const u8, sender_id: i32) !void {
-    const start = try w.begin(.send_message);
+    return writeMessagePacket(w, .send_message, sender, text, target, sender_id);
+}
+
+pub fn writeMessagePacket(w: *Writer, packet: ServerPacket, sender: []const u8, text: []const u8, target: []const u8, sender_id: i32) !void {
+    const start = try w.begin(packet);
     try w.string(sender);
     try w.string(text);
     try w.string(target);

@@ -53,6 +53,12 @@ fn clientPayloadPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, 
     return allocator.dupe(u8, w.bytes());
 }
 
+fn clientIntPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, value: i32) ![]u8 {
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(i32, &payload, value, .little);
+    return clientPayloadPacket(allocator, id, &payload);
+}
+
 fn multiplayerFixtureData(host_id: i32, password: []const u8) multiplayer.MatchData {
     return .{
         .id = 0,
@@ -1246,6 +1252,145 @@ test "stable multiplayer match play relays load score fail skip and completion s
         try std.testing.expect(!slot.loaded);
         try std.testing.expect(!slot.skipped);
     }
+}
+
+test "stable multiplayer invitations and supporter tournament channels follow bancho" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-match-invites.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const host = try sessions.create(try testSessionUser(std.testing.allocator, 30, "invite_host"), 0, 0, 0);
+    const target = try sessions.create(try testSessionUser(std.testing.allocator, 31, "invite_target"), 0, 0, 0);
+    const regular = try sessions.create(try testSessionUser(std.testing.allocator, 32, "regular_viewer"), 0, 0, 0);
+    var supporter_user = try testSessionUser(std.testing.allocator, 33, "supporter_viewer");
+    supporter_user.privileges |= 1 << 4;
+    const supporter = try sessions.create(supporter_user, 0, 0, 0);
+    const bot = try sessions.createBot(try testSessionUser(std.testing.allocator, 3, "kai"));
+    _ = bot;
+
+    const create = try clientMatchPacket(std.testing.allocator, .create_match, host.user.id, "invite-secret");
+    defer std.testing.allocator.free(create);
+    const created = try bancho.poll(std.testing.allocator, &store, &sessions, host, create);
+    defer std.testing.allocator.free(created);
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+
+    const malformed_invite = try clientPayloadPacket(std.testing.allocator, .match_invite, &.{ 1, 2, 3 });
+    defer std.testing.allocator.free(malformed_invite);
+    const malformed_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, malformed_invite);
+    defer std.testing.allocator.free(malformed_result);
+    try std.testing.expectEqual(@as(usize, 0), malformed_result.len);
+
+    const invite = try clientIntPacket(std.testing.allocator, .match_invite, target.user.id);
+    defer std.testing.allocator.free(invite);
+    const invite_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, invite);
+    defer std.testing.allocator.free(invite_result);
+    try std.testing.expectEqual(@as(usize, 0), invite_result.len);
+    const delivered = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(delivered);
+    var delivered_reader: protocol.Reader = .{ .data = delivered };
+    const delivered_packet = (try delivered_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.match_invite, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(delivered_packet.id))));
+    var message: protocol.PayloadReader = .{ .data = delivered_packet.payload };
+    try std.testing.expectEqualStrings(host.user.name, try message.string());
+    try std.testing.expectEqualStrings("Come join my game: [osump://0/invite-secret zigcho stable room].", try message.string());
+    try std.testing.expectEqualStrings(target.user.name, try message.string());
+    try std.testing.expectEqual(host.user.id, try message.int(i32));
+    try std.testing.expectEqual(message.data.len, message.pos);
+
+    const bot_invite = try clientIntPacket(std.testing.allocator, .match_invite, 3);
+    defer std.testing.allocator.free(bot_invite);
+    const bot_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, bot_invite);
+    defer std.testing.allocator.free(bot_result);
+    var bot_reader: protocol.Reader = .{ .data = bot_result };
+    const bot_packet = (try bot_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.send_message, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(bot_packet.id))));
+    var bot_message: protocol.PayloadReader = .{ .data = bot_packet.payload };
+    try std.testing.expectEqualStrings("kai", try bot_message.string());
+    try std.testing.expectEqualStrings("I'm too busy!", try bot_message.string());
+
+    const info_request = try clientIntPacket(std.testing.allocator, .tournament_match_info, 0);
+    defer std.testing.allocator.free(info_request);
+    const regular_info = try bancho.poll(std.testing.allocator, &store, &sessions, regular, info_request);
+    defer std.testing.allocator.free(regular_info);
+    try std.testing.expectEqual(@as(usize, 0), regular_info.len);
+    const supporter_info = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, info_request);
+    defer std.testing.allocator.free(supporter_info);
+    var info_reader: protocol.Reader = .{ .data = supporter_info };
+    const info_packet = (try info_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(info_packet.id))));
+    const public_match = try multiplayer.readMatch(info_packet.payload);
+    try std.testing.expectEqualStrings("", public_match.password);
+
+    const join_tourney = try clientIntPacket(std.testing.allocator, .tournament_join_match_channel, 0);
+    defer std.testing.allocator.free(join_tourney);
+    const regular_join = try bancho.poll(std.testing.allocator, &store, &sessions, regular, join_tourney);
+    defer std.testing.allocator.free(regular_join);
+    try std.testing.expectEqual(@as(usize, 0), regular_join.len);
+    const supporter_join = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, join_tourney);
+    defer std.testing.allocator.free(supporter_join);
+    var join_reader: protocol.Reader = .{ .data = supporter_join };
+    try std.testing.expectEqual(protocol.ServerPacket.channel_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try join_reader.next()).?.id))));
+    try std.testing.expect(supporter.tournamentJoined(0));
+    try drainSession(std.testing.allocator, &store, &sessions, supporter);
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+
+    const ready = try clientEmptyPacket(std.testing.allocator, .match_ready);
+    defer std.testing.allocator.free(ready);
+    const host_ready = try bancho.poll(std.testing.allocator, &store, &sessions, host, ready);
+    defer std.testing.allocator.free(host_ready);
+    const supporter_state = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, "");
+    defer std.testing.allocator.free(supporter_state);
+    var supporter_state_reader: protocol.Reader = .{ .data = supporter_state };
+    try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try supporter_state_reader.next()).?.id))));
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+
+    const room_message = try clientMessagePacket(std.testing.allocator, .send_public_message, supporter.user.name, "tourney room message", "#multi_0", supporter.user.id);
+    defer std.testing.allocator.free(room_message);
+    const supporter_message_result = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, room_message);
+    defer std.testing.allocator.free(supporter_message_result);
+    try std.testing.expectEqual(@as(usize, 0), supporter_message_result.len);
+    const host_message = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_message);
+    var host_message_reader: protocol.Reader = .{ .data = host_message };
+    try std.testing.expectEqual(protocol.ServerPacket.send_message, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try host_message_reader.next()).?.id))));
+
+    const join_match = try clientJoinMatchPacket(std.testing.allocator, 0, "invite-secret");
+    defer std.testing.allocator.free(join_match);
+    const occupied_viewer = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, join_match);
+    defer std.testing.allocator.free(occupied_viewer);
+    var occupied_reader: protocol.Reader = .{ .data = occupied_viewer };
+    try std.testing.expectEqual(protocol.ServerPacket.match_join_fail, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try occupied_reader.next()).?.id))));
+    try std.testing.expect(supporter.tournamentJoined(0));
+
+    const leave_tourney = try clientIntPacket(std.testing.allocator, .tournament_leave_match_channel, 0);
+    defer std.testing.allocator.free(leave_tourney);
+    const supporter_leave = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, leave_tourney);
+    defer std.testing.allocator.free(supporter_leave);
+    var leave_reader: protocol.Reader = .{ .data = supporter_leave };
+    try std.testing.expectEqual(protocol.ServerPacket.channel_kick, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try leave_reader.next()).?.id))));
+    try std.testing.expect(!supporter.tournamentJoined(0));
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+
+    const rejoin_tourney = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, join_tourney);
+    defer std.testing.allocator.free(rejoin_tourney);
+    try std.testing.expect(supporter.tournamentJoined(0));
+    const part_match = try clientEmptyPacket(std.testing.allocator, .part_match);
+    defer std.testing.allocator.free(part_match);
+    const host_part = try bancho.poll(std.testing.allocator, &store, &sessions, host, part_match);
+    defer std.testing.allocator.free(host_part);
+    try std.testing.expect(sessions.matchById(0) == null);
+    try std.testing.expect(!supporter.tournamentJoined(0));
+    const disposed_channel = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, "");
+    defer std.testing.allocator.free(disposed_channel);
+    var disposed_channel_reader: protocol.Reader = .{ .data = disposed_channel };
+    _ = (try disposed_channel_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.channel_kick, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try disposed_channel_reader.next()).?.id))));
 }
 
 test "lazer custom mod acronyms are bounded" {

@@ -1,5 +1,17 @@
 # changelog
 
+## 2026-08-11 — dead sessions stop staying online forever
+
+the session list tracked `last_seen` but never did anything with it. logout returned an empty response without removing the player, a client that vanished stayed online forever, and every broadcast could keep growing that dead client's queue.
+
+logout removes the session now and broadcasts the proper `user_logout` packet with the user ID and trailing zero byte. I checked bancho.py's current behavior here too: osu! sometimes sends a bogus logout 300–800 ms after login, so logout is deliberately ignored during the first second instead of instantly kicking a fresh client.
+
+idle sessions expire after 300 seconds, matching bancho.py's `OSU_CLIENT_MIN_PING_INTERVAL`. cleanup happens under the same session lock as token polling. reconnect replacement, explicit logout, idle expiry, and queue overflow all leave the remaining clients with a logout event instead of ghost presence.
+
+outgoing queues have a hard 1 MiB ceiling now. crossing it frees the queued allocation immediately, marks that client overflowed, and removes it on its next poll through the normal restart path. later broadcasts do not start growing the queue again while it waits.
+
+51 tests pass in Debug and ReleaseSafe. the new coverage sends the real client logout packet, checks the first-second exception, forces a session past five minutes, fills a queue exactly to its cap, crosses it, and checks removal.
+
 ## 2026-08-11 — stop letting request memory outlive the request
 
 the review found three real lifetime bugs in current main, so those came before adding another surface.

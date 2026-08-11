@@ -210,5 +210,5 @@ fn sendPm(allocator: std.mem.Allocator, sender: *sessions_mod.Session, text: []c
     var msg = protocol.Writer.init(allocator);
     defer msg.deinit();
     try protocol.writeMessage(&msg, "kai", text, sender.user.name, 3);
-    try sender.queue.appendSlice(allocator, msg.bytes());
+    try sender.enqueue(allocator, msg.bytes());
 }

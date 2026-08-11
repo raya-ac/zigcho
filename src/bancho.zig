@@ -9,6 +9,7 @@ const commands = @import("commands.zig");
 const log = @import("logutil.zig");
 
 pub const LoginResult = struct { token: []const u8, body: []u8 };
+pub const session_idle_seconds: i64 = 300;
 
 pub fn clientPrivileges(server_privileges: u32, grant_direct: bool) u8 {
     const unrestricted: u32 = 1 << 0;
@@ -62,6 +63,7 @@ fn stats(w: *protocol.Writer, store: *storage.Store, s: *const sessions_mod.Sess
 pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !LoginResult {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
+    pruneExpiredLocked(allocator, sessions);
     var lines = std.mem.splitScalar(u8, body, '\n');
     const name = std.mem.trim(u8, lines.next() orelse "", "\r");
     const password = std.mem.trim(u8, lines.next() orelse "", "\r");
@@ -93,6 +95,7 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     const country_display: []const u8 = if (login_country) |c| &c else "??";
     std.debug.print("{s}  ► country  :{s} {s}\n", .{ log.dim, log.reset, country_display });
     std.debug.print("{s}  ► utc      :{s} {d}\n", .{ log.dim, log.reset, utc });
+    if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
     const session = try sessions.create(user, utc, longitude, latitude);
     try out.packetInt(.protocol_version, 19);
     try out.packetInt(.user_id, user.id);
@@ -118,11 +121,40 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
 }
 
 fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
-    try target.queue.appendSlice(allocator, bytes);
+    try target.enqueue(allocator, bytes);
 }
 
-fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
-    session.last_seen = std.Io.Clock.real.now(sessions.io).toSeconds();
+fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+    var event = protocol.Writer.init(allocator);
+    defer event.deinit();
+    const start = event.begin(.user_logout) catch return;
+    event.int(i32, session.user.id) catch return;
+    event.byte(0) catch return;
+    event.finish(start);
+    sessions.broadcast(event.bytes(), session) catch {};
+}
+
+fn removeSessionLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+    broadcastLogoutLocked(allocator, sessions, session);
+    sessions.remove(session);
+}
+
+fn pruneExpiredLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions) void {
+    const now = std.Io.Clock.real.now(sessions.io).toSeconds();
+    var index: usize = 0;
+    while (index < sessions.items.items.len) {
+        const session = sessions.items.items[index];
+        if (!session.is_bot and now - session.last_seen >= session_idle_seconds) {
+            removeSessionLocked(allocator, sessions, session);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8, logged_out: *bool) ![]u8 {
+    const now = std.Io.Clock.real.now(sessions.io).toSeconds();
+    session.last_seen = now;
     var out = protocol.Writer.init(allocator);
     defer out.deinit();
     try out.raw(session.queue.items);
@@ -217,7 +249,10 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             e.finish(st);
             try sessions.broadcast(e.bytes(), session);
         },
-        .logout => return allocator.dupe(u8, out.bytes()),
+        .logout => {
+            if (now - session.login_time >= 1) logged_out.* = true;
+            return allocator.dupe(u8, out.bytes());
+        },
         else => {},
     };
     return allocator.dupe(u8, out.bytes());
@@ -226,14 +261,25 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
 pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
-    return pollLocked(allocator, store, sessions, session, body);
+    var logged_out = false;
+    const result = try pollLocked(allocator, store, sessions, session, body, &logged_out);
+    if (logged_out) removeSessionLocked(allocator, sessions, session);
+    return result;
 }
 
 pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, token: []const u8, body: []const u8) !?[]u8 {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
+    pruneExpiredLocked(allocator, sessions);
     const session = sessions.byToken(token) orelse return null;
-    return try pollLocked(allocator, store, sessions, session, body);
+    if (session.queue_overflowed) {
+        removeSessionLocked(allocator, sessions, session);
+        return null;
+    }
+    var logged_out = false;
+    const result = try pollLocked(allocator, store, sessions, session, body, &logged_out);
+    if (logged_out) removeSessionLocked(allocator, sessions, session);
+    return result;
 }
 
 pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, mode: u8, mods: i32) !void {

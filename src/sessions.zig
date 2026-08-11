@@ -1,6 +1,8 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 
+pub const max_queue_bytes = 1024 * 1024;
+
 pub const Session = struct {
     token: [64]u8,
     user: domain.User,
@@ -12,8 +14,10 @@ pub const Session = struct {
     map_md5: [32]u8 = [_]u8{0} ** 32,
     info_text: [96]u8 = [_]u8{0} ** 96,
     info_len: usize = 0,
+    login_time: i64,
     last_seen: i64,
     queue: std.ArrayList(u8) = .empty,
+    queue_overflowed: bool = false,
     is_bot: bool = false,
     joined_osu: bool = false,
     joined_announce: bool = false,
@@ -27,6 +31,17 @@ pub const Session = struct {
         if (std.mem.eql(u8, name, "#osu")) return self.joined_osu;
         if (std.mem.eql(u8, name, "#announce")) return self.joined_announce;
         return false;
+    }
+    pub fn enqueue(self: *Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        if (self.queue_overflowed) return;
+        const next_len = std.math.add(usize, self.queue.items.len, bytes.len) catch max_queue_bytes + 1;
+        if (next_len > max_queue_bytes) {
+            self.queue.deinit(allocator);
+            self.queue = .empty;
+            self.queue_overflowed = true;
+            return;
+        }
+        try self.queue.appendSlice(allocator, bytes);
     }
 };
 
@@ -51,7 +66,8 @@ pub const Sessions = struct {
     pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
         if (self.byUser(user.id)) |old| self.remove(old);
         const s = try self.allocator.create(Session);
-        s.* = .{ .token = undefined, .user = user, .utc_offset = utc_offset, .last_seen = std.Io.Clock.real.now(self.io).toSeconds(), .longitude = longitude, .latitude = latitude };
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        s.* = .{ .token = undefined, .user = user, .utc_offset = utc_offset, .login_time = now, .last_seen = now, .longitude = longitude, .latitude = latitude };
         var random: [32]u8 = undefined;
         try std.Io.randomSecure(self.io, &random);
         _ = std.fmt.bufPrint(&s.token, "{x}", .{random}) catch unreachable;
@@ -64,6 +80,7 @@ pub const Sessions = struct {
         s.* = .{
             .token = [_]u8{0} ** 64,
             .user = user,
+            .login_time = std.math.maxInt(i64),
             .last_seen = std.math.maxInt(i64),
             .is_bot = true,
             .joined_osu = true,
@@ -95,7 +112,7 @@ pub const Sessions = struct {
         };
     }
     pub fn broadcast(self: *Sessions, bytes: []const u8, except: ?*Session) !void {
-        for (self.items.items) |s| if (s != except and !s.is_bot) try s.queue.appendSlice(self.allocator, bytes);
+        for (self.items.items) |s| if (s != except and !s.is_bot) try s.enqueue(self.allocator, bytes);
     }
     pub fn humanCount(self: *const Sessions) usize {
         var count: usize = 0;
@@ -122,7 +139,7 @@ pub const Sessions = struct {
     }
     pub fn broadcastChannel(self: *Sessions, name: []const u8, bytes: []const u8, except: ?*Session) !void {
         for (self.items.items) |s| if (s != except and !s.is_bot and s.joined(name)) {
-            try s.queue.appendSlice(self.allocator, bytes);
+            try s.enqueue(self.allocator, bytes);
         };
     }
 };

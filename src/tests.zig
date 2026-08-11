@@ -32,6 +32,15 @@ fn clientMessagePacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, 
     return allocator.dupe(u8, w.bytes());
 }
 
+fn clientEmptyPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket) ![]u8 {
+    var w = protocol.Writer.init(allocator);
+    defer w.deinit();
+    try w.int(u16, @intFromEnum(id));
+    try w.byte(0);
+    try w.int(u32, 0);
+    return allocator.dupe(u8, w.bytes());
+}
+
 fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -283,6 +292,84 @@ test "poll by token survives session replacement and rejects the stale token" {
     const replacement_poll = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &replacement_token, "")).?;
     defer std.testing.allocator.free(replacement_poll);
     try std.testing.expectEqual(@as(usize, 0), replacement_poll.len);
+}
+
+test "logout removes the session and tells the remaining clients" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/session-logout.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const leaving = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
+    const remaining = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
+    const leaving_token = leaving.token;
+    const remaining_token = remaining.token;
+    const logout = try clientEmptyPacket(std.testing.allocator, .logout);
+    defer std.testing.allocator.free(logout);
+
+    const ignored_reply = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &leaving_token, logout)).?;
+    defer std.testing.allocator.free(ignored_reply);
+    try std.testing.expect(sessions.byUser(1) != null);
+
+    leaving.login_time -= 2;
+    const reply = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &leaving_token, logout)).?;
+    defer std.testing.allocator.free(reply);
+    try std.testing.expect(sessions.byUser(1) == null);
+
+    const event = (try bancho.pollByToken(std.testing.allocator, &store, &sessions, &remaining_token, "")).?;
+    defer std.testing.allocator.free(event);
+    var reader: protocol.Reader = .{ .data = event };
+    const packet = (try reader.next()).?;
+    try std.testing.expectEqual(@as(u16, @intFromEnum(protocol.ServerPacket.user_logout)), @intFromEnum(packet.id));
+    var payload: protocol.PayloadReader = .{ .data = packet.payload };
+    try std.testing.expectEqual(@as(i32, 1), try payload.int(i32));
+    try std.testing.expectEqual(@as(u8, 0), try payload.byte());
+}
+
+test "idle sessions expire before token polling" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/session-expiry.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const expired = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
+    const token = expired.token;
+    expired.last_seen -= bancho.session_idle_seconds + 1;
+
+    try std.testing.expect((try bancho.pollByToken(std.testing.allocator, &store, &sessions, &token, "")) == null);
+    try std.testing.expect(sessions.byUser(1) == null);
+}
+
+test "a stopped client cannot grow its outgoing queue past the cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/session-queue.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const stopped = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
+    const token = stopped.token;
+    const full = try std.testing.allocator.alloc(u8, sessions_mod.max_queue_bytes);
+    defer std.testing.allocator.free(full);
+    @memset(full, 1);
+    try stopped.enqueue(std.testing.allocator, full);
+    try stopped.enqueue(std.testing.allocator, "x");
+
+    try std.testing.expect(stopped.queue_overflowed);
+    try std.testing.expectEqual(@as(usize, 0), stopped.queue.items.len);
+    try std.testing.expect((try bancho.pollByToken(std.testing.allocator, &store, &sessions, &token, "")) == null);
+    try std.testing.expect(sessions.byUser(1) == null);
 }
 
 test "joined public chat delivers once and kai answers private chat as user three" {

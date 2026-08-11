@@ -7,6 +7,30 @@ pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+pub const ClientHardware = struct {
+    osu_path_md5: []const u8,
+    adapters_md5: []const u8,
+    uninstall_md5: []const u8,
+    disk_signature_md5: []const u8,
+    client_version: []const u8,
+    running_under_wine: bool,
+    actionable: bool,
+};
+
+pub const HardwareEnforcement = struct {
+    allocator: std.mem.Allocator,
+    matched_user_ids: []i32,
+
+    pub fn deinit(self: *HardwareEnforcement) void {
+        self.allocator.free(self.matched_user_ids);
+        self.* = undefined;
+    }
+
+    pub fn restricted(self: HardwareEnforcement) bool {
+        return self.matched_user_ids.len != 0;
+    }
+};
+
 pub const Store = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
@@ -78,6 +102,8 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_010.sql"));
         }
+        if (version < 11) try self.exec(@embedFile("migration_011.sql"));
+        if (version < 12) try self.exec(@embedFile("migration_012.sql"));
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -192,6 +218,97 @@ pub const Store = struct {
             try self.exec(q);
         }
         return id;
+    }
+
+    pub fn recordClientHardware(self: *Store, user_id: i32, hardware: ClientHardware) !HardwareEnforcement {
+        var matched: std.ArrayList(i32) = .empty;
+        errdefer matched.deinit(self.allocator);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+
+        if (hardware.actionable) {
+            var match_stmt: ?*c.sqlite3_stmt = null;
+            const match_sql = "SELECT DISTINCT user_id FROM client_hardware WHERE user_id!=?1 AND user_id!=3 AND adapters_md5=?2 AND uninstall_md5=?3 AND disk_signature_md5=?4 ORDER BY user_id";
+            if (c.sqlite3_prepare_v2(self.db, match_sql, -1, &match_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(match_stmt);
+            _ = c.sqlite3_bind_int(match_stmt, 1, user_id);
+            _ = c.sqlite3_bind_text(match_stmt, 2, hardware.adapters_md5.ptr, @intCast(hardware.adapters_md5.len), null);
+            _ = c.sqlite3_bind_text(match_stmt, 3, hardware.uninstall_md5.ptr, @intCast(hardware.uninstall_md5.len), null);
+            _ = c.sqlite3_bind_text(match_stmt, 4, hardware.disk_signature_md5.ptr, @intCast(hardware.disk_signature_md5.len), null);
+            while (c.sqlite3_step(match_stmt) == c.SQLITE_ROW) try matched.append(self.allocator, c.sqlite3_column_int(match_stmt, 0));
+        }
+
+        var insert_stmt: ?*c.sqlite3_stmt = null;
+        const insert_sql = "INSERT INTO client_hardware(user_id,osu_path_md5,adapters_md5,uninstall_md5,disk_signature_md5,client_version,running_under_wine) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(user_id,osu_path_md5,adapters_md5,uninstall_md5,disk_signature_md5) DO UPDATE SET client_version=excluded.client_version,running_under_wine=excluded.running_under_wine,last_seen=unixepoch(),occurrences=occurrences+1";
+        if (c.sqlite3_prepare_v2(self.db, insert_sql, -1, &insert_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(insert_stmt);
+        _ = c.sqlite3_bind_int(insert_stmt, 1, user_id);
+        _ = c.sqlite3_bind_text(insert_stmt, 2, hardware.osu_path_md5.ptr, @intCast(hardware.osu_path_md5.len), null);
+        _ = c.sqlite3_bind_text(insert_stmt, 3, hardware.adapters_md5.ptr, @intCast(hardware.adapters_md5.len), null);
+        _ = c.sqlite3_bind_text(insert_stmt, 4, hardware.uninstall_md5.ptr, @intCast(hardware.uninstall_md5.len), null);
+        _ = c.sqlite3_bind_text(insert_stmt, 5, hardware.disk_signature_md5.ptr, @intCast(hardware.disk_signature_md5.len), null);
+        _ = c.sqlite3_bind_text(insert_stmt, 6, hardware.client_version.ptr, @intCast(hardware.client_version.len), null);
+        _ = c.sqlite3_bind_int(insert_stmt, 7, @intFromBool(hardware.running_under_wine));
+        if (c.sqlite3_step(insert_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+
+        if (matched.items.len != 0) {
+            if (try self.restrictUserLocked(user_id)) try self.insertRestrictionAuditLocked(user_id, matched.items[0], "multiaccount_hwid_exact");
+            for (matched.items) |matched_user_id| {
+                if (try self.restrictUserLocked(matched_user_id)) try self.insertRestrictionAuditLocked(matched_user_id, user_id, "multiaccount_hwid_exact");
+            }
+        }
+
+        const owned_matches = try matched.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned_matches);
+        try self.exec("COMMIT");
+        return .{ .allocator = self.allocator, .matched_user_ids = owned_matches };
+    }
+
+    pub fn restrictForClientFlag(self: *Store, user_id: i32, flags: u32) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        const changed = try self.restrictUserLocked(user_id);
+        if (changed) {
+            var detail_buf: [64]u8 = undefined;
+            const detail = try std.fmt.bufPrint(&detail_buf, "stable_lastfm_hq flags:{d}", .{flags});
+            try self.insertAuditLocked(3, "account.restrict", user_id, detail);
+        }
+        try self.exec("COMMIT");
+        return changed;
+    }
+
+    fn restrictUserLocked(self: *Store, user_id: i32) !bool {
+        if (user_id == 3) return false;
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE users SET restricted=1 WHERE id=?1 AND id!=3 AND restricted=0", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
+    fn insertRestrictionAuditLocked(self: *Store, target_user_id: i32, matched_user_id: i32, reason: []const u8) !void {
+        var detail_buf: [128]u8 = undefined;
+        const detail = try std.fmt.bufPrint(&detail_buf, "{s} matched_user:{d}", .{ reason, matched_user_id });
+        try self.insertAuditLocked(3, "account.restrict", target_user_id, detail);
+    }
+
+    fn insertAuditLocked(self: *Store, actor_id: i32, action: []const u8, target_user_id: i32, detail: []const u8) !void {
+        var target_buf: [24]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "user:{d}", .{target_user_id});
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO audit_log(actor_id,action,target,detail) VALUES(?1,?2,?3,?4)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, actor_id);
+        _ = c.sqlite3_bind_text(stmt, 2, action.ptr, @intCast(action.len), null);
+        _ = c.sqlite3_bind_text(stmt, 3, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, detail.ptr, @intCast(detail.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
     pub const RegistrationConflicts = struct { username: bool, email: bool };

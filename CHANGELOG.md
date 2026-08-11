@@ -1,5 +1,15 @@
 # changelog
 
+## 2026-08-11 — stable remembers the machine and kai looks like staff
+
+zigcho now reads stable's complete login fingerprint instead of throwing it away. it stores the four hashes, client build, Wine state, first and last seen times, and repeat count. the raw adapter list is validated and then discarded.
+
+automatic multiaccount restrictions need an exact adapter, uninstall, and disk match against the same other account. one matching value is only evidence. common empty and zero hashes cannot trigger it either. an exact match restricts both accounts atomically, records who matched who, disconnects the older live session, and gives the new login stable's restricted packet without announcing that player to everyone else.
+
+the hq!osu assembly and file flags restrict and disconnect. the leftover registry flag is logged without the old random restriction behavior.
+
+kai at user ID 3 now has durable admin and developer privileges. its real Stable presence packet carries both colour bits. 77 tests pass in Debug, ReleaseSafe, and the pinned x86 Linux build.
+
 ## 2026-08-11 — stop making every login wait for one password
 
 login held the global session lock, then called into SQLite, then ran Argon2 while SQLite was still locked. one slow password check could make polling, another login, and unrelated database reads line up behind it.

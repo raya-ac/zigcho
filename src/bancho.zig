@@ -20,6 +20,88 @@ pub const LoginResult = struct {
         self.* = undefined;
     }
 };
+
+pub const StableLoginDetails = struct {
+    osu_version: []const u8,
+    utc_offset: i8,
+    display_city: bool,
+    pm_private: bool,
+    hardware: storage.ClientHardware,
+};
+
+fn isMd5(value: []const u8) bool {
+    if (value.len != 32) return false;
+    for (value) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
+}
+
+fn isValidClientVersion(value: []const u8) bool {
+    if (value.len < 9 or value[0] != 'b') return false;
+    for (value[1..9]) |char| if (!std.ascii.isDigit(char)) return false;
+    var remainder = value[9..];
+    if (remainder.len >= 2 and remainder[0] == '.' and std.ascii.isDigit(remainder[1])) remainder = remainder[2..];
+    return remainder.len == 0 or
+        std.mem.eql(u8, remainder, "beta") or
+        std.mem.eql(u8, remainder, "cuttingedge") or
+        std.mem.eql(u8, remainder, "dev") or
+        std.mem.eql(u8, remainder, "tourney");
+}
+
+fn commonHardwareHash(value: []const u8) bool {
+    return std.mem.eql(u8, value, "00000000000000000000000000000000") or
+        std.ascii.eqlIgnoreCase(value, "d41d8cd98f00b204e9800998ecf8427e") or
+        std.ascii.eqlIgnoreCase(value, "cfcd208495d565ef66e7dff9f98764da");
+}
+
+pub fn parseStableLoginDetails(details: []const u8) !StableLoginDetails {
+    var fields = std.mem.splitScalar(u8, details, '|');
+    const osu_version = fields.next() orelse return error.InvalidLoginDetails;
+    const utc_text = fields.next() orelse return error.InvalidLoginDetails;
+    const display_city = fields.next() orelse return error.InvalidLoginDetails;
+    const client_hashes = fields.next() orelse return error.InvalidLoginDetails;
+    const pm_private = fields.next() orelse return error.InvalidLoginDetails;
+    if (fields.next() != null or !isValidClientVersion(osu_version)) return error.InvalidLoginDetails;
+    const utc_offset = std.fmt.parseInt(i8, utc_text, 10) catch return error.InvalidLoginDetails;
+    if (utc_offset < -24 or utc_offset > 24) return error.InvalidLoginDetails;
+    if ((!std.mem.eql(u8, display_city, "0") and !std.mem.eql(u8, display_city, "1")) or
+        (!std.mem.eql(u8, pm_private, "0") and !std.mem.eql(u8, pm_private, "1"))) return error.InvalidLoginDetails;
+    if (client_hashes.len < 2 or client_hashes[client_hashes.len - 1] != ':') return error.InvalidLoginDetails;
+
+    var hashes = std.mem.splitScalar(u8, client_hashes[0 .. client_hashes.len - 1], ':');
+    const osu_path_md5 = hashes.next() orelse return error.InvalidLoginDetails;
+    const adapters_str = hashes.next() orelse return error.InvalidLoginDetails;
+    const adapters_md5 = hashes.next() orelse return error.InvalidLoginDetails;
+    const uninstall_md5 = hashes.next() orelse return error.InvalidLoginDetails;
+    const disk_signature_md5 = hashes.next() orelse return error.InvalidLoginDetails;
+    if (hashes.next() != null or !isMd5(osu_path_md5) or !isMd5(adapters_md5) or !isMd5(uninstall_md5) or !isMd5(disk_signature_md5)) return error.InvalidLoginDetails;
+
+    const running_under_wine = std.mem.eql(u8, adapters_str, "runningunderwine");
+    if (!running_under_wine) {
+        if (adapters_str.len < 2 or adapters_str[adapters_str.len - 1] != '.') return error.InvalidLoginDetails;
+        var adapters = std.mem.splitScalar(u8, adapters_str[0 .. adapters_str.len - 1], '.');
+        var any_adapter = false;
+        while (adapters.next()) |adapter| if (adapter.len != 0) {
+            any_adapter = true;
+        };
+        if (!any_adapter) return error.InvalidLoginDetails;
+    }
+
+    return .{
+        .osu_version = osu_version,
+        .utc_offset = utc_offset,
+        .display_city = std.mem.eql(u8, display_city, "1"),
+        .pm_private = std.mem.eql(u8, pm_private, "1"),
+        .hardware = .{
+            .osu_path_md5 = osu_path_md5,
+            .adapters_md5 = adapters_md5,
+            .uninstall_md5 = uninstall_md5,
+            .disk_signature_md5 = disk_signature_md5,
+            .client_version = osu_version,
+            .running_under_wine = running_under_wine,
+            .actionable = !commonHardwareHash(adapters_md5) and !commonHardwareHash(uninstall_md5) and !commonHardwareHash(disk_signature_md5),
+        },
+    };
+}
 pub const session_idle_seconds: i64 = 300;
 
 const SnapshotUser = struct {
@@ -27,6 +109,7 @@ const SnapshotUser = struct {
     name: []u8,
     country: [2]u8,
     privileges: u32,
+    restricted: bool,
 };
 
 const SessionSnapshot = struct {
@@ -51,6 +134,7 @@ const SessionSnapshot = struct {
                 .name = try allocator.dupe(u8, session.user.name),
                 .country = session.user.country,
                 .privileges = session.user.privileges,
+                .restricted = session.user.restricted,
             },
             .utc_offset = session.utc_offset,
             .action = session.action,
@@ -83,6 +167,7 @@ const LoginCapture = struct {
     client_privileges: u8,
     osu_count: i32,
     announce_count: i32,
+    restricted: bool,
     sessions: std.ArrayList(SessionSnapshot) = .empty,
 
     fn deinit(self: *LoginCapture) void {
@@ -115,7 +200,8 @@ fn presence(w: *protocol.Writer, s: anytype) !void {
     try w.string(s.user.name);
     try w.byte(@intCast(@as(i16, s.utc_offset) + 24));
     try w.byte(country.numeric(&s.user.country));
-    try w.byte(clientPrivileges(s.user.privileges, false) | (@as(u8, s.mode) << 5));
+    const visible_privileges = if (s.user.restricted) s.user.privileges & ~@as(u32, 1) else s.user.privileges;
+    try w.byte(clientPrivileges(visible_privileges, false) | (@as(u8, s.mode) << 5));
     try w.float(f32, s.longitude);
     try w.float(f32, s.latitude);
     try w.int(i32, 0);
@@ -152,12 +238,13 @@ fn loginFailure(allocator: std.mem.Allocator, token_text: []const u8, notificati
     return .{ .allocator = allocator, .token = token, .body = try allocator.dupe(u8, out.bytes()) };
 }
 
-fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32) !LoginCapture {
+fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, matched_user_ids: []const i32) !LoginCapture {
     var user_owned = true;
     errdefer if (user_owned) {
         allocator.free(user.name);
         allocator.free(user.safe_name);
     };
+    for (matched_user_ids) |matched_user_id| if (sessions.byUser(matched_user_id)) |matched| removeSessionLocked(allocator, sessions, matched);
     if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
     const session = try sessions.create(user, utc, longitude, latitude);
     user_owned = false;
@@ -169,9 +256,10 @@ fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sess
         .token = token,
         .user_id = user.id,
         .silence_end = user.silence_end,
-        .client_privileges = clientPrivileges(user.privileges, true),
+        .client_privileges = clientPrivileges(if (user.restricted) user.privileges & ~@as(u32, 1) else user.privileges, true),
         .osu_count = @intCast(sessions.channelCount("#osu")),
         .announce_count = @intCast(sessions.channelCount("#announce")),
+        .restricted = user.restricted,
     };
     errdefer {
         for (capture.sessions.items) |*snapshot| snapshot.deinit();
@@ -196,6 +284,9 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     if (name.len < 2 or password.len != 32) {
         return loginFailure(allocator, "invalid-request", "Invalid login request.");
     }
+    const parsed = parseStableLoginDetails(details) catch {
+        return loginFailure(allocator, "invalid-request", "Please restart osu! and try again.");
+    };
     var user = (try store.authenticate(allocator, name, password)) orelse {
         return loginFailure(allocator, "no", "Incorrect credentials.");
     };
@@ -208,21 +299,24 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         try store.updateCountry(user.id, value);
         user.country = value;
     }
-    var utc: i8 = 0;
-    var detail_it = std.mem.splitScalar(u8, details, '|');
-    _ = detail_it.next();
-    if (detail_it.next()) |offset| utc = std.fmt.parseInt(i8, offset, 10) catch 0;
+    var enforcement = try store.recordClientHardware(user.id, parsed.hardware);
+    defer enforcement.deinit();
+    if (enforcement.restricted()) {
+        user.restricted = true;
+        std.log.warn("stable login restricted exact hardware match: user_id={d} matches={any}", .{ user.id, enforcement.matched_user_ids });
+    }
     std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}  ► user_id  :{s} {d}\n", .{ log.dim, log.reset, user.id });
     const country_display: []const u8 = if (login_country) |c| &c else "??";
     std.debug.print("{s}  ► country  :{s} {s}\n", .{ log.dim, log.reset, country_display });
-    std.debug.print("{s}  ► utc      :{s} {d}\n", .{ log.dim, log.reset, utc });
+    std.debug.print("{s}  ► utc      :{s} {d}\n", .{ log.dim, log.reset, parsed.utc_offset });
+    std.debug.print("{s}  ► client   :{s} {s} ({s})\n", .{ log.dim, log.reset, parsed.osu_version, if (parsed.hardware.running_under_wine) "wine" else "win32" });
     sessions.mutex.lockUncancelable(sessions.io);
     pruneExpiredLocked(allocator, sessions);
     user_transferred = true;
-    var capture = captureLoginLocked(allocator, sessions, user, utc, longitude, latitude) catch |err| {
+    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, enforcement.matched_user_ids) catch |err| {
         sessions.mutex.unlock(sessions.io);
         return err;
     };
@@ -250,15 +344,19 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     try protocol.writeChannel(&out, "#osu", "general", capture.osu_count);
     try protocol.writeChannel(&out, "#announce", "updates", capture.announce_count);
     try out.packetEmpty(.channel_info_end);
-    for (capture.sessions.items, 0..) |*other, index| if (index != own_index) {
+    for (capture.sessions.items, 0..) |*other, index| if (index != own_index and !other.user.restricted) {
         try presence(&out, other);
         try stats(&out, store, other);
     };
+    if (capture.restricted) {
+        try out.packetEmpty(.account_restricted);
+        try protocol.writeMessage(&out, "kai", "Your account is restricted. If this was a mistake, contact staff so we can review it.", own.user.name, 3);
+    }
     var announce = protocol.Writer.init(allocator);
     defer announce.deinit();
-    try presence(&announce, own);
-    try stats(&announce, store, own);
-    {
+    if (!capture.restricted) {
+        try presence(&announce, own);
+        try stats(&announce, store, own);
         sessions.mutex.lockUncancelable(sessions.io);
         defer sessions.mutex.unlock(sessions.io);
         if (sessions.byToken(capture.token)) |current| {
@@ -1209,6 +1307,13 @@ pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions
     const result = try pollLocked(allocator, store, sessions, session, body, &logged_out);
     if (logged_out) removeSessionLocked(allocator, sessions, session);
     return result;
+}
+
+pub fn disconnectRestrictedUser(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32) void {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.byUser(user_id) orelse return;
+    if (!session.is_bot) removeSessionLocked(allocator, sessions, session);
 }
 
 pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, mode: u8, mods: i32) !void {

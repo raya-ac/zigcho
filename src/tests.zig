@@ -20,6 +20,9 @@ const config_mod = @import("config.zig");
 const multiplayer = @import("multiplayer.zig");
 const registration = @import("registration.zig");
 
+const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
+const ari_stable_login = "ari\n00000000000000000000000000000000\n" ++ stable_login_details;
+
 fn clientMessagePacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, sender: []const u8, message: []const u8, target: []const u8, sender_id: i32) ![]u8 {
     var w = protocol.Writer.init(allocator);
     defer w.deinit();
@@ -364,7 +367,7 @@ test "login result owns its token after the session is replaced" {
     const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    var result = try bancho.login(std.testing.allocator, &store, &sessions, "ari\n00000000000000000000000000000000\n20260811|0", .{ 'A', 'U' }, 138.6, -34.9);
+    var result = try bancho.login(std.testing.allocator, &store, &sessions, ari_stable_login, .{ 'A', 'U' }, 138.6, -34.9);
     defer result.deinit();
     const original_token = try std.testing.allocator.dupe(u8, result.token);
     defer std.testing.allocator.free(original_token);
@@ -391,8 +394,166 @@ test "login ownership cleans every induced allocation failure" {
     defer store.close();
     try store.migrate();
     _ = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
-    var context: LoginAllocationContext = .{ .store = &store, .body = "ari\n00000000000000000000000000000000\n20260811|0" };
+    var context: LoginAllocationContext = .{ .store = &store, .body = ari_stable_login };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, loginAllocationRun, .{&context});
+}
+
+test "stable login details require the complete client hardware contract" {
+    const parsed = try bancho.parseStableLoginDetails(stable_login_details);
+    try std.testing.expectEqualStrings("b20260811", parsed.osu_version);
+    try std.testing.expectEqual(@as(i8, 0), parsed.utc_offset);
+    try std.testing.expect(!parsed.display_city);
+    try std.testing.expect(!parsed.pm_private);
+    try std.testing.expect(!parsed.hardware.running_under_wine);
+    try std.testing.expect(parsed.hardware.actionable);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", parsed.hardware.osu_path_md5);
+
+    const wine = try bancho.parseStableLoginDetails("b20260811cuttingedge|-5|1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:runningunderwine:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|1");
+    try std.testing.expect(wine.hardware.running_under_wine);
+    try std.testing.expect(wine.display_city);
+    try std.testing.expect(wine.pm_private);
+    try std.testing.expectEqual(@as(i8, -5), wine.utc_offset);
+
+    const common_disk = try bancho.parseStableLoginDetails("b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:cfcd208495d565ef66e7dff9f98764da:|0");
+    try std.testing.expect(!common_disk.hardware.actionable);
+    try std.testing.expectError(error.InvalidLoginDetails, bancho.parseStableLoginDetails("b20260811|0"));
+    try std.testing.expectError(error.InvalidLoginDetails, bancho.parseStableLoginDetails("20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0"));
+    try std.testing.expectError(error.InvalidLoginDetails, bancho.parseStableLoginDetails("b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0"));
+    try std.testing.expectError(error.InvalidLoginDetails, bancho.parseStableLoginDetails("b20260811|0|0|short:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0"));
+}
+
+test "exact stable hardware matches restrict both accounts without partial false positives" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/hardware.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
+            "(40,'first','first',x'00',x'00'),(41,'second','second',x'00',x'00')," ++
+            "(42,'common-one','common_one',x'00',x'00'),(43,'common-two','common_two',x'00',x'00')",
+    );
+    const exact: storage.ClientHardware = .{
+        .osu_path_md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .adapters_md5 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .uninstall_md5 = "cccccccccccccccccccccccccccccccc",
+        .disk_signature_md5 = "dddddddddddddddddddddddddddddddd",
+        .client_version = "b20260811",
+        .running_under_wine = false,
+        .actionable = true,
+    };
+    var first = try store.recordClientHardware(40, exact);
+    first.deinit();
+    var first_again = try store.recordClientHardware(40, exact);
+    first_again.deinit();
+
+    const partial: storage.ClientHardware = .{
+        .osu_path_md5 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        .adapters_md5 = exact.adapters_md5,
+        .uninstall_md5 = "ffffffffffffffffffffffffffffffff",
+        .disk_signature_md5 = "11111111111111111111111111111111",
+        .client_version = exact.client_version,
+        .running_under_wine = false,
+        .actionable = true,
+    };
+    var partial_result = try store.recordClientHardware(41, partial);
+    defer partial_result.deinit();
+    try std.testing.expect(!partial_result.restricted());
+    var second_exact = try store.recordClientHardware(41, exact);
+    defer second_exact.deinit();
+    try std.testing.expectEqualSlices(i32, &.{40}, second_exact.matched_user_ids);
+
+    const first_user = (try store.userById(std.testing.allocator, 40)).?;
+    defer std.testing.allocator.free(first_user.name);
+    defer std.testing.allocator.free(first_user.safe_name);
+    const second_user = (try store.userById(std.testing.allocator, 41)).?;
+    defer std.testing.allocator.free(second_user.name);
+    defer std.testing.allocator.free(second_user.safe_name);
+    try std.testing.expect(first_user.restricted);
+    try std.testing.expect(second_user.restricted);
+
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT occurrences FROM client_hardware WHERE user_id=40 AND adapters_md5='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(stmt, 0));
+
+    const common: storage.ClientHardware = .{
+        .osu_path_md5 = exact.osu_path_md5,
+        .adapters_md5 = exact.adapters_md5,
+        .uninstall_md5 = exact.uninstall_md5,
+        .disk_signature_md5 = "cfcd208495d565ef66e7dff9f98764da",
+        .client_version = exact.client_version,
+        .running_under_wine = false,
+        .actionable = false,
+    };
+    var common_one = try store.recordClientHardware(42, common);
+    common_one.deinit();
+    var common_two = try store.recordClientHardware(43, common);
+    defer common_two.deinit();
+    try std.testing.expect(!common_two.restricted());
+}
+
+test "an exact hardware login restricts both accounts and disconnects the matched session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/hardware-login.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const first_id = try store.register("first", "first@example.invalid", "00000000000000000000000000000000");
+    const second_id = try store.register("second", "second@example.invalid", "00000000000000000000000000000000");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const first_body = "first\n00000000000000000000000000000000\n" ++ stable_login_details;
+    var first_login = try bancho.login(std.testing.allocator, &store, &sessions, first_body, .{ 'A', 'U' }, 0, 0);
+    defer first_login.deinit();
+    try std.testing.expect(sessions.byUser(first_id) != null);
+
+    const second_body = "second\n00000000000000000000000000000000\n" ++ stable_login_details;
+    var second_login = try bancho.login(std.testing.allocator, &store, &sessions, second_body, .{ 'A', 'U' }, 0, 0);
+    defer second_login.deinit();
+    try std.testing.expect(sessions.byUser(first_id) == null);
+    try std.testing.expect(sessions.byUser(second_id).?.user.restricted);
+    try expectPacket(second_login.body, .account_restricted);
+
+    const first_user = (try store.userById(std.testing.allocator, first_id)).?;
+    defer std.testing.allocator.free(first_user.name);
+    defer std.testing.allocator.free(first_user.safe_name);
+    try std.testing.expect(first_user.restricted);
+}
+
+test "high confidence stable client flags restrict once while registry evidence stays audit only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/client-flags.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(50,'hq','hq',x'00',x'00'),(51,'registry','registry',x'00',x'00')");
+    try store.recordLastFmFlag(51, @as(u32, 1) << 19);
+    const registry_user = (try store.userById(std.testing.allocator, 51)).?;
+    defer std.testing.allocator.free(registry_user.name);
+    defer std.testing.allocator.free(registry_user.safe_name);
+    try std.testing.expect(!registry_user.restricted);
+
+    const hq_flags = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
+    try std.testing.expect(try store.restrictForClientFlag(50, hq_flags));
+    try std.testing.expect(!try store.restrictForClientFlag(50, hq_flags));
+    const hq_user = (try store.userById(std.testing.allocator, 50)).?;
+    defer std.testing.allocator.free(hq_user.name);
+    defer std.testing.allocator.free(hq_user.safe_name);
+    try std.testing.expect(hq_user.restricted);
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.create(try testSessionUser(std.testing.allocator, 50, "hq"), 0, 0, 0);
+    bancho.disconnectRestrictedUser(std.testing.allocator, &sessions, 50);
+    try std.testing.expect(sessions.byUser(50) == null);
 }
 
 test "owned stable submissions do not borrow decrypted request memory" {
@@ -730,6 +891,35 @@ test "server roles map to stable privileges and login always grants supporter" {
     try std.testing.expectEqual(@as(u8, 5), bancho.clientPrivileges(normal, true));
     try std.testing.expectEqual(@as(u8, 5), bancho.clientPrivileges(qat, true));
     try std.testing.expectEqual(@as(u8, 7), bancho.clientPrivileges(gmt, true));
+}
+
+test "kai presence carries the stable owner and developer colour bits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/kai-colour.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    _ = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
+    var result = try bancho.login(std.testing.allocator, &store, &sessions, ari_stable_login, .{ 'A', 'U' }, 0, 0);
+    defer result.deinit();
+
+    var reader: protocol.Reader = .{ .data = result.body };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.user_presence)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        if (try payload.int(i32) != 3) continue;
+        try std.testing.expectEqualStrings("kai", try payload.string());
+        _ = try payload.byte();
+        _ = try payload.byte();
+        try std.testing.expectEqual(@as(u8, 25), try payload.byte());
+        return;
+    }
+    return error.MissingKaiPresence;
 }
 
 test "lazer trailing slashes use the same API route" {
@@ -2373,6 +2563,9 @@ test "kai migration preserves an account already using id three" {
     defer std.testing.allocator.free(bot.name);
     defer std.testing.allocator.free(bot.safe_name);
     try std.testing.expectEqualStrings("kai", bot.name);
+    try std.testing.expect(bot.privileges & (1 << 13) != 0);
+    try std.testing.expect(bot.privileges & (1 << 14) != 0);
+    try std.testing.expectEqual(@as(u8, 25), bancho.clientPrivileges(bot.privileges, false));
     const preserved = (try store.userById(std.testing.allocator, 4)).?;
     defer std.testing.allocator.free(preserved.name);
     defer std.testing.allocator.free(preserved.safe_name);

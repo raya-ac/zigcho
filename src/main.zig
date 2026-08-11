@@ -521,7 +521,12 @@ const App = struct {
                 try self.store.recordLastFmFlag(user.id, flags);
             }
             std.log.info("lastfm: user_id={d} action={s} flags={d} b={s}", .{ user.id, action, flags, beatmap_or_flag });
-            const hq_or_registry: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18) | (@as(u32, 1) << 19);
+            const hq_flags: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
+            if (flags & hq_flags != 0) {
+                _ = try self.store.restrictForClientFlag(user.id, flags);
+                bancho.disconnectRestrictedUser(self.allocator, &self.sessions, user.id);
+            }
+            const hq_or_registry: u32 = hq_flags | (@as(u32, 1) << 19);
             return respond(req, .ok, "text/plain", if (flags & hq_or_registry != 0) "-3" else "", &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-rate.php") and req.head.method == .GET) {

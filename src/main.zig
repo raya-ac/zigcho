@@ -234,6 +234,28 @@ const App = struct {
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"debug alpha\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
         }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v1/rankings")) {
+            const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
+            const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+            if ((mode > 6 and mode != 8) or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid rankings\"}", &.{});
+            const listing = try self.store.siteRankings(self.allocator, mode, offset);
+            defer self.allocator.free(listing);
+            return respond(req, .ok, "application/json", listing, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/users/")) {
+            const user_id = std.fmt.parseInt(i32, path["/api/v1/users/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user\"}", &.{});
+            if (user_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user\"}", &.{});
+            const profile = (try self.store.siteProfile(self.allocator, user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            defer self.allocator.free(profile);
+            return respond(req, .ok, "application/json", profile, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/beatmapsets/")) {
+            const set_id = std.fmt.parseInt(i32, path["/api/v1/beatmapsets/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+            if (set_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+            const set = (try self.store.lazerBeatmapSet(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
+            defer self.allocator.free(set);
+            return respond(req, .ok, "application/json", set, &.{});
+        }
         if (req.head.method == .GET and (isAvatarHost(host_owned) or std.mem.startsWith(u8, path, "/avatars/") or std.mem.startsWith(u8, path, "/avatar/"))) {
             if (avatarUserId(path)) |user_id| {
                 const key = (try self.store.avatarForUser(user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"avatar not found\"}", &.{});
@@ -692,10 +714,11 @@ const App = struct {
             defer self.allocator.free(replay);
             return respond(req, .ok, "application/octet-stream", replay, &.{});
         }
-        if (std.mem.eql(u8, path, "/")) {
+        const site_page = std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/rankings") or std.mem.startsWith(u8, path, "/u/") or std.mem.startsWith(u8, path, "/beatmapsets/");
+        if (req.head.method == .GET and site_page) {
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
-                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
             return respond(req, .ok, "text/html; charset=utf-8", status_page, &headers);

@@ -866,6 +866,82 @@ pub const Store = struct {
         };
     }
 
+    pub fn siteRankings(self: *Store, allocator: std.mem.Allocator, mode: u8, offset: u16) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT row_number() OVER(ORDER BY s.pp DESC,u.id ASC),u.id,u.name,u.country,u.privileges,s.pp,s.accuracy,s.plays,s.ranked_score,s.total_score,s.max_combo FROM stats s JOIN users u ON u.id=s.user_id WHERE s.mode=?1 AND u.id!=3 AND u.restricted=0 AND s.plays>0 ORDER BY s.pp DESC,u.id ASC LIMIT 100 OFFSET ?2";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, mode);
+        _ = c.sqlite3_bind_int(stmt, 2, offset);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"mode\":{d},\"offset\":{d},\"players\":[", .{ mode, offset });
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{{\"rank\":{d},\"id\":{d},\"name\":", .{ c.sqlite3_column_int(stmt, 0), c.sqlite3_column_int(stmt, 1) });
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+            try output.writer.writeAll(",\"country\":");
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+            try output.writer.print(",\"privileges\":{d},\"pp\":{d},\"accuracy\":{d},\"plays\":{d},\"ranked_score\":{d},\"total_score\":{d},\"max_combo\":{d}}}", .{ c.sqlite3_column_int64(stmt, 4), c.sqlite3_column_int(stmt, 5), c.sqlite3_column_double(stmt, 6), c.sqlite3_column_int(stmt, 7), c.sqlite3_column_int64(stmt, 8), c.sqlite3_column_int64(stmt, 9), c.sqlite3_column_int(stmt, 10) });
+        }
+        try output.writer.writeAll("]}");
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var user: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT id,name,country,privileges,created_at FROM users WHERE id=?1 AND id!=3 AND restricted=0", -1, &user, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(user);
+        _ = c.sqlite3_bind_int(user, 1, user_id);
+        if (c.sqlite3_step(user) != c.SQLITE_ROW) return null;
+        var stats: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM stats r JOIN users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND ru.restricted=0 AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM stats s WHERE s.user_id=?1 ORDER BY s.mode", -1, &stats, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stats);
+        _ = c.sqlite3_bind_int(stats, 1, user_id);
+        var scores: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 ORDER BY s.id DESC LIMIT 20", -1, &scores, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(scores);
+        _ = c.sqlite3_bind_int(scores, 1, user_id);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"id\":{d},\"name\":", .{c.sqlite3_column_int(user, 0)});
+        try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 1)));
+        try output.writer.writeAll(",\"country\":");
+        try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 2)));
+        try output.writer.print(",\"privileges\":{d},\"created_at\":{d},\"stats\":[", .{ c.sqlite3_column_int64(user, 3), c.sqlite3_column_int64(user, 4) });
+        var first = true;
+        while (c.sqlite3_step(stats) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ c.sqlite3_column_int(stats, 0), c.sqlite3_column_int64(stats, 1), c.sqlite3_column_int64(stats, 2), c.sqlite3_column_int(stats, 3), c.sqlite3_column_int(stats, 4), c.sqlite3_column_int(stats, 5), c.sqlite3_column_int64(stats, 6), c.sqlite3_column_double(stats, 7), c.sqlite3_column_int(stats, 8), c.sqlite3_column_int(stats, 9) });
+        }
+        try output.writer.writeAll("],\"scores\":[");
+        first = true;
+        while (c.sqlite3_step(scores) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{{\"id\":{d},\"score\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"mode\":{d},\"namespace\":", .{ c.sqlite3_column_int64(scores, 0), c.sqlite3_column_int64(scores, 1), c.sqlite3_column_double(scores, 2), c.sqlite3_column_double(scores, 3), c.sqlite3_column_int(scores, 4), c.sqlite3_column_int(scores, 5), c.sqlite3_column_int(scores, 6) });
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(scores, 7)));
+            try output.writer.print(",\"passed\":{},\"submitted_at\":{d},\"set_id\":{d},\"map_id\":{d},\"artist\":", .{ c.sqlite3_column_int(scores, 8) != 0, c.sqlite3_column_int64(scores, 9), c.sqlite3_column_int(scores, 10), c.sqlite3_column_int(scores, 11) });
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(scores, 12)));
+            try output.writer.writeAll(",\"title\":");
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(scores, 13)));
+            try output.writer.writeAll(",\"version\":");
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(scores, 14)));
+            try output.writer.print(",\"status\":{d}}}", .{c.sqlite3_column_int(scores, 15)});
+        }
+        try output.writer.writeAll("]}");
+        var list = output.toArrayList();
+        return try list.toOwnedSlice(allocator);
+    }
+
     fn upgradePassword(self: *Store, user_id: i32, password_md5: []const u8, previous_hash: []const u8) !void {
         var hash_buffer: [256]u8 = undefined;
         const hash = try std.crypto.pwhash.argon2.strHash(password_md5, .{ .allocator = self.allocator, .params = .owasp_2id }, &hash_buffer, self.io);

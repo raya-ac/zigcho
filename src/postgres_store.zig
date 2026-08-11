@@ -1084,6 +1084,72 @@ pub const Store = struct {
         return .{ .users = try result.int(i64, 0, 0), .plays = try result.int(i64, 0, 1), .passed = try result.int(i64, 0, 2), .maps = try result.int(i64, 0, 3) };
     }
 
+    pub fn siteRankings(self: *Store, allocator: std.mem.Allocator, mode: u8, offset: u16) ![]u8 {
+        var mode_buf: [4]u8 = undefined;
+        var offset_buf: [8]u8 = undefined;
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        const offset_text = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(allocator, lease.conn, "SELECT row_number() OVER(ORDER BY s.pp DESC,u.id ASC),u.id,u.name,u.country,u.privileges,s.pp,s.accuracy,s.plays,s.ranked_score,s.total_score,s.max_combo FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND u.id!=3 AND NOT u.restricted AND s.plays>0 ORDER BY s.pp DESC,u.id ASC LIMIT 100 OFFSET $2", &.{ mode_text, offset_text });
+        defer result.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"mode\":{d},\"offset\":{d},\"players\":[", .{ mode, offset });
+        for (0..result.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            try output.writer.print("{{\"rank\":{d},\"id\":{d},\"name\":", .{ try result.int(i32, row, 0), try result.int(i32, row, 1) });
+            try jsonString(&output.writer, result.value(row, 2));
+            try output.writer.writeAll(",\"country\":");
+            try jsonString(&output.writer, result.value(row, 3));
+            try output.writer.print(",\"privileges\":{d},\"pp\":{d},\"accuracy\":{d},\"plays\":{d},\"ranked_score\":{d},\"total_score\":{d},\"max_combo\":{d}}}", .{ try result.int(u32, row, 4), try result.int(i32, row, 5), try result.float(f64, row, 6), try result.int(i32, row, 7), try result.int(i64, row, 8), try result.int(i64, row, 9), try result.int(i32, row, 10) });
+        }
+        try output.writer.writeAll("]}");
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?[]u8 {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var user = try postgres.queryParams(allocator, lease.conn, "SELECT id,name,country,privileges,created_at FROM zigcho.users WHERE id=$1 AND id!=3 AND NOT restricted", &.{id});
+        defer user.deinit();
+        if (user.rows() == 0) return null;
+        var stats = try postgres.queryParams(allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s WHERE s.user_id=$1 ORDER BY s.mode", &.{id});
+        defer stats.deinit();
+        var scores = try postgres.queryParams(allocator, lease.conn, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 ORDER BY s.id DESC LIMIT 20", &.{id});
+        defer scores.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"id\":{d},\"name\":", .{try user.int(i32, 0, 0)});
+        try jsonString(&output.writer, user.value(0, 1));
+        try output.writer.writeAll(",\"country\":");
+        try jsonString(&output.writer, user.value(0, 2));
+        try output.writer.print(",\"privileges\":{d},\"created_at\":{d},\"stats\":[", .{ try user.int(u32, 0, 3), try user.int(i64, 0, 4) });
+        for (0..stats.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ try stats.int(u8, row, 0), try stats.int(i64, row, 1), try stats.int(i64, row, 2), try stats.int(i32, row, 3), try stats.int(i32, row, 4), try stats.int(i32, row, 5), try stats.int(i64, row, 6), try stats.float(f64, row, 7), try stats.int(i32, row, 8), try stats.int(i32, row, 9) });
+        }
+        try output.writer.writeAll("],\"scores\":[");
+        for (0..scores.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            try output.writer.print("{{\"id\":{d},\"score\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"mode\":{d},\"namespace\":", .{ try scores.int(i64, row, 0), try scores.int(i64, row, 1), try scores.float(f64, row, 2), try scores.float(f64, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(u8, row, 6) });
+            try jsonString(&output.writer, scores.value(row, 7));
+            try output.writer.print(",\"passed\":{},\"submitted_at\":{d},\"set_id\":{d},\"map_id\":{d},\"artist\":", .{ try scores.boolean(row, 8), try scores.int(i64, row, 9), try scores.int(i32, row, 10), try scores.int(i32, row, 11) });
+            try jsonString(&output.writer, scores.value(row, 12));
+            try output.writer.writeAll(",\"title\":");
+            try jsonString(&output.writer, scores.value(row, 13));
+            try output.writer.writeAll(",\"version\":");
+            try jsonString(&output.writer, scores.value(row, 14));
+            try output.writer.print(",\"status\":{d}}}", .{try scores.int(i8, row, 15)});
+        }
+        try output.writer.writeAll("]}");
+        var list = output.toArrayList();
+        return try list.toOwnedSlice(allocator);
+    }
+
     pub fn insertLazerScore(self: *Store, user_id: i32, input: lazer.ScoreInput, raw_json: []const u8) !i64 {
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
@@ -1451,6 +1517,15 @@ test "postgres account auth stats and token slice" {
     const worse_placement = (try store.scoreLeaderboardPlacement(worse_id)).?;
     try std.testing.expect(!worse_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), worse_placement.rank);
+    const site_rankings = try store.siteRankings(std.testing.allocator, 0, 0);
+    defer std.testing.allocator.free(site_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"name\":\"ari\"") != null);
+    const site_profile = (try store.siteProfile(std.testing.allocator, user_id)).?;
+    defer std.testing.allocator.free(site_profile);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"AU\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"artist\":\"artist\"") != null);
     var relax = score;
     relax.online_checksum = "cccccccccccccccccccccccccccccccc";
     relax.total_score = 600_000;

@@ -775,6 +775,18 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     try std.testing.expectEqual(@as(i32, 0), worse_placement.rank);
     try std.testing.expect(!webhook.shouldAnnounceScore(worse_placement, 999.0));
     try std.testing.expect(!webhook.shouldAnnounceScore(.{ .rank = 50, .submitted_is_best = true }, 999.0));
+    const site_rankings = try store.siteRankings(std.testing.allocator, 0, 0);
+    defer std.testing.allocator.free(site_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"name\":\"requester\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"pp\":27") != null);
+    const site_profile = (try store.siteProfile(std.testing.allocator, requester)).?;
+    defer std.testing.allocator.free(site_profile);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"XX\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "Zigcho Fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"scores\":[{") != null);
+    try std.testing.expect((try store.siteProfile(std.testing.allocator, 999_999)) == null);
     const ranked_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
     defer std.testing.allocator.free(ranked_board);
     try std.testing.expect(std.mem.startsWith(u8, ranked_board, "2|false|"));

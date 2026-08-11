@@ -1,7 +1,7 @@
 [Unit]
 Description=zigcho osu server
-After=network-online.target
-Wants=network-online.target
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
 
 [Service]
 Type=simple
@@ -10,7 +10,8 @@ Group=zigcho
 WorkingDirectory=/var/lib/zigcho
 StateDirectory=zigcho
 StateDirectoryMode=0700
-ExecStart=/opt/zigcho/current/zigcho 127.0.0.1 27180 /var/lib/zigcho/zigcho.db
+Environment="ZIGCHO_POSTGRES_URL=dbname=zigcho user=zigcho host=/var/run/postgresql connect_timeout=5"
+ExecStart=/opt/zigcho/current/zigcho 127.0.0.1 27180
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s

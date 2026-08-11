@@ -1,5 +1,6 @@
 const std = @import("std");
-const storage = @import("storage.zig");
+const storage = @import("runtime_storage.zig");
+const sqlite_storage = @import("storage.zig");
 const sessions_mod = @import("sessions.zig");
 const bancho = @import("bancho.zig");
 const lazer = @import("lazer.zig");
@@ -754,8 +755,8 @@ fn serveConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) void 
     app.serve(&req) catch |err| std.log.err("request failed: {t}", .{err});
 }
 
-fn recalcAllScores(allocator: std.mem.Allocator, store: *storage.Store) !void {
-    const c = storage.c;
+fn recalcAllScores(allocator: std.mem.Allocator, store: *sqlite_storage.Store) !void {
+    const c = sqlite_storage.c;
     std.debug.print("recalculating all scores with akatsuki-pp...\n", .{});
     const scores_sql = "SELECT id,user_id,map_md5,mode,mods,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,score FROM scores WHERE passed=1";
     var stmt: ?*c.sqlite3_stmt = null;
@@ -815,8 +816,8 @@ fn recalcAllScores(allocator: std.mem.Allocator, store: *storage.Store) !void {
     std.debug.print("done.\n", .{});
 }
 
-fn recalcStats(store: *storage.Store) !void {
-    const c = storage.c;
+fn recalcStats(store: *sqlite_storage.Store) !void {
+    const c = sqlite_storage.c;
     const modes_sql = "SELECT DISTINCT user_id,mode FROM stats";
     var m_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(store.db, modes_sql, -1, &m_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -875,9 +876,10 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
     if (args.len > 1 and std.mem.eql(u8, args[1], "recalc")) {
+        if (storage.is_postgres) return error.RecalcRequiresSqliteBuild;
         const db_path: [:0]const u8 = if (args.len > 2) try allocator.dupeZ(u8, args[2]) else "zigcho.db";
         defer if (args.len > 2) allocator.free(db_path);
-        var store = try storage.Store.open(allocator, init.io, db_path);
+        var store = try sqlite_storage.Store.open(allocator, init.io, db_path);
         defer store.close();
         try store.migrate();
         try recalcAllScores(allocator, &store);
@@ -885,7 +887,11 @@ pub fn main(init: std.process.Init) !void {
     }
     const bind = if (args.len > 1) args[1] else "127.0.0.1";
     const port = if (args.len > 2) try std.fmt.parseInt(u16, args[2], 10) else 8080;
-    const db_path: [:0]const u8 = if (args.len > 3) try allocator.dupeZ(u8, args[3]) else "zigcho.db";
+    const default_database: [:0]const u8 = if (storage.is_postgres)
+        std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl)
+    else
+        "zigcho.db";
+    const db_path: [:0]const u8 = if (args.len > 3) try allocator.dupeZ(u8, args[3]) else default_database;
     defer if (args.len > 3) allocator.free(db_path);
     var store = try storage.Store.open(allocator, init.io, db_path);
     defer store.close();

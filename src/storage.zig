@@ -3,6 +3,7 @@ const domain = @import("domain.zig");
 const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
+pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
 });

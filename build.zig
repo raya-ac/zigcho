@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const postgres_prefix = b.option([]const u8, "postgres-prefix", "PostgreSQL installation prefix (macOS defaults to Homebrew postgresql@17)");
+    const postgres_runtime = b.option(bool, "postgres", "Build the server with PostgreSQL runtime storage") orelse false;
 
     const cargo = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "pp/Cargo.toml", "--release", "--locked" });
     const pp_library = b.path(if (target.result.os.tag == .windows) "pp/target/release/zigcho_pp.lib" else "pp/target/release/libzigcho_pp.a");
@@ -14,7 +15,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const server_options = b.addOptions();
+    server_options.addOption(bool, "postgres_runtime", postgres_runtime);
+    mod.addOptions("build_options", server_options);
     mod.linkSystemLibrary("sqlite3", .{});
+    if (postgres_runtime) mod.linkSystemLibrary("pq", .{ .use_pkg_config = .no });
+    if (postgres_runtime and target.result.os.tag == .macos) {
+        const prefix = postgres_prefix orelse "/opt/homebrew/opt/postgresql@17";
+        mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/include/postgresql", .{prefix}) });
+        mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib/postgresql", .{prefix}) });
+    } else if (postgres_runtime and target.result.os.tag == .linux) {
+        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
+    }
     if (target.result.os.tag == .linux) mod.linkSystemLibrary("gcc_s", .{});
     mod.addObjectFile(pp_library);
 
@@ -68,12 +80,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the server").dependOn(&run.step);
 
-    const tests = b.addTest(.{ .root_module = b.createModule(.{
+    const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-    }) });
+    });
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "postgres_runtime", false);
+    test_mod.addOptions("build_options", test_options);
+    const tests = b.addTest(.{ .root_module = test_mod });
     tests.root_module.linkSystemLibrary("sqlite3", .{});
     tests.root_module.linkSystemLibrary("pq", .{ .use_pkg_config = .no });
     if (target.result.os.tag == .macos) {

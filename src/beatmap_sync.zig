@@ -1,7 +1,7 @@
 const std = @import("std");
 const beatmap = @import("beatmap.zig");
 const pp = @import("pp.zig");
-const storage = @import("storage.zig");
+const storage = @import("runtime_storage.zig");
 
 const metadata_limit = 256 * 1024;
 const archive_limit = 128 * 1024 * 1024;

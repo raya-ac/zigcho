@@ -21,5 +21,6 @@ COPY . .
 
 RUN zig build test \
     && zig build -Doptimize=ReleaseSafe \
+    && zig build -Dpostgres=true -Doptimize=ReleaseSafe \
     && mkdir /out \
     && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/

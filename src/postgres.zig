@@ -29,6 +29,24 @@ pub const Result = struct {
         const len: usize = @intCast(c.PQgetlength(self.raw, @intCast(row), @intCast(column)));
         return ptr[0..len];
     }
+
+    pub fn int(self: Result, comptime T: type, row: usize, column: usize) !T {
+        if (self.isNull(row, column)) return error.DatabaseNull;
+        return std.fmt.parseInt(T, self.value(row, column), 10);
+    }
+
+    pub fn float(self: Result, comptime T: type, row: usize, column: usize) !T {
+        if (self.isNull(row, column)) return error.DatabaseNull;
+        return std.fmt.parseFloat(T, self.value(row, column));
+    }
+
+    pub fn boolean(self: Result, row: usize, column: usize) !bool {
+        if (self.isNull(row, column)) return error.DatabaseNull;
+        const bytes = self.value(row, column);
+        if (std.mem.eql(u8, bytes, "t")) return true;
+        if (std.mem.eql(u8, bytes, "f")) return false;
+        return error.InvalidDatabaseBoolean;
+    }
 };
 
 fn statusOk(status: c.ExecStatusType) bool {
@@ -47,6 +65,14 @@ fn reportError(conn: *c.PGconn, result: ?*c.PGresult) void {
     std.log.err("postgres connection failed: {s}", .{message});
 }
 
+fn resultError(raw: *c.PGresult) error{ UniqueViolation, DatabaseQueryFailed } {
+    const state_ptr = c.PQresultErrorField(raw, c.PG_DIAG_SQLSTATE);
+    if (state_ptr) |state| {
+        if (std.mem.eql(u8, std.mem.span(state), "23505")) return error.UniqueViolation;
+    }
+    return error.DatabaseQueryFailed;
+}
+
 pub fn connect(conninfo: [:0]const u8) !*c.PGconn {
     const conn = c.PQconnectdb(conninfo.ptr) orelse return error.DatabaseOpenFailed;
     errdefer c.PQfinish(conn);
@@ -62,7 +88,7 @@ pub fn exec(conn: *c.PGconn, sql: [:0]const u8) !void {
     defer c.PQclear(raw);
     if (!statusOk(c.PQresultStatus(raw))) {
         reportError(conn, raw);
-        return error.DatabaseQueryFailed;
+        return resultError(raw);
     }
 }
 
@@ -71,9 +97,38 @@ pub fn query(conn: *c.PGconn, sql: [:0]const u8) !Result {
     errdefer c.PQclear(raw);
     if (!statusOk(c.PQresultStatus(raw))) {
         reportError(conn, raw);
-        return error.DatabaseQueryFailed;
+        return resultError(raw);
     }
     return .{ .raw = raw };
+}
+
+pub fn encodeBytea(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, 2 + bytes.len * 2);
+    out[0] = '\\';
+    out[1] = 'x';
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, index| {
+        out[2 + index * 2] = alphabet[byte >> 4];
+        out[3 + index * 2] = alphabet[byte & 0x0f];
+    }
+    return out;
+}
+
+fn hexNibble(char: u8) !u8 {
+    return switch (char) {
+        '0'...'9' => char - '0',
+        'a'...'f' => char - 'a' + 10,
+        'A'...'F' => char - 'A' + 10,
+        else => error.InvalidDatabaseBytea,
+    };
+}
+
+pub fn decodeBytea(allocator: std.mem.Allocator, text_value: []const u8) ![]u8 {
+    if (text_value.len < 2 or text_value[0] != '\\' or text_value[1] != 'x' or (text_value.len - 2) % 2 != 0) return error.InvalidDatabaseBytea;
+    const out = try allocator.alloc(u8, (text_value.len - 2) / 2);
+    errdefer allocator.free(out);
+    for (out, 0..) |*byte, index| byte.* = (try hexNibble(text_value[2 + index * 2])) << 4 | try hexNibble(text_value[3 + index * 2]);
+    return out;
 }
 
 pub fn queryParams(allocator: std.mem.Allocator, conn: *c.PGconn, sql: [:0]const u8, params: []const ?[]const u8) !Result {
@@ -105,7 +160,7 @@ pub fn queryParams(allocator: std.mem.Allocator, conn: *c.PGconn, sql: [:0]const
     errdefer c.PQclear(raw);
     if (!statusOk(c.PQresultStatus(raw))) {
         reportError(conn, raw);
-        return error.DatabaseQueryFailed;
+        return resultError(raw);
     }
     return .{ .raw = raw };
 }
@@ -170,22 +225,34 @@ pub const Pool = struct {
     };
 
     pub fn acquire(self: *Pool) Lease {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         while (true) {
+            self.mutex.lockUncancelable(self.io);
+            var selected: ?usize = null;
             for (self.in_use, 0..) |busy, index| {
                 if (busy) continue;
                 self.in_use[index] = true;
-                const conn = self.connections[index];
-                if (c.PQstatus(conn) != c.CONNECTION_OK) c.PQreset(conn);
-                if (c.PQstatus(conn) != c.CONNECTION_OK) {
-                    self.in_use[index] = false;
-                    self.available.signal(self.io);
-                    continue;
-                }
-                return .{ .pool = self, .index = index, .conn = conn };
+                selected = index;
+                break;
             }
-            self.available.waitUncancelable(self.io, &self.mutex);
+            if (selected == null) {
+                self.available.waitUncancelable(self.io, &self.mutex);
+                self.mutex.unlock(self.io);
+                continue;
+            }
+            const index = selected.?;
+            const conn = self.connections[index];
+            self.mutex.unlock(self.io);
+
+            // Reconnection may block on the network, so never hold the pool's
+            // availability lock while libpq resets one leased connection.
+            if (c.PQstatus(conn) != c.CONNECTION_OK) c.PQreset(conn);
+            if (c.PQstatus(conn) == c.CONNECTION_OK) return .{ .pool = self, .index = index, .conn = conn };
+
+            self.mutex.lockUncancelable(self.io);
+            self.in_use[index] = false;
+            self.available.signal(self.io);
+            self.mutex.unlock(self.io);
+            std.log.err("postgres pool could not restore a connection", .{});
         }
     }
 };

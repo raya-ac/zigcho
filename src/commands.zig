@@ -1,6 +1,6 @@
 const std = @import("std");
 const pp = @import("pp.zig");
-const storage = @import("storage.zig");
+const storage = @import("runtime_storage.zig");
 const beatmap = @import("beatmap.zig");
 const sessions_mod = @import("sessions.zig");
 const protocol = @import("protocol.zig");

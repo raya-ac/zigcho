@@ -1,5 +1,5 @@
 CREATE SCHEMA IF NOT EXISTS zigcho;
-SET LOCAL search_path = zigcho, pg_catalog;
+SET search_path = zigcho, pg_catalog;
 
 CREATE TABLE schema_migrations (
     version integer PRIMARY KEY,

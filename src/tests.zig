@@ -10,7 +10,7 @@ const stable_score = @import("stable_score.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
-const storage = @import("storage.zig");
+const storage = @import("runtime_storage.zig");
 const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
@@ -21,10 +21,12 @@ const multiplayer = @import("multiplayer.zig");
 const registration = @import("registration.zig");
 const postgres = @import("postgres.zig");
 const migrate_postgres = @import("migrate_postgres.zig");
+const postgres_store = @import("postgres_store.zig");
 
 comptime {
     _ = postgres;
     _ = migrate_postgres;
+    _ = postgres_store;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";

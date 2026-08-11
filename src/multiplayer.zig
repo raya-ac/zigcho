@@ -292,6 +292,20 @@ pub fn writeMatch(writer: *protocol.Writer, match: *const Match, send_password: 
     try writer.int(i32, match.seed);
 }
 
+pub fn validScoreFrame(payload: []const u8) bool {
+    if (payload.len != 29 and payload.len != 45) return false;
+    if (payload[25] > 1 or payload[28] > 1) return false;
+    return if (payload[28] == 1) payload.len == 45 else payload.len == 29;
+}
+
+pub fn writeScoreFramePacket(writer: *protocol.Writer, payload: []const u8, slot_id: u8) !void {
+    if (!validScoreFrame(payload) or slot_id >= 16) return error.InvalidScoreFrame;
+    const start = try writer.begin(.match_score_update);
+    try writer.raw(payload);
+    writer.list.items[start + 7 + 4] = slot_id;
+    writer.finish(start);
+}
+
 pub fn isTeamVersus(team_type: u8) bool {
     return team_type == 2 or team_type == 3;
 }

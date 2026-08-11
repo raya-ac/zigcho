@@ -311,6 +311,22 @@ fn broadcastDisposeMatchLocked(allocator: std.mem.Allocator, sessions: *sessions
     for (sessions.items.items) |other| if (!other.is_bot and other.in_lobby) try other.enqueue(allocator, event.bytes());
 }
 
+fn containsUser(ids: []const i32, user_id: i32) bool {
+    for (ids) |id| if (id == user_id) return true;
+    return false;
+}
+
+fn broadcastMatchPacketLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16, bytes: []const u8, include_lobby: bool, immune: []const i32) !void {
+    for (sessions.items.items) |other| {
+        if (other.is_bot) continue;
+        if (other.match_id == match_id) {
+            if (!containsUser(immune, other.user.id)) try other.enqueue(allocator, bytes);
+        } else if (include_lobby and other.in_lobby) {
+            try other.enqueue(allocator, bytes);
+        }
+    }
+}
+
 fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
     const match_id = session.match_id orelse return;
     const match = sessions.matchById(match_id) orelse {
@@ -517,6 +533,128 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             const slot = match.slotByUser(session.user.id) orelse continue;
             slot.status = @intFromEnum(multiplayer.SlotStatus.no_map);
             try broadcastMatchStateLocked(allocator, sessions, match, false);
+        },
+        .match_start => {
+            if (packet.payload.len != 0) continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (match.host_id != session.user.id or match.in_progress) continue;
+            var no_map: [16]i32 = undefined;
+            var no_map_count: usize = 0;
+            for (&match.slots) |*slot| {
+                slot.loaded = false;
+                slot.skipped = false;
+                if (slot.user_id) |user_id| {
+                    if (slot.status == @intFromEnum(multiplayer.SlotStatus.no_map)) {
+                        no_map[no_map_count] = user_id;
+                        no_map_count += 1;
+                    } else {
+                        slot.status = @intFromEnum(multiplayer.SlotStatus.playing);
+                    }
+                }
+            }
+            match.in_progress = true;
+            var event = protocol.Writer.init(allocator);
+            defer event.deinit();
+            try multiplayer.writePacket(&event, .match_start, match, true);
+            try broadcastMatchPacketLocked(allocator, sessions, match.id, event.bytes(), false, no_map[0..no_map_count]);
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .match_load_complete => {
+            if (packet.payload.len != 0) continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (!match.in_progress) continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            if (slot.status != @intFromEnum(multiplayer.SlotStatus.playing)) continue;
+            slot.loaded = true;
+            var waiting = false;
+            for (match.slots) |other_slot| if (other_slot.status == @intFromEnum(multiplayer.SlotStatus.playing) and !other_slot.loaded) {
+                waiting = true;
+                break;
+            };
+            if (!waiting) {
+                var event = protocol.Writer.init(allocator);
+                defer event.deinit();
+                try event.packetEmpty(.match_all_players_loaded);
+                try broadcastMatchPacketLocked(allocator, sessions, match.id, event.bytes(), false, &.{});
+            }
+        },
+        .match_score_update => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (!match.in_progress or !multiplayer.validScoreFrame(packet.payload)) continue;
+            const slot_index = match.slotIndexByUser(session.user.id) orelse continue;
+            if (match.slots[slot_index].status != @intFromEnum(multiplayer.SlotStatus.playing)) continue;
+            var event = protocol.Writer.init(allocator);
+            defer event.deinit();
+            try multiplayer.writeScoreFramePacket(&event, packet.payload, @intCast(slot_index));
+            try broadcastMatchPacketLocked(allocator, sessions, match.id, event.bytes(), false, &.{});
+        },
+        .match_failed => {
+            if (packet.payload.len != 0) continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (!match.in_progress) continue;
+            const slot_index = match.slotIndexByUser(session.user.id) orelse continue;
+            if (match.slots[slot_index].status != @intFromEnum(multiplayer.SlotStatus.playing)) continue;
+            var event = protocol.Writer.init(allocator);
+            defer event.deinit();
+            try event.packetInt(.match_player_failed, @intCast(slot_index));
+            try broadcastMatchPacketLocked(allocator, sessions, match.id, event.bytes(), false, &.{});
+        },
+        .match_skip_request => {
+            if (packet.payload.len != 0) continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (!match.in_progress) continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            if (slot.status != @intFromEnum(multiplayer.SlotStatus.playing) or slot.skipped) continue;
+            slot.skipped = true;
+            var skipped_event = protocol.Writer.init(allocator);
+            defer skipped_event.deinit();
+            try skipped_event.packetInt(.match_player_skipped, session.user.id);
+            try broadcastMatchPacketLocked(allocator, sessions, match.id, skipped_event.bytes(), true, &.{});
+            var waiting = false;
+            for (match.slots) |other_slot| if (other_slot.status == @intFromEnum(multiplayer.SlotStatus.playing) and !other_slot.skipped) {
+                waiting = true;
+                break;
+            };
+            if (!waiting) {
+                var skip_event = protocol.Writer.init(allocator);
+                defer skip_event.deinit();
+                try skip_event.packetEmpty(.match_skip);
+                try broadcastMatchPacketLocked(allocator, sessions, match.id, skip_event.bytes(), false, &.{});
+            }
+        },
+        .match_complete => {
+            if (packet.payload.len != 0) continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (!match.in_progress) continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            if (slot.status != @intFromEnum(multiplayer.SlotStatus.playing)) continue;
+            slot.status = @intFromEnum(multiplayer.SlotStatus.complete);
+            var still_playing = false;
+            for (match.slots) |other_slot| if (other_slot.status == @intFromEnum(multiplayer.SlotStatus.playing)) {
+                still_playing = true;
+                break;
+            };
+            if (still_playing) continue;
+            var not_playing: [16]i32 = undefined;
+            var not_playing_count: usize = 0;
+            for (&match.slots) |*other_slot| {
+                if (other_slot.user_id) |user_id| {
+                    if (other_slot.status == @intFromEnum(multiplayer.SlotStatus.complete)) {
+                        other_slot.status = @intFromEnum(multiplayer.SlotStatus.not_ready);
+                    } else {
+                        not_playing[not_playing_count] = user_id;
+                        not_playing_count += 1;
+                    }
+                }
+                other_slot.loaded = false;
+                other_slot.skipped = false;
+            }
+            match.in_progress = false;
+            var event = protocol.Writer.init(allocator);
+            defer event.deinit();
+            try event.packetEmpty(.match_complete);
+            try broadcastMatchPacketLocked(allocator, sessions, match.id, event.bytes(), false, not_playing[0..not_playing_count]);
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
         },
         .match_lock => {
             const match = sessions.matchById(session.match_id orelse continue) orelse continue;

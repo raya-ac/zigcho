@@ -124,6 +124,10 @@ const App = struct {
         return field(target[query_start + 1 ..], key);
     }
 
+    fn validSiteMode(mode: u8) bool {
+        return mode <= 6 or mode == 8;
+    }
+
     fn isAvatarHost(value: ?[]const u8) bool {
         const host = value orelse return false;
         const end = std.mem.findScalar(u8, host, ':') orelse host.len;
@@ -237,7 +241,7 @@ const App = struct {
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v1/rankings")) {
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
-            if ((mode > 6 and mode != 8) or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid rankings\"}", &.{});
+            if (!validSiteMode(mode) or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid rankings\"}", &.{});
             const listing = try self.store.siteRankings(self.allocator, mode, offset);
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
@@ -245,7 +249,9 @@ const App = struct {
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/users/")) {
             const user_id = std.fmt.parseInt(i32, path["/api/v1/users/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user\"}", &.{});
             if (user_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user\"}", &.{});
-            const profile = (try self.store.siteProfile(self.allocator, user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
+            if (!validSiteMode(mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
+            const profile = (try self.store.siteProfile(self.allocator, user_id, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
             defer self.allocator.free(profile);
             return respond(req, .ok, "application/json", profile, &.{});
         }

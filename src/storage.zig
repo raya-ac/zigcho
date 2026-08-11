@@ -893,9 +893,11 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?[]u8 {
+    pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32, stats_mode: u8) !?[]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const score_mode: u8 = if (stats_mode <= 3) stats_mode else if (stats_mode <= 6) stats_mode - 4 else 0;
+        const namespace: []const u8 = if (stats_mode <= 3) "vanilla" else if (stats_mode <= 6) "relax" else "autopilot";
         var user: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "SELECT id,name,country,privileges,created_at FROM users WHERE id=?1 AND id!=3 AND restricted=0", -1, &user, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(user);
@@ -906,16 +908,18 @@ pub const Store = struct {
         defer _ = c.sqlite3_finalize(stats);
         _ = c.sqlite3_bind_int(stats, 1, user_id);
         var scores: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 ORDER BY s.id DESC LIMIT 20", -1, &scores, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 ORDER BY s.id DESC LIMIT 20", -1, &scores, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(scores);
         _ = c.sqlite3_bind_int(scores, 1, user_id);
+        _ = c.sqlite3_bind_int(scores, 2, score_mode);
+        _ = c.sqlite3_bind_text(scores, 3, namespace.ptr, @intCast(namespace.len), null);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         try output.writer.print("{{\"id\":{d},\"name\":", .{c.sqlite3_column_int(user, 0)});
         try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 1)));
         try output.writer.writeAll(",\"country\":");
         try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 2)));
-        try output.writer.print(",\"privileges\":{d},\"created_at\":{d},\"stats\":[", .{ c.sqlite3_column_int64(user, 3), c.sqlite3_column_int64(user, 4) });
+        try output.writer.print(",\"privileges\":{d},\"created_at\":{d},\"selected_mode\":{d},\"stats\":[", .{ c.sqlite3_column_int64(user, 3), c.sqlite3_column_int64(user, 4), stats_mode });
         var first = true;
         while (c.sqlite3_step(stats) == c.SQLITE_ROW) {
             if (!first) try output.writer.writeByte(',');

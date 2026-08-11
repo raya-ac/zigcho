@@ -1109,9 +1109,13 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?[]u8 {
+    pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32, stats_mode: u8) !?[]u8 {
         var id_buf: [24]u8 = undefined;
+        var score_mode_buf: [4]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        const score_mode: u8 = if (stats_mode <= 3) stats_mode else if (stats_mode <= 6) stats_mode - 4 else 0;
+        const score_mode_text = try std.fmt.bufPrint(&score_mode_buf, "{d}", .{score_mode});
+        const namespace: []const u8 = if (stats_mode <= 3) "vanilla" else if (stats_mode <= 6) "relax" else "autopilot";
         var lease = self.pool.acquire();
         defer lease.release();
         var user = try postgres.queryParams(allocator, lease.conn, "SELECT id,name,country,privileges,created_at FROM zigcho.users WHERE id=$1 AND id!=3 AND NOT restricted", &.{id});
@@ -1119,7 +1123,7 @@ pub const Store = struct {
         if (user.rows() == 0) return null;
         var stats = try postgres.queryParams(allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s WHERE s.user_id=$1 ORDER BY s.mode", &.{id});
         defer stats.deinit();
-        var scores = try postgres.queryParams(allocator, lease.conn, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 ORDER BY s.id DESC LIMIT 20", &.{id});
+        var scores = try postgres.queryParams(allocator, lease.conn, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 ORDER BY s.id DESC LIMIT 20", &.{ id, score_mode_text, namespace });
         defer scores.deinit();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
@@ -1127,7 +1131,7 @@ pub const Store = struct {
         try jsonString(&output.writer, user.value(0, 1));
         try output.writer.writeAll(",\"country\":");
         try jsonString(&output.writer, user.value(0, 2));
-        try output.writer.print(",\"privileges\":{d},\"created_at\":{d},\"stats\":[", .{ try user.int(u32, 0, 3), try user.int(i64, 0, 4) });
+        try output.writer.print(",\"privileges\":{d},\"created_at\":{d},\"selected_mode\":{d},\"stats\":[", .{ try user.int(u32, 0, 3), try user.int(i64, 0, 4), stats_mode });
         for (0..stats.rows()) |row| {
             if (row != 0) try output.writer.writeByte(',');
             try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ try stats.int(u8, row, 0), try stats.int(i64, row, 1), try stats.int(i64, row, 2), try stats.int(i32, row, 3), try stats.int(i32, row, 4), try stats.int(i32, row, 5), try stats.int(i64, row, 6), try stats.float(f64, row, 7), try stats.int(i32, row, 8), try stats.int(i32, row, 9) });
@@ -1521,16 +1525,22 @@ test "postgres account auth stats and token slice" {
     defer std.testing.allocator.free(site_rankings);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"name\":\"ari\"") != null);
-    const site_profile = (try store.siteProfile(std.testing.allocator, user_id)).?;
+    const site_profile = (try store.siteProfile(std.testing.allocator, user_id, 0)).?;
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"AU\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"artist\":\"artist\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
     var relax = score;
     relax.online_checksum = "cccccccccccccccccccccccccccccccc";
     relax.total_score = 600_000;
     relax.mods = 128;
     _ = try store.insertStableScore(user_id, relax, 42.5, "relax replay", 15_000);
+    const relax_profile = (try store.siteProfile(std.testing.allocator, user_id, 4)).?;
+    defer std.testing.allocator.free(relax_profile);
+    try std.testing.expect(std.mem.indexOf(u8, relax_profile, "\"selected_mode\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relax_profile, "\"namespace\":\"relax\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relax_profile, "\"namespace\":\"vanilla\"") == null);
     const relax_stats = (try store.statsForUser(user_id, 4)).?;
     try std.testing.expectEqual(@as(i64, 600_000), relax_stats.ranked_score);
     try std.testing.expectEqual(@as(i32, 43), relax_stats.pp);

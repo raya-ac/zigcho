@@ -7,6 +7,7 @@ const rijndael = @import("rijndael.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
+const stable_response = @import("stable_response.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
@@ -22,6 +23,7 @@ const registration = @import("registration.zig");
 const postgres = @import("postgres.zig");
 const migrate_postgres = @import("migrate_postgres.zig");
 const postgres_store = @import("postgres_store.zig");
+const webhook = @import("webhook.zig");
 
 comptime {
     _ = postgres;
@@ -659,6 +661,136 @@ test "beatmap statuses use each client protocol's values" {
     try std.testing.expectEqualStrings("loved", storage.Store.lazerStatus(6));
 }
 
+test "stable score response reports the committed one based leaderboard rank" {
+    const score: stable_score.Submission = .{
+        .map_md5 = "0123456789abcdef0123456789abcdef",
+        .username = "ari",
+        .online_checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 900_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260811000000",
+        .client_flags = "0",
+    };
+    const response = try stable_response.scoreSubmission(std.testing.allocator, 4, 99, score, .{ .id = 10, .set_id = 20, .plays = 8, .passes = 6 }, .{ .rank = 3, .submitted_is_best = true }, .{ .global_rank = 8, .pp = 100 }, .{ .global_rank = 7, .pp = 120 }, 42.25);
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "chartId:beatmap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "rankAfter:4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "onlineScoreId:99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "chartId:overall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "rankBefore:8|rankAfter:7") != null);
+}
+
+test "beatmap ranking requires two nominators and changes the whole stable status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/ranking.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const requester = try store.register("requester", "requester@example.invalid", "00000000000000000000000000000000");
+    const first_bn = try store.register("first bn", "first-bn@example.invalid", "11111111111111111111111111111111");
+    const second_bn = try store.register("second bn", "second-bn@example.invalid", "22222222222222222222222222222222");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 2, 1.7931, 10, map);
+    const pending_score: stable_score.Submission = .{
+        .map_md5 = &hash,
+        .username = "requester",
+        .online_checksum = "dddddddddddddddddddddddddddddddd",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260811000000",
+        .client_flags = "0",
+    };
+    const pending_score_id = try store.insertStableScore(requester, pending_score, 26.8, "pending replay", 12_000);
+    try std.testing.expect((try store.scoreLeaderboardPlacement(pending_score_id)) == null);
+    try std.testing.expectEqual(@as(i32, 0), (try store.statsForUser(requester, 0)).?.pp);
+
+    const requested = try store.requestBeatmapRank(requester, &hash);
+    try std.testing.expectEqual(@as(u32, 1), requested.requests);
+    try std.testing.expectError(error.BeatmapAlreadyRequested, store.requestBeatmapRank(requester, &hash));
+    const queue = try store.beatmapRankQueue(std.testing.allocator);
+    defer std.testing.allocator.free(queue);
+    try std.testing.expect(std.mem.indexOf(u8, queue, "1 request(s) | 0/2 noms") != null);
+
+    const first = try store.nominateBeatmapSet(first_bn, &hash, "clean first review");
+    try std.testing.expectEqual(@as(u32, 1), first.nominations);
+    try std.testing.expectError(error.BeatmapAlreadyNominated, store.nominateBeatmapSet(first_bn, &hash, "duplicate"));
+    try std.testing.expectError(error.NotEnoughNominations, store.applyBeatmapRankAction(first_bn, &hash, .qualify, "too early"));
+    const second = try store.nominateBeatmapSet(second_bn, &hash, "clean second review");
+    try std.testing.expectEqual(@as(u32, 2), second.nominations);
+
+    const qualified = try store.applyBeatmapRankAction(first_bn, &hash, .qualify, "two clean reviews");
+    try std.testing.expectEqual(@as(i8, 5), qualified.status);
+    const viewer = (try store.userById(std.testing.allocator, requester)).?;
+    defer {
+        std.testing.allocator.free(viewer.name);
+        std.testing.allocator.free(viewer.safe_name);
+    }
+    const qualified_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
+    defer std.testing.allocator.free(qualified_board);
+    try std.testing.expect(std.mem.startsWith(u8, qualified_board, "4|false|"));
+
+    const ranked = try store.applyBeatmapRankAction(second_bn, &hash, .rank, "ranking window complete");
+    try std.testing.expectEqual(@as(i8, 3), ranked.status);
+    try std.testing.expectEqual(@as(u32, 0), ranked.requests);
+    try std.testing.expectEqual(@as(u32, 0), ranked.nominations);
+    const ranked_stats = (try store.statsForUser(requester, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1_000_000), ranked_stats.ranked_score);
+    try std.testing.expectEqual(@as(i32, 27), ranked_stats.pp);
+    const placed = (try store.scoreLeaderboardPlacement(pending_score_id)).?;
+    try std.testing.expect(placed.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 0), placed.rank);
+    try std.testing.expect(webhook.shouldAnnounceScore(placed, 26.8));
+    var worse_score = pending_score;
+    worse_score.online_checksum = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    worse_score.total_score = 900_000;
+    const worse_score_id = try store.insertStableScore(requester, worse_score, 20.0, "worse replay", 12_000);
+    const worse_placement = (try store.scoreLeaderboardPlacement(worse_score_id)).?;
+    try std.testing.expect(!worse_placement.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 0), worse_placement.rank);
+    try std.testing.expect(!webhook.shouldAnnounceScore(worse_placement, 999.0));
+    try std.testing.expect(!webhook.shouldAnnounceScore(.{ .rank = 50, .submitted_is_best = true }, 999.0));
+    const ranked_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
+    defer std.testing.allocator.free(ranked_board);
+    try std.testing.expect(std.mem.startsWith(u8, ranked_board, "2|false|"));
+    try store.upsertBeatmap(metadata, &hash, 2, 1.7931, 10, map);
+    try std.testing.expectEqual(@as(i8, 3), (try store.beatmapRankContext(&hash)).?.status);
+
+    const rolled_back = try store.applyBeatmapRankAction(first_bn, &hash, .rollback, "bad ranking metadata");
+    try std.testing.expectEqual(@as(i8, 5), rolled_back.status);
+    try std.testing.expectEqual(@as(i32, 0), (try store.statsForUser(requester, 0)).?.pp);
+    const vetoed = try store.applyBeatmapRankAction(first_bn, &hash, .veto, "send it back through review");
+    try std.testing.expectEqual(@as(i8, 2), vetoed.status);
+    const pending_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
+    defer std.testing.allocator.free(pending_board);
+    try std.testing.expectEqualStrings("0|false", pending_board);
+}
+
 test "Akatsuki archives only yield the exact MD5 map" {
     const map = @embedFile("testdata/synthetic-standard.osu");
     const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
@@ -905,6 +1037,17 @@ test "joined public chat delivers once and kai answers private chat as user thre
     try std.testing.expectEqual(@as(usize, 0), sessions.byUser(3).?.queue.items.len);
 }
 
+test "score announcements only reach players in announcement chat" {
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const joined = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "joined"), .safe_name = try std.testing.allocator.dupe(u8, "joined") }, 0, 0, 0);
+    const outside = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "outside"), .safe_name = try std.testing.allocator.dupe(u8, "outside") }, 0, 0, 0);
+    try std.testing.expect(sessions.join(joined, "#announce"));
+    try bancho.publishAnnouncement(std.testing.allocator, &sessions, "ari set #1 with 500pp");
+    try expectMessageText(joined.queue.items, "ari set #1 with 500pp");
+    try std.testing.expectEqual(@as(usize, 0), outside.queue.items.len);
+}
+
 test "stable chat commands enforce silence and audit staff actions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1082,6 +1225,87 @@ test "stable channel permissions and locks survive in storage" {
     defer _ = storage.c.sqlite3_finalize(stmt);
     try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 0));
+}
+
+test "stable ranking commands enforce bn and admin boundaries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/ranking-commands.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,privileges) VALUES" ++
+            "(30,'player','player',x'00',x'00',3)," ++
+            "(31,'first_bn','first_bn',x'00',x'00',2051)," ++
+            "(32,'second_bn','second_bn',x'00',x'00',2051)," ++
+            "(33,'admin','admin',x'00',x'00',8195);" ++
+            "INSERT INTO stats(user_id,mode) VALUES(30,0),(31,0),(32,0),(33,0);",
+    );
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 2, 1.7931, 10, map);
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
+    const player = try sessions.create((try store.userById(std.testing.allocator, 30)).?, 0, 0, 0);
+    const first_bn = try sessions.create((try store.userById(std.testing.allocator, 31)).?, 0, 0, 0);
+    const second_bn = try sessions.create((try store.userById(std.testing.allocator, 32)).?, 0, 0, 0);
+    const admin = try sessions.create((try store.userById(std.testing.allocator, 33)).?, 0, 0, 0);
+    @memcpy(&player.map_md5, &hash);
+    @memcpy(&first_bn.map_md5, &hash);
+    @memcpy(&second_bn.map_md5, &hash);
+    @memcpy(&admin.map_md5, &hash);
+
+    const request = try clientMessagePacket(std.testing.allocator, .send_private_message, "player", "!request", "kai", 30);
+    defer std.testing.allocator.free(request);
+    const request_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, request);
+    defer std.testing.allocator.free(request_reply);
+    try std.testing.expect(std.mem.indexOf(u8, request_reply, "is in the queue now") != null);
+
+    const denied_nomination = try clientMessagePacket(std.testing.allocator, .send_private_message, "player", "!nominate looks good", "kai", 30);
+    defer std.testing.allocator.free(denied_nomination);
+    const denied_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, denied_nomination);
+    defer std.testing.allocator.free(denied_reply);
+    try expectMessageText(denied_reply, "you do not have permission for that");
+
+    const first_nomination = try clientMessagePacket(std.testing.allocator, .send_private_message, "first_bn", "!nominate first review", "kai", 31);
+    defer std.testing.allocator.free(first_nomination);
+    const first_reply = try bancho.poll(std.testing.allocator, &store, &sessions, first_bn, first_nomination);
+    defer std.testing.allocator.free(first_reply);
+    try expectMessageText(first_reply, "set 900000000 has 1/2 nominations");
+
+    const second_nomination = try clientMessagePacket(std.testing.allocator, .send_private_message, "second_bn", "!nominate second review", "kai", 32);
+    defer std.testing.allocator.free(second_nomination);
+    const second_reply = try bancho.poll(std.testing.allocator, &store, &sessions, second_bn, second_nomination);
+    defer std.testing.allocator.free(second_reply);
+    try expectMessageText(second_reply, "set 900000000 has 2/2 nominations");
+
+    const qualify = try clientMessagePacket(std.testing.allocator, .send_private_message, "first_bn", "!qualify both reviews passed", "kai", 31);
+    defer std.testing.allocator.free(qualify);
+    const qualify_reply = try bancho.poll(std.testing.allocator, &store, &sessions, first_bn, qualify);
+    defer std.testing.allocator.free(qualify_reply);
+    try std.testing.expect(std.mem.indexOf(u8, qualify_reply, "is qualified now") != null);
+
+    const rank = try clientMessagePacket(std.testing.allocator, .send_private_message, "second_bn", "!rank qualification window complete", "kai", 32);
+    defer std.testing.allocator.free(rank);
+    const rank_reply = try bancho.poll(std.testing.allocator, &store, &sessions, second_bn, rank);
+    defer std.testing.allocator.free(rank_reply);
+    try std.testing.expect(std.mem.indexOf(u8, rank_reply, "is ranked now") != null);
+
+    const denied_rollback = try clientMessagePacket(std.testing.allocator, .send_private_message, "first_bn", "!rollback not allowed", "kai", 31);
+    defer std.testing.allocator.free(denied_rollback);
+    const denied_rollback_reply = try bancho.poll(std.testing.allocator, &store, &sessions, first_bn, denied_rollback);
+    defer std.testing.allocator.free(denied_rollback_reply);
+    try expectMessageText(denied_rollback_reply, "you do not have permission for that");
+
+    const rollback = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!rollback bad metadata", "kai", 33);
+    defer std.testing.allocator.free(rollback);
+    const rollback_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, rollback);
+    defer std.testing.allocator.free(rollback_reply);
+    try std.testing.expect(std.mem.indexOf(u8, rollback_reply, "is qualified now") != null);
 }
 
 test "server roles map to stable privileges and login always grants supporter" {

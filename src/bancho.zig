@@ -1362,3 +1362,12 @@ pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, session
     try stats(&event, store, session);
     try sessions.broadcast(event.bytes(), null);
 }
+
+pub fn publishAnnouncement(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, text: []const u8) !void {
+    var message = protocol.Writer.init(allocator);
+    defer message.deinit();
+    try protocol.writeMessage(&message, "kai", text, "#announce", 3);
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    try sessions.broadcastChannel("#announce", message.bytes(), null);
+}

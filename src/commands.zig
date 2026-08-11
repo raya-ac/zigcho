@@ -1,4 +1,5 @@
 const std = @import("std");
+const domain = @import("domain.zig");
 const pp = @import("pp.zig");
 const storage = @import("runtime_storage.zig");
 const beatmap = @import("beatmap.zig");
@@ -34,10 +35,11 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
     const args = if (separator == body.len) "" else std.mem.trim(u8, body[separator + 1 ..], " \t");
 
     if (std.ascii.eqlIgnoreCase(cmd, "help") or std.ascii.eqlIgnoreCase(cmd, "h")) {
-        var message: []const u8 = "player: !help !roll [max] !online !stats [name] !np !with <mods acc% misses>";
-        if (has(sender, moderator)) message = "player: !help !roll !online !stats !np !with | mod: !user !silence !unsilence !kick !addnote !notes";
-        if (has(sender, administrator)) message = "player: !help !roll !online !stats !np !with | mod: !user !silence !unsilence !kick !addnote !notes | admin: !restrict !unrestrict !announce !alert !lock !unlock";
-        if (has(sender, developer)) message = "player: !help !roll !online !stats !np !with | mod: !user !silence !unsilence !kick !addnote !notes | admin: !restrict !unrestrict !announce !alert !lock !unlock | dev: !addpriv !rmpriv";
+        var message: []const u8 = "player: !help !roll [max] !online !stats [name] !np !with <mods acc% misses> !request !mapstate";
+        if (has(sender, moderator)) message = "player: !help !roll !online !stats !np !with !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes";
+        if (isNominator(sender)) message = "player: !help !roll !online !stats !np !with !request !mapstate | bn: !requests !nominate !veto !qualify !rank !love";
+        if (has(sender, administrator)) message = "player: !help !roll !online !stats !np !with !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock";
+        if (has(sender, developer)) message = "player: !help !roll !online !stats !np !with !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock | dev: !addpriv !rmpriv";
         try reply(allocator, sessions, sender, reply_target, out, message);
         return .handled;
     }
@@ -49,6 +51,12 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
         handleWith(allocator, store, sender, args) catch {};
         return .handled;
     }
+    if (std.ascii.eqlIgnoreCase(cmd, "request")) return try requestRankCommand(allocator, store, sessions, sender, args, reply_target, out);
+    if (std.ascii.eqlIgnoreCase(cmd, "mapstate")) return try mapStateCommand(allocator, store, sessions, sender, args, reply_target, out);
+    if (std.ascii.eqlIgnoreCase(cmd, "requests")) return try rankQueueCommand(allocator, store, sessions, sender, args, reply_target, out);
+    if (std.ascii.eqlIgnoreCase(cmd, "nominate")) return try nominateCommand(allocator, store, sessions, sender, args, reply_target, out);
+    if (std.ascii.eqlIgnoreCase(cmd, "veto") or std.ascii.eqlIgnoreCase(cmd, "qualify") or std.ascii.eqlIgnoreCase(cmd, "rank") or std.ascii.eqlIgnoreCase(cmd, "love") or std.ascii.eqlIgnoreCase(cmd, "rollback"))
+        return try rankActionCommand(allocator, store, sessions, sender, cmd, args, reply_target, out);
     if (std.ascii.eqlIgnoreCase(cmd, "roll")) {
         const maximum = if (args.len == 0) 100 else std.fmt.parseInt(u16, args, 10) catch 100;
         if (maximum == 0) {
@@ -188,6 +196,132 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
 
 fn has(sender: *const sessions_mod.Session, bits: u32) bool {
     return sender.user.privileges & bits == bits;
+}
+
+fn isNominator(sender: *const sessions_mod.Session) bool {
+    return sender.user.privileges & (nominator | administrator | developer) != 0;
+}
+
+fn currentMap(sender: *const sessions_mod.Session) ?[]const u8 {
+    return if (sender.map_md5[0] == 0) null else &sender.map_md5;
+}
+
+fn rankStatusName(status: i8) []const u8 {
+    return switch (status) {
+        1 => "unsubmitted",
+        2 => "pending",
+        3 => "ranked",
+        4 => "approved",
+        5 => "qualified",
+        6 => "loved",
+        else => "unknown",
+    };
+}
+
+fn replyRankError(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, target: []const u8, out: *protocol.Writer, err: anyerror) !CommandResult {
+    const message: []const u8 = switch (err) {
+        error.BeatmapNotFound => "i don't have that map yet, try again in a sec",
+        error.BeatmapNotPending => "only pending maps can enter the ranking queue",
+        error.BeatmapAlreadyRequested => "you already requested this set",
+        error.BeatmapAlreadyNominated => "you already nominated this set",
+        error.NotEnoughNominations => "this set needs two different nominations first",
+        error.InvalidBeatmapTransition => "that status change is not valid from the set's current state",
+        error.InconsistentBeatmapSet => "the set has mixed statuses; fix it manually before changing it",
+        error.NothingToRollback => "there is no status change to roll back",
+        else => return err,
+    };
+    try reply(allocator, sessions, sender, target, out, message);
+    return .handled;
+}
+
+fn requestRankCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, args: []const u8, target: []const u8, out: *protocol.Writer) !CommandResult {
+    if (args.len != 0) {
+        try reply(allocator, sessions, sender, target, out, "usage: !request after /np");
+        return .handled;
+    }
+    const md5 = currentMap(sender) orelse {
+        try reply(allocator, sessions, sender, target, out, "do /np first so i know what map you're on");
+        return .handled;
+    };
+    const context = store.requestBeatmapRank(sender.user.id, md5) catch |err| return try replyRankError(allocator, sessions, sender, target, out, err);
+    var buf: [160]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "set {d} is in the queue now ({d} request{s})", .{ context.set_id, context.requests, if (context.requests == 1) "" else "s" });
+    try reply(allocator, sessions, sender, target, out, message);
+    return .handled;
+}
+
+fn mapStateCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, args: []const u8, target: []const u8, out: *protocol.Writer) !CommandResult {
+    if (args.len != 0) {
+        try reply(allocator, sessions, sender, target, out, "usage: !mapstate after /np");
+        return .handled;
+    }
+    const md5 = currentMap(sender) orelse {
+        try reply(allocator, sessions, sender, target, out, "do /np first so i know what map you're on");
+        return .handled;
+    };
+    const context = (try store.beatmapRankContext(md5)) orelse return try replyRankError(allocator, sessions, sender, target, out, error.BeatmapNotFound);
+    var buf: [192]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "set {d} | {s} | {d} request(s) | {d}/2 nominations", .{ context.set_id, rankStatusName(context.status), context.requests, context.nominations });
+    try reply(allocator, sessions, sender, target, out, message);
+    return .handled;
+}
+
+fn rankQueueCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, args: []const u8, target: []const u8, out: *protocol.Writer) !CommandResult {
+    if (!isNominator(sender)) return try denied(allocator, sessions, sender, target, out);
+    if (args.len != 0) {
+        try reply(allocator, sessions, sender, target, out, "usage: !requests");
+        return .handled;
+    }
+    const queue = try store.beatmapRankQueue(allocator);
+    defer allocator.free(queue);
+    try reply(allocator, sessions, sender, target, out, if (queue.len == 0) "the ranking queue is empty" else queue);
+    return .handled;
+}
+
+fn nominateCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, args: []const u8, target: []const u8, out: *protocol.Writer) !CommandResult {
+    if (!isNominator(sender)) return try denied(allocator, sessions, sender, target, out);
+    if (args.len == 0) {
+        try reply(allocator, sessions, sender, target, out, "usage: !nominate <reason> after /np");
+        return .handled;
+    }
+    if (args.len > 512) {
+        try reply(allocator, sessions, sender, target, out, "keep the review reason under 512 characters");
+        return .handled;
+    }
+    const md5 = currentMap(sender) orelse {
+        try reply(allocator, sessions, sender, target, out, "do /np first so i know what map you're on");
+        return .handled;
+    };
+    const context = store.nominateBeatmapSet(sender.user.id, md5, args) catch |err| return try replyRankError(allocator, sessions, sender, target, out, err);
+    var buf: [160]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "set {d} has {d}/2 nominations", .{ context.set_id, context.nominations });
+    try reply(allocator, sessions, sender, target, out, message);
+    return .handled;
+}
+
+fn rankActionCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, command: []const u8, args: []const u8, target: []const u8, out: *protocol.Writer) !CommandResult {
+    const rollback = std.ascii.eqlIgnoreCase(command, "rollback");
+    if (rollback) {
+        if (!has(sender, administrator) and !has(sender, developer)) return try denied(allocator, sessions, sender, target, out);
+    } else if (!isNominator(sender)) return try denied(allocator, sessions, sender, target, out);
+    if (args.len == 0) {
+        try reply(allocator, sessions, sender, target, out, "give a reason after the command");
+        return .handled;
+    }
+    if (args.len > 512) {
+        try reply(allocator, sessions, sender, target, out, "keep the review reason under 512 characters");
+        return .handled;
+    }
+    const md5 = currentMap(sender) orelse {
+        try reply(allocator, sessions, sender, target, out, "do /np first so i know what map you're on");
+        return .handled;
+    };
+    const action: domain.BeatmapRankAction = if (std.ascii.eqlIgnoreCase(command, "qualify")) .qualify else if (std.ascii.eqlIgnoreCase(command, "rank")) .rank else if (std.ascii.eqlIgnoreCase(command, "love")) .love else if (std.ascii.eqlIgnoreCase(command, "veto")) .veto else .rollback;
+    const context = store.applyBeatmapRankAction(sender.user.id, md5, action, args) catch |err| return try replyRankError(allocator, sessions, sender, target, out, err);
+    var buf: [192]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "set {d} is {s} now ({d} request(s), {d}/2 nominations)", .{ context.set_id, rankStatusName(context.status), context.requests, context.nominations });
+    try reply(allocator, sessions, sender, target, out, message);
+    return .handled;
 }
 
 fn stableClientPrivileges(server: u32) u8 {

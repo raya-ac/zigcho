@@ -2,6 +2,18 @@ const std = @import("std");
 
 pub const Mode = enum(u8) { osu, taiko, @"catch", mania };
 pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, ranked = 3, approved = 4, qualified = 5, loved = 6 };
+pub const BeatmapRankAction = enum { qualify, rank, love, veto, rollback };
+pub const BeatmapRankContext = struct {
+    map_id: i32,
+    set_id: i32,
+    status: i8,
+    requests: u32,
+    nominations: u32,
+};
+pub const ScorePlacement = struct {
+    rank: i32,
+    submitted_is_best: bool,
+};
 pub const Privileges = packed struct(u32) {
     unrestricted: bool = true,
     verified: bool = true,

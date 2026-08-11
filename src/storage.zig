@@ -93,7 +93,7 @@ pub const Store = struct {
         if (version < 6) try self.exec(@embedFile("migration_006.sql"));
         if (version < 7) try self.exec(@embedFile("migration_007.sql"));
         if (version < 8) {
-            try self.rebuildScoreStats();
+            try self.rebuildScoreStats(true);
             try self.exec(@embedFile("migration_008.sql"));
         }
         if (version < 9) try self.exec(@embedFile("migration_009.sql"));
@@ -106,6 +106,12 @@ pub const Store = struct {
         if (version < 11) try self.exec(@embedFile("migration_011.sql"));
         if (version < 12) try self.exec(@embedFile("migration_012.sql"));
         if (version < 13) try self.exec(@embedFile("migration_013.sql"));
+        if (version < 14) {
+            if (try self.hasBeatmapStatusFrozenColumn())
+                try self.exec("PRAGMA user_version=14")
+            else
+                try self.exec(@embedFile("migration_014.sql"));
+        }
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -118,9 +124,19 @@ pub const Store = struct {
         return false;
     }
 
-    fn rebuildScoreStats(self: *Store) !void {
-        try self.exec("BEGIN IMMEDIATE");
-        errdefer self.exec("ROLLBACK") catch {};
+    fn hasBeatmapStatusFrozenColumn(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(beatmaps)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)), "status_frozen")) return true;
+        }
+        return false;
+    }
+
+    fn rebuildScoreStats(self: *Store, own_transaction: bool) !void {
+        if (own_transaction) try self.exec("BEGIN IMMEDIATE");
+        errdefer if (own_transaction) self.exec("ROLLBACK") catch {};
         try self.exec(
             "UPDATE scores SET best=0;" ++
                 "WITH ordered AS (" ++
@@ -185,7 +201,7 @@ pub const Store = struct {
             if (c.sqlite3_step(update_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
             _ = c.sqlite3_finalize(update_stmt);
         }
-        try self.exec("COMMIT");
+        if (own_transaction) try self.exec("COMMIT");
     }
 
     pub fn register(self: *Store, name: []const u8, email: []const u8, password_md5: []const u8) !i32 {
@@ -458,6 +474,217 @@ pub const Store = struct {
         _ = c.sqlite3_bind_text(stmt, 2, target.ptr, @intCast(target.len), null);
         _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn beatmapRankContext(self: *Store, map_md5: []const u8) !?domain.BeatmapRankContext {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT b.id,b.set_id,b.status,(SELECT count(*) FROM beatmap_rank_requests r WHERE r.set_id=b.set_id AND r.active=1),(SELECT count(*) FROM beatmap_nominations n WHERE n.set_id=b.set_id AND n.active=1) FROM beatmaps b WHERE b.md5=?1";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, map_md5.ptr, @intCast(map_md5.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{
+            .map_id = c.sqlite3_column_int(stmt, 0),
+            .set_id = c.sqlite3_column_int(stmt, 1),
+            .status = @intCast(c.sqlite3_column_int(stmt, 2)),
+            .requests = @intCast(c.sqlite3_column_int(stmt, 3)),
+            .nominations = @intCast(c.sqlite3_column_int(stmt, 4)),
+        };
+    }
+
+    pub fn requestBeatmapRank(self: *Store, requester_id: i32, map_md5: []const u8) !domain.BeatmapRankContext {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var map_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT id,set_id,status FROM beatmaps WHERE md5=?1", -1, &map_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(map_stmt);
+        _ = c.sqlite3_bind_text(map_stmt, 1, map_md5.ptr, @intCast(map_md5.len), null);
+        if (c.sqlite3_step(map_stmt) != c.SQLITE_ROW) return error.BeatmapNotFound;
+        const map_id = c.sqlite3_column_int(map_stmt, 0);
+        const set_id = c.sqlite3_column_int(map_stmt, 1);
+        const status: i8 = @intCast(c.sqlite3_column_int(map_stmt, 2));
+        if (status != @intFromEnum(domain.RankedStatus.pending)) return error.BeatmapNotPending;
+
+        var insert: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(?1,?2,?3)", -1, &insert, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(insert);
+        _ = c.sqlite3_bind_int(insert, 1, set_id);
+        _ = c.sqlite3_bind_int(insert, 2, map_id);
+        _ = c.sqlite3_bind_int(insert, 3, requester_id);
+        if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        if (c.sqlite3_changes(self.db) == 0) return error.BeatmapAlreadyRequested;
+        try self.insertBeatmapRankEventLocked(set_id, requester_id, "request", status, status, "player request");
+        try self.exec("COMMIT");
+        return .{ .map_id = map_id, .set_id = set_id, .status = status, .requests = try self.activeRankCountLocked("beatmap_rank_requests", set_id), .nominations = try self.activeRankCountLocked("beatmap_nominations", set_id) };
+    }
+
+    pub fn nominateBeatmapSet(self: *Store, actor_id: i32, map_md5: []const u8, reason: []const u8) !domain.BeatmapRankContext {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        const context = try self.rankContextLocked(map_md5);
+        if (context.status != @intFromEnum(domain.RankedStatus.pending)) return error.BeatmapNotPending;
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "INSERT INTO beatmap_nominations(set_id,nominator_id,active) VALUES(?1,?2,1) ON CONFLICT(set_id,nominator_id) DO UPDATE SET active=1,updated_at=unixepoch() WHERE beatmap_nominations.active=0";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, context.set_id);
+        _ = c.sqlite3_bind_int(stmt, 2, actor_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        if (c.sqlite3_changes(self.db) == 0) return error.BeatmapAlreadyNominated;
+        try self.insertBeatmapRankEventLocked(context.set_id, actor_id, "nominate", context.status, context.status, reason);
+        try self.exec("COMMIT");
+        var result = context;
+        result.nominations = try self.activeRankCountLocked("beatmap_nominations", context.set_id);
+        return result;
+    }
+
+    pub fn applyBeatmapRankAction(self: *Store, actor_id: i32, map_md5: []const u8, action: domain.BeatmapRankAction, reason: []const u8) !domain.BeatmapRankContext {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var context = try self.rankContextLocked(map_md5);
+        var status_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT min(status),max(status) FROM beatmaps WHERE set_id=?1", -1, &status_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(status_stmt);
+        _ = c.sqlite3_bind_int(status_stmt, 1, context.set_id);
+        if (c.sqlite3_step(status_stmt) != c.SQLITE_ROW or c.sqlite3_column_int(status_stmt, 0) != c.sqlite3_column_int(status_stmt, 1)) return error.InconsistentBeatmapSet;
+        const current = context.status;
+        var target: i8 = current;
+        const action_name: []const u8 = switch (action) {
+            .qualify => "qualify",
+            .rank => "rank",
+            .love => "love",
+            .veto => "veto",
+            .rollback => "rollback",
+        };
+        switch (action) {
+            .qualify => {
+                if (current != @intFromEnum(domain.RankedStatus.pending)) return error.InvalidBeatmapTransition;
+                if (context.nominations < 2) return error.NotEnoughNominations;
+                target = @intFromEnum(domain.RankedStatus.qualified);
+            },
+            .rank => {
+                if (current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
+                target = @intFromEnum(domain.RankedStatus.ranked);
+            },
+            .love => {
+                if (current != @intFromEnum(domain.RankedStatus.pending) and current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
+                target = @intFromEnum(domain.RankedStatus.loved);
+            },
+            .veto => {
+                if (current != @intFromEnum(domain.RankedStatus.pending) and current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
+                target = @intFromEnum(domain.RankedStatus.pending);
+            },
+            .rollback => {
+                var previous: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, "SELECT from_status FROM beatmap_rank_events WHERE set_id=?1 AND from_status!=to_status ORDER BY id DESC LIMIT 1", -1, &previous, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+                defer _ = c.sqlite3_finalize(previous);
+                _ = c.sqlite3_bind_int(previous, 1, context.set_id);
+                if (c.sqlite3_step(previous) != c.SQLITE_ROW) return error.NothingToRollback;
+                target = @intCast(c.sqlite3_column_int(previous, 0));
+            },
+        }
+        var update: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmaps SET status=?1,status_frozen=1,last_update=unixepoch() WHERE set_id=?2", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(update);
+        _ = c.sqlite3_bind_int(update, 1, target);
+        _ = c.sqlite3_bind_int(update, 2, context.set_id);
+        if (c.sqlite3_step(update) != c.SQLITE_DONE or c.sqlite3_changes(self.db) == 0) return error.BeatmapNotFound;
+        if (action == .veto or action == .rollback or action == .rank or action == .love) try self.clearBeatmapNominationsLocked(context.set_id);
+        if (action == .rank or action == .love) try self.resolveBeatmapRequestsLocked(context.set_id);
+        try self.rebuildScoreStats(false);
+        try self.insertBeatmapRankEventLocked(context.set_id, actor_id, action_name, current, target, reason);
+        try self.exec("COMMIT");
+        context.status = target;
+        context.requests = try self.activeRankCountLocked("beatmap_rank_requests", context.set_id);
+        context.nominations = try self.activeRankCountLocked("beatmap_nominations", context.set_id);
+        return context;
+    }
+
+    pub fn beatmapRankQueue(self: *Store, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT r.set_id,count(*),min(r.created_at),min(b.artist),min(b.title),(SELECT count(*) FROM beatmap_nominations n WHERE n.set_id=r.set_id AND n.active=1) FROM beatmap_rank_requests r JOIN beatmaps b ON b.set_id=r.set_id WHERE r.active=1 GROUP BY r.set_id ORDER BY min(r.created_at),r.set_id LIMIT 50";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (output.items.len != 0) try output.append(allocator, '\n');
+            const line = try std.fmt.allocPrint(allocator, "set {d} | {d} request(s) | {d}/2 noms | {s} - {s}", .{ c.sqlite3_column_int(stmt, 0), c.sqlite3_column_int(stmt, 1), c.sqlite3_column_int(stmt, 5), std.mem.span(c.sqlite3_column_text(stmt, 3)), std.mem.span(c.sqlite3_column_text(stmt, 4)) });
+            defer allocator.free(line);
+            try output.appendSlice(allocator, line);
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn rankContextLocked(self: *Store, map_md5: []const u8) !domain.BeatmapRankContext {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT b.id,b.set_id,b.status,(SELECT count(*) FROM beatmap_rank_requests r WHERE r.set_id=b.set_id AND r.active=1),(SELECT count(*) FROM beatmap_nominations n WHERE n.set_id=b.set_id AND n.active=1) FROM beatmaps b WHERE b.md5=?1";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, map_md5.ptr, @intCast(map_md5.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.BeatmapNotFound;
+        return .{ .map_id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .requests = @intCast(c.sqlite3_column_int(stmt, 3)), .nominations = @intCast(c.sqlite3_column_int(stmt, 4)) };
+    }
+
+    fn activeRankCountLocked(self: *Store, comptime table: []const u8, set_id: i32) !u32 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT count(*) FROM " ++ table ++ " WHERE set_id=?1 AND active=1";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return @intCast(c.sqlite3_column_int(stmt, 0));
+    }
+
+    fn clearBeatmapNominationsLocked(self: *Store, set_id: i32) !void {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_nominations SET active=0,updated_at=unixepoch() WHERE set_id=?1 AND active=1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    fn resolveBeatmapRequestsLocked(self: *Store, set_id: i32) !void {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_rank_requests SET active=0,resolved_at=unixepoch() WHERE set_id=?1 AND active=1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    fn insertBeatmapRankEventLocked(self: *Store, set_id: i32, actor_id: i32, action: []const u8, from_status: i8, to_status: i8, reason: []const u8) !void {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO beatmap_rank_events(set_id,actor_id,action,from_status,to_status,reason) VALUES(?1,?2,?3,?4,?5,?6)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        _ = c.sqlite3_bind_int(stmt, 2, actor_id);
+        _ = c.sqlite3_bind_text(stmt, 3, action.ptr, @intCast(action.len), null);
+        _ = c.sqlite3_bind_int(stmt, 4, from_status);
+        _ = c.sqlite3_bind_int(stmt, 5, to_status);
+        _ = c.sqlite3_bind_text(stmt, 6, reason.ptr, @intCast(reason.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        var target_buf: [32]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "beatmapset:{d}", .{set_id});
+        var audit: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO audit_log(actor_id,action,target,detail) VALUES(?1,?2,?3,?4)", -1, &audit, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(audit);
+        _ = c.sqlite3_bind_int(audit, 1, actor_id);
+        var audit_action_buf: [64]u8 = undefined;
+        const audit_action = try std.fmt.bufPrint(&audit_action_buf, "beatmap.{s}", .{action});
+        _ = c.sqlite3_bind_text(audit, 2, audit_action.ptr, @intCast(audit_action.len), null);
+        _ = c.sqlite3_bind_text(audit, 3, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_text(audit, 4, reason.ptr, @intCast(reason.len), null);
+        if (c.sqlite3_step(audit) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
     pub fn channelCanWrite(self: *Store, name: []const u8, privileges: u32) !bool {
@@ -836,7 +1063,7 @@ pub const Store = struct {
     pub fn upsertBeatmap(self: *Store, metadata: beatmap.Metadata, md5: []const u8, status: i8, stars: f64, max_combo: u32, osu_file: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,unixepoch(),?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) ON CONFLICT(id) DO UPDATE SET set_id=excluded.set_id,md5=excluded.md5,artist=excluded.artist,title=excluded.title,version=excluded.version,creator=excluded.creator,status=excluded.status,last_update=excluded.last_update,total_length=excluded.total_length,max_combo=excluded.max_combo,mode=excluded.mode,bpm=excluded.bpm,cs=excluded.cs,ar=excluded.ar,od=excluded.od,hp=excluded.hp,star_rating=excluded.star_rating,source=excluded.source,tags=excluded.tags,osu_file=excluded.osu_file,count_circles=excluded.count_circles,count_sliders=excluded.count_sliders,count_spinners=excluded.count_spinners";
+        const sql = "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,unixepoch(),?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) ON CONFLICT(id) DO UPDATE SET set_id=excluded.set_id,md5=excluded.md5,artist=excluded.artist,title=excluded.title,version=excluded.version,creator=excluded.creator,status=CASE WHEN beatmaps.status_frozen=1 THEN beatmaps.status ELSE excluded.status END,last_update=excluded.last_update,total_length=excluded.total_length,max_combo=excluded.max_combo,mode=excluded.mode,bpm=excluded.bpm,cs=excluded.cs,ar=excluded.ar,od=excluded.od,hp=excluded.hp,star_rating=excluded.star_rating,source=excluded.source,tags=excluded.tags,osu_file=excluded.osu_file,count_circles=excluded.count_circles,count_sliders=excluded.count_sliders,count_spinners=excluded.count_spinners";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -982,26 +1209,16 @@ pub const Store = struct {
 
     pub const BeatmapInfo = struct { id: i32, set_id: i32, max_combo: i32, artist: []const u8, title: []const u8, version: []const u8, star_rating: f64 };
 
-    pub fn scoreRankOnMap(self: *Store, md5: []const u8, mode: u8, namespace: []const u8, score_val: i64, pp_val: f64) i32 {
+    pub fn scoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const is_vanilla = std.mem.eql(u8, namespace, "vanilla");
-        const sql = if (is_vanilla)
-            "SELECT count(*) FROM scores WHERE map_md5=?1 AND mode=?2 AND rank_namespace=?3 AND passed=1 AND score>?4"
-        else
-            "SELECT count(*) FROM scores WHERE map_md5=?1 AND mode=?2 AND rank_namespace=?3 AND passed=1 AND pp>?4";
+        const sql = "SELECT s.best,(SELECT count(*) FROM scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed=1 AND o.best=1 AND ((pb.rank_namespace='vanilla' AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace!='vanilla' AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN scores pb ON pb.user_id=s.user_id AND pb.map_md5=s.map_md5 AND pb.mode=s.mode AND pb.rank_namespace=s.rank_namespace AND pb.passed=1 AND pb.best=1 WHERE s.id=?1 AND s.passed=1 AND b.status>=3";
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return 999;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
-        _ = c.sqlite3_bind_int(stmt, 2, mode);
-        _ = c.sqlite3_bind_text(stmt, 3, namespace.ptr, @intCast(namespace.len), null);
-        if (is_vanilla)
-            _ = c.sqlite3_bind_int64(stmt, 4, score_val)
-        else
-            _ = c.sqlite3_bind_double(stmt, 4, pp_val);
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 999;
-        return c.sqlite3_column_int(stmt, 0);
+        _ = c.sqlite3_bind_int64(stmt, 1, score_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{ .submitted_is_best = c.sqlite3_column_int(stmt, 0) != 0, .rank = c.sqlite3_column_int(stmt, 1) };
     }
 
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {

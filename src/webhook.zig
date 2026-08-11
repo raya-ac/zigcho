@@ -1,4 +1,10 @@
 const std = @import("std");
+const domain = @import("domain.zig");
+
+pub fn shouldAnnounceScore(placement: ?domain.ScorePlacement, pp_value: f64) bool {
+    const current = placement orelse return false;
+    return current.submitted_is_best and current.rank >= 0 and current.rank < 50 and (current.rank < 10 or pp_value >= 500.0);
+}
 
 pub const Webhook = struct {
     allocator: std.mem.Allocator,

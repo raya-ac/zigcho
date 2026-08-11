@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 13;
+const required_sqlite_version = 14;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -29,15 +29,15 @@ const stats = [_]Column{
     .{ .name = "total_hits", .kind = .integer },
 };
 const beatmaps = [_]Column{
-    .{ .name = "id", .kind = .integer },            .{ .name = "set_id", .kind = .integer },         .{ .name = "md5", .kind = .text },
-    .{ .name = "artist", .kind = .text },           .{ .name = "title", .kind = .text },             .{ .name = "version", .kind = .text },
-    .{ .name = "creator", .kind = .text },          .{ .name = "status", .kind = .integer },         .{ .name = "last_update", .kind = .integer },
-    .{ .name = "total_length", .kind = .integer },  .{ .name = "max_combo", .kind = .integer },      .{ .name = "plays", .kind = .integer },
-    .{ .name = "passes", .kind = .integer },        .{ .name = "mode", .kind = .integer },           .{ .name = "bpm", .kind = .real },
-    .{ .name = "cs", .kind = .real },               .{ .name = "ar", .kind = .real },                .{ .name = "od", .kind = .real },
-    .{ .name = "hp", .kind = .real },               .{ .name = "star_rating", .kind = .real },       .{ .name = "source", .kind = .text },
-    .{ .name = "tags", .kind = .text },             .{ .name = "osu_file", .kind = .blob },          .{ .name = "count_circles", .kind = .integer },
-    .{ .name = "count_sliders", .kind = .integer }, .{ .name = "count_spinners", .kind = .integer },
+    .{ .name = "id", .kind = .integer },            .{ .name = "set_id", .kind = .integer },        .{ .name = "md5", .kind = .text },
+    .{ .name = "artist", .kind = .text },           .{ .name = "title", .kind = .text },            .{ .name = "version", .kind = .text },
+    .{ .name = "creator", .kind = .text },          .{ .name = "status", .kind = .integer },        .{ .name = "status_frozen", .kind = .boolean },
+    .{ .name = "last_update", .kind = .integer },   .{ .name = "total_length", .kind = .integer },  .{ .name = "max_combo", .kind = .integer },
+    .{ .name = "plays", .kind = .integer },         .{ .name = "passes", .kind = .integer },        .{ .name = "mode", .kind = .integer },
+    .{ .name = "bpm", .kind = .real },              .{ .name = "cs", .kind = .real },               .{ .name = "ar", .kind = .real },
+    .{ .name = "od", .kind = .real },               .{ .name = "hp", .kind = .real },               .{ .name = "star_rating", .kind = .real },
+    .{ .name = "source", .kind = .text },           .{ .name = "tags", .kind = .text },             .{ .name = "osu_file", .kind = .blob },
+    .{ .name = "count_circles", .kind = .integer }, .{ .name = "count_sliders", .kind = .integer }, .{ .name = "count_spinners", .kind = .integer },
 };
 const scores = [_]Column{
     .{ .name = "id", .kind = .integer },           .{ .name = "user_id", .kind = .integer },      .{ .name = "map_md5", .kind = .text },
@@ -63,6 +63,20 @@ const chat_messages = [_]Column{
 const chat_channels = [_]Column{
     .{ .name = "name", .kind = .text },      .{ .name = "topic", .kind = .text },         .{ .name = "write_privileges", .kind = .integer },
     .{ .name = "locked", .kind = .boolean }, .{ .name = "updated_by", .kind = .integer }, .{ .name = "updated_at", .kind = .integer },
+};
+const beatmap_rank_requests = [_]Column{
+    .{ .name = "id", .kind = .integer },           .{ .name = "set_id", .kind = .integer }, .{ .name = "map_id", .kind = .integer },
+    .{ .name = "requester_id", .kind = .integer }, .{ .name = "active", .kind = .boolean }, .{ .name = "created_at", .kind = .integer },
+    .{ .name = "resolved_at", .kind = .integer },
+};
+const beatmap_nominations = [_]Column{
+    .{ .name = "set_id", .kind = .integer },     .{ .name = "nominator_id", .kind = .integer }, .{ .name = "active", .kind = .boolean },
+    .{ .name = "created_at", .kind = .integer }, .{ .name = "updated_at", .kind = .integer },
+};
+const beatmap_rank_events = [_]Column{
+    .{ .name = "id", .kind = .integer },  .{ .name = "set_id", .kind = .integer },      .{ .name = "actor_id", .kind = .integer },
+    .{ .name = "action", .kind = .text }, .{ .name = "from_status", .kind = .integer }, .{ .name = "to_status", .kind = .integer },
+    .{ .name = "reason", .kind = .text }, .{ .name = "created_at", .kind = .integer },
 };
 const lazer_scores = [_]Column{
     .{ .name = "id", .kind = .integer },          .{ .name = "user_id", .kind = .integer },      .{ .name = "beatmap_id", .kind = .integer },
@@ -102,6 +116,9 @@ const tables = [_]Table{
     .{ .name = "audit_log", .columns = &audit_log, .identity = true },
     .{ .name = "chat_messages", .columns = &chat_messages, .identity = true },
     .{ .name = "chat_channels", .columns = &chat_channels },
+    .{ .name = "beatmap_rank_requests", .columns = &beatmap_rank_requests, .identity = true },
+    .{ .name = "beatmap_nominations", .columns = &beatmap_nominations },
+    .{ .name = "beatmap_rank_events", .columns = &beatmap_rank_events, .identity = true },
     .{ .name = "lazer_scores", .columns = &lazer_scores, .identity = true },
     .{ .name = "custom_mods", .columns = &custom_mods },
     .{ .name = "oauth_tokens", .columns = &oauth_tokens },
@@ -352,7 +369,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 15), tables.len);
+    try std.testing.expectEqual(@as(usize, 18), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("client_hardware", tables[tables.len - 1].name);
 }

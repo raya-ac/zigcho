@@ -105,6 +105,7 @@ pub const Store = struct {
         }
         if (version < 11) try self.exec(@embedFile("migration_011.sql"));
         if (version < 12) try self.exec(@embedFile("migration_012.sql"));
+        if (version < 13) try self.exec(@embedFile("migration_013.sql"));
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -418,6 +419,186 @@ pub const Store = struct {
             .silence_end = c.sqlite3_column_int64(stmt, 5),
             .restricted = c.sqlite3_column_int(stmt, 6) != 0,
         };
+    }
+
+    pub fn userByName(self: *Store, allocator: std.mem.Allocator, name: []const u8) !?domain.User {
+        const safe = try domain.safeName(allocator, name);
+        defer allocator.free(safe);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT id,name,safe_name,country,privileges,silence_end,restricted FROM users WHERE safe_name=?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, safe.ptr, @intCast(safe.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const user_name = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+        errdefer allocator.free(user_name);
+        const safe_name = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+        const cc = std.mem.span(c.sqlite3_column_text(stmt, 3));
+        if (cc.len != 2) return error.InvalidCountry;
+        return .{
+            .id = c.sqlite3_column_int(stmt, 0),
+            .name = user_name,
+            .safe_name = safe_name,
+            .country = .{ cc[0], cc[1] },
+            .privileges = @intCast(c.sqlite3_column_int64(stmt, 4)),
+            .silence_end = c.sqlite3_column_int64(stmt, 5),
+            .restricted = c.sqlite3_column_int(stmt, 6) != 0,
+        };
+    }
+
+    pub fn recordPublicMessage(self: *Store, sender_id: i32, target: []const u8, message: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO chat_messages(sender_id,target,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, sender_id);
+        _ = c.sqlite3_bind_text(stmt, 2, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn channelCanWrite(self: *Store, name: []const u8, privileges: u32) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT CASE WHEN locked!=0 THEN (?2 & 8192)=8192 ELSE (?2 & write_privileges)=write_privileges END FROM chat_channels WHERE name=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 2, privileges);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return true;
+        return c.sqlite3_column_int(stmt, 0) != 0;
+    }
+
+    pub fn setChannelLocked(self: *Store, actor_id: i32, name: []const u8, locked: bool, reason: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE chat_channels SET locked=?1,updated_by=?2,updated_at=unixepoch() WHERE name=?3", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, @intFromBool(locked));
+        _ = c.sqlite3_bind_int(stmt, 2, actor_id);
+        _ = c.sqlite3_bind_text(stmt, 3, name.ptr, @intCast(name.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE or c.sqlite3_changes(self.db) == 0) return error.InvalidChannel;
+        var audit_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO audit_log(actor_id,action,target,detail) VALUES(?1,?2,?3,?4)", -1, &audit_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(audit_stmt);
+        _ = c.sqlite3_bind_int(audit_stmt, 1, actor_id);
+        const action = if (locked) "channel.lock" else "channel.unlock";
+        _ = c.sqlite3_bind_text(audit_stmt, 2, action.ptr, @intCast(action.len), null);
+        _ = c.sqlite3_bind_text(audit_stmt, 3, name.ptr, @intCast(name.len), null);
+        _ = c.sqlite3_bind_text(audit_stmt, 4, reason.ptr, @intCast(reason.len), null);
+        if (c.sqlite3_step(audit_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        try self.exec("COMMIT");
+    }
+
+    pub fn setSilence(self: *Store, actor_id: i32, target_id: i32, silence_end: i64, action: []const u8, reason: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE users SET silence_end=?1 WHERE id=?2 AND id!=3", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, silence_end);
+        _ = c.sqlite3_bind_int(stmt, 2, target_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE or c.sqlite3_changes(self.db) == 0) return error.InvalidModerationTarget;
+        try self.insertAuditLocked(actor_id, action, target_id, reason);
+        try self.exec("COMMIT");
+    }
+
+    pub fn setRestricted(self: *Store, actor_id: i32, target_id: i32, restricted: bool, reason: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE users SET restricted=?1 WHERE id=?2 AND id!=3", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, @intFromBool(restricted));
+        _ = c.sqlite3_bind_int(stmt, 2, target_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE or c.sqlite3_changes(self.db) == 0) return error.InvalidModerationTarget;
+        try self.insertAuditLocked(actor_id, if (restricted) "account.restrict" else "account.unrestrict", target_id, reason);
+        try self.exec("COMMIT");
+    }
+
+    pub fn changePrivileges(self: *Store, actor_id: i32, target_id: i32, bits: u32, add: bool) !u32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = if (add)
+            "UPDATE users SET privileges=privileges | ?1 WHERE id=?2 AND id!=3 RETURNING privileges"
+        else
+            "UPDATE users SET privileges=privileges & ~?1 WHERE id=?2 AND id!=3 RETURNING privileges";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, bits);
+        _ = c.sqlite3_bind_int(stmt, 2, target_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.InvalidModerationTarget;
+        const privileges: u32 = @intCast(c.sqlite3_column_int64(stmt, 0));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        var detail_buf: [64]u8 = undefined;
+        const detail = try std.fmt.bufPrint(&detail_buf, "{s} bits:{d}", .{ if (add) "add" else "remove", bits });
+        try self.insertAuditLocked(actor_id, "account.privileges", target_id, detail);
+        try self.exec("COMMIT");
+        return privileges;
+    }
+
+    pub fn addModerationNote(self: *Store, actor_id: i32, target_id: i32, note: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.insertAuditLocked(actor_id, "account.note", target_id, note);
+    }
+
+    pub fn recordModerationAction(self: *Store, actor_id: i32, target_id: i32, action: []const u8, detail: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.insertAuditLocked(actor_id, action, target_id, detail);
+    }
+
+    pub fn recordAudit(self: *Store, actor_id: i32, action: []const u8, target: []const u8, detail: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO audit_log(actor_id,action,target,detail) VALUES(?1,?2,?3,?4)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, actor_id);
+        _ = c.sqlite3_bind_text(stmt, 2, action.ptr, @intCast(action.len), null);
+        _ = c.sqlite3_bind_text(stmt, 3, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, detail.ptr, @intCast(detail.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn moderationNotes(self: *Store, allocator: std.mem.Allocator, target_id: i32, limit: u8) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var target_buf: [24]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "user:{d}", .{target_id});
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT created_at,action,coalesce(actor_id,0),coalesce(detail,'') FROM audit_log WHERE target=?1 ORDER BY id DESC LIMIT ?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_int(stmt, 2, limit);
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (output.items.len != 0) try output.append(allocator, '\n');
+            const line = try std.fmt.allocPrint(allocator, "{d} | {s} | by {d} | {s}", .{
+                c.sqlite3_column_int64(stmt, 0),
+                std.mem.span(c.sqlite3_column_text(stmt, 1)),
+                c.sqlite3_column_int(stmt, 2),
+                std.mem.span(c.sqlite3_column_text(stmt, 3)),
+            });
+            defer allocator.free(line);
+            try output.appendSlice(allocator, line);
+        }
+        return output.toOwnedSlice(allocator);
     }
 
     pub fn updateCountry(self: *Store, user_id: i32, value: [2]u8) !void {

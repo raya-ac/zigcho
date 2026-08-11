@@ -822,36 +822,71 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             const text = std.mem.trim(u8, try p.string(), " \t\r\n");
             const target_name = try p.string();
             _ = try p.int(i32);
-            if (text.len == 0 or text.len > 2000) continue;
+            if (text.len == 0 or text.len > 2000 or std.mem.indexOfScalar(u8, text, 0) != null) continue;
+            if (session.user.restricted) continue;
+            if (session.user.silence_end > now) {
+                try out.packetInt(.silence_end, @intCast(@min(@as(i64, std.math.maxInt(i32)), session.user.silence_end - now)));
+                continue;
+            }
+            if (packet.id == .send_public_message and !try store.channelCanWrite(target_name, session.user.privileges)) {
+                try out.packetString(.notification, "that channel is read-only right now");
+                continue;
+            }
             if (packet.id == .send_private_message) {
                 if (sessions.byName(target_name)) |target| {
                     if (target.is_bot) {
-                        if (commands.handleCommand(allocator, store, session, text) == .handled) continue;
-                        try protocol.writeMessage(&out, "kai", "commands: !np (pp for current map) | !with mods acc% misses (custom pp)", session.user.name, 3);
+                        if (try commands.handleCommand(allocator, store, sessions, session, text, session.user.name, &out) == .handled) continue;
+                        try protocol.writeMessage(&out, "kai", "try !help — i can do pp, stats, player commands, and staff tools", session.user.name, 3);
                         continue;
                     }
                 }
             }
             if (packet.id == .send_public_message and try handleMultiplayerCommandLocked(allocator, sessions, session, target_name, text)) continue;
+            if (packet.id == .send_public_message and text[0] == '!' and !std.mem.eql(u8, target_name, multiplayer_channel) and !std.mem.eql(u8, target_name, "#spectator")) {
+                if (try commands.handleCommand(allocator, store, sessions, session, text, target_name, &out) == .handled) continue;
+            }
             var message = protocol.Writer.init(allocator);
             defer message.deinit();
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
             if (packet.id == .send_private_message) {
                 if (sessions.byName(target_name)) |target| {
-                    if (!target.is_bot) try queuePacket(target, allocator, message.bytes());
+                    if (!target.is_bot) {
+                        if (target.user.silence_end > now or target.user.restricted) {
+                            var blocked = protocol.Writer.init(allocator);
+                            defer blocked.deinit();
+                            const start = try blocked.begin(.target_is_silenced);
+                            try blocked.string("");
+                            try blocked.string("");
+                            try blocked.string(target.user.name);
+                            try blocked.int(i32, 0);
+                            blocked.finish(start);
+                            try out.raw(blocked.bytes());
+                            continue;
+                        }
+                        try queuePacket(target, allocator, message.bytes());
+                    }
                 }
             } else {
                 if (std.mem.eql(u8, target_name, "#spectator")) {
-                    _ = try broadcastSpectatorChatLocked(allocator, sessions, session, message.bytes());
+                    if (try broadcastSpectatorChatLocked(allocator, sessions, session, message.bytes())) {
+                        const host_id = session.spectating_user_id orelse session.user.id;
+                        var history_target_buf: [32]u8 = undefined;
+                        const history_target = try std.fmt.bufPrint(&history_target_buf, "#spectator_{d}", .{host_id});
+                        store.recordPublicMessage(session.user.id, history_target, text) catch |err| std.log.warn("chat history write failed: {s}", .{@errorName(err)});
+                    }
                     continue;
                 }
                 if (std.mem.eql(u8, target_name, multiplayer_channel)) {
                     const match_id = session.visibleMatchId() orelse continue;
                     try broadcastMatchChatLocked(allocator, sessions, match_id, message.bytes(), session);
+                    var history_target_buf: [32]u8 = undefined;
+                    const history_target = try std.fmt.bufPrint(&history_target_buf, "#multi_{d}", .{match_id});
+                    store.recordPublicMessage(session.user.id, history_target, text) catch |err| std.log.warn("chat history write failed: {s}", .{@errorName(err)});
                     continue;
                 }
                 if (!session.joined(target_name)) continue;
                 try sessions.broadcastChannel(target_name, message.bytes(), session);
+                store.recordPublicMessage(session.user.id, target_name, text) catch |err| std.log.warn("chat history write failed: {s}", .{@errorName(err)});
             }
         },
         .join_lobby => {

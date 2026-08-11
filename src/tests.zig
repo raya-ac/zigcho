@@ -157,6 +157,18 @@ fn expectPacket(data: []const u8, wanted: protocol.ServerPacket) !void {
     return error.MissingPacket;
 }
 
+fn expectMessageText(data: []const u8, expected: []const u8) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.send_message)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        _ = try payload.string();
+        try std.testing.expectEqualStrings(expected, try payload.string());
+        return;
+    }
+    return error.MissingPacket;
+}
+
 const LoginAllocationContext = struct {
     store: *storage.Store,
     body: []const u8,
@@ -853,6 +865,7 @@ test "joined public chat delivers once and kai answers private chat as user thre
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
+    try store.exec("INSERT OR IGNORE INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00')");
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
     _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
@@ -886,10 +899,189 @@ test "joined public chat delivers once and kai answers private chat as user thre
     const bot_packet = (try bot_reader.next()).?;
     var bot_payload: protocol.PayloadReader = .{ .data = bot_packet.payload };
     try std.testing.expectEqualStrings("kai", try bot_payload.string());
-    try std.testing.expectEqualStrings("commands: !np (pp for current map) | !with mods acc% misses (custom pp)", try bot_payload.string());
+    try std.testing.expectEqualStrings("try !help — i can do pp, stats, player commands, and staff tools", try bot_payload.string());
     try std.testing.expectEqualStrings("ari", try bot_payload.string());
     try std.testing.expectEqual(@as(i32, 3), try bot_payload.int(i32));
     try std.testing.expectEqual(@as(usize, 0), sessions.byUser(3).?.queue.items.len);
+}
+
+test "stable chat commands enforce silence and audit staff actions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/chat-moderation.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,privileges) VALUES" ++
+            "(10,'admin','admin',x'00',x'00',12291)," ++
+            "(11,'target','target',x'00',x'00',3)," ++
+            "(12,'observer','observer',x'00',x'00',3);" ++
+            "INSERT INTO stats(user_id,mode) VALUES(10,0),(11,0),(12,0);",
+    );
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
+    const admin = try sessions.create((try store.userById(std.testing.allocator, 10)).?, 0, 0, 0);
+    const target = try sessions.create((try store.userById(std.testing.allocator, 11)).?, 0, 0, 0);
+    const observer = try sessions.create((try store.userById(std.testing.allocator, 12)).?, 0, 0, 0);
+    try std.testing.expect(sessions.join(admin, "#osu"));
+    try std.testing.expect(sessions.join(target, "#osu"));
+    try std.testing.expect(sessions.join(observer, "#osu"));
+
+    const silence = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!silence target 10m testing chat", "kai", 10);
+    defer std.testing.allocator.free(silence);
+    const silence_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, silence);
+    defer std.testing.allocator.free(silence_reply);
+    try expectMessageText(silence_reply, "target was silenced");
+    try std.testing.expect(target.user.silence_end > std.Io.Clock.real.now(std.testing.io).toSeconds());
+    const target_notice = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(target_notice);
+    try expectPacket(target_notice, .silence_end);
+    const observer_notice = try bancho.poll(std.testing.allocator, &store, &sessions, observer, "");
+    defer std.testing.allocator.free(observer_notice);
+    try expectPacket(observer_notice, .user_silenced);
+
+    const silenced_dm = try clientMessagePacket(std.testing.allocator, .send_private_message, "observer", "can you see this", "target", 12);
+    defer std.testing.allocator.free(silenced_dm);
+    const silenced_dm_reply = try bancho.poll(std.testing.allocator, &store, &sessions, observer, silenced_dm);
+    defer std.testing.allocator.free(silenced_dm_reply);
+    try expectPacket(silenced_dm_reply, .target_is_silenced);
+
+    const blocked = try clientMessagePacket(std.testing.allocator, .send_public_message, "target", "this must not land", "#osu", 11);
+    defer std.testing.allocator.free(blocked);
+    const blocked_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, blocked);
+    defer std.testing.allocator.free(blocked_reply);
+    try expectPacket(blocked_reply, .silence_end);
+    const observer_after = try bancho.poll(std.testing.allocator, &store, &sessions, observer, "");
+    defer std.testing.allocator.free(observer_after);
+    try std.testing.expectEqual(@as(usize, 0), observer_after.len);
+
+    const note = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!addnote target watched chat enforcement", "kai", 10);
+    defer std.testing.allocator.free(note);
+    const note_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, note);
+    defer std.testing.allocator.free(note_reply);
+    try expectMessageText(note_reply, "note added");
+    const notes = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!notes target", "kai", 10);
+    defer std.testing.allocator.free(notes);
+    const notes_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, notes);
+    defer std.testing.allocator.free(notes_reply);
+    try std.testing.expect(std.mem.indexOf(u8, notes_reply, "watched chat enforcement") != null);
+
+    const unsilence = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!unsilence target reviewed", "kai", 10);
+    defer std.testing.allocator.free(unsilence);
+    const unsilence_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, unsilence);
+    defer std.testing.allocator.free(unsilence_reply);
+    try expectMessageText(unsilence_reply, "target was unsilenced");
+    try std.testing.expect(target.user.silence_end <= std.Io.Clock.real.now(std.testing.io).toSeconds());
+
+    const restrict = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!restrict target repeated abuse", "kai", 10);
+    defer std.testing.allocator.free(restrict);
+    const restrict_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, restrict);
+    defer std.testing.allocator.free(restrict_reply);
+    try expectMessageText(restrict_reply, "target was restricted");
+    const stored_target = (try store.userById(std.testing.allocator, 11)).?;
+    defer std.testing.allocator.free(stored_target.name);
+    defer std.testing.allocator.free(stored_target.safe_name);
+    try std.testing.expect(stored_target.restricted);
+
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM audit_log WHERE target='user:11'", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(stmt, 0));
+}
+
+test "stable channel permissions and locks survive in storage" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/chat-channels.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,privileges) VALUES" ++
+            "(20,'admin','admin',x'00',x'00',24579)," ++
+            "(21,'player','player',x'00',x'00',3);" ++
+            "INSERT INTO stats(user_id,mode) VALUES(20,0),(21,0);",
+    );
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
+    const admin = try sessions.create((try store.userById(std.testing.allocator, 20)).?, 0, 0, 0);
+    const player = try sessions.create((try store.userById(std.testing.allocator, 21)).?, 0, 0, 0);
+    try std.testing.expect(sessions.join(admin, "#osu"));
+    try std.testing.expect(sessions.join(player, "#osu"));
+
+    const announce = try clientMessagePacket(std.testing.allocator, .send_public_message, "player", "not allowed", "#announce", 21);
+    defer std.testing.allocator.free(announce);
+    const announce_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, announce);
+    defer std.testing.allocator.free(announce_reply);
+    try expectStringPacket(announce_reply, .notification, "that channel is read-only right now");
+
+    const denied_restrict = try clientMessagePacket(std.testing.allocator, .send_private_message, "player", "!restrict admin no", "kai", 21);
+    defer std.testing.allocator.free(denied_restrict);
+    const denied_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, denied_restrict);
+    defer std.testing.allocator.free(denied_reply);
+    try expectMessageText(denied_reply, "you do not have permission for that");
+
+    const lock = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!lock #osu maintenance", "kai", 20);
+    defer std.testing.allocator.free(lock);
+    const lock_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, lock);
+    defer std.testing.allocator.free(lock_reply);
+    try expectMessageText(lock_reply, "channel locked");
+    try std.testing.expect(!try store.channelCanWrite("#osu", 3));
+    try std.testing.expect(try store.channelCanWrite("#osu", 8195));
+
+    const blocked = try clientMessagePacket(std.testing.allocator, .send_public_message, "player", "also not allowed", "#osu", 21);
+    defer std.testing.allocator.free(blocked);
+    const blocked_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, blocked);
+    defer std.testing.allocator.free(blocked_reply);
+    try expectStringPacket(blocked_reply, .notification, "that channel is read-only right now");
+
+    const unlock = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!unlock #osu finished", "kai", 20);
+    defer std.testing.allocator.free(unlock);
+    const unlock_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, unlock);
+    defer std.testing.allocator.free(unlock_reply);
+    try expectMessageText(unlock_reply, "channel unlocked");
+    try std.testing.expect(try store.channelCanWrite("#osu", 3));
+
+    const add_priv = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!addpriv player supporter", "kai", 20);
+    defer std.testing.allocator.free(add_priv);
+    const add_priv_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, add_priv);
+    defer std.testing.allocator.free(add_priv_reply);
+    try expectMessageText(add_priv_reply, "privileges updated");
+    try std.testing.expect(player.user.privileges & (1 << 4) != 0);
+    const privilege_notice = try bancho.poll(std.testing.allocator, &store, &sessions, player, "");
+    defer std.testing.allocator.free(privilege_notice);
+    try expectPacket(privilege_notice, .privileges);
+
+    const remove_priv = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!rmpriv player supporter", "kai", 20);
+    defer std.testing.allocator.free(remove_priv);
+    const remove_priv_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, remove_priv);
+    defer std.testing.allocator.free(remove_priv_reply);
+    try expectMessageText(remove_priv_reply, "privileges updated");
+    try std.testing.expect(player.user.privileges & (1 << 4) == 0);
+    const remove_notice = try bancho.poll(std.testing.allocator, &store, &sessions, player, "");
+    defer std.testing.allocator.free(remove_notice);
+    try expectPacket(remove_notice, .privileges);
+
+    const delivered = try clientMessagePacket(std.testing.allocator, .send_public_message, "player", "back again", "#osu", 21);
+    defer std.testing.allocator.free(delivered);
+    const sender_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, delivered);
+    defer std.testing.allocator.free(sender_reply);
+    try std.testing.expectEqual(@as(usize, 0), sender_reply.len);
+    const received = try bancho.poll(std.testing.allocator, &store, &sessions, admin, "");
+    defer std.testing.allocator.free(received);
+    try expectMessageText(received, "back again");
+
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM chat_messages WHERE sender_id=21 AND target='#osu' AND message='back again'", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 0));
 }
 
 test "server roles map to stable privileges and login always grants supporter" {

@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 12;
+const required_sqlite_version = 13;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -56,6 +56,14 @@ const audit_log = [_]Column{
     .{ .name = "id", .kind = .integer },  .{ .name = "actor_id", .kind = .integer }, .{ .name = "action", .kind = .text },
     .{ .name = "target", .kind = .text }, .{ .name = "detail", .kind = .text },      .{ .name = "created_at", .kind = .integer },
 };
+const chat_messages = [_]Column{
+    .{ .name = "id", .kind = .integer },   .{ .name = "sender_id", .kind = .integer },  .{ .name = "target", .kind = .text },
+    .{ .name = "message", .kind = .text }, .{ .name = "created_at", .kind = .integer },
+};
+const chat_channels = [_]Column{
+    .{ .name = "name", .kind = .text },      .{ .name = "topic", .kind = .text },         .{ .name = "write_privileges", .kind = .integer },
+    .{ .name = "locked", .kind = .boolean }, .{ .name = "updated_by", .kind = .integer }, .{ .name = "updated_at", .kind = .integer },
+};
 const lazer_scores = [_]Column{
     .{ .name = "id", .kind = .integer },          .{ .name = "user_id", .kind = .integer },      .{ .name = "beatmap_id", .kind = .integer },
     .{ .name = "ruleset_id", .kind = .integer },  .{ .name = "total_score", .kind = .integer },  .{ .name = "legacy_total_score", .kind = .integer },
@@ -92,6 +100,8 @@ const tables = [_]Table{
     .{ .name = "favourites", .columns = &favourites },
     .{ .name = "ratings", .columns = &ratings },
     .{ .name = "audit_log", .columns = &audit_log, .identity = true },
+    .{ .name = "chat_messages", .columns = &chat_messages, .identity = true },
+    .{ .name = "chat_channels", .columns = &chat_channels },
     .{ .name = "lazer_scores", .columns = &lazer_scores, .identity = true },
     .{ .name = "custom_mods", .columns = &custom_mods },
     .{ .name = "oauth_tokens", .columns = &oauth_tokens },
@@ -342,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 13), tables.len);
+    try std.testing.expectEqual(@as(usize, 15), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("client_hardware", tables[tables.len - 1].name);
 }

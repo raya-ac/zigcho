@@ -276,9 +276,8 @@ fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, byte
     try target.enqueue(allocator, bytes);
 }
 
-fn matchChannelName(buffer: *[32]u8, match_id: u16) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "#multi_{d}", .{match_id});
-}
+const lobby_channel = "#lobby";
+const multiplayer_channel = "#multiplayer";
 
 fn packetMatchId(payload: []const u8) ?u16 {
     if (payload.len != @sizeOf(i32)) return null;
@@ -299,9 +298,46 @@ fn canUseTournament(session: *const sessions_mod.Session) bool {
 }
 
 fn matchChannelCountLocked(sessions: *const sessions_mod.Sessions, match_id: u16) i32 {
-    var channel_buffer: [32]u8 = undefined;
-    const name = matchChannelName(&channel_buffer, match_id) catch return 0;
-    return @intCast(sessions.channelCount(name));
+    var count: usize = 0;
+    for (sessions.items.items) |other| if (other.match_id == match_id or other.tournamentJoined(match_id)) {
+        count += 1;
+    };
+    return @intCast(count);
+}
+
+fn queueLobbyChannelInfoLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, except: ?*sessions_mod.Session) !void {
+    var info = protocol.Writer.init(allocator);
+    defer info.deinit();
+    try protocol.writeChannel(&info, lobby_channel, "multiplayer lobby", @intCast(sessions.channelCount(lobby_channel)));
+    try sessions.broadcastChannel(lobby_channel, info.bytes(), except);
+}
+
+fn queueMatchChannelInfoLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16, except: ?*sessions_mod.Session) !void {
+    var info = protocol.Writer.init(allocator);
+    defer info.deinit();
+    try protocol.writeChannel(&info, multiplayer_channel, "multiplayer", matchChannelCountLocked(sessions, match_id));
+    for (sessions.items.items) |other| {
+        if (other != except and !other.is_bot and (other.match_id == match_id or other.tournamentJoined(match_id))) {
+            try other.enqueue(allocator, info.bytes());
+        }
+    }
+}
+
+fn closeLobbyLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, response: ?*protocol.Writer) !void {
+    const was_joined = session.joined_lobby_channel;
+    session.in_lobby = false;
+    session.joined_lobby_channel = false;
+    if (!was_joined) return;
+    if (response) |out| try out.packetString(.channel_kick, lobby_channel);
+    try queueLobbyChannelInfoLocked(allocator, sessions, session);
+}
+
+fn broadcastMatchChatLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16, bytes: []const u8, except: ?*sessions_mod.Session) !void {
+    for (sessions.items.items) |other| {
+        if (other != except and !other.is_bot and (other.match_id == match_id or other.tournamentJoined(match_id))) {
+            try other.enqueue(allocator, bytes);
+        }
+    }
 }
 
 fn broadcastMatchStateLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match: *const multiplayer.Match, include_lobby: bool) !void {
@@ -332,11 +368,9 @@ fn broadcastDisposeMatchLocked(allocator: std.mem.Allocator, sessions: *sessions
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
     try event.packetInt(.dispose_match, match_id);
-    var channel_buffer: [32]u8 = undefined;
-    const channel_name = try matchChannelName(&channel_buffer, match_id);
     var channel_kick = protocol.Writer.init(allocator);
     defer channel_kick.deinit();
-    try channel_kick.packetString(.channel_kick, channel_name);
+    try channel_kick.packetString(.channel_kick, multiplayer_channel);
     for (sessions.items.items) |other| {
         if (other.tournamentJoined(match_id)) try other.enqueue(allocator, channel_kick.bytes());
         other.partTournament(match_id);
@@ -483,20 +517,16 @@ fn broadcastMatchPacketLocked(allocator: std.mem.Allocator, sessions: *sessions_
 }
 
 fn sendMatchBotLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16, text: []const u8) !void {
-    var channel_buffer: [32]u8 = undefined;
-    const channel_name = try matchChannelName(&channel_buffer, match_id);
     var message = protocol.Writer.init(allocator);
     defer message.deinit();
-    try protocol.writeMessage(&message, "kai", text, channel_name, 3);
-    try sessions.broadcastChannel(channel_name, message.bytes(), null);
+    try protocol.writeMessage(&message, "kai", text, multiplayer_channel, 3);
+    try broadcastMatchChatLocked(allocator, sessions, match_id, message.bytes(), null);
 }
 
 fn handleMultiplayerCommandLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, target_name: []const u8, text: []const u8) !bool {
     if (text.len < 3 or !std.ascii.eqlIgnoreCase(text[0..3], "!mp") or (text.len > 3 and text[3] != ' ')) return false;
-    var channel_buffer: [32]u8 = undefined;
     const match_id = session.match_id orelse return true;
-    const expected_channel = try matchChannelName(&channel_buffer, match_id);
-    if (!std.mem.eql(u8, target_name, expected_channel)) return true;
+    if (!std.mem.eql(u8, target_name, multiplayer_channel)) return true;
     const match = sessions.matchById(match_id) orelse return true;
 
     var tokens = std.mem.tokenizeScalar(u8, std.mem.trim(u8, text[3..], " \t"), ' ');
@@ -591,8 +621,9 @@ fn handleMultiplayerCommandLocked(allocator: std.mem.Allocator, sessions: *sessi
     return true;
 }
 
-fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, response: ?*protocol.Writer) void {
     const match_id = session.match_id orelse return;
+    if (response) |out| out.packetString(.channel_kick, multiplayer_channel) catch {};
     const match = sessions.matchById(match_id) orelse {
         session.match_id = null;
         return;
@@ -605,6 +636,7 @@ fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessio
     _ = match.removeReferee(session.user.id);
     slot.reset(next_status);
     session.match_id = null;
+    queueMatchChannelInfoLocked(allocator, sessions, match_id, session) catch {};
     if (match.isEmpty()) {
         match.deinit();
         sessions.matches[match_id] = null;
@@ -634,7 +666,8 @@ fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.S
 }
 
 fn removeSessionLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
-    leaveMatchLocked(allocator, sessions, session);
+    closeLobbyLocked(allocator, sessions, session, null) catch {};
+    leaveMatchLocked(allocator, sessions, session, null);
     detachSpectatorLocked(allocator, sessions, session) catch {};
     clearSpectatorsForHostLocked(allocator, sessions, session);
     broadcastLogoutLocked(allocator, sessions, session);
@@ -714,15 +747,26 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                     _ = try broadcastSpectatorChatLocked(allocator, sessions, session, message.bytes());
                     continue;
                 }
+                if (std.mem.eql(u8, target_name, multiplayer_channel)) {
+                    const match_id = session.visibleMatchId() orelse continue;
+                    try broadcastMatchChatLocked(allocator, sessions, match_id, message.bytes(), session);
+                    continue;
+                }
                 if (!session.joined(target_name)) continue;
                 try sessions.broadcastChannel(target_name, message.bytes(), session);
             }
         },
         .join_lobby => {
+            if (session.match_id != null) continue;
+            const newly_joined = !session.joined_lobby_channel;
             session.in_lobby = true;
+            session.joined_lobby_channel = true;
+            if (newly_joined) try out.packetString(.channel_join_success, lobby_channel);
+            try protocol.writeChannel(&out, lobby_channel, "multiplayer lobby", @intCast(sessions.channelCount(lobby_channel)));
+            if (newly_joined) try queueLobbyChannelInfoLocked(allocator, sessions, session);
             for (&sessions.matches) |*entry| if (entry.*) |*match| try multiplayer.writePacket(&out, .new_match, match, false);
         },
-        .part_lobby => session.in_lobby = false,
+        .part_lobby => try closeLobbyLocked(allocator, sessions, session, &out),
         .create_match => {
             const data = multiplayer.readMatch(packet.payload) catch continue;
             if (data.host_id != session.user.id or session.match_id != null or session.user.restricted or session.user.silence_end > now) {
@@ -736,10 +780,11 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             sessions.matches[match_id] = try multiplayer.Match.init(allocator, match_id, data, session.user.id);
             const match = sessions.matchById(match_id).?;
             session.match_id = match_id;
-            session.in_lobby = false;
+            try out.packetString(.channel_join_success, multiplayer_channel);
+            try protocol.writeChannel(&out, multiplayer_channel, "multiplayer", matchChannelCountLocked(sessions, match_id));
+            try closeLobbyLocked(allocator, sessions, session, &out);
             try multiplayer.writePacket(&out, .match_join_success, match, true);
-            var channel_buffer: [32]u8 = undefined;
-            try out.packetString(.channel_join_success, try matchChannelName(&channel_buffer, match_id));
+            try queueMatchChannelInfoLocked(allocator, sessions, match_id, session);
             try broadcastNewMatchLocked(allocator, sessions, match);
             try broadcastMatchStateLocked(allocator, sessions, match, true);
         },
@@ -772,13 +817,14 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             slot.status = @intFromEnum(multiplayer.SlotStatus.not_ready);
             slot.team = if (multiplayer.isTeamVersus(match.team_type)) @intFromEnum(multiplayer.Team.red) else @intFromEnum(multiplayer.Team.neutral);
             session.match_id = match_id;
-            session.in_lobby = false;
+            try out.packetString(.channel_join_success, multiplayer_channel);
+            try protocol.writeChannel(&out, multiplayer_channel, "multiplayer", matchChannelCountLocked(sessions, match_id));
+            try closeLobbyLocked(allocator, sessions, session, &out);
             try multiplayer.writePacket(&out, .match_join_success, match, true);
-            var channel_buffer: [32]u8 = undefined;
-            try out.packetString(.channel_join_success, try matchChannelName(&channel_buffer, match_id));
+            try queueMatchChannelInfoLocked(allocator, sessions, match_id, session);
             try broadcastMatchStateLocked(allocator, sessions, match, true);
         },
-        .part_match => leaveMatchLocked(allocator, sessions, session),
+        .part_match => leaveMatchLocked(allocator, sessions, session, &out),
         .change_slot => {
             const match_id = session.match_id orelse continue;
             const match = sessions.matchById(match_id) orelse continue;
@@ -949,7 +995,9 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                     var kicked = protocol.Writer.init(allocator);
                     defer kicked.deinit();
                     try kicked.packetEmpty(.match_join_fail);
+                    try kicked.packetString(.channel_kick, multiplayer_channel);
                     try target.enqueue(allocator, kicked.bytes());
+                    try queueMatchChannelInfoLocked(allocator, sessions, match.id, target);
                 };
                 slot.reset(.locked);
             }
@@ -1055,36 +1103,38 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             const match = sessions.matchById(match_id) orelse continue;
             if (match.slotByUser(session.user.id) != null) continue;
             session.joinTournament(match_id);
-            var channel_buffer: [32]u8 = undefined;
-            const channel_name = try matchChannelName(&channel_buffer, match_id);
-            try out.packetString(.channel_join_success, channel_name);
-            var info = protocol.Writer.init(allocator);
-            defer info.deinit();
-            try protocol.writeChannel(&info, channel_name, "multiplayer", matchChannelCountLocked(sessions, match_id));
-            try sessions.broadcastChannel(channel_name, info.bytes(), null);
+            try out.packetString(.channel_join_success, multiplayer_channel);
+            try protocol.writeChannel(&out, multiplayer_channel, "multiplayer", matchChannelCountLocked(sessions, match_id));
+            try queueMatchChannelInfoLocked(allocator, sessions, match_id, session);
         },
         .tournament_leave_match_channel => {
             const match_id = packetMatchId(packet.payload) orelse continue;
             if (!canUseTournament(session) or !session.tournamentJoined(match_id)) continue;
             session.partTournament(match_id);
-            var channel_buffer: [32]u8 = undefined;
-            const channel_name = try matchChannelName(&channel_buffer, match_id);
-            try out.packetString(.channel_kick, channel_name);
+            try out.packetString(.channel_kick, multiplayer_channel);
             if (sessions.matchById(match_id) != null) {
-                var info = protocol.Writer.init(allocator);
-                defer info.deinit();
-                try protocol.writeChannel(&info, channel_name, "multiplayer", matchChannelCountLocked(sessions, match_id));
-                try sessions.broadcastChannel(channel_name, info.bytes(), null);
+                try queueMatchChannelInfoLocked(allocator, sessions, match_id, session);
             }
         },
         .channel_join => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             const name = try p.string();
-            if (sessions.join(session, name)) try out.packetString(.channel_join_success, name);
+            if (sessions.join(session, name)) {
+                try out.packetString(.channel_join_success, name);
+                if (std.mem.eql(u8, name, lobby_channel)) {
+                    try protocol.writeChannel(&out, lobby_channel, "multiplayer lobby", @intCast(sessions.channelCount(lobby_channel)));
+                    try queueLobbyChannelInfoLocked(allocator, sessions, session);
+                }
+            }
         },
         .channel_part => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
-            sessions.part(session, try p.string());
+            const name = try p.string();
+            sessions.part(session, name);
+            if (std.mem.eql(u8, name, lobby_channel)) {
+                session.in_lobby = false;
+                try queueLobbyChannelInfoLocked(allocator, sessions, session);
+            }
         },
         .user_stats_request => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };

@@ -126,6 +126,25 @@ fn expectPacketIds(data: []const u8, expected: []const protocol.ServerPacket) !v
     try std.testing.expect((try reader.next()) == null);
 }
 
+fn expectStringPacket(data: []const u8, wanted: protocol.ServerPacket, value: []const u8) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(wanted)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        try std.testing.expectEqualStrings(value, try payload.string());
+        return;
+    }
+    return error.MissingPacket;
+}
+
+fn expectPacket(data: []const u8, wanted: protocol.ServerPacket) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) == @intFromEnum(wanted)) return;
+    }
+    return error.MissingPacket;
+}
+
 const LoginAllocationContext = struct {
     store: *storage.Store,
     body: []const u8,
@@ -870,23 +889,35 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
 
     const join_lobby = try clientEmptyPacket(std.testing.allocator, .join_lobby);
     defer std.testing.allocator.free(join_lobby);
+    const host_lobby = try bancho.poll(std.testing.allocator, &store, &sessions, host, join_lobby);
+    defer std.testing.allocator.free(host_lobby);
+    try expectPacketIds(host_lobby, &.{ .channel_join_success, .channel_info });
+    try expectStringPacket(host_lobby, .channel_join_success, "#lobby");
     const guest_lobby = try bancho.poll(std.testing.allocator, &store, &sessions, guest, join_lobby);
     defer std.testing.allocator.free(guest_lobby);
+    try expectPacketIds(guest_lobby, &.{ .channel_join_success, .channel_info });
+    try expectStringPacket(guest_lobby, .channel_info, "#lobby");
     const observer_lobby = try bancho.poll(std.testing.allocator, &store, &sessions, observer, join_lobby);
     defer std.testing.allocator.free(observer_lobby);
-    try std.testing.expect(guest.in_lobby and observer.in_lobby);
+    try expectPacketIds(observer_lobby, &.{ .channel_join_success, .channel_info });
+    try std.testing.expect(host.in_lobby and guest.in_lobby and observer.in_lobby);
+    try std.testing.expect(host.joined_lobby_channel and guest.joined_lobby_channel and observer.joined_lobby_channel);
+    try drainSession(std.testing.allocator, &store, &sessions, host);
+    try drainSession(std.testing.allocator, &store, &sessions, guest);
+    try drainSession(std.testing.allocator, &store, &sessions, observer);
 
     const create = try clientMatchPacket(std.testing.allocator, .create_match, host.user.id, "room-secret");
     defer std.testing.allocator.free(create);
     const created = try bancho.poll(std.testing.allocator, &store, &sessions, host, create);
     defer std.testing.allocator.free(created);
-    var created_reader: protocol.Reader = .{ .data = created };
-    try std.testing.expectEqual(protocol.ServerPacket.match_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try created_reader.next()).?.id))));
-    try std.testing.expectEqual(protocol.ServerPacket.channel_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try created_reader.next()).?.id))));
-    try std.testing.expect((try created_reader.next()) == null);
+    try expectPacketIds(created, &.{ .channel_join_success, .channel_info, .channel_kick, .match_join_success });
+    try expectStringPacket(created, .channel_join_success, "#multiplayer");
+    try expectStringPacket(created, .channel_kick, "#lobby");
     const match = sessions.matchById(0).?;
     try std.testing.expectEqual(@as(?u16, 0), host.match_id);
     try std.testing.expect(!host.in_lobby);
+    try std.testing.expect(!host.joined_lobby_channel);
+    try std.testing.expect(host.joined("#multiplayer"));
     try std.testing.expectEqual(@as(usize, 1), match.occupied());
 
     const empty = try clientEmptyPacket(std.testing.allocator, .ping);
@@ -894,6 +925,7 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     const guest_discovery = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
     defer std.testing.allocator.free(guest_discovery);
     var discovery_reader: protocol.Reader = .{ .data = guest_discovery };
+    try std.testing.expectEqual(protocol.ServerPacket.channel_info, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
     try std.testing.expectEqual(protocol.ServerPacket.new_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
     try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
 
@@ -909,17 +941,19 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     defer std.testing.allocator.free(right_join);
     const joined = try bancho.poll(std.testing.allocator, &store, &sessions, guest, right_join);
     defer std.testing.allocator.free(joined);
-    var joined_reader: protocol.Reader = .{ .data = joined };
-    try std.testing.expectEqual(protocol.ServerPacket.match_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try joined_reader.next()).?.id))));
-    try std.testing.expectEqual(protocol.ServerPacket.channel_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try joined_reader.next()).?.id))));
+    try expectPacketIds(joined, &.{ .channel_join_success, .channel_info, .channel_kick, .match_join_success });
+    try expectStringPacket(joined, .channel_join_success, "#multiplayer");
+    try expectStringPacket(joined, .channel_kick, "#lobby");
     try std.testing.expectEqual(@as(usize, 2), match.occupied());
     try std.testing.expectEqual(@as(?u16, 0), guest.match_id);
+    try std.testing.expect(!guest.in_lobby and !guest.joined_lobby_channel);
+    try std.testing.expect(guest.joined("#multiplayer"));
 
     const clear_guest = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
     defer std.testing.allocator.free(clear_guest);
     const clear_observer = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
     defer std.testing.allocator.free(clear_observer);
-    const room_message = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "stable room chat", "#multi_0", host.user.id);
+    const room_message = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "stable room chat", "#multiplayer", host.user.id);
     defer std.testing.allocator.free(room_message);
     const host_chat = try bancho.poll(std.testing.allocator, &store, &sessions, host, room_message);
     defer std.testing.allocator.free(host_chat);
@@ -931,7 +965,7 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     var guest_chat_payload: protocol.PayloadReader = .{ .data = guest_chat_packet.payload };
     try std.testing.expectEqualStrings("host", try guest_chat_payload.string());
     try std.testing.expectEqualStrings("stable room chat", try guest_chat_payload.string());
-    try std.testing.expectEqualStrings("#multi_0", try guest_chat_payload.string());
+    try std.testing.expectEqualStrings("#multiplayer", try guest_chat_payload.string());
 
     var slot_payload = protocol.Writer.init(std.testing.allocator);
     defer slot_payload.deinit();
@@ -1013,10 +1047,14 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     const locked = try bancho.poll(std.testing.allocator, &store, &sessions, host, lock_slot);
     defer std.testing.allocator.free(locked);
     try std.testing.expectEqual(@as(?u16, null), guest.match_id);
+    try std.testing.expect(!guest.joined("#multiplayer"));
     try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.locked)), match.slots[3].status);
     const unlocked = try bancho.poll(std.testing.allocator, &store, &sessions, host, lock_slot);
     defer std.testing.allocator.free(unlocked);
     try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.open)), match.slots[3].status);
+    const guest_kicked = try bancho.poll(std.testing.allocator, &store, &sessions, guest, "");
+    defer std.testing.allocator.free(guest_kicked);
+    try expectStringPacket(guest_kicked, .channel_kick, "#multiplayer");
 
     const rejoin = try clientJoinMatchPacket(std.testing.allocator, 0, "new-secret");
     defer std.testing.allocator.free(rejoin);
@@ -1048,23 +1086,90 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     const host_part = try bancho.poll(std.testing.allocator, &store, &sessions, host, host_part_packet);
     defer std.testing.allocator.free(host_part);
     try std.testing.expectEqual(@as(?u16, null), host.match_id);
+    try std.testing.expect(!host.joined("#multiplayer"));
+    try expectStringPacket(host_part, .channel_kick, "#multiplayer");
     try std.testing.expectEqual(guest.user.id, match.host_id);
 
     const transferred = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
     defer std.testing.allocator.free(transferred);
-    var transferred_reader: protocol.Reader = .{ .data = transferred };
-    try std.testing.expectEqual(protocol.ServerPacket.match_transfer_host, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try transferred_reader.next()).?.id))));
-    try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try transferred_reader.next()).?.id))));
+    try expectPacket(transferred, .match_transfer_host);
+    try expectPacket(transferred, .update_match);
 
     const clear_observer_again = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
     defer std.testing.allocator.free(clear_observer_again);
     const guest_part = try bancho.poll(std.testing.allocator, &store, &sessions, guest, host_part_packet);
     defer std.testing.allocator.free(guest_part);
     try std.testing.expect(sessions.matchById(0) == null);
+    try std.testing.expect(!guest.joined("#multiplayer"));
+    try expectStringPacket(guest_part, .channel_kick, "#multiplayer");
     const disposed = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
     defer std.testing.allocator.free(disposed);
     var disposed_reader: protocol.Reader = .{ .data = disposed };
     try std.testing.expectEqual(protocol.ServerPacket.dispose_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try disposed_reader.next()).?.id))));
+}
+
+test "stable multiplayer alias keeps chat inside its bound room" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-match-channel-scope.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const first_host = try sessions.create(try testSessionUser(std.testing.allocator, 80, "first_host"), 0, 0, 0);
+    const first_guest = try sessions.create(try testSessionUser(std.testing.allocator, 81, "first_guest"), 0, 0, 0);
+    const second_host = try sessions.create(try testSessionUser(std.testing.allocator, 82, "second_host"), 0, 0, 0);
+    const second_guest = try sessions.create(try testSessionUser(std.testing.allocator, 83, "second_guest"), 0, 0, 0);
+
+    const first_create = try clientMatchPacket(std.testing.allocator, .create_match, first_host.user.id, "first-secret");
+    defer std.testing.allocator.free(first_create);
+    const first_created = try bancho.poll(std.testing.allocator, &store, &sessions, first_host, first_create);
+    defer std.testing.allocator.free(first_created);
+    try expectStringPacket(first_created, .channel_join_success, "#multiplayer");
+    const first_join = try clientJoinMatchPacket(std.testing.allocator, 0, "first-secret");
+    defer std.testing.allocator.free(first_join);
+    const first_joined = try bancho.poll(std.testing.allocator, &store, &sessions, first_guest, first_join);
+    defer std.testing.allocator.free(first_joined);
+
+    const second_create = try clientMatchPacket(std.testing.allocator, .create_match, second_host.user.id, "second-secret");
+    defer std.testing.allocator.free(second_create);
+    const second_created = try bancho.poll(std.testing.allocator, &store, &sessions, second_host, second_create);
+    defer std.testing.allocator.free(second_created);
+    try std.testing.expectEqual(@as(?u16, 1), second_host.match_id);
+    const second_join = try clientJoinMatchPacket(std.testing.allocator, 1, "second-secret");
+    defer std.testing.allocator.free(second_join);
+    const second_joined = try bancho.poll(std.testing.allocator, &store, &sessions, second_guest, second_join);
+    defer std.testing.allocator.free(second_joined);
+
+    try drainSession(std.testing.allocator, &store, &sessions, first_host);
+    try drainSession(std.testing.allocator, &store, &sessions, first_guest);
+    try drainSession(std.testing.allocator, &store, &sessions, second_host);
+    try drainSession(std.testing.allocator, &store, &sessions, second_guest);
+
+    const message = try clientMessagePacket(std.testing.allocator, .send_public_message, first_host.user.name, "only room zero", "#multiplayer", first_host.user.id);
+    defer std.testing.allocator.free(message);
+    const sent = try bancho.poll(std.testing.allocator, &store, &sessions, first_host, message);
+    defer std.testing.allocator.free(sent);
+    const first_delivery = try bancho.poll(std.testing.allocator, &store, &sessions, first_guest, "");
+    defer std.testing.allocator.free(first_delivery);
+    try expectStringPacket(first_delivery, .send_message, first_host.user.name);
+    const second_host_delivery = try bancho.poll(std.testing.allocator, &store, &sessions, second_host, "");
+    defer std.testing.allocator.free(second_host_delivery);
+    const second_guest_delivery = try bancho.poll(std.testing.allocator, &store, &sessions, second_guest, "");
+    defer std.testing.allocator.free(second_guest_delivery);
+    try std.testing.expectEqual(@as(usize, 0), second_host_delivery.len);
+    try std.testing.expectEqual(@as(usize, 0), second_guest_delivery.len);
+
+    const internal_name = try clientMessagePacket(std.testing.allocator, .send_public_message, first_host.user.name, "hidden name", "#multi_0", first_host.user.id);
+    defer std.testing.allocator.free(internal_name);
+    const internal_result = try bancho.poll(std.testing.allocator, &store, &sessions, first_host, internal_name);
+    defer std.testing.allocator.free(internal_result);
+    const internal_delivery = try bancho.poll(std.testing.allocator, &store, &sessions, first_guest, "");
+    defer std.testing.allocator.free(internal_delivery);
+    try std.testing.expectEqual(@as(usize, 0), internal_delivery.len);
 }
 
 test "stable multiplayer match play relays load score fail skip and completion state" {
@@ -1386,7 +1491,7 @@ test "stable multiplayer invitations and supporter tournament channels follow ba
     try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try supporter_state_reader.next()).?.id))));
     try drainSession(std.testing.allocator, &store, &sessions, host);
 
-    const room_message = try clientMessagePacket(std.testing.allocator, .send_public_message, supporter.user.name, "tourney room message", "#multi_0", supporter.user.id);
+    const room_message = try clientMessagePacket(std.testing.allocator, .send_public_message, supporter.user.name, "tourney room message", "#multiplayer", supporter.user.id);
     defer std.testing.allocator.free(room_message);
     const supporter_message_result = try bancho.poll(std.testing.allocator, &store, &sessions, supporter, room_message);
     defer std.testing.allocator.free(supporter_message_result);
@@ -1458,7 +1563,7 @@ test "stable multiplayer referees can abort and reset an active round" {
     try std.testing.expect(match.isReferee(host.user.id));
     try std.testing.expect(!match.isReferee(guest.user.id));
 
-    const malformed_abort = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp abort now", "#multi_0", host.user.id);
+    const malformed_abort = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp abort now", "#multiplayer", host.user.id);
     defer std.testing.allocator.free(malformed_abort);
     const malformed_abort_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, malformed_abort);
     defer std.testing.allocator.free(malformed_abort_result);
@@ -1471,7 +1576,7 @@ test "stable multiplayer referees can abort and reset an active round" {
     try std.testing.expectEqualStrings("Invalid syntax: !mp abort", try malformed_abort_message.string());
     try drainSession(std.testing.allocator, &store, &sessions, guest);
 
-    const outsider_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp addref ref_outsider", "#multi_0", host.user.id);
+    const outsider_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp addref ref_outsider", "#multiplayer", host.user.id);
     defer std.testing.allocator.free(outsider_ref);
     const outsider_ref_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, outsider_ref);
     defer std.testing.allocator.free(outsider_ref_result);
@@ -1484,7 +1589,7 @@ test "stable multiplayer referees can abort and reset an active round" {
     _ = try outsider_response_message.string();
     try std.testing.expectEqualStrings("User must be in the current match!", try outsider_response_message.string());
 
-    const add_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp addref ref_guest", "#multi_0", host.user.id);
+    const add_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp addref ref_guest", "#multiplayer", host.user.id);
     defer std.testing.allocator.free(add_ref);
     const add_ref_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, add_ref);
     defer std.testing.allocator.free(add_ref_result);
@@ -1504,7 +1609,7 @@ test "stable multiplayer referees can abort and reset an active round" {
     try drainSession(std.testing.allocator, &store, &sessions, host);
     try drainSession(std.testing.allocator, &store, &sessions, guest);
 
-    const abort = try clientMessagePacket(std.testing.allocator, .send_public_message, guest.user.name, "!mp abort", "#multi_0", guest.user.id);
+    const abort = try clientMessagePacket(std.testing.allocator, .send_public_message, guest.user.name, "!mp abort", "#multiplayer", guest.user.id);
     defer std.testing.allocator.free(abort);
     const abort_result = try bancho.poll(std.testing.allocator, &store, &sessions, guest, abort);
     defer std.testing.allocator.free(abort_result);
@@ -1526,7 +1631,7 @@ test "stable multiplayer referees can abort and reset an active round" {
     try std.testing.expectEqualStrings("Match aborted.", try abort_message.string());
     try drainSession(std.testing.allocator, &store, &sessions, guest);
 
-    const remove_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp rmref ref_guest", "#multi_0", host.user.id);
+    const remove_ref = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp rmref ref_guest", "#multiplayer", host.user.id);
     defer std.testing.allocator.free(remove_ref);
     const remove_ref_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, remove_ref);
     defer std.testing.allocator.free(remove_ref_result);
@@ -1546,7 +1651,7 @@ test "stable multiplayer referees can abort and reset an active round" {
     defer std.testing.allocator.free(host_after_denied);
     try std.testing.expectEqual(@as(usize, 0), host_after_denied.len);
 
-    const abort_alias = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp a", "#multi_0", host.user.id);
+    const abort_alias = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "!mp a", "#multiplayer", host.user.id);
     defer std.testing.allocator.free(abort_alias);
     const host_abort_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, abort_alias);
     defer std.testing.allocator.free(host_abort_result);

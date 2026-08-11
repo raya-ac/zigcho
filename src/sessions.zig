@@ -24,6 +24,7 @@ pub const Session = struct {
     joined_osu: bool = false,
     joined_announce: bool = false,
     in_lobby: bool = false,
+    joined_lobby_channel: bool = false,
     match_id: ?u16 = null,
     tourney_matches: u64 = 0,
     spectating_user_id: ?i32 = null,
@@ -36,10 +37,8 @@ pub const Session = struct {
     pub fn joined(self: *const Session, name: []const u8) bool {
         if (std.mem.eql(u8, name, "#osu")) return self.joined_osu;
         if (std.mem.eql(u8, name, "#announce")) return self.joined_announce;
-        if (std.mem.startsWith(u8, name, "#multi_")) {
-            const id = std.fmt.parseInt(u16, name[7..], 10) catch return false;
-            return self.match_id == id or self.tournamentJoined(id);
-        }
+        if (std.mem.eql(u8, name, "#lobby")) return self.joined_lobby_channel;
+        if (std.mem.eql(u8, name, "#multiplayer")) return self.match_id != null or self.tourney_matches != 0;
         return false;
     }
     pub fn tournamentJoined(self: *const Session, match_id: u16) bool {
@@ -51,6 +50,11 @@ pub const Session = struct {
     }
     pub fn partTournament(self: *Session, match_id: u16) void {
         if (match_id < multiplayer.max_matches) self.tourney_matches &= ~(@as(u64, 1) << @intCast(match_id));
+    }
+    pub fn visibleMatchId(self: *const Session) ?u16 {
+        if (self.match_id) |match_id| return match_id;
+        if (self.tourney_matches == 0 or self.tourney_matches & (self.tourney_matches - 1) != 0) return null;
+        return @intCast(@ctz(self.tourney_matches));
     }
     pub fn enqueue(self: *Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
         if (self.queue_overflowed) return;
@@ -187,12 +191,28 @@ pub const Sessions = struct {
     }
     pub fn join(self: *Sessions, session: *Session, name: []const u8) bool {
         _ = self;
-        if (std.mem.eql(u8, name, "#osu")) session.joined_osu = true else if (std.mem.eql(u8, name, "#announce")) session.joined_announce = true else if (!session.joined(name)) return false;
+        if (std.mem.eql(u8, name, "#osu")) {
+            if (session.joined_osu) return false;
+            session.joined_osu = true;
+        } else if (std.mem.eql(u8, name, "#announce")) {
+            if (session.joined_announce) return false;
+            session.joined_announce = true;
+        } else if (std.mem.eql(u8, name, "#lobby") and session.in_lobby) {
+            if (session.joined_lobby_channel) return false;
+            session.joined_lobby_channel = true;
+        } else {
+            return false;
+        }
         return true;
     }
     pub fn part(self: *Sessions, session: *Session, name: []const u8) void {
         _ = self;
-        if (std.mem.eql(u8, name, "#osu")) session.joined_osu = false else if (std.mem.eql(u8, name, "#announce")) session.joined_announce = false;
+        if (std.mem.eql(u8, name, "#osu"))
+            session.joined_osu = false
+        else if (std.mem.eql(u8, name, "#announce"))
+            session.joined_announce = false
+        else if (std.mem.eql(u8, name, "#lobby"))
+            session.joined_lobby_channel = false;
     }
     pub fn broadcastChannel(self: *Sessions, name: []const u8, bytes: []const u8, except: ?*Session) !void {
         for (self.items.items) |s| if (s != except and !s.is_bot and s.joined(name)) {

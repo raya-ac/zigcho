@@ -26,6 +26,7 @@ pub const Session = struct {
     in_lobby: bool = false,
     match_id: ?u16 = null,
     tourney_matches: u64 = 0,
+    spectating_user_id: ?i32 = null,
     longitude: f32 = 0,
     latitude: f32 = 0,
 
@@ -143,6 +144,10 @@ pub const Sessions = struct {
         return if (self.byUser(user_id) != null) .stale_online else .offline;
     }
     pub fn remove(self: *Sessions, target: *Session) void {
+        for (self.items.items) |session| {
+            if (session.spectating_user_id == target.user.id) session.spectating_user_id = null;
+        }
+        target.spectating_user_id = null;
         if (target.match_id) |match_id| if (self.matchById(match_id)) |match| {
             _ = match.removeReferee(target.user.id);
             if (match.slotByUser(target.user.id)) |slot| slot.reset(.open);

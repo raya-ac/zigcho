@@ -117,6 +117,15 @@ fn drainSession(allocator: std.mem.Allocator, store: *storage.Store, sessions: *
     allocator.free(result);
 }
 
+fn expectPacketIds(data: []const u8, expected: []const protocol.ServerPacket) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    for (expected) |wanted| {
+        const actual = (try reader.next()) orelse return error.MissingPacket;
+        try std.testing.expectEqual(wanted, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(actual.id))));
+    }
+    try std.testing.expect((try reader.next()) == null);
+}
+
 const LoginAllocationContext = struct {
     store: *storage.Store,
     body: []const u8,
@@ -138,6 +147,33 @@ fn multiplayerAllocationRun(allocator: std.mem.Allocator, _: void) !void {
     var score_frame = [_]u8{0} ** 29;
     score_frame[25] = 1;
     try multiplayer.writeScoreFramePacket(&writer, &score_frame, 0);
+}
+
+const SpectatorAllocationContext = struct { store: *storage.Store };
+
+fn spectatorAllocationRun(allocator: std.mem.Allocator, context: *SpectatorAllocationContext) !void {
+    var sessions = sessions_mod.Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    const host_user = try testSessionUser(allocator, 70, "allocation_host");
+    var host_owned = true;
+    errdefer if (host_owned) {
+        allocator.free(host_user.name);
+        allocator.free(host_user.safe_name);
+    };
+    _ = try sessions.create(host_user, 0, 0, 0);
+    host_owned = false;
+    const spectator_user = try testSessionUser(allocator, 71, "allocation_spectator");
+    var spectator_owned = true;
+    errdefer if (spectator_owned) {
+        allocator.free(spectator_user.name);
+        allocator.free(spectator_user.safe_name);
+    };
+    const spectator = try sessions.create(spectator_user, 0, 0, 0);
+    spectator_owned = false;
+    const start = try clientIntPacket(allocator, .start_spectating, 70);
+    defer allocator.free(start);
+    const result = try bancho.poll(allocator, context.store, &sessions, spectator, start);
+    defer allocator.free(result);
 }
 
 fn loginAllocationRun(allocator: std.mem.Allocator, context: *LoginAllocationContext) !void {
@@ -1528,6 +1564,173 @@ test "stable multiplayer referees can abort and reset an active round" {
     const guest_part = try bancho.poll(std.testing.allocator, &store, &sessions, guest, part);
     defer std.testing.allocator.free(guest_part);
     try std.testing.expect(!match.isReferee(guest.user.id));
+}
+
+test "stable spectating scopes lifecycle frames chat and failure packets to one host" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-spectating.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const host = try sessions.create(try testSessionUser(std.testing.allocator, 50, "spectate_host"), 0, 0, 0);
+    const first = try sessions.create(try testSessionUser(std.testing.allocator, 51, "spectate_first"), 0, 0, 0);
+    const second = try sessions.create(try testSessionUser(std.testing.allocator, 52, "spectate_second"), 0, 0, 0);
+    const outsider = try sessions.create(try testSessionUser(std.testing.allocator, 53, "spectate_outsider"), 0, 0, 0);
+
+    const start_host = try clientIntPacket(std.testing.allocator, .start_spectating, host.user.id);
+    defer std.testing.allocator.free(start_host);
+    const first_start = try bancho.poll(std.testing.allocator, &store, &sessions, first, start_host);
+    defer std.testing.allocator.free(first_start);
+    try std.testing.expectEqual(host.user.id, first.spectating_user_id.?);
+
+    const first_joined = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
+    defer std.testing.allocator.free(first_joined);
+    try expectPacketIds(first_joined, &.{ .channel_join_success, .channel_info });
+    const host_first_join = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_first_join);
+    try expectPacketIds(host_first_join, &.{ .channel_join_success, .channel_info, .channel_info, .spectator_joined });
+    const outsider_first_join = try bancho.poll(std.testing.allocator, &store, &sessions, outsider, "");
+    defer std.testing.allocator.free(outsider_first_join);
+    try std.testing.expectEqual(@as(usize, 0), outsider_first_join.len);
+
+    const same_host = try bancho.poll(std.testing.allocator, &store, &sessions, first, start_host);
+    defer std.testing.allocator.free(same_host);
+    const host_same_spectator = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_same_spectator);
+    try expectPacketIds(host_same_spectator, &.{.spectator_joined});
+    const first_not_duplicated = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
+    defer std.testing.allocator.free(first_not_duplicated);
+    try std.testing.expectEqual(@as(usize, 0), first_not_duplicated.len);
+
+    const malformed_start = try clientPayloadPacket(std.testing.allocator, .start_spectating, &.{ 1, 2, 3 });
+    defer std.testing.allocator.free(malformed_start);
+    const malformed_result = try bancho.poll(std.testing.allocator, &store, &sessions, first, malformed_start);
+    defer std.testing.allocator.free(malformed_result);
+    try std.testing.expectEqual(host.user.id, first.spectating_user_id.?);
+
+    const second_start = try bancho.poll(std.testing.allocator, &store, &sessions, second, start_host);
+    defer std.testing.allocator.free(second_start);
+    const second_joined = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_joined);
+    try expectPacketIds(second_joined, &.{ .channel_join_success, .channel_info, .fellow_spectator_joined });
+    const first_saw_second = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
+    defer std.testing.allocator.free(first_saw_second);
+    try expectPacketIds(first_saw_second, &.{ .channel_info, .fellow_spectator_joined });
+    const host_saw_second = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_saw_second);
+    try expectPacketIds(host_saw_second, &.{ .channel_info, .spectator_joined });
+
+    const chat = try clientMessagePacket(std.testing.allocator, .send_public_message, first.user.name, "spectator room only", "#spectator", first.user.id);
+    defer std.testing.allocator.free(chat);
+    const chat_result = try bancho.poll(std.testing.allocator, &store, &sessions, first, chat);
+    defer std.testing.allocator.free(chat_result);
+    const host_chat = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_chat);
+    try expectPacketIds(host_chat, &.{.send_message});
+    const second_chat = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_chat);
+    try expectPacketIds(second_chat, &.{.send_message});
+    const outsider_chat = try bancho.poll(std.testing.allocator, &store, &sessions, outsider, "");
+    defer std.testing.allocator.free(outsider_chat);
+    try std.testing.expectEqual(@as(usize, 0), outsider_chat.len);
+
+    const frame_bytes = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const frames = try clientPayloadPacket(std.testing.allocator, .spectate_frames, &frame_bytes);
+    defer std.testing.allocator.free(frames);
+    const frame_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, frames);
+    defer std.testing.allocator.free(frame_result);
+    const first_frames = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
+    defer std.testing.allocator.free(first_frames);
+    var first_frame_reader: protocol.Reader = .{ .data = first_frames };
+    const first_frame = (try first_frame_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.spectate_frames, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(first_frame.id))));
+    try std.testing.expectEqualSlices(u8, &frame_bytes, first_frame.payload);
+    try std.testing.expect((try first_frame_reader.next()) == null);
+    const second_frames = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_frames);
+    try expectPacketIds(second_frames, &.{.spectate_frames});
+    const outsider_frames = try bancho.poll(std.testing.allocator, &store, &sessions, outsider, "");
+    defer std.testing.allocator.free(outsider_frames);
+    try std.testing.expectEqual(@as(usize, 0), outsider_frames.len);
+
+    const cant = try clientEmptyPacket(std.testing.allocator, .cant_spectate);
+    defer std.testing.allocator.free(cant);
+    const cant_result = try bancho.poll(std.testing.allocator, &store, &sessions, first, cant);
+    defer std.testing.allocator.free(cant_result);
+    const host_cant = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_cant);
+    try expectPacketIds(host_cant, &.{.spectator_cant_spectate});
+    const first_cant = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
+    defer std.testing.allocator.free(first_cant);
+    try expectPacketIds(first_cant, &.{.spectator_cant_spectate});
+    const second_cant = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_cant);
+    try expectPacketIds(second_cant, &.{.spectator_cant_spectate});
+
+    const stop = try clientEmptyPacket(std.testing.allocator, .stop_spectating);
+    defer std.testing.allocator.free(stop);
+    const stop_result = try bancho.poll(std.testing.allocator, &store, &sessions, first, stop);
+    defer std.testing.allocator.free(stop_result);
+    try std.testing.expect(first.spectating_user_id == null);
+    const first_stopped = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
+    defer std.testing.allocator.free(first_stopped);
+    try expectPacketIds(first_stopped, &.{.channel_kick});
+    const host_first_left = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(host_first_left);
+    try expectPacketIds(host_first_left, &.{ .channel_info, .spectator_left });
+    const second_first_left = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_first_left);
+    try expectPacketIds(second_first_left, &.{ .channel_info, .fellow_spectator_left });
+
+    const start_outsider = try clientIntPacket(std.testing.allocator, .start_spectating, outsider.user.id);
+    defer std.testing.allocator.free(start_outsider);
+    const switched = try bancho.poll(std.testing.allocator, &store, &sessions, second, start_outsider);
+    defer std.testing.allocator.free(switched);
+    try std.testing.expectEqual(outsider.user.id, second.spectating_user_id.?);
+    const second_switched = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_switched);
+    try expectPacketIds(second_switched, &.{ .channel_kick, .channel_join_success, .channel_info });
+    const old_host_empty = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
+    defer std.testing.allocator.free(old_host_empty);
+    try expectPacketIds(old_host_empty, &.{ .channel_kick, .spectator_left });
+    const new_host_join = try bancho.poll(std.testing.allocator, &store, &sessions, outsider, "");
+    defer std.testing.allocator.free(new_host_join);
+    try expectPacketIds(new_host_join, &.{ .channel_join_success, .channel_info, .channel_info, .spectator_joined });
+
+    const self_start = try clientIntPacket(std.testing.allocator, .start_spectating, host.user.id);
+    defer std.testing.allocator.free(self_start);
+    const self_start_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, self_start);
+    defer std.testing.allocator.free(self_start_result);
+    try std.testing.expect(host.spectating_user_id == null);
+
+    const outsider_id = outsider.user.id;
+    outsider.login_time -= 2;
+    const logout = try clientEmptyPacket(std.testing.allocator, .logout);
+    defer std.testing.allocator.free(logout);
+    const host_logout = try bancho.poll(std.testing.allocator, &store, &sessions, outsider, logout);
+    defer std.testing.allocator.free(host_logout);
+    try std.testing.expect(sessions.byUser(outsider_id) == null);
+    try std.testing.expect(second.spectating_user_id == null);
+    const second_host_logout = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
+    defer std.testing.allocator.free(second_host_logout);
+    try expectPacketIds(second_host_logout, &.{ .channel_kick, .user_logout });
+}
+
+test "stable spectator packet construction survives every allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/spectator-allocation.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var context: SpectatorAllocationContext = .{ .store = &store };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, spectatorAllocationRun, .{&context});
 }
 
 test "lazer custom mod acronyms are bounded" {

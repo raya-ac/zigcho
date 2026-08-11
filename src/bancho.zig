@@ -349,6 +349,128 @@ fn containsUser(ids: []const i32, user_id: i32) bool {
     return false;
 }
 
+fn spectatorCountLocked(sessions: *const sessions_mod.Sessions, host_id: i32) usize {
+    var count: usize = 0;
+    for (sessions.items.items) |other| if (other.spectating_user_id == host_id) {
+        count += 1;
+    };
+    return count;
+}
+
+fn queueSpectatorChannelInfoLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, host_id: i32) !void {
+    const count = spectatorCountLocked(sessions, host_id);
+    if (count == 0) return;
+    var info = protocol.Writer.init(allocator);
+    defer info.deinit();
+    try protocol.writeChannel(&info, "#spectator", "spectator", @intCast(count + 1));
+    for (sessions.items.items) |other| {
+        if (other.user.id == host_id or other.spectating_user_id == host_id) try other.enqueue(allocator, info.bytes());
+    }
+}
+
+fn detachSpectatorLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, spectator: *sessions_mod.Session) !void {
+    const host_id = spectator.spectating_user_id orelse return;
+    const host = sessions.byUser(host_id);
+    spectator.spectating_user_id = null;
+
+    var kick = protocol.Writer.init(allocator);
+    defer kick.deinit();
+    try kick.packetString(.channel_kick, "#spectator");
+    try spectator.enqueue(allocator, kick.bytes());
+
+    const remaining = spectatorCountLocked(sessions, host_id);
+    if (host) |current_host| {
+        if (remaining == 0) {
+            try current_host.enqueue(allocator, kick.bytes());
+        } else {
+            try queueSpectatorChannelInfoLocked(allocator, sessions, host_id);
+        }
+        var left = protocol.Writer.init(allocator);
+        defer left.deinit();
+        try left.packetInt(.spectator_left, spectator.user.id);
+        try current_host.enqueue(allocator, left.bytes());
+    }
+
+    if (remaining > 0) {
+        var fellow_left = protocol.Writer.init(allocator);
+        defer fellow_left.deinit();
+        try fellow_left.packetInt(.fellow_spectator_left, spectator.user.id);
+        for (sessions.items.items) |other| if (other.spectating_user_id == host_id) {
+            try other.enqueue(allocator, fellow_left.bytes());
+        };
+    }
+}
+
+fn attachSpectatorLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, spectator: *sessions_mod.Session, host: *sessions_mod.Session) !void {
+    if (spectator == host or spectator.is_bot or host.is_bot) return;
+    if (spectator.spectating_user_id == host.user.id) {
+        var joined_again = protocol.Writer.init(allocator);
+        defer joined_again.deinit();
+        try joined_again.packetInt(.spectator_joined, spectator.user.id);
+        try host.enqueue(allocator, joined_again.bytes());
+        var fellow_again = protocol.Writer.init(allocator);
+        defer fellow_again.deinit();
+        try fellow_again.packetInt(.fellow_spectator_joined, spectator.user.id);
+        for (sessions.items.items) |other| if (other != spectator and other.spectating_user_id == host.user.id) {
+            try other.enqueue(allocator, fellow_again.bytes());
+        };
+        return;
+    }
+    if (spectator.spectating_user_id != null) try detachSpectatorLocked(allocator, sessions, spectator);
+
+    const first = spectatorCountLocked(sessions, host.user.id) == 0;
+    var channel_join = protocol.Writer.init(allocator);
+    defer channel_join.deinit();
+    try channel_join.packetString(.channel_join_success, "#spectator");
+    if (first) {
+        try host.enqueue(allocator, channel_join.bytes());
+        var host_only_info = protocol.Writer.init(allocator);
+        defer host_only_info.deinit();
+        try protocol.writeChannel(&host_only_info, "#spectator", "spectator", 1);
+        try host.enqueue(allocator, host_only_info.bytes());
+    }
+    try spectator.enqueue(allocator, channel_join.bytes());
+
+    var new_spectator_events = protocol.Writer.init(allocator);
+    defer new_spectator_events.deinit();
+    var fellow_joined = protocol.Writer.init(allocator);
+    defer fellow_joined.deinit();
+    try fellow_joined.packetInt(.fellow_spectator_joined, spectator.user.id);
+    for (sessions.items.items) |other| if (other.spectating_user_id == host.user.id) {
+        try new_spectator_events.packetInt(.fellow_spectator_joined, other.user.id);
+    };
+    spectator.spectating_user_id = host.user.id;
+    errdefer spectator.spectating_user_id = null;
+    try queueSpectatorChannelInfoLocked(allocator, sessions, host.user.id);
+    for (sessions.items.items) |other| if (other != spectator and other.spectating_user_id == host.user.id) {
+        try other.enqueue(allocator, fellow_joined.bytes());
+    };
+    try spectator.enqueue(allocator, new_spectator_events.bytes());
+    var joined = protocol.Writer.init(allocator);
+    defer joined.deinit();
+    try joined.packetInt(.spectator_joined, spectator.user.id);
+    try host.enqueue(allocator, joined.bytes());
+}
+
+fn clearSpectatorsForHostLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, host: *sessions_mod.Session) void {
+    var kick = protocol.Writer.init(allocator);
+    defer kick.deinit();
+    kick.packetString(.channel_kick, "#spectator") catch return;
+    for (sessions.items.items) |other| if (other.spectating_user_id == host.user.id) {
+        other.spectating_user_id = null;
+        other.enqueue(allocator, kick.bytes()) catch {};
+    };
+}
+
+fn broadcastSpectatorChatLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, bytes: []const u8) !bool {
+    const host_id = sender.spectating_user_id orelse if (spectatorCountLocked(sessions, sender.user.id) > 0) sender.user.id else return false;
+    for (sessions.items.items) |other| {
+        if (other == sender or other.is_bot) continue;
+        if (other.user.id == host_id or other.spectating_user_id == host_id) try other.enqueue(allocator, bytes);
+    }
+    return true;
+}
+
 fn broadcastMatchPacketLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16, bytes: []const u8, include_lobby: bool, immune: []const i32) !void {
     for (sessions.items.items) |other| {
         if (other.is_bot) continue;
@@ -513,6 +635,8 @@ fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.S
 
 fn removeSessionLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
     leaveMatchLocked(allocator, sessions, session);
+    detachSpectatorLocked(allocator, sessions, session) catch {};
+    clearSpectatorsForHostLocked(allocator, sessions, session);
     broadcastLogoutLocked(allocator, sessions, session);
     sessions.remove(session);
 }
@@ -586,6 +710,10 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                     if (!target.is_bot) try queuePacket(target, allocator, message.bytes());
                 }
             } else {
+                if (std.mem.eql(u8, target_name, "#spectator")) {
+                    _ = try broadcastSpectatorChatLocked(allocator, sessions, session, message.bytes());
+                    continue;
+                }
                 if (!session.joined(target_name)) continue;
                 try sessions.broadcastChannel(target_name, message.bytes(), session);
             }
@@ -971,21 +1099,34 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             while (i < count) : (i += 1) if (sessions.byUser(try p.int(i32))) |s| try presence(&out, s);
         },
         .start_spectating => {
-            var p: protocol.PayloadReader = .{ .data = packet.payload };
-            if (sessions.byUser(try p.int(i32))) |host| {
-                var e = protocol.Writer.init(allocator);
-                defer e.deinit();
-                try e.packetInt(.spectator_joined, session.user.id);
-                try queuePacket(host, allocator, e.bytes());
-            }
+            const target_id = packetUserId(packet.payload) orelse continue;
+            const host = sessions.byUser(target_id) orelse continue;
+            try attachSpectatorLocked(allocator, sessions, session, host);
+        },
+        .stop_spectating => {
+            if (packet.payload.len != 0) continue;
+            try detachSpectatorLocked(allocator, sessions, session);
         },
         .spectate_frames => {
+            if (packet.payload.len == 0) continue;
             var e = protocol.Writer.init(allocator);
             defer e.deinit();
             const st = try e.begin(.spectate_frames);
             try e.raw(packet.payload);
             e.finish(st);
-            try sessions.broadcast(e.bytes(), session);
+            for (sessions.items.items) |other| if (other.spectating_user_id == session.user.id) {
+                try other.enqueue(allocator, e.bytes());
+            };
+        },
+        .cant_spectate => {
+            if (packet.payload.len != 0) continue;
+            const host_id = session.spectating_user_id orelse continue;
+            var event = protocol.Writer.init(allocator);
+            defer event.deinit();
+            try event.packetInt(.spectator_cant_spectate, session.user.id);
+            for (sessions.items.items) |other| {
+                if (other.user.id == host_id or other.spectating_user_id == host_id) try other.enqueue(allocator, event.bytes());
+            }
         },
         .logout => {
             if (now - session.login_time >= 1) logged_out.* = true;

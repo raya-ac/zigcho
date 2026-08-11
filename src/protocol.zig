@@ -61,6 +61,7 @@ pub const ServerPacket = enum(u16) {
     spectator_joined = 13,
     spectator_left = 14,
     spectate_frames = 15,
+    spectator_cant_spectate = 22,
     notification = 24,
     update_match = 26,
     new_match = 27,

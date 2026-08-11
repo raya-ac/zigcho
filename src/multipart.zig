@@ -48,6 +48,8 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8, boundary: []const u
     errdefer form.deinit();
     var marker_buf: [204]u8 = undefined;
     const marker = try std.fmt.bufPrint(&marker_buf, "--{s}", .{boundary});
+    var delimiter_buf: [204]u8 = undefined;
+    const delimiter = try std.fmt.bufPrint(&delimiter_buf, "\r\n--{s}", .{boundary});
     if (!std.mem.startsWith(u8, body, marker)) return error.InvalidMultipart;
     var cursor: usize = marker.len;
     while (true) {
@@ -62,11 +64,9 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8, boundary: []const u
         const headers_end = std.mem.findPosLinear(u8, body, cursor, "\r\n\r\n") orelse return error.IncompleteMultipart;
         const headers = body[cursor..headers_end];
         cursor = headers_end + 4;
-        const next_prefix_pos = std.mem.findPosLinear(u8, body, cursor, "\r\n--") orelse return error.IncompleteMultipart;
-        const data = body[cursor..next_prefix_pos];
-        cursor = next_prefix_pos + 2;
-        if (!std.mem.startsWith(u8, body[cursor..], marker)) return error.InvalidMultipart;
-        cursor += marker.len;
+        const next_delimiter_pos = findDelimiter(body, cursor, delimiter) orelse return error.IncompleteMultipart;
+        const data = body[cursor..next_delimiter_pos];
+        cursor = next_delimiter_pos + delimiter.len;
 
         var name: ?[]const u8 = null;
         var filename: ?[]const u8 = null;
@@ -86,6 +86,17 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8, boundary: []const u
         try form.parts.append(allocator, .{ .name = name orelse return error.MissingPartName, .filename = filename, .content_type = part_type, .data = data });
         if (form.parts.items.len > 64) return error.TooManyParts;
     }
+}
+
+fn findDelimiter(body: []const u8, start: usize, delimiter: []const u8) ?usize {
+    var cursor = start;
+    while (std.mem.findPosLinear(u8, body, cursor, delimiter)) |position| {
+        const suffix = position + delimiter.len;
+        if (suffix + 2 <= body.len and
+            (std.mem.eql(u8, body[suffix..][0..2], "--") or std.mem.eql(u8, body[suffix..][0..2], "\r\n"))) return position;
+        cursor = suffix;
+    }
+    return null;
 }
 
 fn dispositionValue(value: []const u8, key: []const u8) ?[]const u8 {

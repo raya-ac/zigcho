@@ -2,6 +2,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
+const lazer = @import("lazer.zig");
 pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -428,46 +429,27 @@ pub const Store = struct {
         return c.sqlite3_changes(self.db) > 0;
     }
 
-    pub fn insertLazerScore(self: *Store, user_id: i32, value: std.json.Value, raw_json: []const u8, namespace: []const u8) !i64 {
+    pub fn insertLazerScore(self: *Store, user_id: i32, input: lazer.ScoreInput, raw_json: []const u8) !i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const o = value.object;
-        const beatmap_id = o.get("beatmap_id").?.integer;
-        const ruleset = if (o.get("ruleset_id")) |v| v.integer else 0;
-        const total = o.get("total_score").?.integer;
-        const legacy: ?i64 = if (o.get("legacy_total_score")) |v| switch (v) {
-            .integer => |n| n,
-            else => null,
-        } else null;
-        const acc: f64 = if (o.get("accuracy")) |v| switch (v) {
-            .float => |n| n,
-            .integer => |n| @floatFromInt(n),
-            else => 0,
-        } else 0;
-        const combo: i64 = if (o.get("max_combo")) |v| v.integer else 0;
-        const passed: bool = if (o.get("passed")) |v| v.bool else false;
+        const namespace = @tagName(input.namespace);
         const sql = "INSERT INTO lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace,client_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
-        _ = c.sqlite3_bind_int64(stmt, 2, beatmap_id);
-        _ = c.sqlite3_bind_int64(stmt, 3, ruleset);
-        _ = c.sqlite3_bind_int64(stmt, 4, total);
-        if (legacy) |n| _ = c.sqlite3_bind_int64(stmt, 5, n) else _ = c.sqlite3_bind_null(stmt, 5);
-        _ = c.sqlite3_bind_double(stmt, 6, acc);
-        _ = c.sqlite3_bind_int64(stmt, 7, combo);
-        _ = c.sqlite3_bind_int(stmt, 8, @intFromBool(passed));
+        _ = c.sqlite3_bind_int64(stmt, 2, input.beatmap_id);
+        _ = c.sqlite3_bind_int64(stmt, 3, input.ruleset_id);
+        _ = c.sqlite3_bind_int64(stmt, 4, input.total_score);
+        if (input.legacy_total_score) |n| _ = c.sqlite3_bind_int64(stmt, 5, n) else _ = c.sqlite3_bind_null(stmt, 5);
+        _ = c.sqlite3_bind_double(stmt, 6, input.accuracy);
+        _ = c.sqlite3_bind_int64(stmt, 7, input.max_combo);
+        _ = c.sqlite3_bind_int(stmt, 8, @intFromBool(input.passed));
         _ = c.sqlite3_bind_text(stmt, 9, raw_json.ptr, @intCast(raw_json.len), null);
         _ = c.sqlite3_bind_text(stmt, 10, raw_json.ptr, @intCast(raw_json.len), null);
         _ = c.sqlite3_bind_text(stmt, 11, namespace.ptr, @intCast(namespace.len), null);
-        if (o.get("client_version")) |v| switch (v) {
-            .string => |s| {
-                _ = c.sqlite3_bind_text(stmt, 12, s.ptr, @intCast(s.len), null);
-            },
-            else => {
-                _ = c.sqlite3_bind_null(stmt, 12);
-            },
+        if (input.client_version) |version| {
+            _ = c.sqlite3_bind_text(stmt, 12, version.ptr, @intCast(version.len), null);
         } else _ = c.sqlite3_bind_null(stmt, 12);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         return c.sqlite3_last_insert_rowid(self.db);

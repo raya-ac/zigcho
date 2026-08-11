@@ -452,9 +452,9 @@ const App = struct {
             defer self.allocator.free(user.safe_name);
             const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_json\"}", &.{});
             defer parsed.deinit();
-            const ns = lazer.validateScore(parsed.value) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
-            const ns_name = @tagName(ns);
-            const id = try self.store.insertLazerScore(user.id, parsed.value, body, ns_name);
+            const score = lazer.parseScore(parsed.value) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
+            const ns_name = @tagName(score.namespace);
+            const id = try self.store.insertLazerScore(user.id, score, body);
             var out: [192]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"user_id\":{d},\"rank_namespace\":\"{s}\",\"ranked\":false}}", .{ id, user.id, ns_name });
             return respond(req, .created, "application/json", json, &.{});

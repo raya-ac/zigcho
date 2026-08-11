@@ -647,15 +647,84 @@ test "lazer custom mod acronyms are bounded" {
 }
 
 test "lazer relax scores cannot enter vanilla namespace" {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"total_score\":10,\"mods\":[{\"acronym\":\"RX\",\"settings\":{}}]}", .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":0.98,\"max_combo\":5,\"passed\":true,\"mods\":[{\"acronym\":\"RX\",\"settings\":{}}],\"statistics\":{}}", .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(lazer.Namespace.relax, try lazer.validateScore(parsed.value));
+    try std.testing.expectEqual(lazer.Namespace.relax, (try lazer.parseScore(parsed.value)).namespace);
 }
 
 test "unknown lazer mods enter custom namespace" {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"total_score\":10,\"mods\":[{\"acronym\":\"WIGGLE\",\"settings\":{\"strength\":1.2}}]}", .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":0.98,\"max_combo\":5,\"passed\":true,\"mods\":[{\"acronym\":\"WIGGLE\",\"settings\":{\"strength\":1.2}}],\"statistics\":{}}", .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(lazer.Namespace.custom, try lazer.validateScore(parsed.value));
+    try std.testing.expectEqual(lazer.Namespace.custom, (try lazer.parseScore(parsed.value)).namespace);
+}
+
+test "custom lazer mods win over relax regardless of order" {
+    const fixtures = [_][]const u8{
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":5,\"passed\":true,\"mods\":[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":5,\"passed\":true,\"mods\":[{\"acronym\":\"WIGGLE\"},{\"acronym\":\"RX\"}],\"statistics\":{}}",
+    };
+    for (fixtures) |fixture| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(lazer.Namespace.custom, (try lazer.parseScore(parsed.value)).namespace);
+    }
+}
+
+test "lazer score input is fully typed and bounded before storage" {
+    const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":3,\"total_score\":1000000000000,\"legacy_total_score\":null,\"accuracy\":1,\"max_combo\":10000000,\"passed\":false,\"mods\":[],\"statistics\":{},\"client_version\":null}", .{});
+    defer valid.deinit();
+    const input = try lazer.parseScore(valid.value);
+    try std.testing.expectEqual(@as(i64, 3), input.ruleset_id);
+    try std.testing.expectEqual(@as(i64, 10_000_000), input.max_combo);
+    try std.testing.expectEqual(lazer.Namespace.vanilla, input.namespace);
+
+    const invalid = [_][]const u8{
+        "{\"beatmap_id\":1,\"ruleset_id\":\"osu\",\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":4,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":-1,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1.1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":10000001,\"passed\":true,\"mods\":[],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":1,\"mods\":[],\"statistics\":{}}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":[]}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{},\"client_version\":4}",
+    };
+    for (invalid) |fixture| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidScore, lazer.parseScore(parsed.value));
+    }
+}
+
+test "lazer storage only accepts the typed score input" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/typed-lazer-score.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00')");
+
+    const raw = "{\"beatmap_id\":75,\"ruleset_id\":0,\"total_score\":987654,\"legacy_total_score\":900000,\"accuracy\":0.985,\"max_combo\":321,\"passed\":true,\"mods\":[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}],\"statistics\":{},\"client_version\":\"2026.811.0\"}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), raw);
+    try std.testing.expect(id > 0);
+
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank_namespace,client_version FROM lazer_scores WHERE id=?1", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    _ = storage.c.sqlite3_bind_int64(stmt, 1, id);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 75), storage.c.sqlite3_column_int64(stmt, 0));
+    try std.testing.expectEqual(@as(i64, 0), storage.c.sqlite3_column_int64(stmt, 1));
+    try std.testing.expectEqual(@as(i64, 987654), storage.c.sqlite3_column_int64(stmt, 2));
+    try std.testing.expectEqual(@as(i64, 900000), storage.c.sqlite3_column_int64(stmt, 3));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.985), storage.c.sqlite3_column_double(stmt, 4), 0.000001);
+    try std.testing.expectEqual(@as(i64, 321), storage.c.sqlite3_column_int64(stmt, 5));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 6));
+    try std.testing.expectEqualStrings("custom", std.mem.span(storage.c.sqlite3_column_text(stmt, 7)));
+    try std.testing.expectEqualStrings("2026.811.0", std.mem.span(storage.c.sqlite3_column_text(stmt, 8)));
 }
 
 test "Rijndael-256 matches the py3rijndael block fixture" {
@@ -697,6 +766,17 @@ test "multipart rejects a missing closing boundary" {
     try std.testing.expectError(error.IncompleteMultipart, multipart.parse(std.testing.allocator, body, "zigcho"));
 }
 
+test "multipart ignores boundary-looking bytes inside binary parts" {
+    const replay = "start\r\n--not-zigcho\x00\x01still\r\n--zigcho-but-not-a-delimiter";
+    const body = "--zigcho\r\n" ++
+        "Content-Disposition: form-data; name=\"score\"; filename=\"replay.osr\"\r\n" ++
+        "Content-Type: application/octet-stream\r\n\r\n" ++ replay ++
+        "\r\n--zigcho--\r\n";
+    var form = try multipart.parse(std.testing.allocator, body, "zigcho");
+    defer form.deinit();
+    try std.testing.expectEqualSlices(u8, replay, form.first("score").?.data);
+}
+
 test "stable score payload decrypts from an independent client fixture" {
     var decrypted = try score_crypto.decrypt(
         std.testing.allocator,
@@ -717,6 +797,20 @@ test "stable online score checksum matches the client formula" {
     try std.testing.expect(score.verifyChecksum("20260808", "client-hash-fixture", ""));
     try std.testing.expect(!score.verifyChecksum("20260808", "wrong-client", ""));
     try std.testing.expectApproxEqAbs(@as(f64, 0.97258), score.accuracy(), 0.0001);
+}
+
+test "stable score counters are bounded and widened before arithmetic" {
+    const maximum = "0123456789abcdef0123456789abcdef:Ari:00000000000000000000000000000000:10000000:10000000:10000000:10000000:10000000:10000000:1000000000000:10000000:False:A:0:True:3:260808235959:20260808";
+    const score = try stable_score.parse(maximum);
+    try std.testing.expect(std.math.isFinite(score.accuracy()));
+    try std.testing.expect(!score.verifyChecksum("20260808", "client-hash-fixture", ""));
+
+    const too_many_hits = "0123456789abcdef0123456789abcdef:Ari:00000000000000000000000000000000:10000001:0:0:0:0:0:1:1:False:A:0:True:0:260808235959:20260808";
+    try std.testing.expectError(error.ValueTooLarge, stable_score.parse(too_many_hits));
+    const too_much_combo = "0123456789abcdef0123456789abcdef:Ari:00000000000000000000000000000000:1:0:0:0:0:0:1:10000001:False:A:0:True:0:260808235959:20260808";
+    try std.testing.expectError(error.ValueTooLarge, stable_score.parse(too_much_combo));
+    const too_much_score = "0123456789abcdef0123456789abcdef:Ari:00000000000000000000000000000000:1:0:0:0:0:0:1000000000001:1:False:A:0:True:0:260808235959:20260808";
+    try std.testing.expectError(error.ValueTooLarge, stable_score.parse(too_much_score));
 }
 
 test "stable online score checksum trims the donor marker the client appends to the username" {

@@ -1,5 +1,9 @@
 const std = @import("std");
 
+pub const max_hit_count: i32 = 10_000_000;
+pub const max_combo: i32 = 10_000_000;
+pub const max_total_score: i64 = 1_000_000_000_000;
+
 pub const Submission = struct {
     map_md5: []const u8,
     username: []const u8,
@@ -21,18 +25,18 @@ pub const Submission = struct {
     client_flags: []const u8,
 
     pub fn accuracy(self: Submission) f64 {
-        const total: i32 = switch (self.mode) {
-            0 => self.n300 + self.n100 + self.n50 + self.nmiss,
-            1 => self.n300 + self.n100 + self.nmiss,
-            2, 3 => self.n300 + self.n100 + self.n50 + self.ngeki + self.nkatu + self.nmiss,
+        const total: i64 = switch (self.mode) {
+            0 => @as(i64, self.n300) + @as(i64, self.n100) + @as(i64, self.n50) + @as(i64, self.nmiss),
+            1 => @as(i64, self.n300) + @as(i64, self.n100) + @as(i64, self.nmiss),
+            2, 3 => @as(i64, self.n300) + @as(i64, self.n100) + @as(i64, self.n50) + @as(i64, self.ngeki) + @as(i64, self.nkatu) + @as(i64, self.nmiss),
             else => unreachable,
         };
         if (total == 0) return 0;
         const numerator: i64 = switch (self.mode) {
             0 => 300 * @as(i64, self.n300) + 100 * @as(i64, self.n100) + 50 * @as(i64, self.n50),
             1 => 300 * @as(i64, self.n300) + 150 * @as(i64, self.n100),
-            2 => 300 * @as(i64, self.n300 + self.n100 + self.n50),
-            3 => 300 * @as(i64, self.n300 + self.ngeki) + 200 * @as(i64, self.nkatu) + 100 * @as(i64, self.n100) + 50 * @as(i64, self.n50),
+            2 => 300 * (@as(i64, self.n300) + @as(i64, self.n100) + @as(i64, self.n50)),
+            3 => 300 * (@as(i64, self.n300) + @as(i64, self.ngeki)) + 200 * @as(i64, self.nkatu) + 100 * @as(i64, self.n100) + 50 * @as(i64, self.n50),
             else => unreachable,
         };
         return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(300 * @as(i64, total)));
@@ -57,7 +61,7 @@ pub const Submission = struct {
         const input = std.fmt.bufPrint(
             &input_buffer,
             "chickenmcnuggets{d}o15{d}{d}smustard{d}{d}uu{s}{d}{s}{s}{d}{s}{d}Q{s}{d}{s}{s}{s}{s}",
-            .{ self.n100 + self.n300, self.n50, self.ngeki, self.nkatu, self.nmiss, self.map_md5, self.max_combo, perfect, name, self.total_score, self.grade, self.mods, passed, self.mode, osu_version, self.client_time, client_hash, storyboard_md5 },
+            .{ @as(i64, self.n100) + @as(i64, self.n300), self.n50, self.ngeki, self.nkatu, self.nmiss, self.map_md5, self.max_combo, perfect, name, self.total_score, self.grade, self.mods, passed, self.mode, osu_version, self.client_time, client_hash, storyboard_md5 },
         ) catch return false;
         var digest: [16]u8 = undefined;
         std.crypto.hash.Md5.hash(input, &digest, .{});
@@ -141,8 +145,8 @@ pub fn parse(data: []const u8) !Submission {
         .ngeki = try count(fields[6]),
         .nkatu = try count(fields[7]),
         .nmiss = try count(fields[8]),
-        .total_score = try nonNegative(i64, fields[9]),
-        .max_combo = try nonNegative(i32, fields[10]),
+        .total_score = try boundedNonNegative(i64, fields[9], max_total_score),
+        .max_combo = try boundedNonNegative(i32, fields[10], max_combo),
         .perfect = try parseBool(fields[11]),
         .grade = fields[12],
         .mods = try nonNegative(i32, fields[13]),
@@ -154,11 +158,16 @@ pub fn parse(data: []const u8) !Submission {
 }
 
 fn count(value: []const u8) !i32 {
-    return nonNegative(i32, value);
+    return boundedNonNegative(i32, value, max_hit_count);
 }
 fn nonNegative(comptime T: type, value: []const u8) !T {
     const parsed = try parseInteger(T, value);
     if (parsed < 0) return error.NegativeValue;
+    return parsed;
+}
+fn boundedNonNegative(comptime T: type, value: []const u8, maximum: T) !T {
+    const parsed = try nonNegative(T, value);
+    if (parsed > maximum) return error.ValueTooLarge;
     return parsed;
 }
 fn parseInteger(comptime T: type, value: []const u8) !T {

@@ -7,6 +7,7 @@ const stable_score = @import("stable_score.zig");
 const country = @import("country.zig");
 const commands = @import("commands.zig");
 const log = @import("logutil.zig");
+const multiplayer = @import("multiplayer.zig");
 
 pub const LoginResult = struct {
     allocator: std.mem.Allocator,
@@ -275,6 +276,72 @@ fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, byte
     try target.enqueue(allocator, bytes);
 }
 
+fn matchChannelName(buffer: *[32]u8, match_id: u16) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "#multi_{d}", .{match_id});
+}
+
+fn broadcastMatchStateLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match: *const multiplayer.Match, include_lobby: bool) !void {
+    var room_event = protocol.Writer.init(allocator);
+    defer room_event.deinit();
+    try multiplayer.writePacket(&room_event, .update_match, match, true);
+    var lobby_event = protocol.Writer.init(allocator);
+    defer lobby_event.deinit();
+    if (include_lobby) try multiplayer.writePacket(&lobby_event, .update_match, match, false);
+    for (sessions.items.items) |other| {
+        if (other.is_bot) continue;
+        if (other.match_id == match.id) {
+            try other.enqueue(allocator, room_event.bytes());
+        } else if (include_lobby and other.in_lobby) {
+            try other.enqueue(allocator, lobby_event.bytes());
+        }
+    }
+}
+
+fn broadcastNewMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match: *const multiplayer.Match) !void {
+    var event = protocol.Writer.init(allocator);
+    defer event.deinit();
+    try multiplayer.writePacket(&event, .new_match, match, false);
+    for (sessions.items.items) |other| if (!other.is_bot and other.in_lobby) try other.enqueue(allocator, event.bytes());
+}
+
+fn broadcastDisposeMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, match_id: u16) !void {
+    var event = protocol.Writer.init(allocator);
+    defer event.deinit();
+    try event.packetInt(.dispose_match, match_id);
+    for (sessions.items.items) |other| if (!other.is_bot and other.in_lobby) try other.enqueue(allocator, event.bytes());
+}
+
+fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+    const match_id = session.match_id orelse return;
+    const match = sessions.matchById(match_id) orelse {
+        session.match_id = null;
+        return;
+    };
+    const slot = match.slotByUser(session.user.id) orelse {
+        session.match_id = null;
+        return;
+    };
+    const next_status: multiplayer.SlotStatus = if (slot.status == @intFromEnum(multiplayer.SlotStatus.locked)) .locked else .open;
+    slot.reset(next_status);
+    session.match_id = null;
+    if (match.isEmpty()) {
+        match.deinit();
+        sessions.matches[match_id] = null;
+        broadcastDisposeMatchLocked(allocator, sessions, match_id) catch {};
+        return;
+    }
+    if (match.host_id == session.user.id) {
+        match.host_id = match.firstUser().?;
+        if (sessions.byUser(match.host_id)) |new_host| {
+            var transfer = protocol.Writer.init(allocator);
+            defer transfer.deinit();
+            transfer.packetEmpty(.match_transfer_host) catch {};
+            new_host.enqueue(allocator, transfer.bytes()) catch {};
+        }
+    }
+    broadcastMatchStateLocked(allocator, sessions, match, true) catch {};
+}
+
 fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
@@ -286,6 +353,7 @@ fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.S
 }
 
 fn removeSessionLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+    leaveMatchLocked(allocator, sessions, session);
     broadcastLogoutLocked(allocator, sessions, session);
     sessions.remove(session);
 }
@@ -358,9 +426,192 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                     if (!target.is_bot) try queuePacket(target, allocator, message.bytes());
                 }
             } else {
-                if (!session.joined(target_name) or !std.mem.eql(u8, target_name, "#osu")) continue;
+                if (!session.joined(target_name)) continue;
                 try sessions.broadcastChannel(target_name, message.bytes(), session);
             }
+        },
+        .join_lobby => {
+            session.in_lobby = true;
+            for (&sessions.matches) |*entry| if (entry.*) |*match| try multiplayer.writePacket(&out, .new_match, match, false);
+        },
+        .part_lobby => session.in_lobby = false,
+        .create_match => {
+            const data = multiplayer.readMatch(packet.payload) catch continue;
+            if (data.host_id != session.user.id or session.match_id != null or session.user.restricted or session.user.silence_end > now) {
+                try out.packetEmpty(.match_join_fail);
+                continue;
+            }
+            const match_id = sessions.freeMatchId() orelse {
+                try out.packetEmpty(.match_join_fail);
+                continue;
+            };
+            sessions.matches[match_id] = try multiplayer.Match.init(allocator, match_id, data, session.user.id);
+            const match = sessions.matchById(match_id).?;
+            session.match_id = match_id;
+            session.in_lobby = false;
+            try multiplayer.writePacket(&out, .match_join_success, match, true);
+            var channel_buffer: [32]u8 = undefined;
+            try out.packetString(.channel_join_success, try matchChannelName(&channel_buffer, match_id));
+            try broadcastNewMatchLocked(allocator, sessions, match);
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .join_match => {
+            var payload: protocol.PayloadReader = .{ .data = packet.payload };
+            const raw_match_id = try payload.int(i32);
+            const password = try payload.string();
+            if (payload.pos != packet.payload.len or raw_match_id < 0 or raw_match_id >= multiplayer.max_matches or session.match_id != null or session.user.restricted or session.user.silence_end > now) {
+                try out.packetEmpty(.match_join_fail);
+                continue;
+            }
+            const match_id: u16 = @intCast(raw_match_id);
+            const match = sessions.matchById(match_id) orelse {
+                try out.packetEmpty(.match_join_fail);
+                continue;
+            };
+            if (!std.mem.eql(u8, password, match.password)) {
+                try out.packetEmpty(.match_join_fail);
+                continue;
+            }
+            const slot = match.freeSlot() orelse {
+                try out.packetEmpty(.match_join_fail);
+                continue;
+            };
+            slot.user_id = session.user.id;
+            slot.status = @intFromEnum(multiplayer.SlotStatus.not_ready);
+            slot.team = if (multiplayer.isTeamVersus(match.team_type)) @intFromEnum(multiplayer.Team.red) else @intFromEnum(multiplayer.Team.neutral);
+            session.match_id = match_id;
+            session.in_lobby = false;
+            try multiplayer.writePacket(&out, .match_join_success, match, true);
+            var channel_buffer: [32]u8 = undefined;
+            try out.packetString(.channel_join_success, try matchChannelName(&channel_buffer, match_id));
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .part_match => leaveMatchLocked(allocator, sessions, session),
+        .change_slot => {
+            const match_id = session.match_id orelse continue;
+            const match = sessions.matchById(match_id) orelse continue;
+            var payload: protocol.PayloadReader = .{ .data = packet.payload };
+            const wanted = try payload.int(i32);
+            if (payload.pos != packet.payload.len or wanted < 0 or wanted >= 16) continue;
+            const current = match.slotByUser(session.user.id) orelse continue;
+            const target = &match.slots[@intCast(wanted)];
+            if (target.status != @intFromEnum(multiplayer.SlotStatus.open)) continue;
+            target.* = current.*;
+            current.reset(.open);
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .match_ready => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            slot.status = @intFromEnum(multiplayer.SlotStatus.ready);
+            try broadcastMatchStateLocked(allocator, sessions, match, false);
+        },
+        .match_not_ready, .match_has_beatmap => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            slot.status = @intFromEnum(multiplayer.SlotStatus.not_ready);
+            try broadcastMatchStateLocked(allocator, sessions, match, false);
+        },
+        .match_no_beatmap => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            slot.status = @intFromEnum(multiplayer.SlotStatus.no_map);
+            try broadcastMatchStateLocked(allocator, sessions, match, false);
+        },
+        .match_lock => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (match.host_id != session.user.id) continue;
+            var payload: protocol.PayloadReader = .{ .data = packet.payload };
+            const wanted = try payload.int(i32);
+            if (payload.pos != packet.payload.len or wanted < 0 or wanted >= 16) continue;
+            const slot = &match.slots[@intCast(wanted)];
+            if (slot.user_id == session.user.id) continue;
+            if (slot.status == @intFromEnum(multiplayer.SlotStatus.locked)) {
+                slot.reset(.open);
+            } else {
+                if (slot.user_id) |target_id| if (sessions.byUser(target_id)) |target| {
+                    target.match_id = null;
+                    var kicked = protocol.Writer.init(allocator);
+                    defer kicked.deinit();
+                    try kicked.packetEmpty(.match_join_fail);
+                    try target.enqueue(allocator, kicked.bytes());
+                };
+                slot.reset(.locked);
+            }
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .match_transfer_host => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (match.host_id != session.user.id) continue;
+            var payload: protocol.PayloadReader = .{ .data = packet.payload };
+            const wanted = try payload.int(i32);
+            if (payload.pos != packet.payload.len or wanted < 0 or wanted >= 16) continue;
+            const target_id = match.slots[@intCast(wanted)].user_id orelse continue;
+            const target = sessions.byUser(target_id) orelse continue;
+            match.host_id = target_id;
+            var transfer = protocol.Writer.init(allocator);
+            defer transfer.deinit();
+            try transfer.packetEmpty(.match_transfer_host);
+            try target.enqueue(allocator, transfer.bytes());
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .match_change_mods => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            var payload: protocol.PayloadReader = .{ .data = packet.payload };
+            const mods = try payload.int(i32);
+            if (payload.pos != packet.payload.len or mods < 0) continue;
+            if (match.freemods) {
+                if (match.host_id == session.user.id) match.mods = mods & multiplayer.speed_changing_mods;
+                const slot = match.slotByUser(session.user.id) orelse continue;
+                slot.mods = mods & ~multiplayer.speed_changing_mods;
+            } else {
+                if (match.host_id != session.user.id) continue;
+                match.mods = mods;
+            }
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .match_change_team => {
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (!multiplayer.isTeamVersus(match.team_type)) continue;
+            const slot = match.slotByUser(session.user.id) orelse continue;
+            slot.team = if (slot.team == @intFromEnum(multiplayer.Team.blue)) @intFromEnum(multiplayer.Team.red) else @intFromEnum(multiplayer.Team.blue);
+            try broadcastMatchStateLocked(allocator, sessions, match, false);
+        },
+        .match_change_settings => {
+            const data = multiplayer.readMatch(packet.payload) catch continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (match.host_id != session.user.id or data.host_id != session.user.id) continue;
+            if (data.freemods != match.freemods) {
+                if (data.freemods) {
+                    for (&match.slots) |*slot| if (slot.user_id != null) {
+                        slot.mods = match.mods & ~multiplayer.speed_changing_mods;
+                    };
+                    match.mods &= multiplayer.speed_changing_mods;
+                } else {
+                    const host_slot = match.slotByUser(session.user.id).?;
+                    match.mods = (match.mods & multiplayer.speed_changing_mods) | host_slot.mods;
+                    for (&match.slots) |*slot| slot.mods = 0;
+                }
+                match.freemods = data.freemods;
+            }
+            if (match.team_type != data.team_type) {
+                const team: u8 = if (multiplayer.isTeamVersus(data.team_type)) @intFromEnum(multiplayer.Team.red) else @intFromEnum(multiplayer.Team.neutral);
+                for (&match.slots) |*slot| if (slot.user_id != null) {
+                    slot.team = team;
+                };
+            }
+            try match.updateSettings(data);
+            if (data.map_id == -1) for (&match.slots) |*slot| if (slot.status == @intFromEnum(multiplayer.SlotStatus.ready)) {
+                slot.status = @intFromEnum(multiplayer.SlotStatus.not_ready);
+            };
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
+        },
+        .match_change_password => {
+            const data = multiplayer.readMatch(packet.payload) catch continue;
+            const match = sessions.matchById(session.match_id orelse continue) orelse continue;
+            if (match.host_id != session.user.id or data.host_id != session.user.id) continue;
+            try match.updatePassword(data.password);
+            try broadcastMatchStateLocked(allocator, sessions, match, true);
         },
         .channel_join => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };

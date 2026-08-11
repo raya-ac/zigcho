@@ -17,6 +17,7 @@ const beatmap_sync = @import("beatmap_sync.zig");
 const sessions_mod = @import("sessions.zig");
 const country = @import("country.zig");
 const config_mod = @import("config.zig");
+const multiplayer = @import("multiplayer.zig");
 
 fn clientMessagePacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, sender: []const u8, message: []const u8, target: []const u8, sender_id: i32) ![]u8 {
     var w = protocol.Writer.init(allocator);
@@ -41,10 +42,83 @@ fn clientEmptyPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket) ![
     return allocator.dupe(u8, w.bytes());
 }
 
+fn clientPayloadPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, payload: []const u8) ![]u8 {
+    var w = protocol.Writer.init(allocator);
+    defer w.deinit();
+    try w.int(u16, @intFromEnum(id));
+    try w.byte(0);
+    try w.int(u32, @intCast(payload.len));
+    try w.raw(payload);
+    return allocator.dupe(u8, w.bytes());
+}
+
+fn multiplayerFixtureData(host_id: i32, password: []const u8) multiplayer.MatchData {
+    return .{
+        .id = 0,
+        .in_progress = false,
+        .mods = 0,
+        .name = "zigcho stable room",
+        .password = password,
+        .map_name = "Zigcho - Fixture [Tests]",
+        .map_id = 900000001,
+        .map_md5 = "0123456789abcdef0123456789abcdef",
+        .slot_statuses = [_]u8{@intFromEnum(multiplayer.SlotStatus.open)} ** 16,
+        .slot_teams = [_]u8{@intFromEnum(multiplayer.Team.neutral)} ** 16,
+        .slot_mods = [_]i32{0} ** 16,
+        .host_id = host_id,
+        .mode = 0,
+        .win_condition = 0,
+        .team_type = 0,
+        .freemods = false,
+        .seed = 0,
+    };
+}
+
+fn clientMatchPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, host_id: i32, password: []const u8) ![]u8 {
+    return clientMatchDataPacket(allocator, id, multiplayerFixtureData(host_id, password));
+}
+
+fn clientMatchDataPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, data: multiplayer.MatchData) ![]u8 {
+    var match = try multiplayer.Match.init(allocator, 0, data, data.host_id);
+    defer match.deinit();
+    var payload = protocol.Writer.init(allocator);
+    defer payload.deinit();
+    try multiplayer.writeMatch(&payload, &match, true);
+    return clientPayloadPacket(allocator, id, payload.bytes());
+}
+
+fn clientJoinMatchPacket(allocator: std.mem.Allocator, match_id: i32, password: []const u8) ![]u8 {
+    var payload = protocol.Writer.init(allocator);
+    defer payload.deinit();
+    try payload.int(i32, match_id);
+    try payload.string(password);
+    return clientPayloadPacket(allocator, .join_match, payload.bytes());
+}
+
+fn testSessionUser(allocator: std.mem.Allocator, id: i32, name: []const u8) !domain.User {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    return .{
+        .id = id,
+        .name = owned_name,
+        .safe_name = try allocator.dupe(u8, name),
+    };
+}
+
 const LoginAllocationContext = struct {
     store: *storage.Store,
     body: []const u8,
 };
+
+fn multiplayerAllocationRun(allocator: std.mem.Allocator, _: void) !void {
+    var match = try multiplayer.Match.init(allocator, 1, multiplayerFixtureData(10, "secret"), 10);
+    defer match.deinit();
+    var settings = multiplayerFixtureData(10, "secret");
+    settings.name = "updated stable room";
+    settings.map_name = "updated map";
+    try match.updateSettings(settings);
+    try match.updatePassword("updated-secret");
+}
 
 fn loginAllocationRun(allocator: std.mem.Allocator, context: *LoginAllocationContext) !void {
     var sessions = sessions_mod.Sessions.init(allocator, std.testing.io);
@@ -637,6 +711,252 @@ test "packet framing round trip" {
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, w.bytes()[3..7], .little));
     var p: protocol.PayloadReader = .{ .data = w.bytes()[7..] };
     try std.testing.expectEqualStrings("hello", try p.string());
+}
+
+test "stable multiplayer match wire format round trips and hides lobby passwords" {
+    var match = try multiplayer.Match.init(std.testing.allocator, 7, multiplayerFixtureData(42, "room-secret"), 42);
+    defer match.deinit();
+    match.slots[3].user_id = 84;
+    match.slots[3].status = @intFromEnum(multiplayer.SlotStatus.ready);
+    match.slots[3].team = @intFromEnum(multiplayer.Team.blue);
+
+    var private = protocol.Writer.init(std.testing.allocator);
+    defer private.deinit();
+    try multiplayer.writePacket(&private, .match_join_success, &match, true);
+    var private_reader: protocol.Reader = .{ .data = private.bytes() };
+    const private_packet = (try private_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.match_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(private_packet.id))));
+    const private_match = try multiplayer.readMatch(private_packet.payload);
+    try std.testing.expectEqualStrings("room-secret", private_match.password);
+    try std.testing.expectEqual(@as(i32, 42), private_match.host_id);
+    try std.testing.expectEqual(@as(usize, private_packet.payload.len), private_packet.payload.len);
+
+    var public = protocol.Writer.init(std.testing.allocator);
+    defer public.deinit();
+    try multiplayer.writePacket(&public, .new_match, &match, false);
+    var public_reader: protocol.Reader = .{ .data = public.bytes() };
+    const public_packet = (try public_reader.next()).?;
+    const public_match = try multiplayer.readMatch(public_packet.payload);
+    try std.testing.expectEqualStrings("", public_match.password);
+    try std.testing.expectError(error.TruncatedPayload, multiplayer.readMatch(public_packet.payload[0 .. public_packet.payload.len - 1]));
+}
+
+test "stable multiplayer owned match data survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, multiplayerAllocationRun, .{{}});
+}
+
+test "stable multiplayer room lifecycle keeps lobby slot and host state coherent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-multiplayer.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const host = try sessions.create(try testSessionUser(std.testing.allocator, 10, "host"), 0, 0, 0);
+    const guest = try sessions.create(try testSessionUser(std.testing.allocator, 11, "guest"), 0, 0, 0);
+    const observer = try sessions.create(try testSessionUser(std.testing.allocator, 12, "observer"), 0, 0, 0);
+
+    const join_lobby = try clientEmptyPacket(std.testing.allocator, .join_lobby);
+    defer std.testing.allocator.free(join_lobby);
+    const guest_lobby = try bancho.poll(std.testing.allocator, &store, &sessions, guest, join_lobby);
+    defer std.testing.allocator.free(guest_lobby);
+    const observer_lobby = try bancho.poll(std.testing.allocator, &store, &sessions, observer, join_lobby);
+    defer std.testing.allocator.free(observer_lobby);
+    try std.testing.expect(guest.in_lobby and observer.in_lobby);
+
+    const create = try clientMatchPacket(std.testing.allocator, .create_match, host.user.id, "room-secret");
+    defer std.testing.allocator.free(create);
+    const created = try bancho.poll(std.testing.allocator, &store, &sessions, host, create);
+    defer std.testing.allocator.free(created);
+    var created_reader: protocol.Reader = .{ .data = created };
+    try std.testing.expectEqual(protocol.ServerPacket.match_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try created_reader.next()).?.id))));
+    try std.testing.expectEqual(protocol.ServerPacket.channel_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try created_reader.next()).?.id))));
+    try std.testing.expect((try created_reader.next()) == null);
+    const match = sessions.matchById(0).?;
+    try std.testing.expectEqual(@as(?u16, 0), host.match_id);
+    try std.testing.expect(!host.in_lobby);
+    try std.testing.expectEqual(@as(usize, 1), match.occupied());
+
+    const empty = try clientEmptyPacket(std.testing.allocator, .ping);
+    defer std.testing.allocator.free(empty);
+    const guest_discovery = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
+    defer std.testing.allocator.free(guest_discovery);
+    var discovery_reader: protocol.Reader = .{ .data = guest_discovery };
+    try std.testing.expectEqual(protocol.ServerPacket.new_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
+    try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
+
+    const wrong_join = try clientJoinMatchPacket(std.testing.allocator, 0, "wrong");
+    defer std.testing.allocator.free(wrong_join);
+    const denied = try bancho.poll(std.testing.allocator, &store, &sessions, guest, wrong_join);
+    defer std.testing.allocator.free(denied);
+    var denied_reader: protocol.Reader = .{ .data = denied };
+    try std.testing.expectEqual(protocol.ServerPacket.match_join_fail, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try denied_reader.next()).?.id))));
+    try std.testing.expectEqual(@as(?u16, null), guest.match_id);
+
+    const right_join = try clientJoinMatchPacket(std.testing.allocator, 0, "room-secret");
+    defer std.testing.allocator.free(right_join);
+    const joined = try bancho.poll(std.testing.allocator, &store, &sessions, guest, right_join);
+    defer std.testing.allocator.free(joined);
+    var joined_reader: protocol.Reader = .{ .data = joined };
+    try std.testing.expectEqual(protocol.ServerPacket.match_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try joined_reader.next()).?.id))));
+    try std.testing.expectEqual(protocol.ServerPacket.channel_join_success, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try joined_reader.next()).?.id))));
+    try std.testing.expectEqual(@as(usize, 2), match.occupied());
+    try std.testing.expectEqual(@as(?u16, 0), guest.match_id);
+
+    const clear_guest = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
+    defer std.testing.allocator.free(clear_guest);
+    const clear_observer = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
+    defer std.testing.allocator.free(clear_observer);
+    const room_message = try clientMessagePacket(std.testing.allocator, .send_public_message, host.user.name, "stable room chat", "#multi_0", host.user.id);
+    defer std.testing.allocator.free(room_message);
+    const host_chat = try bancho.poll(std.testing.allocator, &store, &sessions, host, room_message);
+    defer std.testing.allocator.free(host_chat);
+    const guest_chat = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
+    defer std.testing.allocator.free(guest_chat);
+    var guest_chat_reader: protocol.Reader = .{ .data = guest_chat };
+    const guest_chat_packet = (try guest_chat_reader.next()).?;
+    try std.testing.expectEqual(protocol.ServerPacket.send_message, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum(guest_chat_packet.id))));
+    var guest_chat_payload: protocol.PayloadReader = .{ .data = guest_chat_packet.payload };
+    try std.testing.expectEqualStrings("host", try guest_chat_payload.string());
+    try std.testing.expectEqualStrings("stable room chat", try guest_chat_payload.string());
+    try std.testing.expectEqualStrings("#multi_0", try guest_chat_payload.string());
+
+    var slot_payload = protocol.Writer.init(std.testing.allocator);
+    defer slot_payload.deinit();
+    try slot_payload.int(i32, 3);
+    const move_slot = try clientPayloadPacket(std.testing.allocator, .change_slot, slot_payload.bytes());
+    defer std.testing.allocator.free(move_slot);
+    const moved = try bancho.poll(std.testing.allocator, &store, &sessions, guest, move_slot);
+    defer std.testing.allocator.free(moved);
+    try std.testing.expectEqual(@as(?usize, 3), match.slotIndexByUser(guest.user.id));
+
+    const ready_packet = try clientEmptyPacket(std.testing.allocator, .match_ready);
+    defer std.testing.allocator.free(ready_packet);
+    const ready = try bancho.poll(std.testing.allocator, &store, &sessions, guest, ready_packet);
+    defer std.testing.allocator.free(ready);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.ready)), match.slotByUser(guest.user.id).?.status);
+
+    var host_mods_payload = protocol.Writer.init(std.testing.allocator);
+    defer host_mods_payload.deinit();
+    try host_mods_payload.int(i32, (1 << 6) | (1 << 3));
+    const host_mods_packet = try clientPayloadPacket(std.testing.allocator, .match_change_mods, host_mods_payload.bytes());
+    defer std.testing.allocator.free(host_mods_packet);
+    const host_mods_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, host_mods_packet);
+    defer std.testing.allocator.free(host_mods_result);
+    try std.testing.expectEqual(@as(i32, (1 << 6) | (1 << 3)), match.mods);
+
+    var free_settings = multiplayerFixtureData(host.user.id, "room-secret");
+    free_settings.name = "stable teams room";
+    free_settings.freemods = true;
+    free_settings.team_type = 2;
+    const free_settings_packet = try clientMatchDataPacket(std.testing.allocator, .match_change_settings, free_settings);
+    defer std.testing.allocator.free(free_settings_packet);
+    const free_settings_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, free_settings_packet);
+    defer std.testing.allocator.free(free_settings_result);
+    try std.testing.expect(match.freemods);
+    try std.testing.expectEqualStrings("stable teams room", match.name);
+    try std.testing.expectEqual(@as(i32, 1 << 6), match.mods);
+    try std.testing.expectEqual(@as(i32, 1 << 3), match.slotByUser(guest.user.id).?.mods);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.Team.red)), match.slotByUser(guest.user.id).?.team);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.ready)), match.slotByUser(guest.user.id).?.status);
+    var changing_map = free_settings;
+    changing_map.map_id = -1;
+    changing_map.map_name = "";
+    changing_map.map_md5 = "";
+    const changing_map_packet = try clientMatchDataPacket(std.testing.allocator, .match_change_settings, changing_map);
+    defer std.testing.allocator.free(changing_map_packet);
+    const changing_map_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, changing_map_packet);
+    defer std.testing.allocator.free(changing_map_result);
+    try std.testing.expectEqual(@as(i32, -1), match.map_id);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.not_ready)), match.slotByUser(guest.user.id).?.status);
+    const selected_map_packet = try clientMatchDataPacket(std.testing.allocator, .match_change_settings, free_settings);
+    defer std.testing.allocator.free(selected_map_packet);
+    const selected_map_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, selected_map_packet);
+    defer std.testing.allocator.free(selected_map_result);
+    try std.testing.expectEqual(@as(i32, 900000001), match.map_id);
+    var mods_payload = protocol.Writer.init(std.testing.allocator);
+    defer mods_payload.deinit();
+    try mods_payload.int(i32, (1 << 3) | (1 << 4));
+    const guest_mods_packet = try clientPayloadPacket(std.testing.allocator, .match_change_mods, mods_payload.bytes());
+    defer std.testing.allocator.free(guest_mods_packet);
+    const guest_mods_result = try bancho.poll(std.testing.allocator, &store, &sessions, guest, guest_mods_packet);
+    defer std.testing.allocator.free(guest_mods_result);
+    try std.testing.expectEqual(@as(i32, (1 << 3) | (1 << 4)), match.slotByUser(guest.user.id).?.mods);
+    const change_team_packet = try clientEmptyPacket(std.testing.allocator, .match_change_team);
+    defer std.testing.allocator.free(change_team_packet);
+    const changed_team = try bancho.poll(std.testing.allocator, &store, &sessions, guest, change_team_packet);
+    defer std.testing.allocator.free(changed_team);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.Team.blue)), match.slotByUser(guest.user.id).?.team);
+
+    var password_settings = free_settings;
+    password_settings.password = "new-secret";
+    const password_packet = try clientMatchDataPacket(std.testing.allocator, .match_change_password, password_settings);
+    defer std.testing.allocator.free(password_packet);
+    const password_result = try bancho.poll(std.testing.allocator, &store, &sessions, host, password_packet);
+    defer std.testing.allocator.free(password_result);
+    try std.testing.expectEqualStrings("new-secret", match.password);
+
+    const lock_slot = try clientPayloadPacket(std.testing.allocator, .match_lock, slot_payload.bytes());
+    defer std.testing.allocator.free(lock_slot);
+    const locked = try bancho.poll(std.testing.allocator, &store, &sessions, host, lock_slot);
+    defer std.testing.allocator.free(locked);
+    try std.testing.expectEqual(@as(?u16, null), guest.match_id);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.locked)), match.slots[3].status);
+    const unlocked = try bancho.poll(std.testing.allocator, &store, &sessions, host, lock_slot);
+    defer std.testing.allocator.free(unlocked);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(multiplayer.SlotStatus.open)), match.slots[3].status);
+
+    const rejoin = try clientJoinMatchPacket(std.testing.allocator, 0, "new-secret");
+    defer std.testing.allocator.free(rejoin);
+    const rejoined = try bancho.poll(std.testing.allocator, &store, &sessions, guest, rejoin);
+    defer std.testing.allocator.free(rejoined);
+    try std.testing.expectEqual(@as(?u16, 0), guest.match_id);
+    try std.testing.expectEqual(@as(usize, 2), match.occupied());
+    var transfer_payload = protocol.Writer.init(std.testing.allocator);
+    defer transfer_payload.deinit();
+    try transfer_payload.int(i32, @intCast(match.slotIndexByUser(guest.user.id).?));
+    const transfer_to_guest = try clientPayloadPacket(std.testing.allocator, .match_transfer_host, transfer_payload.bytes());
+    defer std.testing.allocator.free(transfer_to_guest);
+    const transferred_to_guest = try bancho.poll(std.testing.allocator, &store, &sessions, host, transfer_to_guest);
+    defer std.testing.allocator.free(transferred_to_guest);
+    try std.testing.expectEqual(guest.user.id, match.host_id);
+    transfer_payload.list.clearRetainingCapacity();
+    try transfer_payload.int(i32, @intCast(match.slotIndexByUser(host.user.id).?));
+    const transfer_to_host = try clientPayloadPacket(std.testing.allocator, .match_transfer_host, transfer_payload.bytes());
+    defer std.testing.allocator.free(transfer_to_host);
+    const transferred_to_host = try bancho.poll(std.testing.allocator, &store, &sessions, guest, transfer_to_host);
+    defer std.testing.allocator.free(transferred_to_host);
+    try std.testing.expectEqual(host.user.id, match.host_id);
+    const clear_guest_again = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
+    defer std.testing.allocator.free(clear_guest_again);
+    const clear_observer_before_part = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
+    defer std.testing.allocator.free(clear_observer_before_part);
+    const host_part_packet = try clientEmptyPacket(std.testing.allocator, .part_match);
+    defer std.testing.allocator.free(host_part_packet);
+    const host_part = try bancho.poll(std.testing.allocator, &store, &sessions, host, host_part_packet);
+    defer std.testing.allocator.free(host_part);
+    try std.testing.expectEqual(@as(?u16, null), host.match_id);
+    try std.testing.expectEqual(guest.user.id, match.host_id);
+
+    const transferred = try bancho.poll(std.testing.allocator, &store, &sessions, guest, empty);
+    defer std.testing.allocator.free(transferred);
+    var transferred_reader: protocol.Reader = .{ .data = transferred };
+    try std.testing.expectEqual(protocol.ServerPacket.match_transfer_host, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try transferred_reader.next()).?.id))));
+    try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try transferred_reader.next()).?.id))));
+
+    const clear_observer_again = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
+    defer std.testing.allocator.free(clear_observer_again);
+    const guest_part = try bancho.poll(std.testing.allocator, &store, &sessions, guest, host_part_packet);
+    defer std.testing.allocator.free(guest_part);
+    try std.testing.expect(sessions.matchById(0) == null);
+    const disposed = try bancho.poll(std.testing.allocator, &store, &sessions, observer, empty);
+    defer std.testing.allocator.free(disposed);
+    var disposed_reader: protocol.Reader = .{ .data = disposed };
+    try std.testing.expectEqual(protocol.ServerPacket.dispose_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try disposed_reader.next()).?.id))));
 }
 
 test "lazer custom mod acronyms are bounded" {

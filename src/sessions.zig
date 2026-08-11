@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const multiplayer = @import("multiplayer.zig");
 
 pub const max_queue_bytes = 1024 * 1024;
 pub const ScoreTokenAuthorization = enum { exact, stale_online, foreign_live, offline, missing };
@@ -22,6 +23,8 @@ pub const Session = struct {
     is_bot: bool = false,
     joined_osu: bool = false,
     joined_announce: bool = false,
+    in_lobby: bool = false,
+    match_id: ?u16 = null,
     longitude: f32 = 0,
     latitude: f32 = 0,
 
@@ -31,6 +34,10 @@ pub const Session = struct {
     pub fn joined(self: *const Session, name: []const u8) bool {
         if (std.mem.eql(u8, name, "#osu")) return self.joined_osu;
         if (std.mem.eql(u8, name, "#announce")) return self.joined_announce;
+        if (std.mem.startsWith(u8, name, "#multi_")) {
+            const id = std.fmt.parseInt(u16, name[7..], 10) catch return false;
+            return self.match_id == id;
+        }
         return false;
     }
     pub fn enqueue(self: *Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -51,11 +58,13 @@ pub const Sessions = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     items: std.ArrayList(*Session) = .empty,
+    matches: [multiplayer.max_matches]?multiplayer.Match = [_]?multiplayer.Match{null} ** multiplayer.max_matches,
 
     pub fn init(a: std.mem.Allocator, io: std.Io) Sessions {
         return .{ .allocator = a, .io = io };
     }
     pub fn deinit(self: *Sessions) void {
+        for (&self.matches) |*entry| if (entry.*) |*match| match.deinit();
         for (self.items.items) |s| {
             s.queue.deinit(self.allocator);
             self.allocator.free(s.user.name);
@@ -104,6 +113,15 @@ pub const Sessions = struct {
         for (self.items.items) |s| if (std.ascii.eqlIgnoreCase(s.user.name, name)) return s;
         return null;
     }
+    pub fn matchById(self: *Sessions, id: u16) ?*multiplayer.Match {
+        if (id >= self.matches.len) return null;
+        if (self.matches[id]) |*match| return match;
+        return null;
+    }
+    pub fn freeMatchId(self: *const Sessions) ?u16 {
+        for (self.matches, 0..) |entry, index| if (entry == null) return @intCast(index);
+        return null;
+    }
     pub fn authorizeScoreToken(self: *Sessions, token: ?[]const u8, user_id: i32) ScoreTokenAuthorization {
         const present_token = token orelse return .missing;
         self.mutex.lockUncancelable(self.io);
@@ -114,6 +132,16 @@ pub const Sessions = struct {
         return if (self.byUser(user_id) != null) .stale_online else .offline;
     }
     pub fn remove(self: *Sessions, target: *Session) void {
+        if (target.match_id) |match_id| if (self.matchById(match_id)) |match| {
+            if (match.slotByUser(target.user.id)) |slot| slot.reset(.open);
+            if (match.isEmpty()) {
+                match.deinit();
+                self.matches[match_id] = null;
+            } else if (match.host_id == target.user.id) {
+                match.host_id = match.firstUser().?;
+            }
+            target.match_id = null;
+        };
         for (self.items.items, 0..) |s, i| if (s == target) {
             _ = self.items.swapRemove(i);
             s.queue.deinit(self.allocator);
@@ -142,7 +170,7 @@ pub const Sessions = struct {
     }
     pub fn join(self: *Sessions, session: *Session, name: []const u8) bool {
         _ = self;
-        if (std.mem.eql(u8, name, "#osu")) session.joined_osu = true else if (std.mem.eql(u8, name, "#announce")) session.joined_announce = true else return false;
+        if (std.mem.eql(u8, name, "#osu")) session.joined_osu = true else if (std.mem.eql(u8, name, "#announce")) session.joined_announce = true else if (!session.joined(name)) return false;
         return true;
     }
     pub fn part(self: *Sessions, session: *Session, name: []const u8) void {

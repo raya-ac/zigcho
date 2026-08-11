@@ -1,5 +1,17 @@
 # changelog
 
+## 2026-08-11 — postgres has a real way in now
+
+the live server is still on SQLite for this phase. I am not going to swap the database underneath bancho while half the storage calls still speak SQLite. what landed is the part that makes the eventual cutover measurable instead of hopeful.
+
+there is a proper PostgreSQL schema under its own `zigcho` namespace, with booleans, jsonb, bytea, foreign keys, identities, and the indexes the current score and map paths need. libpq connections sit behind a hard eight-connection pool instead of growing with request count.
+
+`zigcho-migrate-postgres` reads a stopped version 12 SQLite database in read-only mode. it refuses an old schema and refuses any target where the `zigcho` namespace already exists. the schema and all 13 tables are copied inside one serializable transaction. identity sequences are reset after the copy, then every table count and the total blob bytes are compared before commit. replay, map, archive, token, and password bytes do not get a special "probably fine" exception.
+
+the migration fixture covers every table. PostgreSQL returned the replay byte-for-byte, stored the intended boolean/jsonb/bytea types, and rejected a second import. the pool test also opens both available connections, makes a third worker wait, and proves the lease is returned cleanly.
+
+stable multiplayer and spectating are accepted for this alpha, so they are no longer blocking the rest of the server. the next database phase is the actual runtime port and stopped-data cutover. after that comes the full chat/admin command set, BN+ ranking, and the player site.
+
 ## 2026-08-11 — stable remembers the machine and kai looks like staff
 
 zigcho now reads stable's complete login fingerprint instead of throwing it away. it stores the four hashes, client build, Wine state, first and last seen times, and repeat count. the raw adapter list is validated and then discarded.

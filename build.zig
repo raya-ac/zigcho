@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const postgres_prefix = b.option([]const u8, "postgres-prefix", "PostgreSQL installation prefix (macOS defaults to Homebrew postgresql@17)");
 
     const cargo = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "pp/Cargo.toml", "--release", "--locked" });
     const pp_library = b.path(if (target.result.os.tag == .windows) "pp/target/release/zigcho_pp.lib" else "pp/target/release/libzigcho_pp.a");
@@ -44,6 +45,24 @@ pub fn build(b: *std.Build) void {
     const archive_importer = b.addExecutable(.{ .name = "zigcho-import-archive", .root_module = archive_importer_mod });
     b.installArtifact(archive_importer);
 
+    const postgres_importer_mod = b.createModule(.{
+        .root_source_file = b.path("src/migrate_postgres.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    postgres_importer_mod.linkSystemLibrary("sqlite3", .{});
+    postgres_importer_mod.linkSystemLibrary("pq", .{ .use_pkg_config = .no });
+    if (target.result.os.tag == .macos) {
+        const prefix = postgres_prefix orelse "/opt/homebrew/opt/postgresql@17";
+        postgres_importer_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/include/postgresql", .{prefix}) });
+        postgres_importer_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib/postgresql", .{prefix}) });
+    } else if (target.result.os.tag == .linux) {
+        postgres_importer_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
+    }
+    const postgres_importer = b.addExecutable(.{ .name = "zigcho-migrate-postgres", .root_module = postgres_importer_mod });
+    b.installArtifact(postgres_importer);
+
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
@@ -56,6 +75,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     }) });
     tests.root_module.linkSystemLibrary("sqlite3", .{});
+    tests.root_module.linkSystemLibrary("pq", .{ .use_pkg_config = .no });
+    if (target.result.os.tag == .macos) {
+        const prefix = postgres_prefix orelse "/opt/homebrew/opt/postgresql@17";
+        tests.root_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/include/postgresql", .{prefix}) });
+        tests.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib/postgresql", .{prefix}) });
+    } else if (target.result.os.tag == .linux) {
+        tests.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
+    }
     if (target.result.os.tag == .linux) tests.root_module.linkSystemLibrary("gcc_s", .{});
     tests.root_module.addObjectFile(pp_library);
     tests.step.dependOn(&cargo.step);

@@ -19,6 +19,13 @@ const country = @import("country.zig");
 const config_mod = @import("config.zig");
 const multiplayer = @import("multiplayer.zig");
 const registration = @import("registration.zig");
+const postgres = @import("postgres.zig");
+const migrate_postgres = @import("migrate_postgres.zig");
+
+comptime {
+    _ = postgres;
+    _ = migrate_postgres;
+}
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
 const ari_stable_login = "ari\n00000000000000000000000000000000\n" ++ stable_login_details;

@@ -194,6 +194,23 @@ pub const Store = struct {
         return id;
     }
 
+    pub const RegistrationConflicts = struct { username: bool, email: bool };
+
+    pub fn registrationConflicts(self: *Store, name: []const u8, email: []const u8) !RegistrationConflicts {
+        const safe = try domain.safeName(self.allocator, name);
+        defer self.allocator.free(safe);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "SELECT EXISTS(SELECT 1 FROM users WHERE safe_name=?1), EXISTS(SELECT 1 FROM users WHERE email=?2)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, safe.ptr, @intCast(safe.len), null);
+        _ = c.sqlite3_bind_text(stmt, 2, email.ptr, @intCast(email.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return .{ .username = c.sqlite3_column_int(stmt, 0) != 0, .email = c.sqlite3_column_int(stmt, 1) != 0 };
+    }
+
     pub fn avatarForUser(self: *Store, user_id: i32) !?u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

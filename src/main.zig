@@ -10,6 +10,7 @@ const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
 const status_page = @embedFile("status.html");
 const form_urlencoded = @import("form_urlencoded.zig");
+const registration = @import("registration.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const webhook = @import("webhook.zig");
@@ -359,12 +360,26 @@ const App = struct {
             return respond(req, .ok, "application/x-osu-beatmap", map_file, &headers);
         }
         if (std.mem.eql(u8, path, "/users") and req.head.method == .POST) {
-            const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "name", "user[username]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"name required\"}", &.{});
+            const check = try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"check"});
+            defer if (check) |value| self.allocator.free(value);
+            const stable_registration = check != null;
+            const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "name", "user[username]" })) orelse return respond(req, .bad_request, if (stable_registration) "text/plain" else "application/json", if (stable_registration) "Missing required params" else "{\"error\":\"name required\"}", &.{});
             defer self.allocator.free(name);
-            const email = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "email", "user[user_email]" })) orelse try self.allocator.dupe(u8, "");
+            const email = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "email", "user[user_email]" })) orelse if (stable_registration) return respond(req, .bad_request, "text/plain", "Missing required params", &.{}) else try self.allocator.dupe(u8, "");
             defer self.allocator.free(email);
-            const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "password_md5", "user[password]" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &.{});
+            const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "password_md5", "user[password]" })) orelse return respond(req, .bad_request, if (stable_registration) "text/plain" else "application/json", if (stable_registration) "Missing required params" else "{\"error\":\"password required\"}", &.{});
             defer self.allocator.free(password);
+            if (check) |check_value| {
+                const result = registration.stableRequest(&self.store, name, email, password, check_value) catch |err| return respond(req, if (err == error.InvalidCheck) .bad_request else .internal_server_error, "text/plain", if (err == error.InvalidCheck) "Invalid check value" else "registration failed", &.{});
+                switch (result) {
+                    .ok => return respond(req, .ok, "text/plain", "ok", &.{}),
+                    .validation_failed => |validation| {
+                        var error_buffer: [768]u8 = undefined;
+                        const error_json = try registration.writeStableErrors(&error_buffer, validation);
+                        return respond(req, .bad_request, "application/json", error_json, &.{});
+                    },
+                }
+            }
             const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
             if (name.len < 2 or name.len > 32 or email.len > 254) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
             const id = self.store.register(name, email, &password_md5) catch |err| return respond(req, if (err == error.UserExists) .conflict else .internal_server_error, "application/json", "{\"error\":\"registration failed\"}", &.{});

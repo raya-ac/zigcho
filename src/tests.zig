@@ -18,6 +18,7 @@ const sessions_mod = @import("sessions.zig");
 const country = @import("country.zig");
 const config_mod = @import("config.zig");
 const multiplayer = @import("multiplayer.zig");
+const registration = @import("registration.zig");
 
 fn clientMessagePacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, sender: []const u8, message: []const u8, target: []const u8, sender_id: i32) ![]u8 {
     var w = protocol.Writer.init(allocator);
@@ -673,6 +674,32 @@ test "lazer registration fields are form decoded" {
     try std.testing.expectEqualStrings("zigcho lazer", name);
     try std.testing.expectEqualStrings("qa+zigcho@example.invalid", email);
     try std.testing.expectEqualStrings("long&safe=password", password);
+}
+
+test "stable registration validates before creating and returns bancho form errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-registration.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    const checked = try registration.stableRequest(&store, "new_player", "new@example.test", "good-password", "1");
+    try std.testing.expect(checked == .ok);
+    try std.testing.expectEqual(@as(i64, 0), (try store.serverCounts()).users);
+
+    const created = try registration.stableRequest(&store, "new_player", "new@example.test", "good-password", "0");
+    try std.testing.expect(created == .ok);
+    try std.testing.expectEqual(@as(i64, 1), (try store.serverCounts()).users);
+
+    const duplicate = try registration.stableRequest(&store, "new player", "new@example.test", "good-password", "1");
+    try std.testing.expect(duplicate == .validation_failed);
+    var error_buffer: [768]u8 = undefined;
+    const json = try registration.writeStableErrors(&error_buffer, duplicate.validation_failed);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"username\":[\"Username already taken") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"user_email\":[\"Email already taken") != null);
+    try std.testing.expectError(error.InvalidCheck, registration.stableRequest(&store, "other_player", "other@example.test", "good-password", "no"));
 }
 
 test "official lazer multipart fields are accepted" {

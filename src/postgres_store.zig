@@ -8,6 +8,7 @@ const lazer = @import("lazer.zig");
 const performance_calculator = @import("pp.zig");
 const stable_mods = @import("stable_mods.zig");
 const screenshot_contract = @import("screenshot.zig");
+const media_contract = @import("media_contract.zig");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
 pub const HardwareEnforcement = sqlite_storage.HardwareEnforcement;
@@ -45,6 +46,7 @@ pub const Store = struct {
     pub const ServerCounts = struct { users: i64, plays: i64, passed: i64, maps: i64 };
     pub const BeatmapCacheStats = struct { entries: i64, bytes: i64, hydration_failures: i64 };
     pub const BeatmapCachePrune = struct { entries: i64, bytes: i64 };
+    pub const BeatmapMediaCacheStats = struct { entries: i64, bytes: i64 };
     pub const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
     pub const BeatmapInfo = sqlite_storage.Store.BeatmapInfo;
     pub const BeatmapSelection = sqlite_storage.Store.BeatmapSelection;
@@ -91,7 +93,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -149,6 +151,16 @@ pub const Store = struct {
                     "CREATE TABLE zigcho.screenshots(token char(8) PRIMARY KEY,extension text NOT NULL CHECK(extension IN ('jpeg','png')),uploader_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,image bytea NOT NULL CHECK(octet_length(image)<=4194304),created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint));" ++
                     "CREATE INDEX screenshots_uploader_time ON zigcho.screenshots(uploader_id,created_at DESC);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(18);" ++
+                    "COMMIT",
+            );
+        }
+        if (version <= 18) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "CREATE TABLE zigcho.beatmap_media(set_id integer NOT NULL,kind text NOT NULL CHECK(kind IN ('cover','cover_2x','card','card_2x','list','list_2x','slimcover','slimcover_2x','thumb','thumb_large','preview')),content_type text NOT NULL CHECK(content_type IN ('image/jpeg','audio/ogg','audio/mpeg')),sha256 char(64) NOT NULL,data bytea NOT NULL CHECK(octet_length(data) BETWEEN 1 AND 4194304),fetched_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),last_accessed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),PRIMARY KEY(set_id,kind));" ++
+                    "CREATE INDEX beatmap_media_lru ON zigcho.beatmap_media(last_accessed_at,fetched_at,set_id,kind);" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(19);" ++
                     "COMMIT",
             );
         }
@@ -453,6 +465,68 @@ pub const Store = struct {
         result.deinit();
     }
 
+    pub fn beatmapSetExists(self: *Store, set_id: i32) !bool {
+        var set_buf: [24]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmaps WHERE set_id=$1 LIMIT 1", &.{set});
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn putBeatmapMedia(self: *Store, set_id: i32, kind: media_contract.Kind, content_type: media_contract.ContentType, data: []const u8) !void {
+        if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidBeatmapMedia;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+        var encoded_digest: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&encoded_digest, "{x}", .{digest}) catch unreachable;
+        const encoded_data = try postgres.encodeBytea(self.allocator, data);
+        defer self.allocator.free(encoded_data);
+        var set_buf: [24]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var exists = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmaps WHERE set_id=$1 LIMIT 1", &.{set});
+        defer exists.deinit();
+        if (exists.rows() == 0) return error.UnknownBeatmapSet;
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_media(set_id,kind,content_type,sha256,data,last_accessed_at) VALUES($1,$2,$3,$4,$5,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id,kind) DO UPDATE SET content_type=excluded.content_type,sha256=excluded.sha256,data=excluded.data,fetched_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, kind.dbName(), content_type.value(), &encoded_digest, encoded_data });
+        result.deinit();
+    }
+
+    pub fn beatmapMedia(self: *Store, allocator: std.mem.Allocator, set_id: i32, kind: media_contract.Kind) !?media_contract.Asset {
+        var set_buf: [24]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_media SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 AND kind=$2 RETURNING content_type,data", &.{ set, kind.dbName() });
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        const content_type = media_contract.ContentType.parse(result.value(0, 0)) orelse return error.InvalidStoredBeatmapMedia;
+        const data = try postgres.decodeBytea(allocator, result.value(0, 1));
+        errdefer allocator.free(data);
+        if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidStoredBeatmapMedia;
+        return .{ .data = data, .content_type = content_type };
+    }
+
+    pub fn beatmapMediaCacheStats(self: *Store) !BeatmapMediaCacheStats {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.query(lease.conn, "SELECT count(*),coalesce(sum(octet_length(data)),0) FROM zigcho.beatmap_media");
+        defer result.deinit();
+        return .{ .entries = try result.int(i64, 0, 0), .bytes = try result.int(i64, 0, 1) };
+    }
+
+    pub fn pruneBeatmapMedia(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        var max_buf: [32]u8 = undefined;
+        const max_text = try std.fmt.bufPrint(&max_buf, "{d}", .{@min(max_bytes, @as(u64, std.math.maxInt(i64)))});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "WITH ranked AS (SELECT set_id,kind,octet_length(data) AS bytes,sum(octet_length(data)) OVER(ORDER BY last_accessed_at DESC,fetched_at DESC,set_id DESC,kind DESC) AS running_bytes FROM zigcho.beatmap_media),deleted AS (DELETE FROM zigcho.beatmap_media m USING ranked r WHERE m.set_id=r.set_id AND m.kind=r.kind AND r.running_bytes>$1::bigint RETURNING octet_length(m.data) AS bytes) SELECT count(*),coalesce(sum(bytes),0) FROM deleted", &.{max_text});
+        defer result.deinit();
+        return .{ .entries = try result.int(i64, 0, 0), .bytes = try result.int(i64, 0, 1) };
+    }
+
     pub fn beatmapArchive(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?[]u8 {
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
@@ -723,7 +797,7 @@ pub const Store = struct {
         try jsonString(writer, set_result.value(0, 1));
         try writer.writeAll(",\"creator\":");
         try jsonString(writer, set_result.value(0, 3));
-        try writer.print(",\"user_id\":1,\"covers\":{{\"cover\":\"\",\"cover@2x\":\"\",\"card\":\"\",\"card@2x\":\"\",\"list\":\"\",\"list@2x\":\"\"}},\"preview_url\":\"\",\"play_count\":{d},\"favourite_count\":0,\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":false,\"storyboard\":false,\"submitted_date\":", .{ try set_result.int(i64, 0, 10), try set_result.float(f64, 0, 5) });
+        try writer.print(",\"user_id\":1,\"covers\":{{\"cover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover.jpg\",\"cover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover@2x.jpg\",\"card\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card.jpg\",\"card@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card@2x.jpg\",\"list\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list.jpg\",\"list@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list@2x.jpg\",\"slimcover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover.jpg\",\"slimcover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover@2x.jpg\"}},\"preview_url\":\"https://b.kai.ovh/preview/{d}.mp3\",\"play_count\":{d},\"favourite_count\":0,\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":false,\"storyboard\":false,\"submitted_date\":", .{ set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, try set_result.int(i64, 0, 10), try set_result.float(f64, 0, 5) });
         try jsonString(writer, set_result.value(0, 8));
         try writer.writeAll(",\"last_updated\":");
         try jsonString(writer, set_result.value(0, 8));
@@ -1935,16 +2009,16 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates stable media through eighteen" {
+test "postgres runtime migrates stable media through nineteen" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 18), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 19), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -1953,6 +2027,7 @@ test "postgres runtime migrates stable media through eighteen" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 6));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 7));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 8));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 9));
 }
 
 test "postgres account auth stats and token slice" {
@@ -2133,6 +2208,15 @@ test "postgres account auth stats and token slice" {
     const archive = (try store.beatmapArchive(std.testing.allocator, 2)).?;
     defer std.testing.allocator.free(archive);
     try std.testing.expectEqualStrings("osz archive bytes", archive);
+    const cover = "\xff\xd8\xffcover\xff\xd9";
+    try store.putBeatmapMedia(2, .cover, .jpeg, cover);
+    var stored_cover = (try store.beatmapMedia(std.testing.allocator, 2, .cover)).?;
+    defer stored_cover.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.jpeg, stored_cover.content_type);
+    try std.testing.expectEqualStrings(cover, stored_cover.data);
+    const media_stats = try store.beatmapMediaCacheStats();
+    try std.testing.expectEqual(@as(i64, 1), media_stats.entries);
+    try std.testing.expectEqual(@as(i64, cover.len), media_stats.bytes);
     try store.recordHydrationFailure("cccccccccccccccccccccccccccccccc", 2, "UpstreamUnavailable", 100);
     try std.testing.expect(!try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 129));
     try std.testing.expect(try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 130));
@@ -2147,6 +2231,8 @@ test "postgres account auth stats and token slice" {
     const lazer_set = (try store.lazerBeatmapSet(std.testing.allocator, 2)).?;
     defer std.testing.allocator.free(lazer_set);
     try std.testing.expect(std.mem.indexOf(u8, lazer_set, "\"title\":\"title two\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_set, "https://assets.kai.ovh/beatmaps/2/covers/cover.jpg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_set, "https://b.kai.ovh/preview/2.mp3") != null);
     const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "title two", 0, 0);
     defer std.testing.allocator.free(lazer_search);
     try std.testing.expect(std.mem.indexOf(u8, lazer_search, "\"beatmapsets\":[{") != null);

@@ -17,6 +17,8 @@ const form_urlencoded = @import("form_urlencoded.zig");
 const registration = @import("registration.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
+const beatmap_media = @import("beatmap_media.zig");
+const media_contract = @import("media_contract.zig");
 const webhook = @import("webhook.zig");
 const protocol = @import("protocol.zig");
 const country = @import("country.zig");
@@ -85,6 +87,7 @@ const App = struct {
     sessions: sessions_mod.Sessions,
     limiter: rate_limit.Limiter,
     map_sync: beatmap_sync.Sync,
+    media_sync: beatmap_media.Sync,
     score_webhook: webhook.Webhook,
     geo_client: std.http.Client,
     started_at: i64,
@@ -203,7 +206,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-screenshot.php")) return rate_limit.media_upload;
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return rate_limit.authenticated;
         if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
-        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/ss/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
+        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/ss/") or std.mem.startsWith(u8, path, "/beatmaps/") or std.mem.startsWith(u8, path, "/preview/") or std.mem.startsWith(u8, path, "/thumb/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
@@ -292,7 +295,9 @@ const App = struct {
             self.sessions.mutex.unlock(self.sessions.io);
             const counts = try self.store.serverCounts();
             const cache = try self.store.beatmapCacheStats();
+            const media_cache = try self.store.beatmapMediaCacheStats();
             const hydration = self.map_sync.metrics();
+            const media = self.media_sync.metrics();
             const uptime = @max(@as(i64, 0), std.Io.Clock.real.now(self.store.io).toSeconds() - self.started_at);
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
@@ -306,6 +311,8 @@ const App = struct {
                     "# TYPE zigcho_beatmaps gauge\nzigcho_beatmaps {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_entries gauge\nzigcho_beatmap_cache_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_bytes gauge\nzigcho_beatmap_cache_bytes {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_cache_entries gauge\nzigcho_beatmap_media_cache_entries {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_cache_bytes gauge\nzigcho_beatmap_media_cache_bytes {d}\n" ++
                     "# TYPE zigcho_beatmap_hydration_blocked gauge\nzigcho_beatmap_hydration_blocked {d}\n" ++
                     "# TYPE zigcho_beatmap_hydration_attempts counter\nzigcho_beatmap_hydration_attempts {d}\n" ++
                     "# TYPE zigcho_beatmap_hydration_successes counter\nzigcho_beatmap_hydration_successes {d}\n" ++
@@ -313,8 +320,13 @@ const App = struct {
                     "# TYPE zigcho_beatmap_hydration_backoff_skips counter\nzigcho_beatmap_hydration_backoff_skips {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_pruned_entries counter\nzigcho_beatmap_cache_pruned_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_pruned_bytes counter\nzigcho_beatmap_cache_pruned_bytes {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_fetch_attempts counter\nzigcho_beatmap_media_fetch_attempts {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_fetch_successes counter\nzigcho_beatmap_media_fetch_successes {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_fetch_failures counter\nzigcho_beatmap_media_fetch_failures {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_cache_pruned_entries counter\nzigcho_beatmap_media_cache_pruned_entries {d}\n" ++
+                    "# TYPE zigcho_beatmap_media_cache_pruned_bytes counter\nzigcho_beatmap_media_cache_pruned_bytes {d}\n" ++
                     "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
-                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.pruned_entries, hydration.pruned_bytes, uptime },
+                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.pruned_entries, hydration.pruned_bytes, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
             );
             return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
         }
@@ -662,6 +674,19 @@ const App = struct {
                 .{ .name = "cache-control", .value = "public, max-age=31536000, immutable" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             });
+        }
+        if (req.head.method == .GET) {
+            if (media_contract.parsePath(path)) |media_request| {
+                var asset = (self.media_sync.get(&self.store, media_request) catch |err| {
+                    std.log.warn("beatmap media fetch failed set_id={d} kind={s}: {t}", .{ media_request.set_id, media_request.kind.dbName(), err });
+                    return respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap media upstream unavailable\"}", &.{.{ .name = "cache-control", .value = "no-store" }});
+                }) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap media unavailable\"}", &.{.{ .name = "cache-control", .value = "public, max-age=300" }});
+                defer asset.deinit(self.allocator);
+                return respond(req, .ok, asset.content_type.value(), asset.data, &.{
+                    .{ .name = "cache-control", .value = "public, max-age=86400" },
+                    .{ .name = "x-content-type-options", .value = "nosniff" },
+                });
+            }
         }
         if (req.head.method == .GET and (isAvatarHost(host_owned) or std.mem.startsWith(u8, path, "/avatars/") or std.mem.startsWith(u8, path, "/avatar/"))) {
             if (avatarUserId(path)) |user_id| {
@@ -1395,6 +1420,7 @@ pub fn main(init: std.process.Init) !void {
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key, config.beatmap_cache_max_bytes),
+        .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),

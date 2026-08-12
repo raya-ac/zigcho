@@ -5,6 +5,7 @@ pub const Config = struct {
     osu_api_key: []u8,
     score_webhook: []u8,
     beatmap_cache_max_bytes: u64,
+    beatmap_media_cache_max_bytes: u64,
 
     pub fn empty(allocator: std.mem.Allocator) !Config {
         const osu_api_key = try allocator.dupe(u8, "");
@@ -14,6 +15,7 @@ pub const Config = struct {
             .osu_api_key = osu_api_key,
             .score_webhook = try allocator.dupe(u8, ""),
             .beatmap_cache_max_bytes = 2 * 1024 * 1024 * 1024,
+            .beatmap_media_cache_max_bytes = 512 * 1024 * 1024,
         };
     }
 
@@ -48,6 +50,10 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
             const parsed = std.fmt.parseInt(u64, value, 10) catch continue;
             if (parsed >= 128 * 1024 * 1024 and parsed <= 128 * 1024 * 1024 * 1024)
                 result.beatmap_cache_max_bytes = parsed;
+        } else if (std.mem.eql(u8, key, "beatmap_media_cache_max_bytes")) {
+            const parsed = std.fmt.parseInt(u64, value, 10) catch continue;
+            if (parsed >= 32 * 1024 * 1024 and parsed <= 16 * 1024 * 1024 * 1024)
+                result.beatmap_media_cache_max_bytes = parsed;
         }
     }
     return result;

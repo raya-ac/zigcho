@@ -26,6 +26,8 @@ const postgres_store = @import("postgres_store.zig");
 const webhook = @import("webhook.zig");
 const web_auth = @import("web_auth.zig");
 const screenshot = @import("screenshot.zig");
+const media_contract = @import("media_contract.zig");
+const beatmap_media = @import("beatmap_media.zig");
 
 comptime {
     _ = postgres;
@@ -33,6 +35,8 @@ comptime {
     _ = postgres_store;
     _ = web_auth;
     _ = screenshot;
+    _ = media_contract;
+    _ = beatmap_media;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -408,6 +412,7 @@ test "config values stay owned after the source buffer changes" {
         "osu_api_key=first-key\n" ++
             "score_webhook=https://discord.invalid/first\n" ++
             "beatmap_cache_max_bytes=536870912\n" ++
+            "beatmap_media_cache_max_bytes=268435456\n" ++
             "osu_api_key=final-key\n",
     );
     var config = try config_mod.parse(std.testing.allocator, source);
@@ -419,6 +424,7 @@ test "config values stay owned after the source buffer changes" {
     try std.testing.expectEqualStrings("final-key", config.osu_api_key);
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
     try std.testing.expectEqual(@as(u64, 536870912), config.beatmap_cache_max_bytes);
+    try std.testing.expectEqual(@as(u64, 268435456), config.beatmap_media_cache_max_bytes);
 }
 
 test "beatmap hydration backoff and archive pruning stay bounded" {
@@ -785,6 +791,40 @@ test "stable screenshots survive storage with exact type isolation" {
     defer std.testing.allocator.free(stored);
     try std.testing.expectEqualSlices(u8, png, stored);
     try std.testing.expect((try store.screenshot(std.testing.allocator, "Ab1_-xyZ", "jpeg")) == null);
+}
+
+test "beatmap covers and previews survive the bounded media cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/beatmap-media.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    const jpeg = "\xff\xd8\xffcover bytes\xff\xd9";
+    const ogg = "OggSpreview bytes";
+    try store.putBeatmapMedia(metadata.set_id, .cover, .jpeg, jpeg);
+    try store.putBeatmapMedia(metadata.set_id, .preview, .ogg, ogg);
+    try std.testing.expectError(error.InvalidBeatmapMedia, store.putBeatmapMedia(metadata.set_id, .cover, .ogg, ogg));
+    try std.testing.expectError(error.UnknownBeatmapSet, store.putBeatmapMedia(metadata.set_id + 1, .cover, .jpeg, jpeg));
+    var cover = (try store.beatmapMedia(std.testing.allocator, metadata.set_id, .cover)).?;
+    defer cover.deinit(std.testing.allocator);
+    try std.testing.expectEqual(media_contract.ContentType.jpeg, cover.content_type);
+    try std.testing.expectEqualSlices(u8, jpeg, cover.data);
+    var preview = (try store.beatmapMedia(std.testing.allocator, metadata.set_id, .preview)).?;
+    defer preview.deinit(std.testing.allocator);
+    try std.testing.expectEqual(media_contract.ContentType.ogg, preview.content_type);
+    try std.testing.expectEqualSlices(u8, ogg, preview.data);
+    const before = try store.beatmapMediaCacheStats();
+    try std.testing.expectEqual(@as(i64, 2), before.entries);
+    try std.testing.expectEqual(@as(i64, jpeg.len + ogg.len), before.bytes);
+    const pruned = try store.pruneBeatmapMedia(0);
+    try std.testing.expectEqual(@as(i64, 2), pruned.entries);
+    try std.testing.expectEqual(@as(i64, 0), (try store.beatmapMediaCacheStats()).entries);
 }
 
 test "Akatsuki ranks map into local leaderboard states" {

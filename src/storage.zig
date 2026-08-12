@@ -5,6 +5,7 @@ const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
 const stable_mods = @import("stable_mods.zig");
 const screenshot_contract = @import("screenshot.zig");
+const media_contract = @import("media_contract.zig");
 pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -123,6 +124,7 @@ pub const Store = struct {
                 try self.exec(@embedFile("migration_017.sql"));
         }
         if (version < 18) try self.exec(@embedFile("migration_018.sql"));
+        if (version < 19) try self.exec(@embedFile("migration_019.sql"));
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -1180,6 +1182,11 @@ pub const Store = struct {
         bytes: i64,
     };
 
+    pub const BeatmapMediaCacheStats = struct {
+        entries: i64,
+        bytes: i64,
+    };
+
     pub fn serverCounts(self: *Store) !ServerCounts {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -1717,6 +1724,98 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
+    pub fn beatmapSetExists(self: *Store, set_id: i32) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM beatmaps WHERE set_id=?1 LIMIT 1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
+    pub fn putBeatmapMedia(self: *Store, set_id: i32, kind: media_contract.Kind, content_type: media_contract.ContentType, data: []const u8) !void {
+        if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidBeatmapMedia;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+        var encoded_digest: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&encoded_digest, "{x}", .{digest}) catch unreachable;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var exists: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM beatmaps WHERE set_id=?1 LIMIT 1", -1, &exists, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        _ = c.sqlite3_bind_int(exists, 1, set_id);
+        const known_set = c.sqlite3_step(exists) == c.SQLITE_ROW;
+        _ = c.sqlite3_finalize(exists);
+        if (!known_set) return error.UnknownBeatmapSet;
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "INSERT INTO beatmap_media(set_id,kind,content_type,sha256,data,last_accessed_at) VALUES(?1,?2,?3,?4,?5,unixepoch()) ON CONFLICT(set_id,kind) DO UPDATE SET content_type=excluded.content_type,sha256=excluded.sha256,data=excluded.data,fetched_at=unixepoch(),last_accessed_at=unixepoch()";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        _ = c.sqlite3_bind_text(stmt, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
+        _ = c.sqlite3_bind_text(stmt, 3, content_type.value().ptr, @intCast(content_type.value().len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, &encoded_digest, encoded_digest.len, null);
+        _ = c.sqlite3_bind_blob(stmt, 5, data.ptr, @intCast(data.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn beatmapMedia(self: *Store, allocator: std.mem.Allocator, set_id: i32, kind: media_contract.Kind) !?media_contract.Asset {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT content_type,data FROM beatmap_media WHERE set_id=?1 AND kind=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        _ = c.sqlite3_bind_text(stmt, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const content_type = media_contract.ContentType.parse(std.mem.span(c.sqlite3_column_text(stmt, 0))) orelse return error.InvalidStoredBeatmapMedia;
+        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+        const data = try allocator.dupe(u8, ptr[0..len]);
+        errdefer allocator.free(data);
+        if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidStoredBeatmapMedia;
+        _ = c.sqlite3_finalize(stmt);
+        stmt = null;
+        var touch: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_media SET last_accessed_at=unixepoch() WHERE set_id=?1 AND kind=?2", -1, &touch, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(touch);
+        _ = c.sqlite3_bind_int(touch, 1, set_id);
+        _ = c.sqlite3_bind_text(touch, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
+        if (c.sqlite3_step(touch) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return .{ .data = data, .content_type = content_type };
+    }
+
+    pub fn beatmapMediaCacheStats(self: *Store) !BeatmapMediaCacheStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.mediaCacheSizeLocked();
+    }
+
+    pub fn pruneBeatmapMedia(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const before = try self.mediaCacheSizeLocked();
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "DELETE FROM beatmap_media WHERE (set_id,kind) IN (SELECT set_id,kind FROM (SELECT set_id,kind,sum(length(data)) OVER (ORDER BY last_accessed_at DESC,fetched_at DESC,set_id DESC,kind DESC) AS running_bytes FROM beatmap_media) WHERE running_bytes>?1)";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(@min(max_bytes, @as(u64, std.math.maxInt(i64)))));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        const after = try self.mediaCacheSizeLocked();
+        return .{ .entries = before.entries - after.entries, .bytes = before.bytes - after.bytes };
+    }
+
+    fn mediaCacheSizeLocked(self: *Store) !BeatmapMediaCacheStats {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*),coalesce(sum(length(data)),0) FROM beatmap_media", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return .{ .entries = c.sqlite3_column_int64(stmt, 0), .bytes = c.sqlite3_column_int64(stmt, 1) };
+    }
+
     pub fn beatmapArchive(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?[]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2201,7 +2300,7 @@ pub const Store = struct {
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 1)));
         try writer.writeAll(",\"creator\":");
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 3)));
-        try writer.print(",\"user_id\":1,\"covers\":{{\"cover\":\"\",\"cover@2x\":\"\",\"card\":\"\",\"card@2x\":\"\",\"list\":\"\",\"list@2x\":\"\"}},\"preview_url\":\"\",\"play_count\":{d},\"favourite_count\":0,\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":false,\"storyboard\":false,\"submitted_date\":", .{ c.sqlite3_column_int(set_stmt, 10), c.sqlite3_column_double(set_stmt, 5) });
+        try writer.print(",\"user_id\":1,\"covers\":{{\"cover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover.jpg\",\"cover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover@2x.jpg\",\"card\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card.jpg\",\"card@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card@2x.jpg\",\"list\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list.jpg\",\"list@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list@2x.jpg\",\"slimcover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover.jpg\",\"slimcover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover@2x.jpg\"}},\"preview_url\":\"https://b.kai.ovh/preview/{d}.mp3\",\"play_count\":{d},\"favourite_count\":0,\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":false,\"storyboard\":false,\"submitted_date\":", .{ set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, c.sqlite3_column_int(set_stmt, 10), c.sqlite3_column_double(set_stmt, 5) });
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 8)));
         try writer.writeAll(",\"last_updated\":");
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 8)));

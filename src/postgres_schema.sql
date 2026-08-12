@@ -292,4 +292,19 @@ CREATE TABLE screenshots (
 );
 CREATE INDEX screenshots_uploader_time ON screenshots(uploader_id, created_at DESC);
 
-INSERT INTO schema_migrations(version) VALUES (18);
+CREATE TABLE beatmap_media (
+    set_id integer NOT NULL,
+    kind text NOT NULL CHECK(kind IN (
+        'cover','cover_2x','card','card_2x','list','list_2x',
+        'slimcover','slimcover_2x','thumb','thumb_large','preview'
+    )),
+    content_type text NOT NULL CHECK(content_type IN ('image/jpeg','audio/ogg','audio/mpeg')),
+    sha256 char(64) NOT NULL,
+    data bytea NOT NULL CHECK(octet_length(data) BETWEEN 1 AND 4194304),
+    fetched_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    last_accessed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY(set_id, kind)
+);
+CREATE INDEX beatmap_media_lru ON beatmap_media(last_accessed_at, fetched_at, set_id, kind);
+
+INSERT INTO schema_migrations(version) VALUES (19);

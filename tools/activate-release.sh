@@ -66,8 +66,6 @@ case "$current_schema" in
   ''|*[!0-9]*) echo "invalid current schema version: $current_schema" >&2; exit 1 ;;
 esac
 
-service_stopped=yes
-systemctl stop "$service"
 runuser --user postgres -- env \
   ZIGCHO_BACKUP_DIR="$backup_dir" \
   ZIGCHO_POSTGRES_URL="dbname=zigcho host=/var/run/postgresql connect_timeout=5" \
@@ -83,6 +81,8 @@ runuser --user postgres -- env \
   ZIGCHO_EXPECTED_SCHEMA="$current_schema" \
   "$candidate/tools/restore-postgres-drill.sh" "$backup"
 runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check
+systemctl stop "$service"
+service_stopped=yes
 ln -sfn "$candidate" "$current"
 if systemctl start "$service" \
   && curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused "$health_url" >/dev/null \

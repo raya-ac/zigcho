@@ -13,6 +13,10 @@ esac
 
 mkdir -p "$backup_dir"
 chmod 700 "$backup_dir"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$backup_dir/.backup.lock"
+  flock 9
+fi
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 temporary=$(mktemp "$backup_dir/.zigcho-$stamp.XXXXXX.dump")
 final="$backup_dir/zigcho-$stamp.dump"

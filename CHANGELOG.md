@@ -1,5 +1,11 @@
 # changelog
 
+## 2026-08-13 — map downloads stop hammering the same broken set
+
+beatmap hydration has durable retry state now. failed upstream work backs off from 30 seconds to six hours and stays backed off across a restart. the `.osz` cache has a 2 GiB default ceiling and evicts the least recently used replaceable archives instead of growing inside PostgreSQL forever.
+
+local metrics expose the cache size, pending failures, retry skips, outcomes, and evictions. schema 17 carries all of it through SQLite, PostgreSQL, imports, backups, restores, and rollback. the live daily backup timer now runs the verified dump-and-restore path automatically.
+
 ## 2026-08-11 — postgres has a real way in now
 
 the live server is still on SQLite for this phase. I am not going to swap the database underneath bancho while half the storage calls still speak SQLite. what landed is the part that makes the eventual cutover measurable instead of hopeful.

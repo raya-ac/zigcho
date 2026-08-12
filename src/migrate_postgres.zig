@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 16;
+const required_sqlite_version = 17;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -98,8 +98,12 @@ const oauth_tokens = [_]Column{
     .{ .name = "revoked_at", .kind = .integer }, .{ .name = "last_used_at", .kind = .integer },
 };
 const beatmap_archives = [_]Column{
-    .{ .name = "set_id", .kind = .integer },      .{ .name = "sha256", .kind = .text }, .{ .name = "osz_file", .kind = .blob },
-    .{ .name = "imported_at", .kind = .integer },
+    .{ .name = "set_id", .kind = .integer },      .{ .name = "sha256", .kind = .text },              .{ .name = "osz_file", .kind = .blob },
+    .{ .name = "imported_at", .kind = .integer }, .{ .name = "last_accessed_at", .kind = .integer },
+};
+const beatmap_hydration_failures = [_]Column{
+    .{ .name = "md5", .kind = .text },              .{ .name = "set_id", .kind = .integer },  .{ .name = "attempts", .kind = .integer },
+    .{ .name = "next_retry_at", .kind = .integer }, .{ .name = "last_error", .kind = .text }, .{ .name = "updated_at", .kind = .integer },
 };
 const client_hardware = [_]Column{
     .{ .name = "user_id", .kind = .integer },            .{ .name = "osu_path_md5", .kind = .text },       .{ .name = "adapters_md5", .kind = .text },
@@ -132,6 +136,7 @@ const tables = [_]Table{
     .{ .name = "custom_mods", .columns = &custom_mods },
     .{ .name = "oauth_tokens", .columns = &oauth_tokens },
     .{ .name = "beatmap_archives", .columns = &beatmap_archives },
+    .{ .name = "beatmap_hydration_failures", .columns = &beatmap_hydration_failures },
     .{ .name = "client_hardware", .columns = &client_hardware },
     .{ .name = "moderation_appeals", .columns = &moderation_appeals, .identity = true },
 };
@@ -379,7 +384,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 20), tables.len);
+    try std.testing.expectEqual(@as(usize, 21), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("moderation_appeals", tables[tables.len - 1].name);
 }

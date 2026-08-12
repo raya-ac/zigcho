@@ -114,6 +114,12 @@ pub const Store = struct {
         }
         if (version < 15) try self.exec(@embedFile("migration_015.sql"));
         if (version < 16) try self.exec(@embedFile("migration_016.sql"));
+        if (version < 17) {
+            if (try self.hasBeatmapArchiveAccessColumn())
+                try self.exec("PRAGMA user_version=17")
+            else
+                try self.exec(@embedFile("migration_017.sql"));
+        }
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -132,6 +138,16 @@ pub const Store = struct {
         defer _ = c.sqlite3_finalize(stmt);
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)), "status_frozen")) return true;
+        }
+        return false;
+    }
+
+    fn hasBeatmapArchiveAccessColumn(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(beatmap_archives)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)), "last_accessed_at")) return true;
         }
         return false;
     }
@@ -1091,6 +1107,17 @@ pub const Store = struct {
         maps: i64,
     };
 
+    pub const BeatmapCacheStats = struct {
+        entries: i64,
+        bytes: i64,
+        hydration_failures: i64,
+    };
+
+    pub const BeatmapCachePrune = struct {
+        entries: i64,
+        bytes: i64,
+    };
+
     pub fn serverCounts(self: *Store) !ServerCounts {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -1615,7 +1642,7 @@ pub const Store = struct {
         const exists = c.sqlite3_step(exists_stmt) == c.SQLITE_ROW;
         _ = c.sqlite3_finalize(exists_stmt);
         if (!exists) return error.UnknownBeatmapSet;
-        const sql = "INSERT INTO beatmap_archives(set_id,sha256,osz_file) VALUES(?1,?2,?3) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=unixepoch()";
+        const sql = "INSERT INTO beatmap_archives(set_id,sha256,osz_file,last_accessed_at) VALUES(?1,?2,?3,unixepoch()) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=unixepoch(),last_accessed_at=unixepoch()";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -1635,7 +1662,93 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-        return try allocator.dupe(u8, ptr[0..len]);
+        const owned = try allocator.dupe(u8, ptr[0..len]);
+        _ = c.sqlite3_finalize(stmt);
+        stmt = null;
+        var touch: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_archives SET last_accessed_at=unixepoch() WHERE set_id=?1", -1, &touch, null) != c.SQLITE_OK) {
+            allocator.free(owned);
+            return error.DatabaseQueryFailed;
+        }
+        defer _ = c.sqlite3_finalize(touch);
+        _ = c.sqlite3_bind_int(touch, 1, set_id);
+        if (c.sqlite3_step(touch) != c.SQLITE_DONE) {
+            allocator.free(owned);
+            return error.DatabaseQueryFailed;
+        }
+        return owned;
+    }
+
+    pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT next_retry_at<=?2 FROM beatmap_hydration_failures WHERE md5=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 2, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return true;
+        return c.sqlite3_column_int(stmt, 0) != 0;
+    }
+
+    pub fn recordHydrationFailure(self: *Store, md5: []const u8, set_id: i32, reason: []const u8, now: i64) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = "INSERT INTO beatmap_hydration_failures(md5,set_id,attempts,next_retry_at,last_error,updated_at) VALUES(?1,?2,1,?4+30,?3,?4) ON CONFLICT(md5) DO UPDATE SET set_id=excluded.set_id,attempts=min(32,beatmap_hydration_failures.attempts+1),next_retry_at=excluded.updated_at+min(21600,30*(1 << min(beatmap_hydration_failures.attempts,10))),last_error=excluded.last_error,updated_at=excluded.updated_at";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        _ = c.sqlite3_bind_int(stmt, 2, set_id);
+        _ = c.sqlite3_bind_text(stmt, 3, reason.ptr, @intCast(reason.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 4, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        var trim: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM beatmap_hydration_failures WHERE md5 IN (SELECT md5 FROM beatmap_hydration_failures ORDER BY updated_at DESC,md5 DESC LIMIT -1 OFFSET 10000)", -1, &trim, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(trim);
+        if (c.sqlite3_step(trim) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn clearHydrationFailure(self: *Store, md5: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM beatmap_hydration_failures WHERE md5=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn beatmapCacheStats(self: *Store) !BeatmapCacheStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*),coalesce(sum(length(osz_file)),0),(SELECT count(*) FROM beatmap_hydration_failures) FROM beatmap_archives", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return .{ .entries = c.sqlite3_column_int64(stmt, 0), .bytes = c.sqlite3_column_int64(stmt, 1), .hydration_failures = c.sqlite3_column_int64(stmt, 2) };
+    }
+
+    pub fn pruneBeatmapArchives(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const before = try self.cacheSizeLocked();
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "DELETE FROM beatmap_archives WHERE set_id IN (SELECT set_id FROM (SELECT set_id,sum(length(osz_file)) OVER (ORDER BY last_accessed_at DESC,imported_at DESC,set_id DESC) AS running_bytes FROM beatmap_archives) WHERE running_bytes>?1)";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(@min(max_bytes, @as(u64, std.math.maxInt(i64)))));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        const after = try self.cacheSizeLocked();
+        return .{ .entries = before.entries - after.entries, .bytes = before.bytes - after.bytes };
+    }
+
+    fn cacheSizeLocked(self: *Store) !BeatmapCachePrune {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*),coalesce(sum(length(osz_file)),0) FROM beatmap_archives", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return .{ .entries = c.sqlite3_column_int64(stmt, 0), .bytes = c.sqlite3_column_int64(stmt, 1) };
     }
 
     pub fn beatmapForScore(self: *Store, md5: []const u8) !?BeatmapForScore {

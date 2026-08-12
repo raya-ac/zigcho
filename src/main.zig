@@ -272,6 +272,8 @@ const App = struct {
             const online = self.sessions.humanCount();
             self.sessions.mutex.unlock(self.sessions.io);
             const counts = try self.store.serverCounts();
+            const cache = try self.store.beatmapCacheStats();
+            const hydration = self.map_sync.metrics();
             const uptime = @max(@as(i64, 0), std.Io.Clock.real.now(self.store.io).toSeconds() - self.started_at);
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
@@ -283,8 +285,17 @@ const App = struct {
                     "# TYPE zigcho_plays gauge\nzigcho_plays {d}\n" ++
                     "# TYPE zigcho_passed_plays gauge\nzigcho_passed_plays {d}\n" ++
                     "# TYPE zigcho_beatmaps gauge\nzigcho_beatmaps {d}\n" ++
+                    "# TYPE zigcho_beatmap_cache_entries gauge\nzigcho_beatmap_cache_entries {d}\n" ++
+                    "# TYPE zigcho_beatmap_cache_bytes gauge\nzigcho_beatmap_cache_bytes {d}\n" ++
+                    "# TYPE zigcho_beatmap_hydration_blocked gauge\nzigcho_beatmap_hydration_blocked {d}\n" ++
+                    "# TYPE zigcho_beatmap_hydration_attempts counter\nzigcho_beatmap_hydration_attempts {d}\n" ++
+                    "# TYPE zigcho_beatmap_hydration_successes counter\nzigcho_beatmap_hydration_successes {d}\n" ++
+                    "# TYPE zigcho_beatmap_hydration_failures counter\nzigcho_beatmap_hydration_failures {d}\n" ++
+                    "# TYPE zigcho_beatmap_hydration_backoff_skips counter\nzigcho_beatmap_hydration_backoff_skips {d}\n" ++
+                    "# TYPE zigcho_beatmap_cache_pruned_entries counter\nzigcho_beatmap_cache_pruned_entries {d}\n" ++
+                    "# TYPE zigcho_beatmap_cache_pruned_bytes counter\nzigcho_beatmap_cache_pruned_bytes {d}\n" ++
                     "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
-                .{ online, counts.users, counts.plays, counts.passed, counts.maps, uptime },
+                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.pruned_entries, hydration.pruned_bytes, uptime },
             );
             return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
         }
@@ -1279,7 +1290,7 @@ pub fn main(init: std.process.Init) !void {
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
-        .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key),
+        .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key, config.beatmap_cache_max_bytes),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),

@@ -235,8 +235,20 @@ CREATE TABLE beatmap_archives (
     set_id integer PRIMARY KEY,
     sha256 char(64) NOT NULL,
     osz_file bytea NOT NULL,
-    imported_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
+    imported_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    last_accessed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
 );
+CREATE INDEX beatmap_archives_lru ON beatmap_archives(last_accessed_at, imported_at, set_id);
+
+CREATE TABLE beatmap_hydration_failures (
+    md5 char(32) PRIMARY KEY,
+    set_id integer NOT NULL,
+    attempts smallint NOT NULL DEFAULT 1 CHECK(attempts BETWEEN 1 AND 32),
+    next_retry_at bigint NOT NULL,
+    last_error text NOT NULL,
+    updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
+);
+CREATE INDEX beatmap_hydration_retry ON beatmap_hydration_failures(next_retry_at, updated_at);
 
 CREATE TABLE client_hardware (
     user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -271,4 +283,4 @@ CREATE TABLE moderation_appeals (
 CREATE UNIQUE INDEX moderation_appeals_one_open ON moderation_appeals(user_id, kind) WHERE status='open';
 CREATE INDEX moderation_appeals_queue ON moderation_appeals(status, created_at, id);
 
-INSERT INTO schema_migrations(version) VALUES (16);
+INSERT INTO schema_migrations(version) VALUES (17);

@@ -41,6 +41,8 @@ pub const Store = struct {
 
     pub const RegistrationConflicts = struct { username: bool, email: bool };
     pub const ServerCounts = struct { users: i64, plays: i64, passed: i64, maps: i64 };
+    pub const BeatmapCacheStats = struct { entries: i64, bytes: i64, hydration_failures: i64 };
+    pub const BeatmapCachePrune = struct { entries: i64, bytes: i64 };
     pub const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
     pub const BeatmapInfo = sqlite_storage.Store.BeatmapInfo;
     pub const BeatmapSelection = sqlite_storage.Store.BeatmapSelection;
@@ -87,7 +89,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -122,6 +124,19 @@ pub const Store = struct {
                     "CREATE TABLE zigcho.score_pins(user_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,score_id bigint NOT NULL UNIQUE REFERENCES zigcho.scores(id) ON DELETE CASCADE,pinned_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),PRIMARY KEY(user_id,score_id));" ++
                     "CREATE INDEX score_pins_user_time ON zigcho.score_pins(user_id,pinned_at DESC,score_id DESC);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(16);" ++
+                    "COMMIT",
+            );
+        }
+        if (version <= 16) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "ALTER TABLE zigcho.beatmap_archives ADD COLUMN last_accessed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint);" ++
+                    "UPDATE zigcho.beatmap_archives SET last_accessed_at=imported_at;" ++
+                    "CREATE INDEX beatmap_archives_lru ON zigcho.beatmap_archives(last_accessed_at,imported_at,set_id);" ++
+                    "CREATE TABLE zigcho.beatmap_hydration_failures(md5 char(32) PRIMARY KEY,set_id integer NOT NULL,attempts smallint NOT NULL DEFAULT 1 CHECK(attempts BETWEEN 1 AND 32),next_retry_at bigint NOT NULL,last_error text NOT NULL,updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint));" ++
+                    "CREATE INDEX beatmap_hydration_retry ON zigcho.beatmap_hydration_failures(next_retry_at,updated_at);" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(17);" ++
                     "COMMIT",
             );
         }
@@ -420,7 +435,7 @@ pub const Store = struct {
         var exists = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmaps WHERE set_id=$1 LIMIT 1", &.{set});
         defer exists.deinit();
         if (exists.rows() == 0) return error.UnknownBeatmapSet;
-        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_archives(set_id,sha256,osz_file) VALUES($1,$2,$3) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, sha256, encoded });
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_archives(set_id,sha256,osz_file,last_accessed_at) VALUES($1,$2,$3,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, sha256, encoded });
         result.deinit();
     }
 
@@ -429,10 +444,59 @@ pub const Store = struct {
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT osz_file FROM zigcho.beatmap_archives WHERE set_id=$1", &.{set});
+        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_archives SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 RETURNING osz_file", &.{set});
         defer result.deinit();
         if (result.rows() == 0) return null;
         return try postgres.decodeBytea(allocator, result.value(0, 0));
+    }
+
+    pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
+        var now_buf: [32]u8 = undefined;
+        const now_text = try std.fmt.bufPrint(&now_buf, "{d}", .{now});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT next_retry_at<=$2 FROM zigcho.beatmap_hydration_failures WHERE md5=$1", &.{ md5, now_text });
+        defer result.deinit();
+        if (result.rows() == 0) return true;
+        return try result.boolean(0, 0);
+    }
+
+    pub fn recordHydrationFailure(self: *Store, md5: []const u8, set_id: i32, reason: []const u8, now: i64) !void {
+        var set_buf: [24]u8 = undefined;
+        var now_buf: [32]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        const now_text = try std.fmt.bufPrint(&now_buf, "{d}", .{now});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_hydration_failures(md5,set_id,attempts,next_retry_at,last_error,updated_at) VALUES($1,$2,1,$4::bigint+30,$3,$4) ON CONFLICT(md5) DO UPDATE SET set_id=excluded.set_id,attempts=least(32,zigcho.beatmap_hydration_failures.attempts+1),next_retry_at=excluded.updated_at+least(21600,(30*power(2,least(zigcho.beatmap_hydration_failures.attempts,10)))::bigint),last_error=excluded.last_error,updated_at=excluded.updated_at", &.{ md5, set, reason, now_text });
+        result.deinit();
+        var trim = try postgres.query(lease.conn, "DELETE FROM zigcho.beatmap_hydration_failures WHERE md5 IN(SELECT md5 FROM zigcho.beatmap_hydration_failures ORDER BY updated_at DESC,md5 DESC OFFSET 10000)");
+        trim.deinit();
+    }
+
+    pub fn clearHydrationFailure(self: *Store, md5: []const u8) !void {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.beatmap_hydration_failures WHERE md5=$1", &.{md5});
+        result.deinit();
+    }
+
+    pub fn beatmapCacheStats(self: *Store) !BeatmapCacheStats {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.query(lease.conn, "SELECT count(*),coalesce(sum(octet_length(osz_file)),0),(SELECT count(*) FROM zigcho.beatmap_hydration_failures) FROM zigcho.beatmap_archives");
+        defer result.deinit();
+        return .{ .entries = try result.int(i64, 0, 0), .bytes = try result.int(i64, 0, 1), .hydration_failures = try result.int(i64, 0, 2) };
+    }
+
+    pub fn pruneBeatmapArchives(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        var max_buf: [32]u8 = undefined;
+        const max_text = try std.fmt.bufPrint(&max_buf, "{d}", .{@min(max_bytes, @as(u64, std.math.maxInt(i64)))});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "WITH ranked AS (SELECT set_id,octet_length(osz_file) AS bytes,sum(octet_length(osz_file)) OVER(ORDER BY last_accessed_at DESC,imported_at DESC,set_id DESC) AS running_bytes FROM zigcho.beatmap_archives),deleted AS (DELETE FROM zigcho.beatmap_archives WHERE set_id IN(SELECT set_id FROM ranked WHERE running_bytes>$1::bigint) RETURNING octet_length(osz_file) AS bytes) SELECT count(*),coalesce(sum(bytes),0) FROM deleted", &.{max_text});
+        defer result.deinit();
+        return .{ .entries = try result.int(i64, 0, 0), .bytes = try result.int(i64, 0, 1) };
     }
 
     fn writeDirectText(writer: *std.Io.Writer, value: []const u8) !void {
@@ -1769,22 +1833,23 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates score pins through sixteen" {
+test "postgres runtime migrates beatmap cache controls through seventeen" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 16), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 17), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 4));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 5));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 6));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 7));
 }
 
 test "postgres account auth stats and token slice" {
@@ -1943,6 +2008,11 @@ test "postgres account auth stats and token slice" {
     const archive = (try store.beatmapArchive(std.testing.allocator, 2)).?;
     defer std.testing.allocator.free(archive);
     try std.testing.expectEqualStrings("osz archive bytes", archive);
+    try store.recordHydrationFailure("cccccccccccccccccccccccccccccccc", 2, "UpstreamUnavailable", 100);
+    try std.testing.expect(!try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 129));
+    try std.testing.expect(try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 130));
+    try std.testing.expectEqual(@as(i64, 1), (try store.beatmapCacheStats()).hydration_failures);
+    try store.clearHydrationFailure("cccccccccccccccccccccccccccccccc");
     const direct = try store.stableSearch(std.testing.allocator, "title two", -1, 4, 0);
     defer std.testing.allocator.free(direct);
     try std.testing.expect(std.mem.indexOf(u8, direct, "2.osz|artist two|title two|mapper") != null);
@@ -2048,4 +2118,7 @@ test "postgres account auth stats and token slice" {
         defer recalc_audit.deinit();
         try std.testing.expectEqual(@as(i64, 1), try recalc_audit.int(i64, 0, 0));
     }
+    const pruned = try store.pruneBeatmapArchives(1);
+    try std.testing.expectEqual(@as(i64, 1), pruned.entries);
+    try std.testing.expectEqual(@as(i64, 17), pruned.bytes);
 }

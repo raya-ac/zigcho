@@ -42,14 +42,31 @@ pub const Sync = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     api_key: []const u8 = "",
+    cache_max_bytes: u64,
     in_progress: std.StringHashMap(void),
     in_progress_mutex: std.Io.Mutex = .init,
+    attempts: std.atomic.Value(u64) = .init(0),
+    successes: std.atomic.Value(u64) = .init(0),
+    failures: std.atomic.Value(u64) = .init(0),
+    backoff_skips: std.atomic.Value(u64) = .init(0),
+    pruned_entries: std.atomic.Value(u64) = .init(0),
+    pruned_bytes: std.atomic.Value(u64) = .init(0),
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8) Sync {
+    pub const Metrics = struct {
+        attempts: u64,
+        successes: u64,
+        failures: u64,
+        backoff_skips: u64,
+        pruned_entries: u64,
+        pruned_bytes: u64,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, cache_max_bytes: u64) Sync {
         return .{
             .allocator = allocator,
             .io = io,
             .api_key = api_key,
+            .cache_max_bytes = cache_max_bytes,
             .in_progress = std.StringHashMap(void).init(allocator),
         };
     }
@@ -58,9 +75,25 @@ pub const Sync = struct {
         self.in_progress.deinit();
     }
 
+    pub fn metrics(self: *const Sync) Metrics {
+        return .{
+            .attempts = self.attempts.load(.monotonic),
+            .successes = self.successes.load(.monotonic),
+            .failures = self.failures.load(.monotonic),
+            .backoff_skips = self.backoff_skips.load(.monotonic),
+            .pruned_entries = self.pruned_entries.load(.monotonic),
+            .pruned_bytes = self.pruned_bytes.load(.monotonic),
+        };
+    }
+
     pub fn ensure(self: *Sync, store: *storage.Store, wanted_md5: []const u8, expected_set_id: ?i32) !bool {
         if (!validMd5(wanted_md5)) return false;
         if (try store.beatmapHasFile(wanted_md5)) return true;
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (!try store.hydrationRetryAllowed(wanted_md5, now)) {
+            _ = self.backoff_skips.fetchAdd(1, .monotonic);
+            return false;
+        }
 
         self.in_progress_mutex.lockUncancelable(self.io);
         if (self.in_progress.contains(wanted_md5)) {
@@ -87,13 +120,16 @@ pub const Sync = struct {
             return false;
         }
 
+        _ = self.attempts.fetchAdd(1, .monotonic);
         const remote = self.fetchAndStoreMetadata(store, md5_owned, set_id) catch |err| {
             std.log.warn("metadata fetch failed for {s}: {t}", .{ md5_owned, err });
+            self.recordFailure(store, md5_owned, set_id, err);
             self.removeFromProgress(md5_owned);
             return false;
         };
 
         const thread = std.Thread.spawn(.{}, backgroundDownload, .{ self, store, md5_owned, set_id, remote }) catch {
+            self.recordFailure(store, md5_owned, set_id, error.ThreadSpawnFailed);
             self.removeFromProgress(md5_owned);
             return false;
         };
@@ -167,7 +203,18 @@ pub const Sync = struct {
         defer self.removeFromProgress(md5_owned);
         self.downloadArchive(store, md5_owned, set_id, remote) catch |err| {
             std.log.warn("[hydrate] download failed md5={s}: {t}", .{ md5_owned, err });
+            self.recordFailure(store, md5_owned, set_id, err);
+            return;
         };
+        store.clearHydrationFailure(md5_owned) catch |err| std.log.warn("[hydrate] could not clear failure state md5={s}: {t}", .{ md5_owned, err });
+        _ = self.successes.fetchAdd(1, .monotonic);
+    }
+
+    fn recordFailure(self: *Sync, store: *storage.Store, md5: []const u8, set_id: i32, err: anyerror) void {
+        _ = self.failures.fetchAdd(1, .monotonic);
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        store.recordHydrationFailure(md5, set_id, @errorName(err), now) catch |store_err|
+            std.log.err("[hydrate] could not save failure state md5={s}: {t}", .{ md5, store_err });
     }
 
     fn downloadArchive(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32, remote: RemoteMap) !void {
@@ -234,6 +281,12 @@ pub const Sync = struct {
         var encoded: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&encoded, "{x}", .{digest}) catch unreachable;
         try store.upsertBeatmapArchive(set_id, &encoded, archive);
+        const pruned = try store.pruneBeatmapArchives(self.cache_max_bytes);
+        if (pruned.entries > 0) {
+            _ = self.pruned_entries.fetchAdd(@intCast(pruned.entries), .monotonic);
+            _ = self.pruned_bytes.fetchAdd(@intCast(pruned.bytes), .monotonic);
+            std.log.info("event=beatmap_cache_pruned entries={d} bytes={d}", .{ pruned.entries, pruned.bytes });
+        }
     }
 };
 

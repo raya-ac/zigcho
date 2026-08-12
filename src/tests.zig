@@ -330,6 +330,7 @@ test "config values stay owned after the source buffer changes" {
         u8,
         "osu_api_key=first-key\n" ++
             "score_webhook=https://discord.invalid/first\n" ++
+            "beatmap_cache_max_bytes=536870912\n" ++
             "osu_api_key=final-key\n",
     );
     var config = try config_mod.parse(std.testing.allocator, source);
@@ -340,6 +341,46 @@ test "config values stay owned after the source buffer changes" {
 
     try std.testing.expectEqualStrings("final-key", config.osu_api_key);
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
+    try std.testing.expectEqual(@as(u64, 536870912), config.beatmap_cache_max_bytes);
+}
+
+test "beatmap hydration backoff and archive pruning stay bounded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/beatmap-cache.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES" ++
+            "(1,10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','a','a','a','a',3)," ++
+            "(2,20,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','b','b','b','b',3)",
+    );
+    try store.upsertBeatmapArchive(10, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "old!");
+    try store.upsertBeatmapArchive(20, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "newest");
+    try store.exec("UPDATE beatmap_archives SET last_accessed_at=CASE set_id WHEN 10 THEN 1 ELSE 2 END");
+
+    try store.recordHydrationFailure("cccccccccccccccccccccccccccccccc", 30, "UpstreamUnavailable", 100);
+    try std.testing.expect(!try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 129));
+    try std.testing.expect(try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 130));
+    try store.recordHydrationFailure("cccccccccccccccccccccccccccccccc", 30, "UpstreamUnavailable", 130);
+    try std.testing.expect(!try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 189));
+    try std.testing.expect(try store.hydrationRetryAllowed("cccccccccccccccccccccccccccccccc", 190));
+
+    const pruned = try store.pruneBeatmapArchives(6);
+    try std.testing.expectEqual(@as(i64, 1), pruned.entries);
+    try std.testing.expectEqual(@as(i64, 4), pruned.bytes);
+    try std.testing.expect((try store.beatmapArchive(std.testing.allocator, 10)) == null);
+    const retained = (try store.beatmapArchive(std.testing.allocator, 20)).?;
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualStrings("newest", retained);
+    const stats = try store.beatmapCacheStats();
+    try std.testing.expectEqual(@as(i64, 1), stats.entries);
+    try std.testing.expectEqual(@as(i64, 6), stats.bytes);
+    try std.testing.expectEqual(@as(i64, 1), stats.hydration_failures);
+    try store.clearHydrationFailure("cccccccccccccccccccccccccccccccc");
+    try std.testing.expectEqual(@as(i64, 0), (try store.beatmapCacheStats()).hydration_failures);
 }
 
 test "legacy credentials authenticate and upgrade outside the read lock" {

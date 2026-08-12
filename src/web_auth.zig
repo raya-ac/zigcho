@@ -88,6 +88,10 @@ pub fn websiteHost(host_header: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(host, "kai.ovh") or std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "[::1]");
 }
 
+pub fn protocolHost(host_header: ?[]const u8) bool {
+    return std.ascii.eqlIgnoreCase(hostWithoutPort(host_header orelse return false), "osu.kai.ovh");
+}
+
 pub fn sameOrigin(origin_header: ?[]const u8, host_header: ?[]const u8) bool {
     const origin = origin_header orelse return false;
     const host = host_header orelse return false;
@@ -172,6 +176,9 @@ test "staff origins stay on the website host" {
     try std.testing.expect(!sameOrigin("https://evil.test", "kai.ovh"));
     try std.testing.expect(!sameOrigin(null, "kai.ovh"));
     try std.testing.expect(!websiteHost("api.kai.ovh"));
+    try std.testing.expect(protocolHost("osu.kai.ovh"));
+    try std.testing.expect(protocolHost("OSU.KAI.OVH:443"));
+    try std.testing.expect(!protocolHost("kai.ovh"));
 }
 
 test "staff session JSON escapes names" {

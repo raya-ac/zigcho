@@ -261,6 +261,11 @@ const App = struct {
             if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| break :blk std.mem.trim(u8, trimmed[0..comma], " ");
             break :blk trimmed;
         } else if (header(req, "x-real-ip")) |v| v else null;
+        if ((req.head.method == .GET or req.head.method == .HEAD) and web_auth.protocolHost(host_owned) and routing.websitePage(path)) {
+            const location = try std.fmt.allocPrint(self.allocator, "https://kai.ovh{s}", .{target});
+            defer self.allocator.free(location);
+            return respond(req, .permanent_redirect, "text/plain", "", &.{.{ .name = "location", .value = location }});
+        }
         const body: []u8 = if (req.head.method.requestHasBody()) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
             break :b r.allocRemaining(self.allocator, .limited(bodyLimit(path))) catch |err| switch (err) {
@@ -1115,8 +1120,7 @@ const App = struct {
             defer self.allocator.free(replay);
             return respond(req, .ok, "application/octet-stream", replay, &.{});
         }
-        const site_page = std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/rankings") or std.mem.eql(u8, path, "/appeal") or std.mem.eql(u8, path, "/staff") or std.mem.startsWith(u8, path, "/u/") or std.mem.startsWith(u8, path, "/beatmapsets/");
-        if (req.head.method == .GET and site_page) {
+        if (req.head.method == .GET and routing.websitePage(path)) {
             if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },

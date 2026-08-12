@@ -93,10 +93,19 @@ pub const Sessions = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     items: std.ArrayList(*Session) = .empty,
+    by_token: std.StringHashMap(*Session),
+    by_user: std.AutoHashMap(i32, *Session),
+    by_safe_name: std.StringHashMap(*Session),
     matches: [multiplayer.max_matches]?multiplayer.Match = [_]?multiplayer.Match{null} ** multiplayer.max_matches,
 
     pub fn init(a: std.mem.Allocator, io: std.Io) Sessions {
-        return .{ .allocator = a, .io = io };
+        return .{
+            .allocator = a,
+            .io = io,
+            .by_token = std.StringHashMap(*Session).init(a),
+            .by_user = std.AutoHashMap(i32, *Session).init(a),
+            .by_safe_name = std.StringHashMap(*Session).init(a),
+        };
     }
     pub fn deinit(self: *Sessions) void {
         for (&self.matches) |*entry| if (entry.*) |*match| match.deinit();
@@ -108,9 +117,11 @@ pub const Sessions = struct {
             self.allocator.destroy(s);
         }
         self.items.deinit(self.allocator);
+        self.by_token.deinit();
+        self.by_user.deinit();
+        self.by_safe_name.deinit();
     }
     pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
-        if (self.byUser(user.id)) |old| self.remove(old);
         const s = try self.allocator.create(Session);
         errdefer self.allocator.destroy(s);
         const now = std.Io.Clock.real.now(self.io).toSeconds();
@@ -118,7 +129,15 @@ pub const Sessions = struct {
         var random: [32]u8 = undefined;
         try std.Io.randomSecure(self.io, &random);
         _ = std.fmt.bufPrint(&s.token, "{x}", .{random}) catch unreachable;
-        try self.items.append(self.allocator, s);
+        try self.items.ensureUnusedCapacity(self.allocator, 1);
+        try self.by_token.ensureUnusedCapacity(1);
+        try self.by_user.ensureUnusedCapacity(1);
+        try self.by_safe_name.ensureUnusedCapacity(1);
+        if (self.byUser(user.id)) |old| self.remove(old);
+        self.items.appendAssumeCapacity(s);
+        self.by_token.putAssumeCapacityNoClobber(&s.token, s);
+        self.by_user.putAssumeCapacityNoClobber(user.id, s);
+        self.by_safe_name.putAssumeCapacityNoClobber(user.safe_name, s);
         return s;
     }
     pub fn createWithSocial(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool) !*Session {
@@ -129,7 +148,6 @@ pub const Sessions = struct {
         return session;
     }
     pub fn createBot(self: *Sessions, user: domain.User) !*Session {
-        if (self.byUser(user.id)) |old| self.remove(old);
         const s = try self.allocator.create(Session);
         errdefer self.allocator.destroy(s);
         s.* = .{
@@ -141,20 +159,26 @@ pub const Sessions = struct {
             .joined_osu = true,
             .joined_announce = true,
         };
-        try self.items.append(self.allocator, s);
+        try self.items.ensureUnusedCapacity(self.allocator, 1);
+        try self.by_user.ensureUnusedCapacity(1);
+        try self.by_safe_name.ensureUnusedCapacity(1);
+        if (self.byUser(user.id)) |old| self.remove(old);
+        self.items.appendAssumeCapacity(s);
+        self.by_user.putAssumeCapacityNoClobber(user.id, s);
+        self.by_safe_name.putAssumeCapacityNoClobber(user.safe_name, s);
         return s;
     }
     pub fn byToken(self: *Sessions, token: []const u8) ?*Session {
-        for (self.items.items) |s| if (!s.is_bot and std.mem.eql(u8, &s.token, token)) return s;
-        return null;
+        return self.by_token.get(token);
     }
     pub fn byUser(self: *Sessions, id: i32) ?*Session {
-        for (self.items.items) |s| if (s.user.id == id) return s;
-        return null;
+        return self.by_user.get(id);
     }
     pub fn byName(self: *Sessions, name: []const u8) ?*Session {
-        for (self.items.items) |s| if (std.ascii.eqlIgnoreCase(s.user.name, name)) return s;
-        return null;
+        var safe_buffer: [96]u8 = undefined;
+        if (name.len == 0 or name.len > safe_buffer.len) return null;
+        for (name, 0..) |char, index| safe_buffer[index] = if (char == ' ') '_' else std.ascii.toLower(char);
+        return self.by_safe_name.get(safe_buffer[0..name.len]);
     }
     pub fn matchById(self: *Sessions, id: u16) ?*multiplayer.Match {
         if (id >= self.matches.len) return null;
@@ -191,6 +215,9 @@ pub const Sessions = struct {
             target.match_id = null;
         };
         for (self.items.items, 0..) |s, i| if (s == target) {
+            if (!s.is_bot) _ = self.by_token.remove(&s.token);
+            _ = self.by_user.remove(s.user.id);
+            _ = self.by_safe_name.remove(s.user.safe_name);
             _ = self.items.swapRemove(i);
             s.friend_ids.deinit(self.allocator);
             s.queue.deinit(self.allocator);
@@ -248,3 +275,35 @@ pub const Sessions = struct {
         };
     }
 };
+
+test "session indices follow replacement and removal" {
+    const allocator = std.testing.allocator;
+    var sessions = Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+
+    const first = try sessions.create(.{
+        .id = 10,
+        .name = try allocator.dupe(u8, "Raya Player"),
+        .safe_name = try allocator.dupe(u8, "raya_player"),
+    }, 0, 0, 0);
+    const stale_token = first.token;
+    try std.testing.expect(sessions.byToken(&stale_token) == first);
+    try std.testing.expect(sessions.byUser(10) == first);
+    try std.testing.expect(sessions.byName("raya player") == first);
+    try std.testing.expect(sessions.byName("RAYA_PLAYER") == first);
+
+    const replacement = try sessions.create(.{
+        .id = 10,
+        .name = try allocator.dupe(u8, "Raya Player"),
+        .safe_name = try allocator.dupe(u8, "raya_player"),
+    }, 0, 0, 0);
+    try std.testing.expect(sessions.byToken(&stale_token) == null);
+    try std.testing.expect(sessions.byUser(10) == replacement);
+    try std.testing.expect(sessions.byName("raya player") == replacement);
+
+    const replacement_token = replacement.token;
+    sessions.remove(replacement);
+    try std.testing.expect(sessions.byToken(&replacement_token) == null);
+    try std.testing.expect(sessions.byUser(10) == null);
+    try std.testing.expect(sessions.byName("raya player") == null);
+}

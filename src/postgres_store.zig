@@ -74,6 +74,13 @@ pub const Store = struct {
     pub fn migrate(self: *Store) !void {
         var lease = self.pool.acquire();
         defer lease.release();
+        var exists = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.schema_migrations') IS NOT NULL)::int");
+        const bootstrapped = try exists.int(i32, 0, 0) == 0;
+        exists.deinit();
+        if (bootstrapped) {
+            try postgres.exec(lease.conn, "BEGIN;" ++ @embedFile("postgres_schema.sql") ++ "COMMIT;");
+            return;
+        }
         var result = try postgres.query(lease.conn, "SELECT max(version) FROM zigcho.schema_migrations");
         if (result.rows() == 0 or result.isNull(0, 0)) {
             result.deinit();
@@ -2028,6 +2035,14 @@ test "postgres runtime migrates stable media through nineteen" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 7));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 8));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 9));
+    const kai = (try store.userById(std.testing.allocator, 3)).?;
+    defer {
+        std.testing.allocator.free(kai.name);
+        std.testing.allocator.free(kai.safe_name);
+    }
+    try std.testing.expectEqualStrings("kai", kai.safe_name);
+    try std.testing.expect(kai.privileges & (1 << 13) != 0);
+    try std.testing.expect(kai.privileges & (1 << 14) != 0);
 }
 
 test "postgres account auth stats and token slice" {

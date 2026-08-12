@@ -307,4 +307,15 @@ CREATE TABLE beatmap_media (
 );
 CREATE INDEX beatmap_media_lru ON beatmap_media(last_accessed_at, fetched_at, set_id, kind);
 
+INSERT INTO custom_mods(acronym,name,description,ranked,score_multiplier,settings_schema)
+VALUES('RX','Relax','Server-side cursor relax; clicks are generated automatically.',false,0,'{"type":"object","additionalProperties":false}'::jsonb);
+
+INSERT INTO users(id,name,safe_name,password_hash,password_salt,country,privileges,restricted,avatar_key)
+VALUES(3,'kai','kai',''::bytea,'system'::bytea,'XX',24579,false,1);
+INSERT INTO stats(user_id,mode) VALUES(3,0),(3,1),(3,2),(3,3),(3,4),(3,5),(3,6),(3,8);
+SELECT setval(pg_get_serial_sequence('users','id'),3,true);
+
+INSERT INTO chat_channels(name,topic,write_privileges)
+VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1);
+
 INSERT INTO schema_migrations(version) VALUES (19);

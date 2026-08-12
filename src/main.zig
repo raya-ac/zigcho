@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const domain = @import("domain.zig");
 const storage = @import("runtime_storage.zig");
 const sqlite_storage = @import("storage.zig");
@@ -25,6 +26,8 @@ const country = @import("country.zig");
 const log = @import("logutil.zig");
 const config_mod = @import("config.zig");
 const web_auth = @import("web_auth.zig");
+const proxy = @import("proxy.zig");
+const user_json = @import("user_json.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
@@ -223,13 +226,14 @@ const App = struct {
         return 64 * 1024;
     }
 
-    fn serve(self: *App, req: *std.http.Server.Request) !void {
+    fn serve(self: *App, req: *std.http.Server.Request, peer_ip: ?[]const u8) !void {
         const target = try self.allocator.dupe(u8, req.head.target);
         defer self.allocator.free(target);
         const raw_path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
         const path = routing.canonicalPath(raw_path);
+        const trusted_proxy = proxy.trustsForwardedHeaders(peer_ip);
         if (requestRule(req, path)) |rule| {
-            const client = rate_limit.clientKey(header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"));
+            const client = proxy.clientKey(peer_ip, trusted_proxy, header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"));
             const decision = self.limiter.check(client, rule) catch return respond(req, .service_unavailable, "application/json", "{\"error\":\"rate limiter unavailable\"}", &.{});
             if (!decision.allowed) {
                 var retry_buf: [16]u8 = undefined;
@@ -252,7 +256,7 @@ const App = struct {
         defer if (score_token_owned) |v| self.allocator.free(v);
         const content_type_owned: ?[]u8 = if (req.head.content_type) |v| try self.allocator.dupe(u8, v) else null;
         defer if (content_type_owned) |v| self.allocator.free(v);
-        const country_owned: ?[]u8 = if (header(req, "cf-ipcountry")) |v| try self.allocator.dupe(u8, v) else null;
+        const country_owned: ?[]u8 = if (proxy.countryHeader(trusted_proxy, header(req, "cf-ipcountry"))) |v| try self.allocator.dupe(u8, v) else null;
         defer if (country_owned) |v| self.allocator.free(v);
         const host_owned: ?[]u8 = if (header(req, "host")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (host_owned) |v| self.allocator.free(v);
@@ -262,11 +266,8 @@ const App = struct {
         defer if (csrf_owned) |v| self.allocator.free(v);
         const origin_owned: ?[]u8 = if (header(req, "origin")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (origin_owned) |v| self.allocator.free(v);
-        const client_ip: ?[]const u8 = if (header(req, "cf-connecting-ip")) |v| v else if (header(req, "x-forwarded-for")) |v| blk: {
-            const trimmed = std.mem.trim(u8, v, " ");
-            if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma| break :blk std.mem.trim(u8, trimmed[0..comma], " ");
-            break :blk trimmed;
-        } else if (header(req, "x-real-ip")) |v| v else null;
+        const client_ip_owned: ?[]u8 = if (proxy.clientIp(peer_ip, trusted_proxy, header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"))) |v| try self.allocator.dupe(u8, v) else null;
+        defer if (client_ip_owned) |v| self.allocator.free(v);
         if ((req.head.method == .GET or req.head.method == .HEAD) and web_auth.protocolHost(host_owned) and routing.websitePage(path)) {
             const location = try std.fmt.allocPrint(self.allocator, "https://kai.ovh{s}", .{target});
             defer self.allocator.free(location);
@@ -337,7 +338,7 @@ const App = struct {
             self.sessions.mutex.unlock(self.sessions.io);
             const counts = try self.store.serverCounts();
             var buf: [384]u8 = undefined;
-            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"debug alpha\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
+            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"stable\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/api/v1/appeals")) {
@@ -764,10 +765,10 @@ const App = struct {
                 }
             }
             const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
-            if (name.len < 2 or name.len > 32 or email.len > 254) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
+            if (!registration.validUsername(name) or !registration.validEmail(email) or !registration.validCredential(password)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid fields\"}", &.{});
             const id = self.store.register(name, email, &password_md5) catch |err| return respond(req, if (err == error.UserExists) .conflict else .internal_server_error, "application/json", "{\"error\":\"registration failed\"}", &.{});
-            var out: [96]u8 = undefined;
-            const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"name\":\"{s}\"}}", .{ id, name });
+            var out: [256]u8 = undefined;
+            const json = try user_json.registration(&out, id, name);
             return respond(req, .created, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/oauth/token") and req.head.method == .POST) {
@@ -839,7 +840,7 @@ const App = struct {
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
             var out: [512]u8 = undefined;
-            const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"username\":\"{s}\",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":\"{s}\",\"is_active\":true,\"is_online\":true,\"statistics_rulesets\":{{}}}}", .{ user.id, user.name, user.id, user.country });
+            const json = try user_json.me(&out, user.id, user.name, user.country);
             return respond(req, .ok, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/scores") and req.head.method == .POST) {
@@ -871,7 +872,7 @@ const App = struct {
                 defer self.allocator.free(bytes);
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
-            const geo = if (client_ip) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
+            const geo = if (client_ip_owned) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
             var result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer result.deinit();
             const token_headers = [_]std.http.Header{
@@ -1226,16 +1227,54 @@ const App = struct {
     }
 };
 
+const PosixAddress = extern union {
+    any: std.posix.sockaddr,
+    in: std.posix.sockaddr.in,
+    in6: std.posix.sockaddr.in6,
+};
+
+fn peerIp(stream: std.Io.net.Stream, buffer: []u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) return null;
+    var address: PosixAddress = undefined;
+    var address_len: std.posix.socklen_t = @sizeOf(PosixAddress);
+    std.posix.getpeername(stream.socket.handle, &address.any, &address_len) catch return null;
+    return switch (address.any.family) {
+        std.posix.AF.INET => blk: {
+            const bytes: [4]u8 = @bitCast(address.in.addr);
+            break :blk std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch null;
+        },
+        std.posix.AF.INET6 => blk: {
+            const bytes = address.in6.addr;
+            if (std.mem.eql(u8, bytes[0..12], &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
+                break :blk std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ bytes[12], bytes[13], bytes[14], bytes[15] }) catch null;
+            }
+            break :blk std.fmt.bufPrint(buffer, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+                std.mem.readInt(u16, bytes[0..2], .big),
+                std.mem.readInt(u16, bytes[2..4], .big),
+                std.mem.readInt(u16, bytes[4..6], .big),
+                std.mem.readInt(u16, bytes[6..8], .big),
+                std.mem.readInt(u16, bytes[8..10], .big),
+                std.mem.readInt(u16, bytes[10..12], .big),
+                std.mem.readInt(u16, bytes[12..14], .big),
+                std.mem.readInt(u16, bytes[14..16], .big),
+            }) catch null;
+        },
+        else => null,
+    };
+}
+
 fn serveConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) void {
     var stream = stream_value;
     defer stream.close(io);
+    var peer_buffer: [64]u8 = undefined;
+    const peer_ip = peerIp(stream, &peer_buffer);
     var recv: [64 * 1024]u8 = undefined;
     var send: [64 * 1024]u8 = undefined;
     var cr = stream.reader(io, &recv);
     var cw = stream.writer(io, &send);
     var server: std.http.Server = .init(&cr.interface, &cw.interface);
     var req = server.receiveHead() catch return;
-    app.serve(&req) catch |err| std.log.err("request failed: {t}", .{err});
+    app.serve(&req, peer_ip) catch |err| std.log.err("request failed: {t}", .{err});
 }
 
 fn recalcAllScores(allocator: std.mem.Allocator, store: *sqlite_storage.Store) !void {
@@ -1420,7 +1459,7 @@ pub fn main(init: std.process.Init) !void {
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
-        .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.osu_api_key, config.beatmap_cache_max_bytes),
+        .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.beatmap_cache_max_bytes),
         .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .geo_client = .{ .allocator = allocator, .io = init.io },

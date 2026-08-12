@@ -4,9 +4,9 @@ I'm building an osu! server in Zig because I want something small enough to unde
 
 It is not connected to official osu! accounts. When I say stable and lazer share an account, I mean both clients log into the same account on this server and use the same user ID, punishments, friends, and stats.
 
-This is not ready to put in front of players yet. I would rather leave that sentence here than pretend a green health endpoint means the server is done.
+The Stable slice is the part I am willing to put in front of players now. That means the real client contract, score and stats rules, chat, multiplayer, spectating, moderation, the website, PostgreSQL, and the release path have all been tested together. It does not mean I am pretending the frozen lazer slice is finished.
 
-Stable is the active lane now. I am finishing its real client contract before adding anything else to lazer. The existing lazer API stays available, but new lazer work is frozen unless stable needs shared code underneath it.
+Stable is the release lane now. The existing lazer API stays available, but new lazer work is frozen for this release instead of being mixed into the last Stable gate.
 
 ## where it's at
 
@@ -62,7 +62,7 @@ zig build -Dpostgres=true -Doptimize=ReleaseSafe
 ZIGCHO_POSTGRES_URL='host=/var/run/postgresql dbname=zigcho user=zigcho connect_timeout=5' ./zig-out/bin/zigcho 127.0.0.1 8080
 ```
 
-The arguments are bind address and port. A connection string can be passed as the third argument, but the service uses `ZIGCHO_POSTGRES_URL` so it does not end up in the unit's command line. The server reads `config.ini` from the working directory for runtime settings like `osu_api_key` and `score_webhook`. Public deployments need TLS in front of the server. The complete hostname contract is in `deploy/hosts.txt`, with the reason for each group in `deploy/HOSTS.md`. Do not send stable login credentials over plain HTTP.
+The arguments are bind address and port. A connection string can be passed as the third argument, but the service uses `ZIGCHO_POSTGRES_URL` so it does not end up in the unit's command line. The server reads `config.ini` from the working directory for runtime settings like `score_webhook` and cache ceilings. Public deployments need TLS in front of the server. The complete hostname contract is in `deploy/hosts.txt`, with the reason for each group in `deploy/HOSTS.md`. Do not send stable login credentials over plain HTTP.
 
 The release preflight opens the database, applies the supported migration, verifies the ID-3 `kai` account, and reads the live counters without opening a listener:
 
@@ -94,7 +94,7 @@ The archive importer rejects malformed, empty, trailing, and oversized ZIP files
 
 ## where it is running
 
-The current build is live at `https://kai.ovh`. It is a Debug alpha while the client bugs are being fixed. The stable and lazer names in `deploy/hosts.txt` go to the same process. Bancho token lookup and packet handling happen under the same session lock, so reconnecting cannot leave a request holding a session that another login just destroyed. Infrastructure roots get one small live display instead of a blank response: connected players, accounts, plays, passed plays, cached maps, and the little moving boat. Layerline terminates TLS and sends the traffic to zigcho on `127.0.0.1:27180`. The process runs as its own system user and uses the local PostgreSQL service. The stopped SQLite database is still kept untouched as the quick rollback source.
+The current build is live at `https://kai.ovh`. Stable runs as the ReleaseSafe production lane; lazer remains frozen on the shared API surface it already had. The stable and lazer names in `deploy/hosts.txt` go to the same process. Bancho token lookup and packet handling happen under the same session lock, so reconnecting cannot leave a request holding a session that another login just destroyed. Infrastructure roots get one small live display instead of a blank response: connected players, accounts, plays, passed plays, cached maps, and the little moving boat. Layerline terminates TLS and sends the traffic to zigcho on `127.0.0.1:27180`. The process runs as its own system user and uses the local PostgreSQL service. The stopped SQLite database is still kept untouched as the quick rollback source.
 
 The systemd and Layerline files are in `deploy/`. A release is built from a pinned commit under `/opt/zigcho/releases`, then `tools/activate-release.sh` takes a PostgreSQL backup, restores it into a disposable database, and runs the candidate preflight as the `zigcho` user while the current server keeps answering. it only stops the process for the final symlink switch and restart. if the new process fails, the script puts the old symlink back and restarts it. scheduled backups live under `/var/backups/zigcho`; the daily timer verifies every new dump with a real restore instead of trusting `pg_dump`'s exit code.
 
@@ -146,20 +146,20 @@ A custom mod uses the same shape:
 
 Custom acronyms are two to eight uppercase ASCII characters. They are unranked and go into the `custom` namespace unless the server is deliberately configured to understand and rank them later.
 
-## what still needs doing
+## what is in the Stable release
 
 This is the actual production list, not a wishlist:
 
 - covers, thumbnails, and song previews are fetched only for known mapsets, checked by their real byte signatures, and kept in a bounded PostgreSQL cache. screenshot storage, Stable favourites, and directional friends are backed by PostgreSQL too
-- beatmap hydration from osu API v1 and hinamizawa retries metadata-only maps with durable bounded backoff, at most four distinct hydrations running at once, a 2 GiB default LRU cache ceiling, and local failure/cache/capacity metrics
-- stable multiplayer and spectating are accepted for this alpha and no longer hold the next phases up
+- beatmap hydration uses Nerinyan metadata and Akatsuki's archive service with a Nerinyan archive fallback, then verifies the requested MD5 and calculates the local attributes before accepting anything. metadata-only maps retry with durable bounded backoff, at most four distinct hydrations run at once, the default LRU cache ceiling is 2 GiB, and local metrics expose failures, cache use, and capacity skips
+- stable multiplayer and spectating have passed the installed two-client runs and no longer hold the next phase up
 - stable login records the complete client fingerprint and restricts both accounts on an exact adapter, uninstall, and disk match. partial matches and the common empty or zero signatures do not auto-restrict. staff can review the evidence without exposing full hashes, and a restricted player can send one open appeal of each type from the site
 - PostgreSQL is the only live source of truth. the old SQLite file stays stopped for rollback. daily dumps are checksumed, restored, and checked for schema, index, and foreign-key damage before the timer succeeds
 - chat has the player, moderator, admin, and developer command sets, enforced silences, protected staff targets, persistent channel controls, public history, and an audit trail. the same moderation and channel state is available through the staff site
 - Stable social state now follows the real client contract: kai is always friend ID 3, friend adds/removes are directional and durable, login restores the friends list and private-message setting, friend-only DMs return the proper blocked packet, AFK users answer with their away message, unrestricted presence can be requested again after reconnect, and mod changes immediately return the selected vanilla, Relax, or Autopilot stats to the player who changed them
 - BN+ can put any complete mapset straight into pending, qualified, ranked, approved, or loved from chat or the staff site. requests and nominations stay available as review tools, every direct change is immutable history, and admin rollback is separate
 - the public site has live player profiles, separate vanilla/relax/autopilot rankings, pinned plays, ranked top plays, recent plays, local map pages, appeals, and the staff workspace. vanilla has osu!, taiko, catch, and mania; relax has osu!, taiko, and catch; autopilot has osu! only. failed plays are marked in red and never look like they awarded PP, country fields use flags, and the player/map metadata has deliberate spacing instead of running into its links
-- lazer stays frozen until the remaining Stable ranking, website, and operations work is complete; after that it still needs rooms, event streams, multiplayer spectating, and a properly signed public client release
+- lazer stays frozen for this release. its next slice still needs rooms, event streams, multiplayer spectating, and a properly signed public client release, and none of that is being smuggled into the Stable claim
 - PP uses akatsuki-pp with pinned Stable fixtures for osu!, taiko, catch, and mania. vanilla is locked for all four rulesets, relax is locked for osu!/taiko/catch, and autopilot is locked to osu!; lazer scoring stays frozen with the rest of lazer
 - public operation has structured event logs, local-only Prometheus metrics, the PostgreSQL recalc command, verified backups, and an automatic rollback release switch. the switch still has one short process restart; it is safe, but it is not pretending to be zero-downtime rolling infrastructure
 - stable has passed the installed-client login, map, score, replay, PP, stats, chat, country, and mod-switch paths against public TLS; lazer is still being tested there one real request path at a time

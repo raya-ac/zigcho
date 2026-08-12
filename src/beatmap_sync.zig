@@ -9,29 +9,31 @@ const map_limit = 16 * 1024 * 1024;
 const entry_limit = 4096;
 pub const max_concurrent_hydrations = 4;
 
-const OsuV1Map = struct {
-    beatmap_id: i32,
+const NerinyanMap = struct {
+    id: i32,
     beatmapset_id: i32,
-    approved: i32,
-    file_md5: []const u8,
+    version: []const u8,
+    checksum: ?[]const u8 = null,
+    mode_int: u8 = 0,
+    bpm: ?f64 = null,
+    ar: ?f64 = null,
+    accuracy: ?f64 = null,
+    cs: ?f64 = null,
+    drain: ?f64 = null,
+    total_length: ?i32 = null,
+    max_combo: ?u32 = null,
+    difficulty_rating: ?f64 = null,
+};
+
+const NerinyanSet = struct {
+    id: i32,
+    beatmaps: []NerinyanMap,
+    ranked: i32,
     artist: []const u8 = "",
     title: []const u8 = "",
-    version: []const u8 = "",
     creator: []const u8 = "",
     source: []const u8 = "",
     tags: []const u8 = "",
-    difficultyrating: f64 = 0,
-    diff_size: f64 = 0,
-    diff_approach: f64 = 0,
-    diff_overall: f64 = 0,
-    diff_drain: f64 = 0,
-    mode: u8 = 0,
-    bpm: f64 = 0,
-    total_length: i32 = 0,
-    count_normal: u32 = 0,
-    count_slider: u32 = 0,
-    count_spinner: u32 = 0,
-    max_combo: u32 = 0,
 };
 
 const RemoteMap = struct {
@@ -42,7 +44,6 @@ const RemoteMap = struct {
 pub const Sync = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    api_key: []const u8 = "",
     cache_max_bytes: u64,
     in_progress: std.StringHashMap(void),
     in_progress_mutex: std.Io.Mutex = .init,
@@ -64,11 +65,10 @@ pub const Sync = struct {
         pruned_bytes: u64,
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, cache_max_bytes: u64) Sync {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cache_max_bytes: u64) Sync {
         return .{
             .allocator = allocator,
             .io = io,
-            .api_key = api_key,
             .cache_max_bytes = cache_max_bytes,
             .in_progress = std.StringHashMap(void).init(allocator),
         };
@@ -158,53 +158,63 @@ pub const Sync = struct {
 
         std.log.info("[hydrate] start md5={s} set={d}", .{ wanted_md5, set_id });
 
-        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh/api/get_beatmaps?s={d}&k={s}", .{ set_id, self.api_key });
+        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/v2/beatmapsets/{d}", .{set_id});
         defer self.allocator.free(metadata_url);
         const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
             std.log.warn("[hydrate] metadata fetch failed: {t}", .{err});
             return err;
         };
         defer self.allocator.free(metadata_json);
-        const parsed = std.json.parseFromSlice([]OsuV1Map, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
+        const parsed = std.json.parseFromSlice(NerinyanSet, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
             std.log.warn("[hydrate] metadata parse failed: {t}", .{err});
             return err;
         };
         defer parsed.deinit();
-        if (parsed.value.len == 0) return error.EmptySet;
-        var remote: ?OsuV1Map = null;
-        for (parsed.value) |candidate| {
-            if (std.ascii.eqlIgnoreCase(candidate.file_md5, wanted_md5)) {
+        if (parsed.value.id != set_id or parsed.value.beatmaps.len == 0) return error.IdMismatch;
+        var remote: ?NerinyanMap = null;
+        for (parsed.value.beatmaps) |candidate| {
+            if (candidate.checksum) |checksum| if (std.ascii.eqlIgnoreCase(checksum, wanted_md5)) {
                 remote = candidate;
                 break;
-            }
+            };
         }
         const map_info = remote orelse return error.Md5NotFound;
-        if (map_info.beatmap_id <= 0 or map_info.beatmapset_id != set_id) return error.IdMismatch;
+        if (map_info.id <= 0 or map_info.beatmapset_id != set_id) return error.IdMismatch;
 
         const meta = beatmap.Metadata{
-            .id = map_info.beatmap_id,
+            .id = map_info.id,
             .set_id = map_info.beatmapset_id,
-            .mode = map_info.mode,
-            .artist = map_info.artist,
-            .title = map_info.title,
+            .mode = map_info.mode_int,
+            .artist = parsed.value.artist,
+            .title = parsed.value.title,
             .version = map_info.version,
-            .creator = map_info.creator,
-            .source = map_info.source,
-            .tags = map_info.tags,
-            .hp = map_info.diff_drain,
-            .cs = map_info.diff_size,
-            .od = map_info.diff_overall,
-            .ar = map_info.diff_approach,
-            .bpm = map_info.bpm,
-            .total_length = map_info.total_length,
-            .count_circles = map_info.count_normal,
-            .count_sliders = map_info.count_slider,
-            .count_spinners = map_info.count_spinner,
-            .object_count = map_info.count_normal + map_info.count_slider + map_info.count_spinner,
+            .creator = parsed.value.creator,
+            .source = parsed.value.source,
+            .tags = parsed.value.tags,
+            .hp = map_info.drain orelse 0,
+            .cs = map_info.cs orelse 0,
+            .od = map_info.accuracy orelse 0,
+            .ar = map_info.ar orelse 0,
+            .bpm = map_info.bpm orelse 0,
+            .total_length = map_info.total_length orelse 0,
+            .count_circles = 0,
+            .count_sliders = 0,
+            .count_spinners = 0,
+            .object_count = 0,
         };
-        try store.upsertBeatmapMeta(meta, wanted_md5, localStatus(map_info.approved), map_info.difficultyrating, map_info.max_combo);
-        std.log.info("[hydrate] metadata ok — {s} - {s} [{s}] stars={d:.2}", .{ map_info.artist, map_info.title, map_info.version, map_info.difficultyrating });
-        return .{ .approved = map_info.approved, .beatmap_id = map_info.beatmap_id };
+        try store.upsertBeatmapMeta(meta, wanted_md5, localStatus(parsed.value.ranked), map_info.difficulty_rating orelse 0, map_info.max_combo orelse 0);
+        std.log.info("[hydrate] metadata ok — {s} - {s} [{s}] stars={d:.2}", .{ parsed.value.artist, parsed.value.title, map_info.version, map_info.difficulty_rating orelse 0 });
+        return .{ .approved = parsed.value.ranked, .beatmap_id = map_info.id };
+    }
+
+    fn fetchArchive(self: *Sync, client: *std.http.Client, set_id: i32) ![]u8 {
+        const primary_url = try std.fmt.allocPrint(self.allocator, "https://beatmaps.akatsuki.gg/api/d/{d}", .{set_id});
+        defer self.allocator.free(primary_url);
+        if (fetchFn(client, self.allocator, primary_url, archive_limit)) |bytes| return bytes else |err| if (err == error.OutOfMemory) return err;
+
+        const next_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/d/{d}", .{set_id});
+        defer self.allocator.free(next_url);
+        return fetchFn(client, self.allocator, next_url, archive_limit);
     }
 
     fn removeFromProgress(self: *Sync, md5: []const u8) void {
@@ -236,24 +246,8 @@ pub const Sync = struct {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
-        const mirror_json_url = try std.fmt.allocPrint(self.allocator, "https://mirror.hinamizawa.ai/d/{d}", .{set_id});
-        defer self.allocator.free(mirror_json_url);
         std.log.info("[hydrate] downloading archive set={d}", .{set_id});
-        const mirror_json = fetchFn(&client, self.allocator, mirror_json_url, 4096) catch |err| {
-            std.log.warn("[hydrate] mirror fetch failed: {t}", .{err});
-            return err;
-        };
-        defer self.allocator.free(mirror_json);
-        const mirror_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, mirror_json, .{}) catch return error.InvalidMirrorJson;
-        defer mirror_parsed.deinit();
-        const download_url = mirror_parsed.value.object.get("download_url") orelse return error.NoDownloadUrl;
-        const url_str = switch (download_url) {
-            .string => |s| s,
-            else => return error.DownloadUrlNotString,
-        };
-        const fetch_url = try std.fmt.allocPrint(self.allocator, "{s}?noVideo=true", .{url_str});
-        defer self.allocator.free(fetch_url);
-        const archive = fetchFn(&client, self.allocator, fetch_url, archive_limit) catch |err| {
+        const archive = self.fetchArchive(&client, set_id) catch |err| {
             std.log.warn("[hydrate] archive fetch failed: {t}", .{err});
             return err;
         };
@@ -306,7 +300,7 @@ pub const Sync = struct {
 };
 
 fn hydrationClaimAllocationRun(allocator: std.mem.Allocator) !void {
-    var sync = Sync.init(allocator, std.testing.io, "", 1);
+    var sync = Sync.init(allocator, std.testing.io, 1);
     defer sync.deinit();
     const result = try sync.claim("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     switch (result) {
@@ -323,7 +317,7 @@ test "beatmap hydration bounds distinct work and deduplicates maps" {
         "dddddddddddddddddddddddddddddddd",
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     };
-    var sync = Sync.init(std.testing.allocator, std.testing.io, "", 1);
+    var sync = Sync.init(std.testing.allocator, std.testing.io, 1);
     defer sync.deinit();
     var held: [max_concurrent_hydrations][]const u8 = undefined;
     for (hashes[0..max_concurrent_hydrations], 0..) |hash, index| {

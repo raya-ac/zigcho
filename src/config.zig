@@ -2,17 +2,13 @@ const std = @import("std");
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    osu_api_key: []u8,
     score_webhook: []u8,
     beatmap_cache_max_bytes: u64,
     beatmap_media_cache_max_bytes: u64,
 
     pub fn empty(allocator: std.mem.Allocator) !Config {
-        const osu_api_key = try allocator.dupe(u8, "");
-        errdefer allocator.free(osu_api_key);
         return .{
             .allocator = allocator,
-            .osu_api_key = osu_api_key,
             .score_webhook = try allocator.dupe(u8, ""),
             .beatmap_cache_max_bytes = 2 * 1024 * 1024 * 1024,
             .beatmap_media_cache_max_bytes = 512 * 1024 * 1024,
@@ -20,7 +16,6 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
-        self.allocator.free(self.osu_api_key);
         self.allocator.free(self.score_webhook);
         self.* = undefined;
     }
@@ -42,9 +37,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
         const eq = std.mem.findScalar(u8, trimmed, '=') orelse continue;
         const key = std.mem.trim(u8, trimmed[0..eq], " \t");
         const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "osu_api_key")) {
-            try result.replace(&result.osu_api_key, value);
-        } else if (std.mem.eql(u8, key, "score_webhook")) {
+        if (std.mem.eql(u8, key, "score_webhook")) {
             try result.replace(&result.score_webhook, value);
         } else if (std.mem.eql(u8, key, "beatmap_cache_max_bytes")) {
             const parsed = std.fmt.parseInt(u64, value, 10) catch continue;

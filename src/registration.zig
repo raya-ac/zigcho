@@ -26,14 +26,14 @@ pub const StableResult = union(enum) {
     validation_failed: Validation,
 };
 
-fn validUsername(value: []const u8) bool {
+pub fn validUsername(value: []const u8) bool {
     if (value.len < 2 or value.len > 15) return false;
     if (std.mem.indexOfScalar(u8, value, '_') != null and std.mem.indexOfScalar(u8, value, ' ') != null) return false;
     for (value) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == ' ' or byte == '[' or byte == ']' or byte == '-')) return false;
     return true;
 }
 
-fn validEmail(value: []const u8) bool {
+pub fn validEmail(value: []const u8) bool {
     const at = std.mem.indexOfScalar(u8, value, '@') orelse return false;
     if (at == 0 or at > 200 or std.mem.indexOfScalarPos(u8, value, at + 1, '@') != null) return false;
     for (value[0..at]) |byte| if (std.ascii.isWhitespace(byte)) return false;
@@ -50,7 +50,7 @@ fn validEmail(value: []const u8) bool {
     return suffixes != 0;
 }
 
-fn validPassword(value: []const u8) bool {
+pub fn validPassword(value: []const u8) bool {
     if (value.len < 8 or value.len > 32) return false;
     var seen = [_]bool{false} ** 256;
     var unique: usize = 0;
@@ -59,6 +59,14 @@ fn validPassword(value: []const u8) bool {
         unique += 1;
     };
     return unique > 3;
+}
+
+pub fn validCredential(value: []const u8) bool {
+    if (value.len == 32) {
+        for (value) |byte| if (!std.ascii.isHex(byte)) return validPassword(value);
+        return true;
+    }
+    return validPassword(value);
 }
 
 pub fn validate(store: *storage.Store, name: []const u8, email: []const u8, password: []const u8) !Validation {
@@ -113,4 +121,18 @@ pub fn writeStableErrors(buffer: []u8, validation: Validation) ![]const u8 {
     }
     try writer.writeAll("}}}");
     return buffer[0..writer.end];
+}
+
+test "shared account fields use the stable username boundary" {
+    try std.testing.expect(validUsername("raya"));
+    try std.testing.expect(validUsername("raya-ac"));
+    try std.testing.expect(!validUsername("raya\"admin"));
+    try std.testing.expect(!validUsername("raya\\admin"));
+    try std.testing.expect(!validUsername("raya_ ac"));
+    try std.testing.expect(!validUsername("a"));
+    try std.testing.expect(validEmail("raya@example.test"));
+    try std.testing.expect(!validEmail("raya@example"));
+    try std.testing.expect(!validPassword("00000000000000000000000000000000"));
+    try std.testing.expect(validCredential("00000000000000000000000000000000"));
+    try std.testing.expect(!validCredential("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
 }

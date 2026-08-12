@@ -46,12 +46,16 @@ until curl --fail --silent "$origin/health" >/dev/null 2>&1; do
 done
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/users" \
+  --data-urlencode 'name=bad"name' --data-urlencode 'email=bad-name@example.test' --data-urlencode 'password_md5=StablePass123!')
+expect_status "$code" 400 reject_unsafe_shared_name
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/users" \
   --data-urlencode 'name=staffer' --data-urlencode 'email=staffer@example.test' --data-urlencode 'password_md5=StablePass123!')
 expect_status "$code" 201 register_staff
 staff_id=$(jq -er '.id' "$response")
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/users" \
-  --data-urlencode 'name=restricted player' --data-urlencode 'email=restricted@example.test' --data-urlencode 'password_md5=StablePass123!')
+  --data-urlencode 'name=restricted' --data-urlencode 'email=restricted@example.test' --data-urlencode 'password_md5=StablePass123!')
 expect_status "$code" 201 register_player
 player_id=$(jq -er '.id' "$response")
 
@@ -71,9 +75,10 @@ stable_login_body="social player
 00000000000000000000000000000000
 b20260811|0|0|11111111111111111111111111111111:1.2.3.:22222222222222222222222222222222:33333333333333333333333333333333:44444444444444444444444444444444:|1"
 code=$(curl --silent --show-error --dump-header "$headers" --output "$response" --write-out '%{http_code}' --request POST "$origin/" \
-  --header 'User-Agent: osu!' --data-binary "$stable_login_body")
+  --header 'User-Agent: osu!' --header 'CF-IPCountry: AU' --data-binary "$stable_login_body")
 expect_status "$code" 200 stable_social_login
 grep -qi '^osu-token: [0-9a-f]\{64\}' "$headers" || fail missing_stable_token
+[ "$(sqlite3 "$database" "SELECT country FROM users WHERE id=$social_player_id")" = AU ] || fail trusted_proxy_country_not_saved
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-getfriends.php" \
   --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000')
@@ -102,18 +107,18 @@ expect_status "$code" 200 stable_get_favourites
 grep -qx '9001' "$response" || fail missing_favourite
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/appeals" \
-  --header 'Origin: https://evil.test' --data-urlencode 'username=restricted player' --data-urlencode 'password=StablePass123!' \
+  --header 'Origin: https://evil.test' --data-urlencode 'username=restricted' --data-urlencode 'password=StablePass123!' \
   --data-urlencode 'kind=restriction' --data-urlencode 'message=This restriction needs a manual review please.')
 expect_status "$code" 403 appeal_wrong_origin
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/appeals" \
-  --header "Origin: $origin" --data-urlencode 'username=restricted player' --data-urlencode 'password=StablePass123!' \
+  --header "Origin: $origin" --data-urlencode 'username=restricted' --data-urlencode 'password=StablePass123!' \
   --data-urlencode 'kind=restriction' --data-urlencode 'message=This restriction needs a manual review please.')
 expect_status "$code" 201 appeal_create
 appeal_id=$(jq -er '.id' "$response")
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/appeals" \
-  --header "Origin: $origin" --data-urlencode 'username=restricted player' --data-urlencode 'password=StablePass123!' \
+  --header "Origin: $origin" --data-urlencode 'username=restricted' --data-urlencode 'password=StablePass123!' \
   --data-urlencode 'kind=restriction' --data-urlencode 'message=This duplicate appeal should be refused safely.')
 expect_status "$code" 409 appeal_duplicate
 
@@ -153,7 +158,7 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
 expect_status "$code" 200 staff_ranking_after_direct_statuses
 jq -e '[.history[] | select(.set_id == 9001) | .action] | index("love") != null and index("approve") != null and index("pending") != null and index("qualify") != null and index("rank") != null' "$response" >/dev/null || fail missing_direct_ranking_history
 
-encoded_player=$(printf '%s' 'restricted player' | jq -sRr @uri)
+encoded_player=$(printf '%s' 'restricted' | jq -sRr @uri)
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/moderation?user=$encoded_player" --header "Cookie: $cookie")
 expect_status "$code" 200 moderation_lookup
 jq -e ".user.id == $player_id and .user.restricted == true" "$response" >/dev/null || fail invalid_moderation_lookup

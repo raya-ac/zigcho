@@ -318,6 +318,7 @@ const App = struct {
                     "# TYPE zigcho_beatmap_hydration_successes counter\nzigcho_beatmap_hydration_successes {d}\n" ++
                     "# TYPE zigcho_beatmap_hydration_failures counter\nzigcho_beatmap_hydration_failures {d}\n" ++
                     "# TYPE zigcho_beatmap_hydration_backoff_skips counter\nzigcho_beatmap_hydration_backoff_skips {d}\n" ++
+                    "# TYPE zigcho_beatmap_hydration_capacity_skips counter\nzigcho_beatmap_hydration_capacity_skips {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_pruned_entries counter\nzigcho_beatmap_cache_pruned_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_pruned_bytes counter\nzigcho_beatmap_cache_pruned_bytes {d}\n" ++
                     "# TYPE zigcho_beatmap_media_fetch_attempts counter\nzigcho_beatmap_media_fetch_attempts {d}\n" ++
@@ -326,7 +327,7 @@ const App = struct {
                     "# TYPE zigcho_beatmap_media_cache_pruned_entries counter\nzigcho_beatmap_media_cache_pruned_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_media_cache_pruned_bytes counter\nzigcho_beatmap_media_cache_pruned_bytes {d}\n" ++
                     "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
-                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.pruned_entries, hydration.pruned_bytes, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
+                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.capacity_skips, hydration.pruned_entries, hydration.pruned_bytes, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
             );
             return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
         }

@@ -151,7 +151,7 @@ Custom acronyms are two to eight uppercase ASCII characters. They are unranked a
 This is the actual production list, not a wishlist:
 
 - covers, thumbnails, and song previews are fetched only for known mapsets, checked by their real byte signatures, and kept in a bounded PostgreSQL cache. screenshot storage, Stable favourites, and directional friends are backed by PostgreSQL too
-- beatmap hydration from osu API v1 and hinamizawa retries metadata-only maps with durable bounded backoff, a 2 GiB default LRU cache ceiling, and local failure/cache metrics
+- beatmap hydration from osu API v1 and hinamizawa retries metadata-only maps with durable bounded backoff, at most four distinct hydrations running at once, a 2 GiB default LRU cache ceiling, and local failure/cache/capacity metrics
 - stable multiplayer and spectating are accepted for this alpha and no longer hold the next phases up
 - stable login records the complete client fingerprint and restricts both accounts on an exact adapter, uninstall, and disk match. partial matches and the common empty or zero signatures do not auto-restrict. staff can review the evidence without exposing full hashes, and a restricted player can send one open appeal of each type from the site
 - PostgreSQL is the only live source of truth. the old SQLite file stays stopped for rollback. daily dumps are checksumed, restored, and checked for schema, index, and foreign-key damage before the timer succeeds

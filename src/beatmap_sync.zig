@@ -7,6 +7,7 @@ const metadata_limit = 256 * 1024;
 const archive_limit = 128 * 1024 * 1024;
 const map_limit = 16 * 1024 * 1024;
 const entry_limit = 4096;
+pub const max_concurrent_hydrations = 4;
 
 const OsuV1Map = struct {
     beatmap_id: i32,
@@ -49,6 +50,7 @@ pub const Sync = struct {
     successes: std.atomic.Value(u64) = .init(0),
     failures: std.atomic.Value(u64) = .init(0),
     backoff_skips: std.atomic.Value(u64) = .init(0),
+    capacity_skips: std.atomic.Value(u64) = .init(0),
     pruned_entries: std.atomic.Value(u64) = .init(0),
     pruned_bytes: std.atomic.Value(u64) = .init(0),
 
@@ -57,6 +59,7 @@ pub const Sync = struct {
         successes: u64,
         failures: u64,
         backoff_skips: u64,
+        capacity_skips: u64,
         pruned_entries: u64,
         pruned_bytes: u64,
     };
@@ -81,6 +84,7 @@ pub const Sync = struct {
             .successes = self.successes.load(.monotonic),
             .failures = self.failures.load(.monotonic),
             .backoff_skips = self.backoff_skips.load(.monotonic),
+            .capacity_skips = self.capacity_skips.load(.monotonic),
             .pruned_entries = self.pruned_entries.load(.monotonic),
             .pruned_bytes = self.pruned_bytes.load(.monotonic),
         };
@@ -95,21 +99,11 @@ pub const Sync = struct {
             return false;
         }
 
-        self.in_progress_mutex.lockUncancelable(self.io);
-        if (self.in_progress.contains(wanted_md5)) {
-            self.in_progress_mutex.unlock(self.io);
-            return false;
-        }
-        const md5_owned = self.allocator.dupe(u8, wanted_md5) catch {
-            self.in_progress_mutex.unlock(self.io);
-            return false;
+        const md5_owned = switch (self.claim(wanted_md5) catch return false) {
+            .claimed => |value| value,
+            .duplicate => return false,
+            .at_capacity => return false,
         };
-        self.in_progress.put(md5_owned, {}) catch {
-            self.allocator.free(md5_owned);
-            self.in_progress_mutex.unlock(self.io);
-            return false;
-        };
-        self.in_progress_mutex.unlock(self.io);
 
         const set_id = expected_set_id orelse {
             self.removeFromProgress(md5_owned);
@@ -135,6 +129,27 @@ pub const Sync = struct {
         };
         thread.detach();
         return false;
+    }
+
+    const Claim = union(enum) {
+        claimed: []const u8,
+        duplicate,
+        at_capacity,
+    };
+
+    fn claim(self: *Sync, wanted_md5: []const u8) !Claim {
+        self.in_progress_mutex.lockUncancelable(self.io);
+        defer self.in_progress_mutex.unlock(self.io);
+        if (self.in_progress.contains(wanted_md5)) return .duplicate;
+        if (self.in_progress.count() >= max_concurrent_hydrations) {
+            _ = self.capacity_skips.fetchAdd(1, .monotonic);
+            return .at_capacity;
+        }
+
+        const md5_owned = try self.allocator.dupe(u8, wanted_md5);
+        errdefer self.allocator.free(md5_owned);
+        try self.in_progress.put(md5_owned, {});
+        return .{ .claimed = md5_owned };
     }
 
     fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !RemoteMap {
@@ -289,6 +304,56 @@ pub const Sync = struct {
         }
     }
 };
+
+fn hydrationClaimAllocationRun(allocator: std.mem.Allocator) !void {
+    var sync = Sync.init(allocator, std.testing.io, "", 1);
+    defer sync.deinit();
+    const result = try sync.claim("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    switch (result) {
+        .claimed => |md5| sync.removeFromProgress(md5),
+        else => return error.UnexpectedClaimResult,
+    }
+}
+
+test "beatmap hydration bounds distinct work and deduplicates maps" {
+    const hashes = [_][]const u8{
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddd",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    };
+    var sync = Sync.init(std.testing.allocator, std.testing.io, "", 1);
+    defer sync.deinit();
+    var held: [max_concurrent_hydrations][]const u8 = undefined;
+    for (hashes[0..max_concurrent_hydrations], 0..) |hash, index| {
+        held[index] = switch (try sync.claim(hash)) {
+            .claimed => |md5| md5,
+            else => return error.UnexpectedClaimResult,
+        };
+    }
+
+    try std.testing.expect(switch (try sync.claim(hashes[0])) {
+        .duplicate => true,
+        else => false,
+    });
+    try std.testing.expect(switch (try sync.claim(hashes[4])) {
+        .at_capacity => true,
+        else => false,
+    });
+    try std.testing.expectEqual(@as(u64, 1), sync.metrics().capacity_skips);
+
+    sync.removeFromProgress(held[0]);
+    held[0] = switch (try sync.claim(hashes[4])) {
+        .claimed => |md5| md5,
+        else => return error.UnexpectedClaimResult,
+    };
+    for (held) |md5| sync.removeFromProgress(md5);
+}
+
+test "beatmap hydration claims clean every induced allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hydrationClaimAllocationRun, .{});
+}
 
 pub fn needsHydration(store: *storage.Store, wanted_md5: []const u8) !bool {
     return !try store.beatmapHasFile(wanted_md5);

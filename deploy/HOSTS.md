@@ -8,11 +8,11 @@ osu! does not use one neat origin. stable and lazer both expect a collection of 
 - `c`, `c1` through `c6`, `ce`, and `cho` are the stable Bancho web relays
 - `a` serves the stored default avatar for each real user at `/{user_id}`
 - `s` serves the Stable screenshot upload links under `/ss/{filename}`
-- `assets` and `i` are kept for beatmap covers, previews, and images
+- `assets` and `i` serve beatmap covers, previews, and images
 - `b`, `bm6`, and `bm10` are kept for beatmap metadata and archive delivery
 - `spectator` is kept for lazer spectator and multiplayer streams
 - `bss` is kept for beatmap submission traffic
 
-The names existing does not mean every protocol behind them is finished. Covers, previews, lazer realtime streams, and beatmap submission are still reserved surfaces. The page says that plainly.
+The names existing does not mean every protocol behind them is finished. Lazer realtime streams and beatmap submission are still reserved surfaces. The page says that plainly.
 
 Stable IRC is a separate TCP service. A wildcard HTTPS route cannot provide it, so `irc.kai.ovh` is deliberately not in this list until there is an IRC listener and a separately verified TCP route.

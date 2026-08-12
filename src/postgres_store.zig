@@ -2001,7 +2001,7 @@ test "postgres account auth stats and token slice" {
     try std.testing.expectEqual(@as(i32, 0), worse_placement.rank);
     try std.testing.expectEqual(score_id, try store.setScorePinned(user_id, score.map_md5, 0, 0, "vanilla", true));
     var hidden = score;
-    hidden.online_checksum = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    hidden.online_checksum = "55555555555555555555555555555555";
     hidden.total_score = 800_000;
     hidden.mods = stable_mods.hidden;
     const hidden_id = try store.insertStableScore(user_id, hidden, 18, "hidden replay", 12_000);

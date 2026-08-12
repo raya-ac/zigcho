@@ -310,6 +310,11 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     const session_friend_ids = try allocator.dupe(i32, response_friend_ids);
     var friends_transferred = false;
     defer if (!friends_transferred) allocator.free(session_friend_ids);
+    const unread_messages = try store.unreadDirectMessages(allocator, user.id);
+    defer {
+        for (unread_messages) |*message| message.deinit(allocator);
+        allocator.free(unread_messages);
+    }
     std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
@@ -351,6 +356,13 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     try protocol.writeChannel(&out, "#announce", "updates", capture.announce_count);
     try out.packetEmpty(.channel_info_end);
     try out.packetIntList(.friends_list, response_friend_ids);
+    var unread_senders = std.AutoHashMap(i32, void).init(allocator);
+    defer unread_senders.deinit();
+    for (unread_messages) |message| {
+        const sender = try unread_senders.getOrPut(message.from_id);
+        if (!sender.found_existing) try protocol.writeMessage(&out, message.from_name, "Unread messages", own.user.name, message.from_id);
+        try protocol.writeMessage(&out, message.from_name, message.message, own.user.name, message.from_id);
+    }
     for (capture.sessions.items, 0..) |*other, index| if (index != own_index and !other.user.restricted) {
         try presence(&out, other);
         try stats(&out, store, other);
@@ -921,7 +933,26 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                             try protocol.writeMessage(&out, target.user.name, target.away(), session.user.name, target.user.id);
                         }
                         try queuePacket(target, allocator, message.bytes());
+                        store.storeDirectMessage(session.user.id, target.user.id, text) catch |err| std.log.warn("direct message write failed: {s}", .{@errorName(err)});
                     }
+                } else if (try store.userByName(allocator, target_name)) |target_user| {
+                    defer {
+                        allocator.free(target_user.name);
+                        allocator.free(target_user.safe_name);
+                    }
+                    if (target_user.silence_end > now or target_user.restricted) {
+                        const start = try out.begin(.target_is_silenced);
+                        try out.string("");
+                        try out.string("");
+                        try out.string(target_user.name);
+                        try out.int(i32, 0);
+                        out.finish(start);
+                        continue;
+                    }
+                    try store.storeDirectMessage(session.user.id, target_user.id, text);
+                    var notice_buf: [192]u8 = undefined;
+                    const notice = try std.fmt.bufPrint(&notice_buf, "{s} is offline, but they'll get your message when they next log in.", .{target_user.name});
+                    try out.packetString(.notification, notice);
                 }
             } else {
                 if (std.mem.eql(u8, target_name, "#spectator")) {

@@ -6,9 +6,6 @@ pub fn build(b: *std.Build) void {
     const postgres_prefix = b.option([]const u8, "postgres-prefix", "PostgreSQL installation prefix (macOS defaults to Homebrew postgresql@17)");
     const postgres_runtime = b.option(bool, "postgres", "Build the server with PostgreSQL runtime storage") orelse false;
 
-    const cargo = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "pp/Cargo.toml", "--release", "--locked" });
-    const pp_library = b.path(if (target.result.os.tag == .windows) "pp/target/release/zigcho_pp.lib" else "pp/target/release/libzigcho_pp.a");
-
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -28,10 +25,8 @@ pub fn build(b: *std.Build) void {
         mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
     }
     if (target.result.os.tag == .linux) mod.linkSystemLibrary("gcc_s", .{});
-    mod.addObjectFile(pp_library);
 
     const exe = b.addExecutable(.{ .name = "zigcho", .root_module = mod });
-    exe.step.dependOn(&cargo.step);
     b.installArtifact(exe);
 
     const importer_mod = b.createModule(.{
@@ -42,9 +37,7 @@ pub fn build(b: *std.Build) void {
     });
     importer_mod.linkSystemLibrary("sqlite3", .{});
     if (target.result.os.tag == .linux) importer_mod.linkSystemLibrary("gcc_s", .{});
-    importer_mod.addObjectFile(pp_library);
     const importer = b.addExecutable(.{ .name = "zigcho-import", .root_module = importer_mod });
-    importer.step.dependOn(&cargo.step);
     b.installArtifact(importer);
 
     const archive_importer_mod = b.createModule(.{
@@ -100,8 +93,6 @@ pub fn build(b: *std.Build) void {
         tests.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
     }
     if (target.result.os.tag == .linux) tests.root_module.linkSystemLibrary("gcc_s", .{});
-    tests.root_module.addObjectFile(pp_library);
-    tests.step.dependOn(&cargo.step);
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run all tests").dependOn(&run_tests.step);
 }

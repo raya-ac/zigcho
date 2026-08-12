@@ -17,7 +17,7 @@ case "$release" in
   "$release_root"/*) ;;
   *) echo "usage: $0 /opt/zigcho/releases/<commit>" >&2; exit 1 ;;
 esac
-if [ ! -x "$release/zigcho" ] || [ ! -x "$release/tools/backup-postgres.sh" ] || [ ! -x "$release/tools/restore-postgres-drill.sh" ]; then
+if [ ! -x "$release/zigcho" ] || [ ! -s "$release/pp-engine-version" ] || [ ! -x "$release/tools/backup-postgres.sh" ] || [ ! -x "$release/tools/restore-postgres-drill.sh" ]; then
   echo "candidate release is incomplete: $release" >&2
   exit 1
 fi
@@ -32,6 +32,15 @@ previous=$(readlink -f "$current")
 case "$previous" in
   "$release_root"/*) ;;
   *) echo "current release is not a valid rollback target: $previous" >&2; exit 1 ;;
+esac
+candidate_pp=$(sed -n '1p' "$candidate/pp-engine-version")
+previous_pp=legacy-akatsuki
+if [ -s "$previous/pp-engine-version" ]; then
+  previous_pp=$(sed -n '1p' "$previous/pp-engine-version")
+fi
+[ -n "$candidate_pp" ] || { echo "empty pp engine marker" >&2; exit 1; }
+case "$candidate_pp:$previous_pp" in
+  *[!A-Za-z0-9._:-]*) echo "invalid pp engine marker" >&2; exit 1 ;;
 esac
 
 restore_previous() {
@@ -83,13 +92,18 @@ runuser --user postgres -- env \
 runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check
 systemctl stop "$service"
 service_stopped=yes
+recalculated=no
+if [ "$candidate_pp" != "$previous_pp" ]; then
+  runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" recalc
+  recalculated=yes
+fi
 ln -sfn "$candidate" "$current"
 if systemctl start "$service" \
   && curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused "$health_url" >/dev/null \
   && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$'; then
   release_active=yes
   trap - EXIT HUP INT TERM
-  echo "release_active candidate=$candidate rollback=$previous"
+  echo "release_active candidate=$candidate rollback=$previous pp_engine=$candidate_pp recalculated=$recalculated"
   exit 0
 fi
 false

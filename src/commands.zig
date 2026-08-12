@@ -592,7 +592,7 @@ pub fn handleNp(allocator: std.mem.Allocator, store: *storage.Store, sender: *se
             .mode = sender.mode,
             .lazer = 0,
             .mods = @intCast(sender.mods),
-            .max_combo = meta.object_count,
+            .max_combo = std.math.maxInt(u32),
             .n_geki = if (sender.mode == 3) total_hits else 0,
             .n_katu = 0,
             .n300 = n300,
@@ -735,7 +735,20 @@ fn handleWith(allocator: std.mem.Allocator, store: *storage.Store, sender: *sess
     const n300_f: f64 = @max(0, @as(f64, @floatFromInt(total_hits)) * (3.0 * acc - 1.0) / 2.0);
     const n300: u32 = @intFromFloat(@min(@as(f64, @floatFromInt(total_hits)), std.math.round(n300_f)));
     const n100: u32 = total_hits -| n300;
-    const max_combo_f: f64 = @as(f64, @floatFromInt(meta.object_count)) * combo_pct / 100.0;
+    const full_combo = try pp.calculate(map_file, .{
+        .mode = sender.mode,
+        .lazer = 0,
+        .mods = @intCast(mods),
+        .max_combo = std.math.maxInt(u32),
+        .n_geki = if (sender.mode == 3) total_hits else 0,
+        .n_katu = 0,
+        .n300 = if (sender.mode == 3) 0 else total_hits,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    });
+    const max_combo_f: f64 = @as(f64, @floatFromInt(full_combo.max_combo)) * combo_pct / 100.0;
     const max_combo: u32 = @intFromFloat(std.math.round(max_combo_f));
 
     const result = pp.calculate(map_file, .{

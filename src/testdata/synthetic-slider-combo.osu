@@ -1,0 +1,29 @@
+osu file format v14
+
+[General]
+AudioFilename: synthetic.mp3
+Mode: 0
+
+[Metadata]
+Title:Zigcho Slider Combo Fixture
+Artist:Zigcho
+Creator:Ari
+Version:Combo
+BeatmapID:900000041
+BeatmapSetID:900000040
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+OverallDifficulty:8
+ApproachRate:9
+SliderMultiplier:1.4
+SliderTickRate:1
+
+[TimingPoints]
+0,500,4,2,1,60,1,0
+
+[HitObjects]
+64,192,1000,1,0,0:0:0:0:
+128,192,1500,2,0,B|384:192,2,280
+256,192,5000,8,0,6000

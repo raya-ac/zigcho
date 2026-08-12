@@ -69,7 +69,8 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
 expect_status "$code" 201 register_social_friend
 social_friend_id=$(jq -er '.id' "$response")
 
-sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; INSERT INTO friends(user_id,friend_id) VALUES($social_player_id,$social_friend_id); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id);"
+sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; UPDATE users SET privileges=privileges|(1<<4) WHERE id=$social_player_id; INSERT INTO friends(user_id,friend_id) VALUES($social_player_id,$social_friend_id); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10),(9002,9002,'90029002900290029002900290029002','ranked artist','ranked title','ranked diff','ranked mapper',3,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id); INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,checksum,rank_namespace,best,time_elapsed) VALUES($social_player_id,'90029002900290029002900290029002',0,8,1000000,20,1,10,10,0,0,0,0,0,1,1,'smoke-score-checksum','vanilla',1,12000); INSERT INTO direct_messages(from_id,to_id,message) VALUES($social_friend_id,$social_player_id,'offline smoke hello'); INSERT INTO beatmap_archives(set_id,sha256,osz_file) VALUES(9002,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',x'6f737a20736d6f6b65');"
+score_id=$(sqlite3 "$database" "SELECT id FROM scores WHERE checksum='smoke-score-checksum'")
 
 stable_login_body="social player
 00000000000000000000000000000000
@@ -78,6 +79,7 @@ code=$(curl --silent --show-error --dump-header "$headers" --output "$response" 
   --header 'User-Agent: osu!' --header 'CF-IPCountry: AU' --data-binary "$stable_login_body")
 expect_status "$code" 200 stable_social_login
 grep -qi '^osu-token: [0-9a-f]\{64\}' "$headers" || fail missing_stable_token
+grep -aFq 'offline smoke hello' "$response" || fail missing_offline_mail_on_login
 [ "$(sqlite3 "$database" "SELECT country FROM users WHERE id=$social_player_id")" = AU ] || fail trusted_proxy_country_not_saved
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-getfriends.php" \
@@ -105,6 +107,63 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
   --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000')
 expect_status "$code" 200 stable_get_favourites
 grep -qx '9001' "$response" || fail missing_favourite
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST \
+  "$origin/web/osu-getbeatmapinfo.php?u=social%20player&h=00000000000000000000000000000000" \
+  --data '{"Filenames":["ranked artist - ranked title (ranked mapper) [ranked diff].osu"],"Ids":[]}')
+expect_status "$code" 200 stable_get_beatmap_info
+grep -qx '0|9002|9002|90029002900290029002900290029002|1|XH|N|N|N' "$response" || fail invalid_stable_beatmap_info
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/web/osu-comment.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'p=00000000000000000000000000000000' --data-urlencode 'b=9002' \
+  --data-urlencode 's=9002' --data-urlencode "r=$score_id" --data-urlencode 'm=0' --data-urlencode 'a=post' \
+  --data-urlencode 'target=song' --data-urlencode 'starttime=nan' --data-urlencode 'comment=must not be stored')
+expect_status "$code" 400 stable_comment_reject_non_finite_time
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/web/osu-comment.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'p=00000000000000000000000000000000' --data-urlencode 'b=9002' \
+  --data-urlencode 's=9002' --data-urlencode "r=$score_id" --data-urlencode 'm=0' --data-urlencode 'a=post' \
+  --data-urlencode 'target=song' --data-urlencode 'f=ff66aa' --data-urlencode 'starttime=12.5' --data-urlencode 'comment=stable smoke comment')
+expect_status "$code" 200 stable_comment_post
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/web/osu-comment.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'p=00000000000000000000000000000000' --data-urlencode 'b=9002' \
+  --data-urlencode 's=9002' --data-urlencode "r=$score_id" --data-urlencode 'm=0' --data-urlencode 'a=get')
+expect_status "$code" 200 stable_comment_get
+grep -qx '12.5.song.supporter|ff66aa.stable smoke comment' "$response" || fail invalid_stable_comment_response
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-markasread.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000' --data-urlencode 'channel=social friend')
+expect_status "$code" 200 stable_mark_mail_read
+[ "$(sqlite3 "$database" "SELECT read FROM direct_messages WHERE to_id=$social_player_id AND from_id=$social_friend_id")" = 1 ] || fail mail_not_marked_read
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/p/doyoureallywanttoaskpeppy")
+expect_status "$code" 200 stable_peppy_dm_guard
+grep -Fq 'blocked from being messaged' "$response" || fail invalid_peppy_dm_guard
+
+code=$(curl --silent --show-error --dump-header "$headers" --output "$response" --write-out '%{http_code}' --request POST "$origin/difficulty-rating" --data '')
+expect_status "$code" 307 stable_difficulty_redirect
+grep -qi '^location: https://osu.ppy.sh/difficulty-rating' "$headers" || fail invalid_difficulty_redirect
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/bancho_connect.php" --data-urlencode 'v=b20260811')
+expect_status "$code" 200 stable_bancho_connect
+[ ! -s "$response" ] || fail bancho_connect_must_be_empty
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/check-updates.php" --data-urlencode 'action=check' --data-urlencode 'stream=stable')
+expect_status "$code" 200 stable_check_updates
+[ ! -s "$response" ] || fail check_updates_must_be_empty
+
+code=$(curl --silent --show-error --dump-header "$headers" --output "$response" --write-out '%{http_code}' "$origin/web/maps/example.osu")
+expect_status "$code" 301 stable_updated_map_redirect
+grep -qi '^location: https://osu.ppy.sh/web/maps/example.osu' "$headers" || fail invalid_updated_map_redirect
+
+code=$(curl --silent --show-error --dump-header "$headers" --output "$response" --write-out '%{http_code}' "$origin/beatmaps/9002" --header 'Host: osu.kai.ovh')
+expect_status "$code" 301 stable_beatmap_link_redirect
+grep -qi '^location: https://osu.ppy.sh/beatmaps/9002' "$headers" || fail invalid_beatmap_link_redirect
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/d/9002n")
+expect_status "$code" 200 stable_no_video_archive
+grep -qx 'osz smoke' "$response" || fail invalid_no_video_archive
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/appeals" \
   --header 'Origin: https://evil.test' --data-urlencode 'username=restricted' --data-urlencode 'password=StablePass123!' \

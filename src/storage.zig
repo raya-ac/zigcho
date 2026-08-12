@@ -125,6 +125,7 @@ pub const Store = struct {
         }
         if (version < 18) try self.exec(@embedFile("migration_018.sql"));
         if (version < 19) try self.exec(@embedFile("migration_019.sql"));
+        if (version < 20) try self.exec(@embedFile("migration_020.sql"));
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -559,6 +560,202 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 2, set_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         return c.sqlite3_changes(self.db) != 0;
+    }
+
+    pub const StableBeatmapInfo = struct {
+        id: i32,
+        set_id: i32,
+        md5: [32]u8,
+        status: i32,
+        grades: [4][]const u8,
+    };
+
+    pub fn stableGrade(mode: u8, mods: i32, accuracy: f64, n300: i32, n100: i32, n50: i32, nmiss: i32) []const u8 {
+        const hidden = mods & ((1 << 3) | (1 << 10)) != 0;
+        const base: []const u8 = switch (mode) {
+            0 => standard: {
+                const total = n300 + n100 + n50 + nmiss;
+                if (total <= 0) break :standard "N";
+                const ratio_300 = @as(f64, @floatFromInt(n300)) / @as(f64, @floatFromInt(total));
+                const ratio_50 = @as(f64, @floatFromInt(n50)) / @as(f64, @floatFromInt(total));
+                if (n100 == 0 and n50 == 0 and nmiss == 0) break :standard "X";
+                if (ratio_300 > 0.9 and ratio_50 <= 0.01 and nmiss == 0) break :standard "S";
+                if ((ratio_300 > 0.8 and nmiss == 0) or ratio_300 > 0.9) break :standard "A";
+                if ((ratio_300 > 0.7 and nmiss == 0) or ratio_300 > 0.8) break :standard "B";
+                if (ratio_300 > 0.6) break :standard "C";
+                break :standard "D";
+            },
+            1 => taiko: {
+                const total = n300 + n100 + nmiss;
+                if (total <= 0) break :taiko "N";
+                const ratio_300 = @as(f64, @floatFromInt(n300)) / @as(f64, @floatFromInt(total));
+                if (n100 == 0 and nmiss == 0) break :taiko "X";
+                if (ratio_300 > 0.9 and nmiss == 0) break :taiko "S";
+                if ((ratio_300 > 0.8 and nmiss == 0) or ratio_300 > 0.9) break :taiko "A";
+                if ((ratio_300 > 0.7 and nmiss == 0) or ratio_300 > 0.8) break :taiko "B";
+                if (ratio_300 > 0.6) break :taiko "C";
+                break :taiko "D";
+            },
+            2 => if (accuracy >= 1.0) "X" else if (accuracy > 0.98) "S" else if (accuracy > 0.94) "A" else if (accuracy > 0.90) "B" else if (accuracy > 0.85) "C" else "D",
+            3 => if (accuracy >= 1.0) "X" else if (accuracy > 0.95) "S" else if (accuracy > 0.9) "A" else if (accuracy > 0.8) "B" else if (accuracy > 0.7) "C" else "D",
+            else => "N",
+        };
+        if (!hidden) return base;
+        if (std.mem.eql(u8, base, "X")) return "XH";
+        if (std.mem.eql(u8, base, "S")) return "SH";
+        return base;
+    }
+
+    fn stableBeatmapInfoLocked(self: *Store, user_id: i32, field: []const u8, by_id: bool) !?StableBeatmapInfo {
+        const sql = if (by_id)
+            "SELECT id,set_id,md5,status FROM beatmaps WHERE id=CAST(?1 AS INTEGER)"
+        else
+            "SELECT id,set_id,md5,status FROM beatmaps WHERE artist || ' - ' || title || ' (' || creator || ') [' || version || '].osu'=?1";
+        var map_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &map_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(map_stmt);
+        _ = c.sqlite3_bind_text(map_stmt, 1, field.ptr, @intCast(field.len), null);
+        if (c.sqlite3_step(map_stmt) != c.SQLITE_ROW) return null;
+        const md5_text = std.mem.span(c.sqlite3_column_text(map_stmt, 2));
+        if (md5_text.len != 32) return error.InvalidBeatmapChecksum;
+        var info: StableBeatmapInfo = .{
+            .id = c.sqlite3_column_int(map_stmt, 0),
+            .set_id = c.sqlite3_column_int(map_stmt, 1),
+            .md5 = undefined,
+            .status = switch (stableStatus(c.sqlite3_column_int(map_stmt, 3))) {
+                0 => 0,
+                2 => 1,
+                3 => 2,
+                4 => 3,
+                5 => 4,
+                else => 0,
+            },
+            .grades = .{ "N", "N", "N", "N" },
+        };
+        @memcpy(&info.md5, md5_text);
+        var score_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT mode,mods,accuracy,n300,n100,n50,nmiss FROM scores WHERE user_id=?1 AND map_md5=?2 AND rank_namespace='vanilla' AND passed=1 AND best=1 AND mode BETWEEN 0 AND 3", -1, &score_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(score_stmt);
+        _ = c.sqlite3_bind_int(score_stmt, 1, user_id);
+        _ = c.sqlite3_bind_text(score_stmt, 2, info.md5[0..].ptr, info.md5.len, null);
+        while (c.sqlite3_step(score_stmt) == c.SQLITE_ROW) {
+            const mode: u8 = @intCast(c.sqlite3_column_int(score_stmt, 0));
+            info.grades[mode] = stableGrade(mode, c.sqlite3_column_int(score_stmt, 1), c.sqlite3_column_double(score_stmt, 2), c.sqlite3_column_int(score_stmt, 3), c.sqlite3_column_int(score_stmt, 4), c.sqlite3_column_int(score_stmt, 5), c.sqlite3_column_int(score_stmt, 6));
+        }
+        return info;
+    }
+
+    pub fn stableBeatmapInfoByFilename(self: *Store, user_id: i32, filename: []const u8) !?StableBeatmapInfo {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.stableBeatmapInfoLocked(user_id, filename, false);
+    }
+
+    pub fn stableBeatmapInfoById(self: *Store, user_id: i32, map_id: i32) !?StableBeatmapInfo {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{map_id});
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.stableBeatmapInfoLocked(user_id, id, true);
+    }
+
+    pub fn addBeatmapComment(self: *Store, user_id: i32, target_type: []const u8, target_id: i64, time: f64, comment: []const u8, colour: ?[]const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO beatmap_comments(target_id,target_type,user_id,time,comment,colour) VALUES(?1,?2,?3,?4,?5,?6)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, target_id);
+        _ = c.sqlite3_bind_text(stmt, 2, target_type.ptr, @intCast(target_type.len), null);
+        _ = c.sqlite3_bind_int(stmt, 3, user_id);
+        _ = c.sqlite3_bind_double(stmt, 4, time);
+        _ = c.sqlite3_bind_text(stmt, 5, comment.ptr, @intCast(comment.len), null);
+        if (colour) |value| _ = c.sqlite3_bind_text(stmt, 6, value.ptr, @intCast(value.len), null) else _ = c.sqlite3_bind_null(stmt, 6);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn beatmapComments(self: *Store, allocator: std.mem.Allocator, score_id: i64, set_id: i32, map_id: i32) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT c.time,c.target_type,u.privileges,c.colour,c.comment FROM beatmap_comments c JOIN users u ON u.id=c.user_id WHERE (c.target_type='replay' AND c.target_id=?1) OR (c.target_type='song' AND c.target_id=?2) OR (c.target_type='map' AND c.target_id=?3) ORDER BY c.id LIMIT 1000";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, score_id);
+        _ = c.sqlite3_bind_int(stmt, 2, set_id);
+        _ = c.sqlite3_bind_int(stmt, 3, map_id);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte('\n');
+            first = false;
+            const privileges: u32 = @intCast(c.sqlite3_column_int64(stmt, 2));
+            const format = if (privileges & (1 << 11) != 0) "bat" else if (privileges & (1 << 4) != 0) "supporter" else "";
+            const colour = if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) "" else std.mem.span(c.sqlite3_column_text(stmt, 3));
+            try output.writer.print("{d}\t{s}\t{s}", .{ c.sqlite3_column_double(stmt, 0), std.mem.span(c.sqlite3_column_text(stmt, 1)), format });
+            if (colour.len != 0) try output.writer.print("|{s}", .{colour});
+            try output.writer.print("\t{s}", .{std.mem.span(c.sqlite3_column_text(stmt, 4))});
+        }
+        return output.toOwnedSlice();
+    }
+
+    pub const DirectMessage = struct {
+        id: i64,
+        from_id: i32,
+        from_name: []u8,
+        message: []u8,
+
+        pub fn deinit(self: *DirectMessage, allocator: std.mem.Allocator) void {
+            allocator.free(self.from_name);
+            allocator.free(self.message);
+            self.* = undefined;
+        }
+    };
+
+    pub fn storeDirectMessage(self: *Store, from_id: i32, to_id: i32, message: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, from_id);
+        _ = c.sqlite3_bind_int(stmt, 2, to_id);
+        _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn unreadDirectMessages(self: *Store, allocator: std.mem.Allocator, to_id: i32) ![]DirectMessage {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT d.id,d.from_id,u.name,d.message FROM direct_messages d JOIN users u ON u.id=d.from_id WHERE d.to_id=?1 AND d.read=0 ORDER BY d.created_at,d.id LIMIT 1000", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, to_id);
+        var messages: std.ArrayList(DirectMessage) = .empty;
+        errdefer {
+            for (messages.items) |*message| message.deinit(allocator);
+            messages.deinit(allocator);
+        }
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const from_name = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+            errdefer allocator.free(from_name);
+            const message = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+            errdefer allocator.free(message);
+            try messages.append(allocator, .{ .id = c.sqlite3_column_int64(stmt, 0), .from_id = c.sqlite3_column_int(stmt, 1), .from_name = from_name, .message = message });
+        }
+        return messages.toOwnedSlice(allocator);
+    }
+
+    pub fn markDirectMessagesRead(self: *Store, to_id: i32, from_id: i32) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE direct_messages SET read=1 WHERE to_id=?1 AND from_id=?2 AND read=0", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, to_id);
+        _ = c.sqlite3_bind_int(stmt, 2, from_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
     pub fn recordPublicMessage(self: *Store, sender_id: i32, target: []const u8, message: []const u8) !void {

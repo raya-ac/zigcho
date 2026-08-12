@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 19;
+const required_sqlite_version = 20;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -55,6 +55,15 @@ const score_pins = [_]Column{
 const friends = [_]Column{ .{ .name = "user_id", .kind = .integer }, .{ .name = "friend_id", .kind = .integer } };
 const favourites = [_]Column{ .{ .name = "user_id", .kind = .integer }, .{ .name = "set_id", .kind = .integer }, .{ .name = "created_at", .kind = .integer } };
 const ratings = [_]Column{ .{ .name = "user_id", .kind = .integer }, .{ .name = "map_md5", .kind = .text }, .{ .name = "rating", .kind = .integer }, .{ .name = "created_at", .kind = .integer } };
+const beatmap_comments = [_]Column{
+    .{ .name = "id", .kind = .integer },      .{ .name = "target_id", .kind = .integer },  .{ .name = "target_type", .kind = .text },
+    .{ .name = "user_id", .kind = .integer }, .{ .name = "time", .kind = .real },          .{ .name = "comment", .kind = .text },
+    .{ .name = "colour", .kind = .text },     .{ .name = "created_at", .kind = .integer },
+};
+const direct_messages = [_]Column{
+    .{ .name = "id", .kind = .integer },   .{ .name = "from_id", .kind = .integer }, .{ .name = "to_id", .kind = .integer },
+    .{ .name = "message", .kind = .text }, .{ .name = "read", .kind = .boolean },    .{ .name = "created_at", .kind = .integer },
+};
 const audit_log = [_]Column{
     .{ .name = "id", .kind = .integer },  .{ .name = "actor_id", .kind = .integer }, .{ .name = "action", .kind = .text },
     .{ .name = "target", .kind = .text }, .{ .name = "detail", .kind = .text },      .{ .name = "created_at", .kind = .integer },
@@ -135,6 +144,8 @@ const tables = [_]Table{
     .{ .name = "friends", .columns = &friends },
     .{ .name = "favourites", .columns = &favourites },
     .{ .name = "ratings", .columns = &ratings },
+    .{ .name = "beatmap_comments", .columns = &beatmap_comments, .identity = true },
+    .{ .name = "direct_messages", .columns = &direct_messages, .identity = true },
     .{ .name = "audit_log", .columns = &audit_log, .identity = true },
     .{ .name = "chat_messages", .columns = &chat_messages, .identity = true },
     .{ .name = "chat_channels", .columns = &chat_channels },
@@ -368,6 +379,12 @@ fn migrate(allocator: std.mem.Allocator, sqlite_path: [:0]const u8, conninfo: [:
     try postgres.exec(target, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     errdefer postgres.exec(target, "ROLLBACK") catch {};
     try postgres.exec(target, @embedFile("postgres_schema.sql"));
+    // The runtime schema is independently bootable, so it seeds kai, the RX
+    // mod, and the public channels. An imported v20 SQLite database already
+    // contains those canonical rows. Clear only the schema seeds before the
+    // all-table copy so the source remains authoritative and count parity is
+    // exact instead of relying on conflict-specific merge behavior.
+    try postgres.exec(target, "DELETE FROM zigcho.stats; DELETE FROM zigcho.users; DELETE FROM zigcho.custom_mods; DELETE FROM zigcho.chat_channels");
     for (tables) |table| {
         const copied = try copyTable(allocator, source, target, table);
         std.debug.print("  {s}: {d}\n", .{ table.name, copied });
@@ -399,7 +416,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 23), tables.len);
+    try std.testing.expectEqual(@as(usize, 25), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("beatmap_media", tables[tables.len - 1].name);
 }

@@ -213,7 +213,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
-        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php")) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
         return null;
     }
 
@@ -221,6 +221,7 @@ const App = struct {
         if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return 20 * 1024 * 1024;
+        if (std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php")) return 32 * 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-screenshot.php")) return screenshot.max_bytes + 256 * 1024;
         if (std.mem.eql(u8, path, "/")) return 1024 * 1024;
         return 64 * 1024;
@@ -705,7 +706,9 @@ const App = struct {
             }
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/d/")) {
-            const set_id = std.fmt.parseInt(i32, path[3..], 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const raw_set_id = path[3..];
+            const set_id_text = if (std.mem.endsWith(u8, raw_set_id, "n")) raw_set_id[0 .. raw_set_id.len - 1] else raw_set_id;
+            const set_id = std.fmt.parseInt(i32, set_id_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
             const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
             defer self.allocator.free(archive);
             var disposition_buf: [96]u8 = undefined;
@@ -881,8 +884,138 @@ const App = struct {
             };
             return respond(req, .ok, "application/octet-stream", result.body, &token_headers);
         }
-        if (std.mem.eql(u8, path, "/web/bancho_connect.php")) return respond(req, .ok, "text/plain", "ok", &.{});
-        if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "application/json", "{\"latest\":null}", &.{});
+        if (std.mem.eql(u8, path, "/p/doyoureallywanttoaskpeppy") and req.head.method == .GET) {
+            return respond(req, .ok, "text/plain", "This user's ID is usually peppy's (when on bancho), and is blocked from being messaged by the osu! client.", &.{});
+        }
+        if (std.mem.eql(u8, path, "/difficulty-rating") and req.head.method == .POST) {
+            return respond(req, .temporary_redirect, "text/plain", "", &.{.{ .name = "location", .value = "https://osu.ppy.sh/difficulty-rating" }});
+        }
+        if (std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") and req.head.method == .POST) {
+            const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "h") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer freeUser(self.allocator, user);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "", &.{});
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return respond(req, .bad_request, "text/plain", "", &.{});
+            const filenames_value = parsed.value.object.get("Filenames") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const ids_value = parsed.value.object.get("Ids") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            if (filenames_value != .array or ids_value != .array or filenames_value.array.items.len + ids_value.array.items.len > 65_536) return respond(req, .bad_request, "text/plain", "", &.{});
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            var response_count: usize = 0;
+            for (filenames_value.array.items, 0..) |item, index| {
+                if (item != .string or item.string.len == 0 or item.string.len > 512 or std.mem.indexOfScalar(u8, item.string, 0) != null) return respond(req, .bad_request, "text/plain", "", &.{});
+                const info = (try self.store.stableBeatmapInfoByFilename(user.id, item.string)) orelse continue;
+                if (response_count != 0) try output.writer.writeByte('\n');
+                response_count += 1;
+                try output.writer.print("{d}|{d}|{d}|{s}|{d}|{s}|{s}|{s}|{s}", .{ index, info.id, info.set_id, &info.md5, info.status, info.grades[0], info.grades[1], info.grades[2], info.grades[3] });
+            }
+            for (ids_value.array.items, 0..) |item, offset| {
+                if (item != .integer or item.integer <= 0 or item.integer > std.math.maxInt(i32)) return respond(req, .bad_request, "text/plain", "", &.{});
+                const info = (try self.store.stableBeatmapInfoById(user.id, @intCast(item.integer))) orelse continue;
+                if (response_count != 0) try output.writer.writeByte('\n');
+                response_count += 1;
+                try output.writer.print("{d}|{d}|{d}|{s}|{d}|{s}|{s}|{s}|{s}", .{ filenames_value.array.items.len + offset, info.id, info.set_id, &info.md5, info.status, info.grades[0], info.grades[1], info.grades[2], info.grades[3] });
+            }
+            return respond(req, .ok, "text/plain", output.written(), &.{});
+        }
+        if (std.mem.eql(u8, path, "/web/osu-comment.php") and req.head.method == .POST) {
+            const encoded_name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"u"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(encoded_name);
+            const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"p"})) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(password);
+            const user = (try self.store.authenticate(self.allocator, encoded_name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer freeUser(self.allocator, user);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "", &.{});
+            const map_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"b"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(map_text);
+            const set_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"s"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(set_text);
+            const score_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"r"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(score_text);
+            const mode_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"m"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(mode_text);
+            const action = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"a"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(action);
+            const map_id = std.fmt.parseInt(i32, map_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const set_id = std.fmt.parseInt(i32, set_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const score_id = std.fmt.parseInt(i64, score_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const mode = std.fmt.parseInt(u8, mode_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            if (map_id < 0 or set_id < 0 or score_id < 0 or mode > 3) return respond(req, .bad_request, "text/plain", "", &.{});
+            if (std.mem.eql(u8, action, "get")) {
+                const comments = try self.store.beatmapComments(self.allocator, score_id, set_id, map_id);
+                defer self.allocator.free(comments);
+                return respond(req, .ok, "text/plain", comments, &.{});
+            }
+            if (!std.mem.eql(u8, action, "post")) return respond(req, .bad_request, "text/plain", "", &.{});
+            const target_type = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"target"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(target_type);
+            const time_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"starttime"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(time_text);
+            const comment_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comment"})) orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            defer self.allocator.free(comment_owned);
+            const colour_owned = try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"f"});
+            defer if (colour_owned) |value| self.allocator.free(value);
+            if (!std.mem.eql(u8, target_type, "song") and !std.mem.eql(u8, target_type, "map") and !std.mem.eql(u8, target_type, "replay")) return respond(req, .bad_request, "text/plain", "", &.{});
+            const start_time = std.fmt.parseFloat(f64, time_text) catch return respond(req, .bad_request, "text/plain", "", &.{});
+            const comment = std.mem.trim(u8, comment_owned, " \t\r\n");
+            if (!std.math.isFinite(start_time) or start_time < 0 or start_time > 1_000_000_000 or comment.len == 0 or comment.len > 80 or !std.unicode.utf8ValidateSlice(comment) or std.mem.indexOfAny(u8, comment, "\r\n\t") != null) return respond(req, .bad_request, "text/plain", "", &.{});
+            var colour: ?[]const u8 = null;
+            if (colour_owned) |value| {
+                if (value.len != 6) return respond(req, .bad_request, "text/plain", "", &.{});
+                for (value) |char| if (!std.ascii.isHex(char)) return respond(req, .bad_request, "text/plain", "", &.{});
+                if (user.privileges & (1 << 4) != 0) colour = value;
+            }
+            const target_id: i64 = if (std.mem.eql(u8, target_type, "song")) set_id else if (std.mem.eql(u8, target_type, "map")) map_id else score_id;
+            try self.store.addBeatmapComment(user.id, target_type, target_id, start_time, comment, colour);
+            return respond(req, .ok, "text/plain", "", &.{});
+        }
+        if (std.mem.eql(u8, path, "/web/osu-markasread.php") and req.head.method == .GET) {
+            const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "h") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const encoded_channel = queryField(target, "channel") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer freeUser(self.allocator, user);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "", &.{});
+            const channel_buf = try self.allocator.dupe(u8, encoded_channel);
+            defer self.allocator.free(channel_buf);
+            for (channel_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const channel = std.Uri.percentDecodeInPlace(channel_buf);
+            if (channel.len > 32 or std.mem.indexOfScalar(u8, channel, 0) != null) return respond(req, .bad_request, "text/plain", "", &.{});
+            if (channel.len != 0) if (try self.store.userByName(self.allocator, channel)) |other| {
+                defer freeUser(self.allocator, other);
+                try self.store.markDirectMessagesRead(user.id, other.id);
+            };
+            return respond(req, .ok, "text/plain", "", &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/web/maps/") and path.len > "/web/maps/".len) {
+            const location = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh{s}", .{raw_path});
+            defer self.allocator.free(location);
+            return respond(req, .moved_permanently, "text/plain", "", &.{.{ .name = "location", .value = location }});
+        }
+        if (req.head.method == .GET and web_auth.protocolHost(host_owned) and (std.mem.startsWith(u8, path, "/beatmaps/") or std.mem.startsWith(u8, path, "/community/forums/topics/") or (std.mem.startsWith(u8, path, "/beatmapsets/") and std.mem.endsWith(u8, path, "/discussion")))) {
+            const location = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh{s}", .{raw_path});
+            defer self.allocator.free(location);
+            return respond(req, .moved_permanently, "text/plain", "", &.{.{ .name = "location", .value = location }});
+        }
+        if (std.mem.eql(u8, path, "/web/bancho_connect.php")) return respond(req, .ok, "text/plain", "", &.{});
+        if (std.mem.eql(u8, path, "/web/check-updates.php")) return respond(req, .ok, "text/plain", "", &.{});
         if (std.mem.eql(u8, path, "/web/lastfm.php") and req.head.method == .GET) {
             const action = queryField(target, "action") orelse return respond(req, .bad_request, "text/plain", "", &.{});
             if (!std.mem.eql(u8, action, "np") and !std.mem.eql(u8, action, "scrobble")) return respond(req, .bad_request, "text/plain", "", &.{});
@@ -1279,7 +1412,7 @@ fn serveConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) void 
 
 fn recalcAllScores(allocator: std.mem.Allocator, store: *sqlite_storage.Store) !void {
     const c = sqlite_storage.c;
-    std.debug.print("recalculating all scores with akatsuki-pp...\n", .{});
+    std.debug.print("recalculating all scores with zigcho pp {s}...\n", .{pp.engine_version});
     const scores_sql = "SELECT id,user_id,map_md5,mode,mods,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,score FROM scores WHERE passed=1";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(store.db, scores_sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;

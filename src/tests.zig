@@ -328,6 +328,23 @@ fn loginAllocationRun(allocator: std.mem.Allocator, context: *LoginAllocationCon
     try std.testing.expectEqual(@as(usize, 64), result.token.len);
 }
 
+fn ppAllocationRun(allocator: std.mem.Allocator, _: void) !void {
+    const result = try pp.calculateWithAllocator(allocator, @embedFile("testdata/synthetic-standard.osu"), .{
+        .mode = 0,
+        .lazer = 0,
+        .mods = 0,
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    });
+    try std.testing.expectApproxEqAbs(@as(f64, 26.895763), result.pp, 0.0001);
+}
+
 const AuthStressContext = struct {
     store: *storage.Store,
     failed: *std.atomic.Value(bool),
@@ -557,7 +574,9 @@ test "login ownership cleans every induced allocation failure" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
-    _ = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    const ari_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    const sender_id = try store.register("mail sender", "sender@example.invalid", "11111111111111111111111111111111");
+    try store.storeDirectMessage(sender_id, ari_id, "allocation owned mail");
     var context: LoginAllocationContext = .{ .store = &store, .body = ari_stable_login };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, loginAllocationRun, .{&context});
 }
@@ -852,6 +871,114 @@ test "beatmap statuses use each client protocol's values" {
     try std.testing.expectEqualStrings("approved", storage.Store.lazerStatus(4));
     try std.testing.expectEqualStrings("qualified", storage.Store.lazerStatus(5));
     try std.testing.expectEqualStrings("loved", storage.Store.lazerStatus(6));
+}
+
+test "stable beatmap grades keep each ruleset's exact boundaries" {
+    try std.testing.expectEqualStrings("S", storage.Store.stableGrade(0, 0, 0, 91, 8, 1, 0));
+    try std.testing.expectEqualStrings("A", storage.Store.stableGrade(0, 0, 0, 90, 9, 1, 0));
+    try std.testing.expectEqualStrings("S", storage.Store.stableGrade(1, 0, 0.95, 91, 9, 0, 0));
+    try std.testing.expectEqualStrings("A", storage.Store.stableGrade(1, 0, 0.95, 90, 10, 0, 0));
+    try std.testing.expectEqualStrings("A", storage.Store.stableGrade(1, 0, 0.90, 91, 8, 0, 1));
+    try std.testing.expectEqualStrings("S", storage.Store.stableGrade(2, 0, 0.9801, 0, 0, 0, 0));
+    try std.testing.expectEqualStrings("A", storage.Store.stableGrade(2, 0, 0.98, 0, 0, 0, 0));
+    try std.testing.expectEqualStrings("B", storage.Store.stableGrade(2, 0, 0.94, 0, 0, 0, 0));
+    try std.testing.expectEqualStrings("C", storage.Store.stableGrade(2, 0, 0.90, 0, 0, 0, 0));
+    try std.testing.expectEqualStrings("D", storage.Store.stableGrade(2, 0, 0.85, 0, 0, 0, 0));
+    try std.testing.expectEqualStrings("S", storage.Store.stableGrade(3, 0, 0.9501, 0, 0, 0, 0));
+    try std.testing.expectEqualStrings("SH", storage.Store.stableGrade(3, 1 << 3, 0.9501, 0, 0, 0, 0));
+}
+
+test "stable beatmap info comments and direct mail keep the real client contract" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-web-contract.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const player_id = try store.register("stable player", "stable-player@example.invalid", "00000000000000000000000000000000");
+    const supporter_id = try store.register("map supporter", "map-supporter@example.invalid", "11111111111111111111111111111111");
+    try store.exec("UPDATE users SET privileges=privileges|(1<<4) WHERE safe_name='map_supporter'");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 6, 1.7931, 10, map);
+    const score: stable_score.Submission = .{
+        .map_md5 = &hash,
+        .username = "stable player",
+        .online_checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "XH",
+        .mods = 1 << 3,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260811000000",
+        .client_flags = "0",
+    };
+    _ = try store.insertStableScore(player_id, score, 26.8, "replay", 12_000);
+    const filename = try std.fmt.allocPrint(std.testing.allocator, "{s} - {s} ({s}) [{s}].osu", .{ metadata.artist, metadata.title, metadata.creator, metadata.version });
+    defer std.testing.allocator.free(filename);
+    const by_filename = (try store.stableBeatmapInfoByFilename(player_id, filename)).?;
+    try std.testing.expectEqual(metadata.id, by_filename.id);
+    try std.testing.expectEqual(@as(i32, 4), by_filename.status);
+    try std.testing.expectEqualStrings("XH", by_filename.grades[0]);
+    try std.testing.expectEqualStrings("N", by_filename.grades[1]);
+    const by_id = (try store.stableBeatmapInfoById(player_id, metadata.id)).?;
+    try std.testing.expectEqualSlices(u8, &hash, &by_id.md5);
+
+    try store.addBeatmapComment(supporter_id, "song", metadata.set_id, 12.5, "whole set comment", "ff66aa");
+    try store.addBeatmapComment(player_id, "map", metadata.id, 20, "map comment", null);
+    const comments = try store.beatmapComments(std.testing.allocator, 0, metadata.set_id, metadata.id);
+    defer std.testing.allocator.free(comments);
+    try std.testing.expect(std.mem.indexOf(u8, comments, "12.5\tsong\tsupporter|ff66aa\twhole set comment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, comments, "20\tmap\t\tmap comment") != null);
+
+    try store.storeDirectMessage(supporter_id, player_id, "offline hello");
+    const unread = try store.unreadDirectMessages(std.testing.allocator, player_id);
+    defer {
+        for (unread) |*message| message.deinit(std.testing.allocator);
+        std.testing.allocator.free(unread);
+    }
+    try std.testing.expectEqual(@as(usize, 1), unread.len);
+    try std.testing.expectEqualStrings("map supporter", unread[0].from_name);
+    try std.testing.expectEqualStrings("offline hello", unread[0].message);
+    try store.markDirectMessagesRead(player_id, supporter_id);
+    const read = try store.unreadDirectMessages(std.testing.allocator, player_id);
+    defer std.testing.allocator.free(read);
+    try std.testing.expectEqual(@as(usize, 0), read.len);
+}
+
+test "stable login replays unread private mail without marking it read" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-offline-mail.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const recipient = try store.register("mail target", "mail-target@example.invalid", "00000000000000000000000000000000");
+    const sender = try store.register("mail sender", "mail-sender@example.invalid", "11111111111111111111111111111111");
+    try store.storeDirectMessage(sender, recipient, "saved while you were away");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    var result = try bancho.login(std.testing.allocator, &store, &sessions, "mail target\n00000000000000000000000000000000\n" ++ stable_login_details, .{ 'A', 'U' }, 0, 0);
+    defer result.deinit();
+    try expectMessageText(result.body, "Unread messages");
+    try expectMessageContains(result.body, "saved while you were away");
+    const unread = try store.unreadDirectMessages(std.testing.allocator, recipient);
+    defer {
+        for (unread) |*message| message.deinit(std.testing.allocator);
+        std.testing.allocator.free(unread);
+    }
+    try std.testing.expectEqual(@as(usize, 1), unread.len);
 }
 
 test "stable score response reports the committed one based leaderboard rank" {
@@ -1587,6 +1714,16 @@ test "stable social packets enforce friend-only dms and away presence contracts"
     const target_message = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
     defer std.testing.allocator.free(target_message);
     try expectMessageText(target_message, "delivered once");
+    const delivered_unread = try store.unreadDirectMessages(std.testing.allocator, target.user.id);
+    defer {
+        for (delivered_unread) |*message| message.deinit(std.testing.allocator);
+        std.testing.allocator.free(delivered_unread);
+    }
+    try std.testing.expectEqual(@as(usize, 1), delivered_unread.len);
+    try store.markDirectMessagesRead(target.user.id, sender.user.id);
+    const delivered_read = try store.unreadDirectMessages(std.testing.allocator, target.user.id);
+    defer std.testing.allocator.free(delivered_read);
+    try std.testing.expectEqual(@as(usize, 0), delivered_read.len);
 
     const afk = try clientActionPacket(std.testing.allocator, 1);
     defer std.testing.allocator.free(afk);
@@ -3488,6 +3625,7 @@ test "stable performance fixtures lock every ruleset and common mod path" {
     const expected_hd = [_]f64{ 29.196351, 14.156509, 3.058956, 0.740225 };
     const expected_dt = [_]f64{ 56.075908, 19.565074, 3.316334, 0.616461 };
     const expected_stars = [_]f64{ 1.806515, 0.279849, 0.511245, 0.488839 };
+    const expected_max_combo = [_]u32{ 10, 10, 10, 20 };
     for (fixtures, 0..) |fixture, index| {
         const full_combo = try pp.calculate(fixture.map, .{
             .mode = fixture.mode,
@@ -3560,6 +3698,7 @@ test "stable performance fixtures lock every ruleset and common mod path" {
         try std.testing.expectApproxEqAbs(expected_hd[index], hidden.pp, 0.0001);
         try std.testing.expectApproxEqAbs(expected_dt[index], double_time.pp, 0.0001);
         try std.testing.expectApproxEqAbs(expected_stars[index], full_combo.stars, 0.0001);
+        try std.testing.expectEqual(expected_max_combo[index], full_combo.max_combo);
         try std.testing.expect(missed.pp < full_combo.pp);
     }
     try std.testing.expectEqual(@as(?u8, 0), stable_score.statsMode(0, 0));
@@ -3574,6 +3713,86 @@ test "stable performance fixtures lock every ruleset and common mod path" {
     try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(1, 8192));
     try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(2, 8192));
     try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(3, 8192));
+}
+
+test "native performance combo counts sliders spinners and converted objects" {
+    const map = @embedFile("testdata/synthetic-slider-combo.osu");
+    const expected = [_]u32{ 7, 1, 6, 33 };
+    for (expected, 0..) |max_combo, mode| {
+        const result = try pp.calculate(map, .{
+            .mode = @intCast(mode),
+            .lazer = 0,
+            .mods = 0,
+            .max_combo = max_combo,
+            .n_geki = if (mode == 3) 3 else 0,
+            .n_katu = 0,
+            .n300 = if (mode == 3) 0 else 3,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        try std.testing.expectEqual(max_combo, result.max_combo);
+        try std.testing.expect(std.math.isFinite(result.pp));
+        try std.testing.expect(std.math.isFinite(result.stars));
+    }
+}
+
+test "native stable performance fixtures lock relax and autopilot" {
+    const Fixture = struct { mode: u8, map: []const u8, mods: u32, expected_pp: f64, expected_stars: f64 };
+    const fixtures = [_]Fixture{
+        .{ .mode = 0, .map = @embedFile("testdata/synthetic-standard.osu"), .mods = 128, .expected_pp = 2.839156, .expected_stars = 1.572586 },
+        .{ .mode = 1, .map = @embedFile("testdata/synthetic-taiko.osu"), .mods = 128, .expected_pp = 13.168693, .expected_stars = 0.279849 },
+        .{ .mode = 2, .map = @embedFile("testdata/synthetic-catch.osu"), .mods = 128, .expected_pp = 2.549130, .expected_stars = 0.511245 },
+        .{ .mode = 0, .map = @embedFile("testdata/synthetic-standard.osu"), .mods = 8192, .expected_pp = 23.612298, .expected_stars = 0.718662 },
+    };
+    for (fixtures) |fixture| {
+        const result = try pp.calculate(fixture.map, .{
+            .mode = fixture.mode,
+            .lazer = 0,
+            .mods = fixture.mods,
+            .max_combo = 10,
+            .n_geki = 0,
+            .n_katu = 0,
+            .n300 = 10,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        try std.testing.expectApproxEqAbs(fixture.expected_pp, result.pp, 0.0001);
+        try std.testing.expectApproxEqAbs(fixture.expected_stars, result.stars, 0.0001);
+    }
+    try std.testing.expectError(error.UnsupportedModMode, pp.calculate(@embedFile("testdata/synthetic-mania.osu"), .{
+        .mode = 3,
+        .lazer = 0,
+        .mods = 128,
+        .max_combo = 10,
+        .n_geki = 10,
+        .n_katu = 0,
+        .n300 = 0,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    }));
+    try std.testing.expectError(error.UnsupportedModMode, pp.calculate(@embedFile("testdata/synthetic-taiko.osu"), .{
+        .mode = 1,
+        .lazer = 0,
+        .mods = 8192,
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    }));
+}
+
+test "native performance engine survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ppAllocationRun, .{{}});
 }
 
 test "beatmap metadata parser owns the import contract" {

@@ -43,6 +43,7 @@ pub const Store = struct {
     pub const ServerCounts = struct { users: i64, plays: i64, passed: i64, maps: i64 };
     pub const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
     pub const BeatmapInfo = sqlite_storage.Store.BeatmapInfo;
+    pub const BeatmapSelection = sqlite_storage.Store.BeatmapSelection;
     pub const BeatmapRating = sqlite_storage.Store.BeatmapRating;
     pub const PpSnapshot = sqlite_storage.Store.PpSnapshot;
     pub const directStatus = sqlite_storage.Store.directStatus;
@@ -86,7 +87,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -111,6 +112,16 @@ pub const Store = struct {
                     "CREATE UNIQUE INDEX moderation_appeals_one_open ON zigcho.moderation_appeals(user_id,kind) WHERE status='open';" ++
                     "CREATE INDEX moderation_appeals_queue ON zigcho.moderation_appeals(status,created_at,id);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(15);" ++
+                    "COMMIT",
+            );
+        }
+        if (version <= 15) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "CREATE TABLE zigcho.score_pins(user_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,score_id bigint NOT NULL UNIQUE REFERENCES zigcho.scores(id) ON DELETE CASCADE,pinned_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),PRIMARY KEY(user_id,score_id));" ++
+                    "CREATE INDEX score_pins_user_time ON zigcho.score_pins(user_id,pinned_at DESC,score_id DESC);" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(16);" ++
                     "COMMIT",
             );
         }
@@ -343,6 +354,60 @@ pub const Store = struct {
         defer result.deinit();
         if (result.rows() == 0) return null;
         return try postgres.decodeBytea(allocator, result.value(0, 0));
+    }
+
+    pub fn beatmapSelectionById(self: *Store, map_id: i32) !?BeatmapSelection {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{map_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT md5,mode FROM zigcho.beatmaps WHERE id=$1", &.{id});
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        const md5 = result.value(0, 0);
+        if (md5.len != 32) return error.InvalidBeatmap;
+        var selection: BeatmapSelection = .{ .md5 = undefined, .mode = try result.int(u8, 0, 1) };
+        @memcpy(&selection.md5, md5);
+        return selection;
+    }
+
+    pub fn setScorePinned(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, namespace: []const u8, pinned: bool) !i64 {
+        var user_buf: [24]u8 = undefined;
+        var mode_buf: [4]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var locked_user = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.users WHERE id=$1 FOR UPDATE", &.{user});
+        defer locked_user.deinit();
+        if (locked_user.rows() == 0) return error.UserNotFound;
+        var score = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.scores WHERE user_id=$1 AND map_md5=$2 AND mode=$3 AND rank_namespace=$4 AND passed ORDER BY best DESC,pp DESC,score DESC,id DESC LIMIT 1", &.{ user, map_md5, mode_text, namespace });
+        defer score.deinit();
+        if (score.rows() == 0) return error.NoPassedScore;
+        const score_id = try score.int(i64, 0, 0);
+        var score_buf: [24]u8 = undefined;
+        const score_text = try std.fmt.bufPrint(&score_buf, "{d}", .{score_id});
+        if (pinned) {
+            var old = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.score_pins p USING zigcho.scores s WHERE p.user_id=$1 AND p.score_id=s.id AND s.user_id=$1 AND s.map_md5=$2 AND s.mode=$3 AND s.rank_namespace=$4 AND p.score_id<>$5", &.{ user, map_md5, mode_text, namespace, score_text });
+            old.deinit();
+            var pins = try postgres.queryParams(self.allocator, lease.conn, "SELECT p.score_id FROM zigcho.score_pins p JOIN zigcho.scores s ON s.id=p.score_id WHERE p.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 FOR UPDATE OF p", &.{ user, mode_text, namespace });
+            defer pins.deinit();
+            var already_pinned = false;
+            for (0..pins.rows()) |row| if (try pins.int(i64, row, 0) == score_id) {
+                already_pinned = true;
+                break;
+            };
+            if (!already_pinned and pins.rows() >= 3) return error.TooManyPinnedScores;
+            var update = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.score_pins(user_id,score_id) VALUES($1,$2) ON CONFLICT(user_id,score_id) DO UPDATE SET pinned_at=extract(epoch FROM clock_timestamp())::bigint", &.{ user, score_text });
+            update.deinit();
+        } else {
+            var update = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.score_pins p USING zigcho.scores s WHERE p.user_id=$1 AND p.score_id=s.id AND s.user_id=$1 AND s.map_md5=$2 AND s.mode=$3 AND s.rank_namespace=$4", &.{ user, map_md5, mode_text, namespace });
+            update.deinit();
+        }
+        try postgres.exec(lease.conn, "COMMIT");
+        return score_id;
     }
 
     pub fn upsertBeatmapArchive(self: *Store, set_id: i32, sha256: []const u8, osz_file: []const u8) !void {
@@ -1376,6 +1441,23 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    fn writeSiteScores(writer: *std.Io.Writer, scores: *postgres.Result) !void {
+        try writer.writeByte('[');
+        for (0..scores.rows()) |row| {
+            if (row != 0) try writer.writeByte(',');
+            try writer.print("{{\"id\":{d},\"score\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"mode\":{d},\"namespace\":", .{ try scores.int(i64, row, 0), try scores.int(i64, row, 1), try scores.float(f64, row, 2), try scores.float(f64, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(u8, row, 6) });
+            try jsonString(writer, scores.value(row, 7));
+            try writer.print(",\"passed\":{},\"submitted_at\":{d},\"set_id\":{d},\"map_id\":{d},\"artist\":", .{ try scores.boolean(row, 8), try scores.int(i64, row, 9), try scores.int(i32, row, 10), try scores.int(i32, row, 11) });
+            try jsonString(writer, scores.value(row, 12));
+            try writer.writeAll(",\"title\":");
+            try jsonString(writer, scores.value(row, 13));
+            try writer.writeAll(",\"version\":");
+            try jsonString(writer, scores.value(row, 14));
+            try writer.print(",\"status\":{d}}}", .{try scores.int(i8, row, 15)});
+        }
+        try writer.writeByte(']');
+    }
+
     pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32, stats_mode: u8) !?[]u8 {
         var id_buf: [24]u8 = undefined;
         var score_mode_buf: [4]u8 = undefined;
@@ -1390,8 +1472,13 @@ pub const Store = struct {
         if (user.rows() == 0) return null;
         var stats = try postgres.queryParams(allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s WHERE s.user_id=$1 ORDER BY s.mode", &.{id});
         defer stats.deinit();
-        var scores = try postgres.queryParams(allocator, lease.conn, "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 ORDER BY s.id DESC LIMIT 20", &.{ id, score_mode_text, namespace });
-        defer scores.deinit();
+        const columns = "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 ";
+        var pinned = try postgres.queryParams(allocator, lease.conn, columns ++ "JOIN zigcho.score_pins p ON p.score_id=s.id AND p.user_id=s.user_id WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed ORDER BY p.pinned_at DESC,p.score_id DESC LIMIT 3", &.{ id, score_mode_text, namespace });
+        defer pinned.deinit();
+        var top = try postgres.queryParams(allocator, lease.conn, columns ++ "WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN (3,4) ORDER BY s.pp DESC,s.id ASC LIMIT 100", &.{ id, score_mode_text, namespace });
+        defer top.deinit();
+        var recent = try postgres.queryParams(allocator, lease.conn, columns ++ "WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 ORDER BY s.id DESC LIMIT 20", &.{ id, score_mode_text, namespace });
+        defer recent.deinit();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         try output.writer.print("{{\"id\":{d},\"name\":", .{try user.int(i32, 0, 0)});
@@ -1403,20 +1490,13 @@ pub const Store = struct {
             if (row != 0) try output.writer.writeByte(',');
             try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ try stats.int(u8, row, 0), try stats.int(i64, row, 1), try stats.int(i64, row, 2), try stats.int(i32, row, 3), try stats.int(i32, row, 4), try stats.int(i32, row, 5), try stats.int(i64, row, 6), try stats.float(f64, row, 7), try stats.int(i32, row, 8), try stats.int(i32, row, 9) });
         }
-        try output.writer.writeAll("],\"scores\":[");
-        for (0..scores.rows()) |row| {
-            if (row != 0) try output.writer.writeByte(',');
-            try output.writer.print("{{\"id\":{d},\"score\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"mode\":{d},\"namespace\":", .{ try scores.int(i64, row, 0), try scores.int(i64, row, 1), try scores.float(f64, row, 2), try scores.float(f64, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(u8, row, 6) });
-            try jsonString(&output.writer, scores.value(row, 7));
-            try output.writer.print(",\"passed\":{},\"submitted_at\":{d},\"set_id\":{d},\"map_id\":{d},\"artist\":", .{ try scores.boolean(row, 8), try scores.int(i64, row, 9), try scores.int(i32, row, 10), try scores.int(i32, row, 11) });
-            try jsonString(&output.writer, scores.value(row, 12));
-            try output.writer.writeAll(",\"title\":");
-            try jsonString(&output.writer, scores.value(row, 13));
-            try output.writer.writeAll(",\"version\":");
-            try jsonString(&output.writer, scores.value(row, 14));
-            try output.writer.print(",\"status\":{d}}}", .{try scores.int(i8, row, 15)});
-        }
-        try output.writer.writeAll("]}");
+        try output.writer.writeAll("],\"pinned_scores\":");
+        try writeSiteScores(&output.writer, &pinned);
+        try output.writer.writeAll(",\"top_scores\":");
+        try writeSiteScores(&output.writer, &top);
+        try output.writer.writeAll(",\"recent_scores\":");
+        try writeSiteScores(&output.writer, &recent);
+        try output.writer.writeByte('}');
         var list = output.toArrayList();
         return try list.toOwnedSlice(allocator);
     }
@@ -1683,21 +1763,22 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates staff workflow schema through fifteen" {
+test "postgres runtime migrates score pins through sixteen" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 15), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 16), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 4));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 5));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 6));
 }
 
 test "postgres account auth stats and token slice" {
@@ -1789,6 +1870,7 @@ test "postgres account auth stats and token slice" {
     const worse_placement = (try store.scoreLeaderboardPlacement(worse_id)).?;
     try std.testing.expect(!worse_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), worse_placement.rank);
+    try std.testing.expectEqual(score_id, try store.setScorePinned(user_id, score.map_md5, 0, "vanilla", true));
     const site_rankings = try store.siteRankings(std.testing.allocator, 0, 0);
     defer std.testing.allocator.free(site_rankings);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
@@ -1799,6 +1881,9 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"artist\":\"artist\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
     var relax = score;
     relax.online_checksum = "cccccccccccccccccccccccccccccccc";
     relax.total_score = 600_000;

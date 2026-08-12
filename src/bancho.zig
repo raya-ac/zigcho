@@ -812,9 +812,6 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             defer event.deinit();
             try stats(&event, store, session);
             try sessions.broadcast(event.bytes(), session);
-            if (session.action == 1 and session.map_md5[0] != 0) {
-                commands.handleNp(allocator, store, session) catch {};
-            }
         },
         .send_public_message, .send_private_message => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
@@ -835,12 +832,14 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             if (packet.id == .send_private_message) {
                 if (sessions.byName(target_name)) |target| {
                     if (target.is_bot) {
+                        if (try commands.handleNowPlaying(allocator, store, session, text)) continue;
                         if (try commands.handleCommand(allocator, store, sessions, session, text, session.user.name, &out) == .handled) continue;
-                        try protocol.writeMessage(&out, "kai", "try !help — i can do pp, stats, player commands, and staff tools", session.user.name, 3);
+                        try protocol.writeMessage(&out, "kai", "send /np here for pp, then use !with for a custom play", session.user.name, 3);
                         continue;
                     }
                 }
             }
+            _ = if (packet.id == .send_public_message) try commands.handleNowPlaying(allocator, store, session, text) else false;
             if (packet.id == .send_public_message and try handleMultiplayerCommandLocked(allocator, sessions, session, target_name, text)) continue;
             if (packet.id == .send_public_message and text[0] == '!' and !std.mem.eql(u8, target_name, multiplayer_channel) and !std.mem.eql(u8, target_name, "#spectator")) {
                 if (try commands.handleCommand(allocator, store, sessions, session, text, target_name, &out) == .handled) continue;

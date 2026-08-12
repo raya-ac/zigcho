@@ -3,6 +3,7 @@ set -eu
 
 backup_dir=${ZIGCHO_BACKUP_DIR:-/var/backups/zigcho}
 admin_url=${ZIGCHO_POSTGRES_ADMIN_URL:-dbname=postgres}
+expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-16}
 cd /
 
 case "$backup_dir" in
@@ -50,7 +51,7 @@ invalid_indexes=$(psql --dbname="$drill_db" --tuples-only --no-align --command="
 unvalidated_fks=$(psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT count(*) FROM pg_constraint WHERE contype='f' AND NOT convalidated")
 counts=$(psql --dbname="$drill_db" --tuples-only --no-align --field-separator=, --command="SELECT (SELECT count(*) FROM zigcho.users),(SELECT count(*) FROM zigcho.scores),(SELECT count(*) FROM zigcho.beatmaps),(SELECT count(*) FROM zigcho.audit_log)")
 
-if [ "$schema_version" != "15" ] || [ "$invalid_indexes" != "0" ] || [ "$unvalidated_fks" != "0" ]; then
+if [ "$schema_version" != "$expected_schema" ] || [ "$invalid_indexes" != "0" ] || [ "$unvalidated_fks" != "0" ]; then
   echo "restore_drill_failed schema=$schema_version invalid_indexes=$invalid_indexes unvalidated_fks=$unvalidated_fks" >&2
   exit 1
 fi

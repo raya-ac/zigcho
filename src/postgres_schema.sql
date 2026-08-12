@@ -97,6 +97,14 @@ CREATE INDEX scores_leaderboard ON scores(map_md5, mode, mods, pp DESC, score DE
 CREATE UNIQUE INDEX scores_checksum_unique ON scores(checksum) WHERE checksum IS NOT NULL;
 CREATE INDEX scores_stable_board ON scores(map_md5, mode, rank_namespace, best, score DESC);
 
+CREATE TABLE score_pins (
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    score_id bigint NOT NULL UNIQUE REFERENCES scores(id) ON DELETE CASCADE,
+    pinned_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY (user_id, score_id)
+);
+CREATE INDEX score_pins_user_time ON score_pins(user_id, pinned_at DESC, score_id DESC);
+
 CREATE TABLE friends (
     user_id integer REFERENCES users(id) ON DELETE CASCADE,
     friend_id integer REFERENCES users(id) ON DELETE CASCADE,
@@ -263,4 +271,4 @@ CREATE TABLE moderation_appeals (
 CREATE UNIQUE INDEX moderation_appeals_one_open ON moderation_appeals(user_id, kind) WHERE status='open';
 CREATE INDEX moderation_appeals_queue ON moderation_appeals(status, created_at, id);
 
-INSERT INTO schema_migrations(version) VALUES (15);
+INSERT INTO schema_migrations(version) VALUES (16);

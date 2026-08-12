@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 15;
+const required_sqlite_version = 16;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -48,6 +48,9 @@ const scores = [_]Column{
     .{ .name = "perfect", .kind = .boolean },      .{ .name = "passed", .kind = .boolean },       .{ .name = "replay", .kind = .blob },
     .{ .name = "submitted_at", .kind = .integer }, .{ .name = "checksum", .kind = .text },        .{ .name = "rank_namespace", .kind = .text },
     .{ .name = "best", .kind = .boolean },         .{ .name = "time_elapsed", .kind = .integer },
+};
+const score_pins = [_]Column{
+    .{ .name = "user_id", .kind = .integer }, .{ .name = "score_id", .kind = .integer }, .{ .name = "pinned_at", .kind = .integer },
 };
 const friends = [_]Column{ .{ .name = "user_id", .kind = .integer }, .{ .name = "friend_id", .kind = .integer } };
 const favourites = [_]Column{ .{ .name = "user_id", .kind = .integer }, .{ .name = "set_id", .kind = .integer }, .{ .name = "created_at", .kind = .integer } };
@@ -115,6 +118,7 @@ const tables = [_]Table{
     .{ .name = "stats", .columns = &stats },
     .{ .name = "beatmaps", .columns = &beatmaps },
     .{ .name = "scores", .columns = &scores, .identity = true },
+    .{ .name = "score_pins", .columns = &score_pins },
     .{ .name = "friends", .columns = &friends },
     .{ .name = "favourites", .columns = &favourites },
     .{ .name = "ratings", .columns = &ratings },
@@ -375,7 +379,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 19), tables.len);
+    try std.testing.expectEqual(@as(usize, 20), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("moderation_appeals", tables[tables.len - 1].name);
 }

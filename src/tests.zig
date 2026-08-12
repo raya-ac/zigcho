@@ -173,6 +173,18 @@ fn expectMessageText(data: []const u8, expected: []const u8) !void {
     return error.MissingPacket;
 }
 
+fn expectMessageContains(data: []const u8, expected: []const u8) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.send_message)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        _ = try payload.string();
+        const message = try payload.string();
+        if (std.mem.indexOf(u8, message, expected) != null) return;
+    }
+    return error.MissingPacket;
+}
+
 const LoginAllocationContext = struct {
     store: *storage.Store,
     body: []const u8,
@@ -784,6 +796,7 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     failed_score.perfect = false;
     failed_score.grade = "F";
     _ = try store.insertStableScore(requester, failed_score, 0, "", 8_000);
+    try std.testing.expectEqual(pending_score_id, try store.setScorePinned(requester, &hash, 0, "vanilla", true));
     const site_rankings = try store.siteRankings(std.testing.allocator, 0, 0);
     defer std.testing.allocator.free(site_rankings);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
@@ -797,11 +810,15 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_mode\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"namespace\":\"vanilla\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"scores\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
     const empty_autopilot_profile = (try store.siteProfile(std.testing.allocator, requester, 8)).?;
     defer std.testing.allocator.free(empty_autopilot_profile);
     try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"selected_mode\":8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"scores\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"pinned_scores\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"top_scores\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"recent_scores\":[]") != null);
     try std.testing.expect((try store.siteProfile(std.testing.allocator, 999_999, 0)) == null);
     const ranked_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
     defer std.testing.allocator.free(ranked_board);
@@ -817,6 +834,102 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     const pending_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
     defer std.testing.allocator.free(pending_board);
     try std.testing.expectEqualStrings("0|false", pending_board);
+}
+
+test "profile pins replace the selected map and keep three per stable score slice" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/profile-pins.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("pin player", "pin-player@example.invalid", "00000000000000000000000000000000");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const base_metadata = try beatmap.parse(map);
+    const hashes = [_][]const u8{
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+        "33333333333333333333333333333333",
+        "44444444444444444444444444444444",
+    };
+    const checksums = [_][]const u8{
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddd",
+    };
+    var score_ids: [4]i64 = undefined;
+    for (hashes, checksums, 0..) |hash, checksum, index| {
+        var metadata = base_metadata;
+        metadata.id = 910_000_001 + @as(i32, @intCast(index));
+        metadata.set_id = 910_000_000 + @as(i32, @intCast(index));
+        try store.upsertBeatmap(metadata, hash, 3, 1.8, 10, map);
+        const score: stable_score.Submission = .{
+            .map_md5 = hash,
+            .username = "pin player",
+            .online_checksum = checksum,
+            .n300 = 10,
+            .n100 = 0,
+            .n50 = 0,
+            .ngeki = 0,
+            .nkatu = 0,
+            .nmiss = 0,
+            .total_score = 1_000_000 + @as(i64, @intCast(index)),
+            .max_combo = 10,
+            .perfect = true,
+            .grade = "X",
+            .mods = 0,
+            .passed = true,
+            .mode = 0,
+            .client_time = "260812000000",
+            .client_flags = "0",
+        };
+        score_ids[index] = try store.insertStableScore(user_id, score, 10.0 + @as(f64, @floatFromInt(index)), "replay", 1_000);
+    }
+
+    for (hashes[0..3], score_ids[0..3]) |hash, score_id|
+        try std.testing.expectEqual(score_id, try store.setScorePinned(user_id, hash, 0, "vanilla", true));
+    try std.testing.expectError(error.TooManyPinnedScores, store.setScorePinned(user_id, hashes[3], 0, "vanilla", true));
+
+    const replacement: stable_score.Submission = .{
+        .map_md5 = hashes[0],
+        .username = "pin player",
+        .online_checksum = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 2_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260812000001",
+        .client_flags = "0",
+    };
+    const replacement_id = try store.insertStableScore(user_id, replacement, 99.0, "better replay", 1_000);
+    try std.testing.expectEqual(replacement_id, try store.setScorePinned(user_id, hashes[0], 0, "vanilla", true));
+    try std.testing.expectEqual(score_ids[1], try store.setScorePinned(user_id, hashes[1], 0, "vanilla", false));
+    try std.testing.expectEqual(score_ids[3], try store.setScorePinned(user_id, hashes[3], 0, "vanilla", true));
+
+    const profile = (try store.siteProfile(std.testing.allocator, user_id, 0)).?;
+    defer std.testing.allocator.free(profile);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, profile, .{});
+    defer parsed.deinit();
+    const pinned = parsed.value.object.get("pinned_scores").?.array.items;
+    const top = parsed.value.object.get("top_scores").?.array.items;
+    const recent = parsed.value.object.get("recent_scores").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), pinned.len);
+    try std.testing.expectEqual(@as(usize, 4), top.len);
+    try std.testing.expectEqual(@as(usize, 5), recent.len);
+    try std.testing.expectEqual(replacement_id, top[0].object.get("id").?.integer);
+    try std.testing.expectEqual(replacement_id, recent[0].object.get("id").?.integer);
+    for (pinned) |item| try std.testing.expect(item.object.get("id").?.integer != score_ids[0]);
 }
 
 test "staff web data keeps appeals and moderation actions auditable" {
@@ -1100,10 +1213,48 @@ test "joined public chat delivers once and kai answers private chat as user thre
     const bot_packet = (try bot_reader.next()).?;
     var bot_payload: protocol.PayloadReader = .{ .data = bot_packet.payload };
     try std.testing.expectEqualStrings("kai", try bot_payload.string());
-    try std.testing.expectEqualStrings("try !help — i can do pp, stats, player commands, and staff tools", try bot_payload.string());
+    try std.testing.expectEqualStrings("send /np here for pp, then use !with for a custom play", try bot_payload.string());
     try std.testing.expectEqualStrings("ari", try bot_payload.string());
     try std.testing.expectEqual(@as(i32, 3), try bot_payload.int(i32));
     try std.testing.expectEqual(@as(usize, 0), sessions.byUser(3).?.queue.items.len);
+}
+
+test "stable slash np selects the linked map and returns pp without a fake pp command" {
+    const commands = @import("commands.zig");
+    const modern = commands.parseNowPlaying("\x01ACTION is listening to [https://osu.ppy.sh/beatmapsets/900000000#osu/900000001 Zigcho - Zigcho Fixture [Tests]] +HD\x01").?;
+    try std.testing.expectEqual(@as(i32, 900000001), modern.beatmap_id);
+    try std.testing.expectEqual(@as(?u8, 0), modern.mode);
+    try std.testing.expectEqual(@as(?i32, 1 << 3), modern.mods);
+    const legacy = commands.parseNowPlaying("\x01ACTION is playing [https://osu.ppy.sh/b/900000001 Zigcho - Zigcho Fixture [Tests]]\x01").?;
+    try std.testing.expectEqual(@as(i32, 900000001), legacy.beatmap_id);
+    try std.testing.expect(commands.parseNowPlaying("!pp") == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/slash-np.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("np player", "np-player@example.invalid", "00000000000000000000000000000000");
+    const map = @embedFile("testdata/synthetic-standard.osu");
+    const metadata = try beatmap.parse(map);
+    const hash = beatmap.md5(map);
+    try store.upsertBeatmap(metadata, &hash, 3, 1.8, 10, map);
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot((try store.userById(std.testing.allocator, 3)).?);
+    const player = try sessions.create((try store.userById(std.testing.allocator, user_id)).?, 0, 0, 0);
+    const np = try clientMessagePacket(std.testing.allocator, .send_private_message, "np player", "\x01ACTION is listening to [https://osu.ppy.sh/beatmapsets/900000000#osu/900000001 Zigcho - Zigcho Fixture [Tests]]\x01", "kai", user_id);
+    defer std.testing.allocator.free(np);
+    const response = try bancho.poll(std.testing.allocator, &store, &sessions, player, np);
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqual(@as(i32, 900000001), player.map_id);
+    try std.testing.expectEqualSlices(u8, &hash, &player.map_md5);
+    const pp_reply = try bancho.poll(std.testing.allocator, &store, &sessions, player, "");
+    defer std.testing.allocator.free(pp_reply);
+    try expectMessageContains(pp_reply, "90%:");
+    try expectMessageContains(pp_reply, "100%:");
 }
 
 test "score announcements only reach players in announcement chat" {

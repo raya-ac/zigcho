@@ -35,22 +35,20 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
     const args = if (separator == body.len) "" else std.mem.trim(u8, body[separator + 1 ..], " \t");
 
     if (std.ascii.eqlIgnoreCase(cmd, "help") or std.ascii.eqlIgnoreCase(cmd, "h")) {
-        var message: []const u8 = "player: !help !roll [max] !online !stats [name] !np !with <mods acc% misses> !request !mapstate";
-        if (has(sender, moderator)) message = "player: !help !roll !online !stats !np !with !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes";
-        if (isNominator(sender)) message = "player: !help !roll !online !stats !np !with !request !mapstate | bn: !requests !nominate !veto !qualify !rank !love";
-        if (has(sender, administrator)) message = "player: !help !roll !online !stats !np !with !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock";
-        if (has(sender, developer)) message = "player: !help !roll !online !stats !np !with !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock | dev: !addpriv !rmpriv";
+        var message: []const u8 = "player: /np !with <mods acc% misses> !pin !unpin !roll [max] !online !stats [name] !request !mapstate";
+        if (has(sender, moderator)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes";
+        if (isNominator(sender)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | bn: !requests !nominate !veto !qualify !rank !love";
+        if (has(sender, administrator)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock";
+        if (has(sender, developer)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock | dev: !addpriv !rmpriv";
         try reply(allocator, sessions, sender, reply_target, out, message);
-        return .handled;
-    }
-    if (std.ascii.eqlIgnoreCase(cmd, "np")) {
-        handleNp(allocator, store, sender) catch {};
         return .handled;
     }
     if (std.ascii.eqlIgnoreCase(cmd, "with")) {
         handleWith(allocator, store, sender, args) catch {};
         return .handled;
     }
+    if (std.ascii.eqlIgnoreCase(cmd, "pin") or std.ascii.eqlIgnoreCase(cmd, "unpin"))
+        return try pinCommand(allocator, store, sessions, sender, reply_target, out, std.ascii.eqlIgnoreCase(cmd, "pin"));
     if (std.ascii.eqlIgnoreCase(cmd, "request")) return try requestRankCommand(allocator, store, sessions, sender, args, reply_target, out);
     if (std.ascii.eqlIgnoreCase(cmd, "mapstate")) return try mapStateCommand(allocator, store, sessions, sender, args, reply_target, out);
     if (std.ascii.eqlIgnoreCase(cmd, "requests")) return try rankQueueCommand(allocator, store, sessions, sender, args, reply_target, out);
@@ -552,27 +550,122 @@ pub fn handleNp(allocator: std.mem.Allocator, store: *storage.Store, sender: *se
         try sendPm(allocator, sender, "couldn't parse the map file");
         return;
     };
-    var mod_buf: [32]u8 = undefined;
-    const mods_str = modString(&mod_buf, sender.mods);
-    const result = pp.calculate(map_file, .{
-        .mode = sender.mode,
-        .lazer = 0,
-        .mods = @intCast(sender.mods),
-        .max_combo = meta.object_count,
-        .n_geki = if (sender.mode == 3) meta.object_count else 0,
-        .n_katu = 0,
-        .n300 = meta.object_count,
-        .n100 = 0,
-        .n50 = 0,
-        .misses = 0,
-        .legacy_total_score = 1_000_000,
-    }) catch {
-        try sendPm(allocator, sender, "pp calc failed on this map");
-        return;
-    };
+    const accuracies = [_]f64{ 90, 95, 98, 99, 100 };
     var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s} — {s} [{s}] | ★ {d:.2} | {s} | {d:.2}pp (100%, FC)", .{ meta.artist, meta.title, meta.version, result.stars, mods_str, result.pp }) catch return;
-    try sendPm(allocator, sender, msg);
+    var writer = std.Io.Writer.fixed(&buf);
+    var mod_buf: [32]u8 = undefined;
+    try writer.print("{s} — {s} [{s}] | {s}", .{ meta.artist, meta.title, meta.version, modString(&mod_buf, sender.mods) });
+    for (accuracies) |accuracy| {
+        const total_hits = meta.object_count;
+        const n300_f: f64 = @max(0, @as(f64, @floatFromInt(total_hits)) * (3.0 * (accuracy / 100.0) - 1.0) / 2.0);
+        const n300: u32 = @intFromFloat(@min(@as(f64, @floatFromInt(total_hits)), std.math.round(n300_f)));
+        const result = pp.calculate(map_file, .{
+            .mode = sender.mode,
+            .lazer = 0,
+            .mods = @intCast(sender.mods),
+            .max_combo = meta.object_count,
+            .n_geki = if (sender.mode == 3) total_hits else 0,
+            .n_katu = 0,
+            .n300 = n300,
+            .n100 = total_hits -| n300,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        }) catch {
+            try sendPm(allocator, sender, "pp calc failed on this map");
+            return;
+        };
+        try writer.print(" | {d:.0}%: {d:.2}pp", .{ accuracy, result.pp });
+    }
+    try sendPm(allocator, sender, buf[0..writer.end]);
+}
+
+pub const NowPlaying = struct { beatmap_id: i32, mode: ?u8 = null, mods: ?i32 = null };
+
+pub fn parseNowPlaying(text: []const u8) ?NowPlaying {
+    const prefix = "\x01ACTION is ";
+    if (!std.mem.startsWith(u8, text, prefix) or text.len < prefix.len + 16 or text[text.len - 1] != 1) return null;
+    const action = text[prefix.len..];
+    const verbs = [_][]const u8{ "playing ", "editing ", "watching ", "listening to " };
+    var rest: ?[]const u8 = null;
+    for (verbs) |verb| if (std.mem.startsWith(u8, action, verb)) {
+        rest = action[verb.len..];
+        break;
+    };
+    const body = rest orelse return null;
+    if (body.len == 0 or body[0] != '[') return null;
+    const url_end = std.mem.indexOfScalar(u8, body, ' ') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, body, ']') orelse return null;
+    if (close <= url_end) return null;
+    var url = body[1..url_end];
+    if (!(std.mem.startsWith(u8, url, "https://osu.ppy.sh/") or std.mem.startsWith(u8, url, "https://osu.kai.ovh/") or std.mem.startsWith(u8, url, "https://kai.ovh/"))) return null;
+    if (!(std.mem.indexOf(u8, url, "/beatmapsets/") != null or std.mem.indexOf(u8, url, "/beatmaps/") != null or std.mem.indexOf(u8, url, "/b/") != null)) return null;
+    if (std.mem.indexOfScalar(u8, url, '?')) |query| url = url[0..query];
+    url = std.mem.trimEnd(u8, url, "/");
+    var digit_start = url.len;
+    while (digit_start > 0 and std.ascii.isDigit(url[digit_start - 1])) digit_start -= 1;
+    if (digit_start == url.len) return null;
+    const beatmap_id = std.fmt.parseInt(i32, url[digit_start..], 10) catch return null;
+    if (beatmap_id <= 0) return null;
+
+    var result: NowPlaying = .{ .beatmap_id = beatmap_id };
+    if (std.mem.indexOf(u8, url, "#taiko/")) |_| result.mode = 1 else if (std.mem.indexOf(u8, url, "#fruits/")) |_| result.mode = 2 else if (std.mem.indexOf(u8, url, "#mania/")) |_| result.mode = 3 else if (std.mem.indexOf(u8, url, "#osu/")) |_| result.mode = 0;
+    const tail = body[close + 1 .. body.len - 1];
+    if (std.mem.indexOf(u8, tail, "<Taiko>")) |_| result.mode = 1 else if (std.mem.indexOf(u8, tail, "<CatchTheBeat>")) |_| result.mode = 2 else if (std.mem.indexOf(u8, tail, "<osu!mania>")) |_| result.mode = 3;
+    if (std.mem.indexOfScalar(u8, tail, '+')) |plus| {
+        var start = plus + 1;
+        while (start < tail.len and (tail[start] == ' ' or tail[start] == '~' or tail[start] == '|')) start += 1;
+        var end = start;
+        while (end < tail.len and std.ascii.isAlphanumeric(tail[end])) end += 1;
+        if (end != start and end - start <= 32) {
+            var lower: [32]u8 = undefined;
+            for (tail[start..end], 0..) |char, index| lower[index] = std.ascii.toLower(char);
+            result.mods = parseMods(lower[0 .. end - start]);
+        }
+    }
+    return result;
+}
+
+pub fn handleNowPlaying(allocator: std.mem.Allocator, store: *storage.Store, sender: *sessions_mod.Session, text: []const u8) !bool {
+    const now_playing = parseNowPlaying(text) orelse return false;
+    sender.map_id = now_playing.beatmap_id;
+    @memset(&sender.map_md5, 0);
+    const selection = (try store.beatmapSelectionById(now_playing.beatmap_id)) orelse {
+        try sendPm(allocator, sender, "i don't have that map yet, open its leaderboard and /np it again in a sec");
+        return true;
+    };
+    sender.map_md5 = selection.md5;
+    sender.mode = now_playing.mode orelse selection.mode;
+    sender.mods = now_playing.mods orelse 0;
+    try handleNp(allocator, store, sender);
+    return true;
+}
+
+fn namespaceForMods(mods: i32) []const u8 {
+    if (mods & (1 << 13) != 0) return "autopilot";
+    if (mods & (1 << 7) != 0) return "relax";
+    if (mods & (1 << 27) != 0) return "scorev2";
+    return "vanilla";
+}
+
+fn pinCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, reply_target: []const u8, out: *protocol.Writer, pinned: bool) !CommandResult {
+    if (sender.map_md5[0] == 0) {
+        try reply(allocator, sessions, sender, reply_target, out, "do /np first so i know which play you mean");
+        return .handled;
+    }
+    const score_id = store.setScorePinned(sender.user.id, &sender.map_md5, sender.mode, namespaceForMods(sender.mods), pinned) catch |err| {
+        const message: []const u8 = switch (err) {
+            error.NoPassedScore => "you don't have a passed play on that map in this mode",
+            error.TooManyPinnedScores => "you already have three pinned plays; unpin one first",
+            else => "i couldn't update that pin",
+        };
+        try reply(allocator, sessions, sender, reply_target, out, message);
+        return .handled;
+    };
+    var buf: [96]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "score #{d} {s}", .{ score_id, if (pinned) "pinned" else "unpinned" });
+    try reply(allocator, sessions, sender, reply_target, out, message);
+    return .handled;
 }
 
 fn handleWith(allocator: std.mem.Allocator, store: *storage.Store, sender: *sessions_mod.Session, args: []const u8) !void {

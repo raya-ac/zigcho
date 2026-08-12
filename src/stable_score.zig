@@ -1,4 +1,5 @@
 const std = @import("std");
+const stable_mods = @import("stable_mods.zig");
 
 pub const max_hit_count: i32 = 10_000_000;
 pub const max_combo: i32 = 10_000_000;
@@ -43,13 +44,7 @@ pub const Submission = struct {
     }
 
     pub fn rankNamespace(self: Submission) []const u8 {
-        const relax: i32 = 1 << 7;
-        const autopilot: i32 = 1 << 13;
-        const scorev2: i32 = 1 << 27;
-        if (self.mods & autopilot != 0) return "autopilot";
-        if (self.mods & relax != 0) return "relax";
-        if (self.mods & scorev2 != 0) return "scorev2";
-        return "vanilla";
+        return stable_mods.namespace(self.mods);
     }
 
     pub fn verifyChecksum(self: Submission, osu_version: []const u8, client_hash: []const u8, storyboard_md5: []const u8) bool {

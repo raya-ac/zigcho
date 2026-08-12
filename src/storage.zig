@@ -3,6 +3,7 @@ const domain = @import("domain.zig");
 const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
+const stable_mods = @import("stable_mods.zig");
 pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -1619,7 +1620,7 @@ pub const Store = struct {
         return selection;
     }
 
-    pub fn setScorePinned(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, namespace: []const u8, pinned: bool) !i64 {
+    pub fn setScorePinned(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, mods: i32, namespace: []const u8, pinned: bool) !i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.exec("BEGIN IMMEDIATE");
@@ -1627,24 +1628,26 @@ pub const Store = struct {
 
         const score_id = block: {
             var score: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "SELECT id FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND rank_namespace=?4 AND passed=1 ORDER BY best DESC,pp DESC,score DESC,id DESC LIMIT 1", -1, &score, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT id FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND rank_namespace=?4 AND mods=?5 AND passed=1 ORDER BY best DESC,pp DESC,score DESC,id DESC LIMIT 1", -1, &score, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
             defer _ = c.sqlite3_finalize(score);
             _ = c.sqlite3_bind_int(score, 1, user_id);
             _ = c.sqlite3_bind_text(score, 2, map_md5.ptr, @intCast(map_md5.len), null);
             _ = c.sqlite3_bind_int(score, 3, mode);
             _ = c.sqlite3_bind_text(score, 4, namespace.ptr, @intCast(namespace.len), null);
+            _ = c.sqlite3_bind_int(score, 5, mods);
             if (c.sqlite3_step(score) != c.SQLITE_ROW) return error.NoPassedScore;
             break :block c.sqlite3_column_int64(score, 0);
         };
 
         if (pinned) {
             var old: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM score_pins WHERE user_id=?1 AND score_id<>?2 AND score_id IN (SELECT id FROM scores WHERE user_id=?1 AND map_md5=?3 AND mode=?4 AND rank_namespace=?5)", -1, &old, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM score_pins WHERE user_id=?1 AND score_id<>?2 AND score_id IN (SELECT id FROM scores WHERE user_id=?1 AND map_md5=?3 AND mode=?4 AND mods=?5 AND rank_namespace=?6)", -1, &old, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
             _ = c.sqlite3_bind_int(old, 1, user_id);
             _ = c.sqlite3_bind_int64(old, 2, score_id);
             _ = c.sqlite3_bind_text(old, 3, map_md5.ptr, @intCast(map_md5.len), null);
             _ = c.sqlite3_bind_int(old, 4, mode);
-            _ = c.sqlite3_bind_text(old, 5, namespace.ptr, @intCast(namespace.len), null);
+            _ = c.sqlite3_bind_int(old, 5, mods);
+            _ = c.sqlite3_bind_text(old, 6, namespace.ptr, @intCast(namespace.len), null);
             if (c.sqlite3_step(old) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
             _ = c.sqlite3_finalize(old);
 
@@ -1680,11 +1683,12 @@ pub const Store = struct {
             }
         } else {
             var remove: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM score_pins WHERE user_id=?1 AND score_id IN (SELECT id FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND rank_namespace=?4)", -1, &remove, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM score_pins WHERE user_id=?1 AND score_id IN (SELECT id FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND mods=?4 AND rank_namespace=?5)", -1, &remove, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
             _ = c.sqlite3_bind_int(remove, 1, user_id);
             _ = c.sqlite3_bind_text(remove, 2, map_md5.ptr, @intCast(map_md5.len), null);
             _ = c.sqlite3_bind_int(remove, 3, mode);
-            _ = c.sqlite3_bind_text(remove, 4, namespace.ptr, @intCast(namespace.len), null);
+            _ = c.sqlite3_bind_int(remove, 4, mods);
+            _ = c.sqlite3_bind_text(remove, 5, namespace.ptr, @intCast(namespace.len), null);
             if (c.sqlite3_step(remove) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
             _ = c.sqlite3_finalize(remove);
         }
@@ -2249,7 +2253,7 @@ pub const Store = struct {
             var unavailable = output.toArrayList();
             return unavailable.toOwnedSlice(allocator);
         }
-        const namespace = if (requested_mods & (1 << 13) != 0) "autopilot" else if (requested_mods & (1 << 7) != 0) "relax" else if (requested_mods & (1 << 27) != 0) "scorev2" else "vanilla";
+        const namespace = stable_mods.namespace(requested_mods);
         const uses_pp = std.mem.eql(u8, namespace, "relax") or std.mem.eql(u8, namespace, "autopilot");
         const filter = " FROM scores s JOIN users u ON u.id=s.user_id WHERE s.map_md5=?1 AND s.mode=?2 AND s.passed=1 AND s.best=1 AND s.rank_namespace=?3 AND (?4!=2 OR s.mods=?5) AND (?4!=3 OR s.user_id=?6 OR EXISTS(SELECT 1 FROM friends f WHERE f.user_id=?6 AND f.friend_id=s.user_id)) AND (?4!=4 OR u.country=?7)";
         const count_sql = "SELECT min(count(*),50)" ++ filter;

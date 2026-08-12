@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const stable_mods = @import("stable_mods.zig");
 
 pub fn shouldAnnounceScore(placement: ?domain.ScorePlacement, pp_value: f64) bool {
     const current = placement orelse return false;
@@ -48,7 +49,7 @@ pub const Webhook = struct {
     pub fn postScore(self: *Webhook, data: ScoreData) void {
         if (self.url.len == 0) return;
         var buf: [4096]u8 = undefined;
-        var mod_buf: [32]u8 = undefined;
+        var mod_buf: [64]u8 = undefined;
         const json = buildJson(&buf, &mod_buf, data) catch return;
         const json_owned = self.allocator.dupe(u8, json) catch return;
         const url_owned = self.allocator.dupe(u8, self.url) catch {
@@ -85,10 +86,10 @@ pub const Webhook = struct {
         }
     }
 
-    fn buildJson(buf: *[4096]u8, mod_buf: *[32]u8, data: ScoreData) ![]const u8 {
+    fn buildJson(buf: *[4096]u8, mod_buf: *[64]u8, data: ScoreData) ![]const u8 {
         const display_grade = gradeDisplay(data.grade);
         const color = gradeColor(data.grade);
-        const mods_str = modString(mod_buf, data.mods);
+        const mods_str = stable_mods.shortString(mod_buf, data.mods);
         const mode_str = modeName(data.mode);
         var w = std.Io.Writer.fixed(buf);
         try w.writeAll("{\"username\":");
@@ -147,40 +148,5 @@ pub const Webhook = struct {
             3 => "osu!mania",
             else => "osu!",
         };
-    }
-
-    fn modString(buf: *[32]u8, mods: i32) []const u8 {
-        if (mods == 0) return "NM";
-        var pos: usize = 0;
-        const mod_names = [_]struct { bit: i32, name: []const u8 }{
-            .{ .bit = 1 << 0, .name = "NF" },
-            .{ .bit = 1 << 1, .name = "EZ" },
-            .{ .bit = 1 << 3, .name = "HD" },
-            .{ .bit = 1 << 4, .name = "HR" },
-            .{ .bit = 1 << 5, .name = "SD" },
-            .{ .bit = 1 << 6, .name = "DT" },
-            .{ .bit = 1 << 7, .name = "RX" },
-            .{ .bit = 1 << 8, .name = "HT" },
-            .{ .bit = 1 << 10, .name = "NC" },
-            .{ .bit = 1 << 12, .name = "FL" },
-            .{ .bit = 1 << 13, .name = "AP" },
-            .{ .bit = 1 << 14, .name = "SO" },
-            .{ .bit = 1 << 15, .name = "AT" },
-            .{ .bit = 1 << 16, .name = "CN" },
-            .{ .bit = 1 << 17, .name = "TP" },
-            .{ .bit = 1 << 20, .name = "FI" },
-            .{ .bit = 1 << 22, .name = "RN" },
-            .{ .bit = 1 << 23, .name = "CL" },
-            .{ .bit = 1 << 27, .name = "V2" },
-            .{ .bit = 1 << 29, .name = "MR" },
-        };
-        for (mod_names) |m| {
-            if (mods & m.bit != 0) {
-                @memcpy(buf[pos..][0..2], m.name);
-                pos += 2;
-            }
-        }
-        if (pos == 0) return "NM";
-        return buf[0..pos];
     }
 };

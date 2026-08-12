@@ -6,6 +6,7 @@ const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
 const performance_calculator = @import("pp.zig");
+const stable_mods = @import("stable_mods.zig");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
 pub const HardwareEnforcement = sqlite_storage.HardwareEnforcement;
@@ -386,11 +387,13 @@ pub const Store = struct {
         return selection;
     }
 
-    pub fn setScorePinned(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, namespace: []const u8, pinned: bool) !i64 {
+    pub fn setScorePinned(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, mods_value: i32, namespace: []const u8, pinned: bool) !i64 {
         var user_buf: [24]u8 = undefined;
         var mode_buf: [4]u8 = undefined;
+        var mods_buf: [16]u8 = undefined;
         const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
         const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        const mods = try std.fmt.bufPrint(&mods_buf, "{d}", .{mods_value});
         var lease = self.pool.acquire();
         defer lease.release();
         try postgres.exec(lease.conn, "BEGIN");
@@ -398,14 +401,14 @@ pub const Store = struct {
         var locked_user = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.users WHERE id=$1 FOR UPDATE", &.{user});
         defer locked_user.deinit();
         if (locked_user.rows() == 0) return error.UserNotFound;
-        var score = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.scores WHERE user_id=$1 AND map_md5=$2 AND mode=$3 AND rank_namespace=$4 AND passed ORDER BY best DESC,pp DESC,score DESC,id DESC LIMIT 1", &.{ user, map_md5, mode_text, namespace });
+        var score = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.scores WHERE user_id=$1 AND map_md5=$2 AND mode=$3 AND rank_namespace=$4 AND mods=$5 AND passed ORDER BY best DESC,pp DESC,score DESC,id DESC LIMIT 1", &.{ user, map_md5, mode_text, namespace, mods });
         defer score.deinit();
         if (score.rows() == 0) return error.NoPassedScore;
         const score_id = try score.int(i64, 0, 0);
         var score_buf: [24]u8 = undefined;
         const score_text = try std.fmt.bufPrint(&score_buf, "{d}", .{score_id});
         if (pinned) {
-            var old = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.score_pins p USING zigcho.scores s WHERE p.user_id=$1 AND p.score_id=s.id AND s.user_id=$1 AND s.map_md5=$2 AND s.mode=$3 AND s.rank_namespace=$4 AND p.score_id<>$5", &.{ user, map_md5, mode_text, namespace, score_text });
+            var old = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.score_pins p USING zigcho.scores s WHERE p.user_id=$1 AND p.score_id=s.id AND s.user_id=$1 AND s.map_md5=$2 AND s.mode=$3 AND s.rank_namespace=$4 AND s.mods=$5 AND p.score_id<>$6", &.{ user, map_md5, mode_text, namespace, mods, score_text });
             old.deinit();
             var pins = try postgres.queryParams(self.allocator, lease.conn, "SELECT p.score_id FROM zigcho.score_pins p JOIN zigcho.scores s ON s.id=p.score_id WHERE p.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 FOR UPDATE OF p", &.{ user, mode_text, namespace });
             defer pins.deinit();
@@ -418,7 +421,7 @@ pub const Store = struct {
             var update = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.score_pins(user_id,score_id) VALUES($1,$2) ON CONFLICT(user_id,score_id) DO UPDATE SET pinned_at=extract(epoch FROM clock_timestamp())::bigint", &.{ user, score_text });
             update.deinit();
         } else {
-            var update = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.score_pins p USING zigcho.scores s WHERE p.user_id=$1 AND p.score_id=s.id AND s.user_id=$1 AND s.map_md5=$2 AND s.mode=$3 AND s.rank_namespace=$4", &.{ user, map_md5, mode_text, namespace });
+            var update = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.score_pins p USING zigcho.scores s WHERE p.user_id=$1 AND p.score_id=s.id AND s.user_id=$1 AND s.map_md5=$2 AND s.mode=$3 AND s.rank_namespace=$4 AND s.mods=$5", &.{ user, map_md5, mode_text, namespace, mods });
             update.deinit();
         }
         try postgres.exec(lease.conn, "COMMIT");
@@ -602,7 +605,7 @@ pub const Store = struct {
         const board = try std.fmt.bufPrint(&board_buf, "{d}", .{board_type});
         const mods = try std.fmt.bufPrint(&mods_buf, "{d}", .{requested_mods});
         const viewer_id = try std.fmt.bufPrint(&viewer_buf, "{d}", .{viewer.id});
-        const namespace = if (requested_mods & (1 << 13) != 0) "autopilot" else if (requested_mods & (1 << 7) != 0) "relax" else if (requested_mods & (1 << 27) != 0) "scorev2" else "vanilla";
+        const namespace = stable_mods.namespace(requested_mods);
         const uses_pp = std.mem.eql(u8, namespace, "relax") or std.mem.eql(u8, namespace, "autopilot");
         const filter = " FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.map_md5=$1 AND s.mode=$2 AND s.passed AND s.best AND s.rank_namespace=$3 AND ($4::int!=2 OR s.mods=$5) AND ($4::int!=3 OR s.user_id=$6 OR EXISTS(SELECT 1 FROM zigcho.friends f WHERE f.user_id=$6 AND f.friend_id=s.user_id)) AND ($4::int!=4 OR u.country=$7)";
         const params = &.{ map_md5, mode_text, namespace, board, mods, viewer_id, viewer.country[0..] };
@@ -1996,7 +1999,23 @@ test "postgres account auth stats and token slice" {
     const worse_placement = (try store.scoreLeaderboardPlacement(worse_id)).?;
     try std.testing.expect(!worse_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), worse_placement.rank);
-    try std.testing.expectEqual(score_id, try store.setScorePinned(user_id, score.map_md5, 0, "vanilla", true));
+    try std.testing.expectEqual(score_id, try store.setScorePinned(user_id, score.map_md5, 0, 0, "vanilla", true));
+    var hidden = score;
+    hidden.online_checksum = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    hidden.total_score = 800_000;
+    hidden.mods = stable_mods.hidden;
+    const hidden_id = try store.insertStableScore(user_id, hidden, 18, "hidden replay", 12_000);
+    try std.testing.expectEqual(hidden_id, try store.setScorePinned(user_id, score.map_md5, 0, stable_mods.hidden, "vanilla", true));
+    try std.testing.expectError(error.NoPassedScore, store.setScorePinned(user_id, score.map_md5, 0, stable_mods.hard_rock, "vanilla", true));
+    {
+        var user_id_buf: [24]u8 = undefined;
+        const user_id_text = try std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var pinned = try postgres.queryParams(std.testing.allocator, lease.conn, "SELECT count(*) FROM zigcho.score_pins WHERE user_id=$1", &.{user_id_text});
+        defer pinned.deinit();
+        try std.testing.expectEqual(@as(i64, 2), try pinned.int(i64, 0, 0));
+    }
     const site_rankings = try store.siteRankings(std.testing.allocator, 0, 0);
     defer std.testing.allocator.free(site_rankings);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);

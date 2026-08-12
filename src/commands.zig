@@ -6,6 +6,7 @@ const beatmap = @import("beatmap.zig");
 const sessions_mod = @import("sessions.zig");
 const protocol = @import("protocol.zig");
 const stable_score = @import("stable_score.zig");
+const stable_mods = @import("stable_mods.zig");
 
 pub const PpResult = struct {
     pp: f64,
@@ -581,8 +582,8 @@ pub fn handleNp(allocator: std.mem.Allocator, store: *storage.Store, sender: *se
     const accuracies = [_]f64{ 90, 95, 98, 99, 100 };
     var buf: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
-    var mod_buf: [32]u8 = undefined;
-    try writer.print("{s} — {s} [{s}] | {s}", .{ meta.artist, meta.title, meta.version, modString(&mod_buf, sender.mods) });
+    var mod_buf: [64]u8 = undefined;
+    try writer.print("{s} — {s} [{s}] | {s}", .{ meta.artist, meta.title, meta.version, stable_mods.shortString(&mod_buf, sender.mods) });
     for (accuracies) |accuracy| {
         const total_hits = meta.object_count;
         const n300_f: f64 = @max(0, @as(f64, @floatFromInt(total_hits)) * (3.0 * (accuracy / 100.0) - 1.0) / 2.0);
@@ -640,17 +641,7 @@ pub fn parseNowPlaying(text: []const u8) ?NowPlaying {
     if (std.mem.indexOf(u8, url, "#taiko/")) |_| result.mode = 1 else if (std.mem.indexOf(u8, url, "#fruits/")) |_| result.mode = 2 else if (std.mem.indexOf(u8, url, "#mania/")) |_| result.mode = 3 else if (std.mem.indexOf(u8, url, "#osu/")) |_| result.mode = 0;
     const tail = body[close + 1 .. body.len - 1];
     if (std.mem.indexOf(u8, tail, "<Taiko>")) |_| result.mode = 1 else if (std.mem.indexOf(u8, tail, "<CatchTheBeat>")) |_| result.mode = 2 else if (std.mem.indexOf(u8, tail, "<osu!mania>")) |_| result.mode = 3;
-    if (std.mem.indexOfScalar(u8, tail, '+')) |plus| {
-        var start = plus + 1;
-        while (start < tail.len and (tail[start] == ' ' or tail[start] == '~' or tail[start] == '|')) start += 1;
-        var end = start;
-        while (end < tail.len and std.ascii.isAlphanumeric(tail[end])) end += 1;
-        if (end != start and end - start <= 32) {
-            var lower: [32]u8 = undefined;
-            for (tail[start..end], 0..) |char, index| lower[index] = std.ascii.toLower(char);
-            result.mods = parseMods(lower[0 .. end - start]);
-        }
-    }
+    result.mods = stable_mods.parseNowPlayingTail(tail);
     return result;
 }
 
@@ -663,17 +654,14 @@ pub fn handleNowPlaying(allocator: std.mem.Allocator, store: *storage.Store, sen
         return true;
     };
     sender.map_md5 = selection.md5;
-    sender.mode = now_playing.mode orelse selection.mode;
+    sender.mode = now_playing.mode orelse sender.mode;
     sender.mods = now_playing.mods orelse 0;
     try handleNp(allocator, store, sender);
     return true;
 }
 
 fn namespaceForMods(mods: i32) []const u8 {
-    if (mods & (1 << 13) != 0) return "autopilot";
-    if (mods & (1 << 7) != 0) return "relax";
-    if (mods & (1 << 27) != 0) return "scorev2";
-    return "vanilla";
+    return stable_mods.namespace(mods);
 }
 
 fn pinCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, reply_target: []const u8, out: *protocol.Writer, pinned: bool) !CommandResult {
@@ -681,7 +669,7 @@ fn pinCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
         try reply(allocator, sessions, sender, reply_target, out, "do /np first so i know which play you mean");
         return .handled;
     }
-    const score_id = store.setScorePinned(sender.user.id, &sender.map_md5, sender.mode, namespaceForMods(sender.mods), pinned) catch |err| {
+    const score_id = store.setScorePinned(sender.user.id, &sender.map_md5, sender.mode, stable_mods.canonical(sender.mods), namespaceForMods(sender.mods), pinned) catch |err| {
         const message: []const u8 = switch (err) {
             error.NoPassedScore => "you don't have a passed play on that map in this mode",
             error.TooManyPinnedScores => "you already have three pinned plays; unpin one first",
@@ -732,13 +720,15 @@ fn handleWith(allocator: std.mem.Allocator, store: *storage.Store, sender: *sess
         } else if (std.mem.endsWith(u8, lower, "m") and lower.len > 1) {
             misses = std.fmt.parseInt(u32, lower[0 .. lower.len - 1], 10) catch continue;
         } else {
-            const parsed = parseMods(lower) orelse continue;
+            const parsed = stable_mods.parseCompact(lower) orelse continue;
             mods = parsed;
         }
     }
 
-    var mod_buf: [32]u8 = undefined;
-    const mods_str = modString(&mod_buf, mods);
+    mods = stable_mods.canonical(mods);
+    sender.mods = mods;
+    var mod_buf: [64]u8 = undefined;
+    const mods_str = stable_mods.shortString(&mod_buf, mods);
     const total_objects = meta.object_count;
     const total_hits = if (misses > total_objects) total_objects else total_objects - misses;
     const acc = accuracy / 100.0;
@@ -767,72 +757,6 @@ fn handleWith(allocator: std.mem.Allocator, store: *storage.Store, sender: *sess
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "{s} — {s} [{s}] | ★ {d:.2} | {s} | {d:.2}pp ({d:.1}%, {d}x combo, {d}m)", .{ meta.artist, meta.title, meta.version, result.stars, mods_str, result.pp, accuracy, max_combo, misses }) catch return;
     try sendPm(allocator, sender, msg);
-}
-
-fn parseMods(str: []const u8) ?i32 {
-    var mods: i32 = 0;
-    var i: usize = 0;
-    while (i + 1 < str.len) : (i += 2) {
-        const pair = str[i..][0..2];
-        const bit: i32 = if (std.mem.eql(u8, pair, "nf")) 1 << 0 //
-        else if (std.mem.eql(u8, pair, "ez")) 1 << 1 //
-        else if (std.mem.eql(u8, pair, "hd")) 1 << 3 //
-        else if (std.mem.eql(u8, pair, "hr")) 1 << 4 //
-        else if (std.mem.eql(u8, pair, "sd")) 1 << 5 //
-        else if (std.mem.eql(u8, pair, "dt")) 1 << 6 //
-        else if (std.mem.eql(u8, pair, "rx")) 1 << 7 //
-        else if (std.mem.eql(u8, pair, "ht")) 1 << 8 //
-        else if (std.mem.eql(u8, pair, "nc")) 1 << 10 //
-        else if (std.mem.eql(u8, pair, "fl")) 1 << 12 //
-        else if (std.mem.eql(u8, pair, "ap")) 1 << 13 //
-        else if (std.mem.eql(u8, pair, "so")) 1 << 14 //
-        else if (std.mem.eql(u8, pair, "at")) 1 << 15 //
-        else if (std.mem.eql(u8, pair, "cn")) 1 << 16 //
-        else if (std.mem.eql(u8, pair, "tp")) 1 << 17 //
-        else if (std.mem.eql(u8, pair, "fi")) 1 << 20 //
-        else if (std.mem.eql(u8, pair, "rn")) 1 << 22 //
-        else if (std.mem.eql(u8, pair, "cl")) 1 << 23 //
-        else if (std.mem.eql(u8, pair, "v2")) 1 << 27 //
-        else if (std.mem.eql(u8, pair, "mr")) 1 << 29 //
-        else return null;
-        mods |= bit;
-    }
-    return mods;
-}
-
-fn modString(buf: *[32]u8, mods: i32) []const u8 {
-    if (mods == 0) return "NM";
-    var pos: usize = 0;
-    const mod_names = [_]struct { bit: i32, name: []const u8 }{
-        .{ .bit = 1 << 0, .name = "NF" },
-        .{ .bit = 1 << 1, .name = "EZ" },
-        .{ .bit = 1 << 3, .name = "HD" },
-        .{ .bit = 1 << 4, .name = "HR" },
-        .{ .bit = 1 << 5, .name = "SD" },
-        .{ .bit = 1 << 6, .name = "DT" },
-        .{ .bit = 1 << 7, .name = "RX" },
-        .{ .bit = 1 << 8, .name = "HT" },
-        .{ .bit = 1 << 10, .name = "NC" },
-        .{ .bit = 1 << 12, .name = "FL" },
-        .{ .bit = 1 << 13, .name = "AP" },
-        .{ .bit = 1 << 14, .name = "SO" },
-        .{ .bit = 1 << 15, .name = "AT" },
-        .{ .bit = 1 << 16, .name = "CN" },
-        .{ .bit = 1 << 17, .name = "TP" },
-        .{ .bit = 1 << 20, .name = "FI" },
-        .{ .bit = 1 << 22, .name = "RN" },
-        .{ .bit = 1 << 23, .name = "CL" },
-        .{ .bit = 1 << 27, .name = "V2" },
-        .{ .bit = 1 << 29, .name = "MR" },
-    };
-    for (mod_names) |m| {
-        if (mods & m.bit != 0) {
-            @memcpy(buf[pos..][0..2], m.name);
-            pos += 2;
-        }
-    }
-    if (pos == 0) return "NM";
-    return buf[0..pos];
 }
 
 fn sendPm(allocator: std.mem.Allocator, sender: *sessions_mod.Session, text: []const u8) !void {

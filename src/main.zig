@@ -625,8 +625,19 @@ const App = struct {
             return respond(req, .ok, "application/json", listing, &.{});
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/users/")) {
-            const user_id = std.fmt.parseInt(i32, path["/api/v1/users/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user\"}", &.{});
-            if (user_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user\"}", &.{});
+            const encoded_identifier = path["/api/v1/users/".len..];
+            if (encoded_identifier.len == 0 or encoded_identifier.len > 96 or std.mem.indexOfScalar(u8, encoded_identifier, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const identifier_buffer = try self.allocator.dupe(u8, encoded_identifier);
+            defer self.allocator.free(identifier_buffer);
+            const identifier = std.Uri.percentDecodeInPlace(identifier_buffer);
+            if (identifier.len < 1 or identifier.len > 32 or std.mem.indexOfScalar(u8, identifier, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const user_id = std.fmt.parseInt(i32, identifier, 10) catch resolve: {
+                const found = (try self.store.userByName(self.allocator, identifier)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+                defer self.allocator.free(found.name);
+                defer self.allocator.free(found.safe_name);
+                break :resolve found.id;
+            };
+            if (user_id <= 0) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             if (!validSiteMode(mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             const profile = (try self.store.siteProfile(self.allocator, user_id, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
@@ -1120,14 +1131,15 @@ const App = struct {
             defer self.allocator.free(replay);
             return respond(req, .ok, "application/octet-stream", replay, &.{});
         }
-        if (req.head.method == .GET and routing.websitePage(path)) {
+        const known_website_page = routing.websitePage(path);
+        if (req.head.method == .GET and (known_website_page or (web_auth.websiteHost(host_owned) and routing.websiteFallback(path)))) {
             if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
                 .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
-            return respond(req, .ok, "text/html; charset=utf-8", status_page, &headers);
+            return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", status_page, &headers);
         }
         return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
     }

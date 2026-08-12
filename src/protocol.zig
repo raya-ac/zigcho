@@ -204,6 +204,13 @@ pub const Writer = struct {
         try self.string(value);
         self.finish(start);
     }
+    pub fn packetIntList(self: *Writer, id: ServerPacket, values: []const i32) !void {
+        if (values.len > std.math.maxInt(u16)) return error.ListTooLarge;
+        const start = try self.begin(id);
+        try self.int(u16, @intCast(values.len));
+        for (values) |value| try self.int(i32, value);
+        self.finish(start);
+    }
     pub fn byte(self: *Writer, value: u8) !void {
         try self.list.append(self.allocator, value);
     }

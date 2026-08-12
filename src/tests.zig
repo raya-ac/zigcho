@@ -75,6 +75,18 @@ fn clientIntPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, valu
     return clientPayloadPacket(allocator, id, &payload);
 }
 
+fn clientActionPacket(allocator: std.mem.Allocator, action: u8) ![]u8 {
+    var payload = protocol.Writer.init(allocator);
+    defer payload.deinit();
+    try payload.byte(action);
+    try payload.string("");
+    try payload.string("");
+    try payload.int(i32, 0);
+    try payload.byte(0);
+    try payload.int(i32, 0);
+    return clientPayloadPacket(allocator, .change_action, payload.bytes());
+}
+
 fn multiplayerFixtureData(host_id: i32, password: []const u8) multiplayer.MatchData {
     return .{
         .id = 0,
@@ -159,6 +171,42 @@ fn expectPacket(data: []const u8, wanted: protocol.ServerPacket) !void {
         if (@intFromEnum(packet.id) == @intFromEnum(wanted)) return;
     }
     return error.MissingPacket;
+}
+
+fn expectIntListContains(data: []const u8, wanted: protocol.ServerPacket, values: []const i32) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(wanted)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        const count = try payload.int(u16);
+        var found = [_]bool{false} ** 16;
+        try std.testing.expect(values.len <= found.len);
+        for (0..count) |_| {
+            const actual = try payload.int(i32);
+            for (values, 0..) |value, index| if (actual == value) {
+                found[index] = true;
+            };
+        }
+        for (found[0..values.len]) |present| try std.testing.expect(present);
+        return;
+    }
+    return error.MissingPacket;
+}
+
+fn expectPresenceUsers(data: []const u8, included: []const i32, excluded: []const i32) !void {
+    var found = [_]bool{false} ** 16;
+    try std.testing.expect(included.len <= found.len);
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.user_presence)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        const actual = try payload.int(i32);
+        for (included, 0..) |user_id, index| if (actual == user_id) {
+            found[index] = true;
+        };
+        for (excluded) |user_id| try std.testing.expect(actual != user_id);
+    }
+    for (found[0..included.len]) |present| try std.testing.expect(present);
 }
 
 fn expectMessageText(data: []const u8, expected: []const u8) !void {
@@ -1224,6 +1272,161 @@ test "a stopped client cannot grow its outgoing queue past the cap" {
     try std.testing.expectEqual(@as(usize, 0), stopped.queue.items.len);
     try std.testing.expect((try bancho.pollByToken(std.testing.allocator, &store, &sessions, &token, "")) == null);
     try std.testing.expect(sessions.byUser(1) == null);
+}
+
+test "stable friends and favourites stay directional and always include kai" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/social-storage.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
+            "(40,'sender','sender',x'00',x'00'),(41,'target','target',x'00',x'00')",
+    );
+
+    const initial = try store.friendIds(std.testing.allocator, 40);
+    defer std.testing.allocator.free(initial);
+    try std.testing.expectEqualSlices(i32, &.{3}, initial);
+    try std.testing.expect(try store.addFriend(40, 41));
+    try std.testing.expect(!try store.addFriend(40, 41));
+    try std.testing.expect(!try store.addFriend(40, 40));
+    try std.testing.expect(!try store.addFriend(40, 3));
+    const sender_friends = try store.friendIds(std.testing.allocator, 40);
+    defer std.testing.allocator.free(sender_friends);
+    try std.testing.expect(std.mem.indexOfScalar(i32, sender_friends, 41) != null);
+    try std.testing.expect(std.mem.indexOfScalar(i32, sender_friends, 3) != null);
+    const target_friends = try store.friendIds(std.testing.allocator, 41);
+    defer std.testing.allocator.free(target_friends);
+    try std.testing.expectEqualSlices(i32, &.{3}, target_friends);
+    try std.testing.expect(try store.removeFriend(40, 41));
+    try std.testing.expect(!try store.removeFriend(40, 41));
+    try std.testing.expect(!try store.removeFriend(40, 3));
+
+    try std.testing.expect(try store.addFavourite(40, 900000000));
+    try std.testing.expect(!try store.addFavourite(40, 900000000));
+    try std.testing.expect(try store.addFavourite(40, 900000001));
+    try std.testing.expectError(error.InvalidBeatmapSet, store.addFavourite(40, 0));
+    const favourites = try store.favouriteSetIds(std.testing.allocator, 40);
+    defer std.testing.allocator.free(favourites);
+    try std.testing.expectEqualSlices(i32, &.{ 900000000, 900000001 }, favourites);
+}
+
+test "stable login owns friend state and restores private message privacy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/social-login.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const player_id = try store.register("social", "social@example.invalid", "00000000000000000000000000000000");
+    const friend_id = try store.register("friend", "friend@example.invalid", "11111111111111111111111111111111");
+    try std.testing.expect(try store.addFriend(player_id, friend_id));
+    const body = "social\n00000000000000000000000000000000\n" ++
+        "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|1";
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    var result = try bancho.login(std.testing.allocator, &store, &sessions, body, .{ 'A', 'U' }, 0, 0);
+    defer result.deinit();
+    try expectIntListContains(result.body, .friends_list, &.{ 3, friend_id });
+    const session = sessions.byUser(player_id).?;
+    try std.testing.expect(session.block_non_friend_dms);
+    try std.testing.expect(session.isFriend(3));
+    try std.testing.expect(session.isFriend(friend_id));
+}
+
+test "stable social packets enforce friend-only dms and away presence contracts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/social-packets.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,privileges,restricted) VALUES" ++
+            "(40,'sender','sender',x'00',x'00',3,0)," ++
+            "(41,'target','target',x'00',x'00',3,0)," ++
+            "(42,'restricted','restricted',x'00',x'00',2,1)",
+    );
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const sender = try sessions.create((try store.userById(std.testing.allocator, 40)).?, 0, 0, 0);
+    const target = try sessions.create((try store.userById(std.testing.allocator, 41)).?, 0, 0, 0);
+    _ = try sessions.create((try store.userById(std.testing.allocator, 42)).?, 0, 0, 0);
+
+    const privacy = try clientIntPacket(std.testing.allocator, .toggle_block_non_friend_dms, 1);
+    defer std.testing.allocator.free(privacy);
+    const privacy_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, privacy);
+    defer std.testing.allocator.free(privacy_reply);
+    try std.testing.expect(target.block_non_friend_dms);
+
+    const blocked = try clientMessagePacket(std.testing.allocator, .send_private_message, "sender", "blocked", "target", 40);
+    defer std.testing.allocator.free(blocked);
+    const blocked_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, blocked);
+    defer std.testing.allocator.free(blocked_reply);
+    try expectPacket(blocked_reply, .user_dm_blocked);
+    try std.testing.expectEqual(@as(usize, 0), target.queue.items.len);
+
+    const add = try clientIntPacket(std.testing.allocator, .friend_add, 40);
+    defer std.testing.allocator.free(add);
+    const add_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, add);
+    defer std.testing.allocator.free(add_reply);
+    try std.testing.expect(target.isFriend(40));
+    const delivered = try clientMessagePacket(std.testing.allocator, .send_private_message, "sender", "delivered once", "target", 40);
+    defer std.testing.allocator.free(delivered);
+    const delivered_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, delivered);
+    defer std.testing.allocator.free(delivered_reply);
+    const target_message = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(target_message);
+    try expectMessageText(target_message, "delivered once");
+
+    const afk = try clientActionPacket(std.testing.allocator, 1);
+    defer std.testing.allocator.free(afk);
+    const afk_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, afk);
+    defer std.testing.allocator.free(afk_reply);
+    const away = try clientMessagePacket(std.testing.allocator, .set_away_message, "target", "getting tea", "", 41);
+    defer std.testing.allocator.free(away);
+    const away_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, away);
+    defer std.testing.allocator.free(away_reply);
+    try std.testing.expectEqualStrings("getting tea", target.away());
+    const away_dm = try clientMessagePacket(std.testing.allocator, .send_private_message, "sender", "ping", "target", 40);
+    defer std.testing.allocator.free(away_dm);
+    const away_dm_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, away_dm);
+    defer std.testing.allocator.free(away_dm_reply);
+    try expectMessageText(away_dm_reply, "getting tea");
+    const target_ping = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(target_ping);
+    try expectMessageText(target_ping, "ping");
+
+    const remove = try clientIntPacket(std.testing.allocator, .friend_remove, 40);
+    defer std.testing.allocator.free(remove);
+    const remove_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, remove);
+    defer std.testing.allocator.free(remove_reply);
+    try std.testing.expect(!target.isFriend(40));
+    const blocked_again_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, blocked);
+    defer std.testing.allocator.free(blocked_again_reply);
+    try expectPacket(blocked_again_reply, .user_dm_blocked);
+
+    const friends_only = try clientIntPacket(std.testing.allocator, .receive_updates, 2);
+    defer std.testing.allocator.free(friends_only);
+    const filter_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, friends_only);
+    defer std.testing.allocator.free(filter_reply);
+    try std.testing.expectEqual(@as(u8, 2), sender.presence_filter);
+    const invalid_filter = try clientIntPacket(std.testing.allocator, .receive_updates, 3);
+    defer std.testing.allocator.free(invalid_filter);
+    const invalid_filter_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, invalid_filter);
+    defer std.testing.allocator.free(invalid_filter_reply);
+    try std.testing.expectEqual(@as(u8, 2), sender.presence_filter);
+
+    const presence_all = try clientIntPacket(std.testing.allocator, .user_presence_request_all, 0);
+    defer std.testing.allocator.free(presence_all);
+    const presence_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, presence_all);
+    defer std.testing.allocator.free(presence_reply);
+    try expectPresenceUsers(presence_reply, &.{ 40, 41 }, &.{42});
 }
 
 test "joined public chat delivers once and kai answers private chat as user three" {

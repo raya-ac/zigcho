@@ -482,6 +482,80 @@ pub const Store = struct {
         };
     }
 
+    pub fn friendIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT friend_id FROM friends WHERE user_id=?1 ORDER BY friend_id LIMIT 1000", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        var list: std.ArrayList(i32) = .empty;
+        errdefer list.deinit(allocator);
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try list.append(allocator, c.sqlite3_column_int(stmt, 0)),
+            c.SQLITE_DONE => break,
+            else => return error.DatabaseQueryFailed,
+        };
+        if (user_id != 3 and std.mem.indexOfScalar(i32, list.items, 3) == null) try list.append(allocator, 3);
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn addFriend(self: *Store, user_id: i32, friend_id: i32) !bool {
+        if (user_id == friend_id or friend_id == 3) return false;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO friends(user_id,friend_id) VALUES(?1,?2)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        _ = c.sqlite3_bind_int(stmt, 2, friend_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
+    pub fn removeFriend(self: *Store, user_id: i32, friend_id: i32) !bool {
+        if (friend_id == 3) return false;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM friends WHERE user_id=?1 AND friend_id=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        _ = c.sqlite3_bind_int(stmt, 2, friend_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
+    pub fn favouriteSetIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT set_id FROM favourites WHERE user_id=?1 ORDER BY created_at,set_id LIMIT 10000", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        var list: std.ArrayList(i32) = .empty;
+        errdefer list.deinit(allocator);
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try list.append(allocator, c.sqlite3_column_int(stmt, 0)),
+            c.SQLITE_DONE => break,
+            else => return error.DatabaseQueryFailed,
+        };
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn addFavourite(self: *Store, user_id: i32, set_id: i32) !bool {
+        if (set_id <= 0) return error.InvalidBeatmapSet;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO favourites(user_id,set_id) VALUES(?1,?2)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        _ = c.sqlite3_bind_int(stmt, 2, set_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
     pub fn recordPublicMessage(self: *Store, sender_id: i32, target: []const u8, message: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

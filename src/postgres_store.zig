@@ -863,6 +863,72 @@ pub const Store = struct {
         return try userFromResult(allocator, result, 0);
     }
 
+    pub fn friendIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(allocator, lease.conn, "SELECT friend_id FROM zigcho.friends WHERE user_id=$1 ORDER BY friend_id LIMIT 1000", &.{id});
+        defer result.deinit();
+        var list: std.ArrayList(i32) = .empty;
+        errdefer list.deinit(allocator);
+        for (0..result.rows()) |row| try list.append(allocator, try result.int(i32, row, 0));
+        if (user_id != 3 and std.mem.indexOfScalar(i32, list.items, 3) == null) try list.append(allocator, 3);
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn addFriend(self: *Store, user_id: i32, friend_id: i32) !bool {
+        if (user_id == friend_id or friend_id == 3) return false;
+        var user_buf: [24]u8 = undefined;
+        var friend_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const friend = try std.fmt.bufPrint(&friend_buf, "{d}", .{friend_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.friends(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", &.{ user, friend });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn removeFriend(self: *Store, user_id: i32, friend_id: i32) !bool {
+        if (friend_id == 3) return false;
+        var user_buf: [24]u8 = undefined;
+        var friend_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const friend = try std.fmt.bufPrint(&friend_buf, "{d}", .{friend_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.friends WHERE user_id=$1 AND friend_id=$2 RETURNING 1", &.{ user, friend });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn favouriteSetIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(allocator, lease.conn, "SELECT set_id FROM zigcho.favourites WHERE user_id=$1 ORDER BY created_at,set_id LIMIT 10000", &.{id});
+        defer result.deinit();
+        var list: std.ArrayList(i32) = .empty;
+        errdefer list.deinit(allocator);
+        for (0..result.rows()) |row| try list.append(allocator, try result.int(i32, row, 0));
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn addFavourite(self: *Store, user_id: i32, set_id: i32) !bool {
+        if (set_id <= 0) return error.InvalidBeatmapSet;
+        var user_buf: [24]u8 = undefined;
+        var set_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.favourites(user_id,set_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", &.{ user, set });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
     pub fn recordPublicMessage(self: *Store, sender_id: i32, target: []const u8, message: []const u8) !void {
         var id_buf: [24]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{sender_id});
@@ -2029,6 +2095,25 @@ test "postgres account auth stats and token slice" {
         std.testing.allocator.free(by_name.safe_name);
     }
     try std.testing.expectEqual(second_id, by_name.id);
+    const initial_friends = try store.friendIds(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(initial_friends);
+    try std.testing.expect(std.mem.indexOfScalar(i32, initial_friends, 3) != null);
+    try std.testing.expect(try store.addFriend(user_id, second_id));
+    try std.testing.expect(!try store.addFriend(user_id, second_id));
+    const friends = try store.friendIds(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(friends);
+    try std.testing.expect(std.mem.indexOfScalar(i32, friends, 3) != null);
+    try std.testing.expect(std.mem.indexOfScalar(i32, friends, second_id) != null);
+    const reverse_friends = try store.friendIds(std.testing.allocator, second_id);
+    defer std.testing.allocator.free(reverse_friends);
+    try std.testing.expect(std.mem.indexOfScalar(i32, reverse_friends, user_id) == null);
+    try std.testing.expect(try store.removeFriend(user_id, second_id));
+    try std.testing.expect(!try store.removeFriend(user_id, second_id));
+    try std.testing.expect(try store.addFavourite(user_id, 900000000));
+    try std.testing.expect(!try store.addFavourite(user_id, 900000000));
+    const favourites = try store.favouriteSetIds(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(favourites);
+    try std.testing.expect(std.mem.indexOfScalar(i32, favourites, 900000000) != null);
     {
         var lease = store.pool.acquire();
         defer lease.release();

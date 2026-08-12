@@ -30,6 +30,16 @@ fn freeUser(allocator: std.mem.Allocator, user: domain.User) void {
     allocator.free(user.safe_name);
 }
 
+fn intLines(allocator: std.mem.Allocator, values: []const i32) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (values, 0..) |value, index| {
+        if (index != 0) try output.writer.writeByte('\n');
+        try output.writer.print("{d}", .{value});
+    }
+    return output.toOwnedSlice();
+}
+
 fn validWebText(value: []const u8, minimum: usize, maximum: usize) bool {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     return trimmed.len >= minimum and trimmed.len <= maximum and std.unicode.utf8ValidateSlice(trimmed);
@@ -190,6 +200,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return rate_limit.authenticated;
+        if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
         if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
@@ -875,7 +886,29 @@ const App = struct {
                 },
             };
         }
-        if (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php")) return respond(req, .ok, "text/plain", "", &.{});
+        if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) {
+            const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
+            const password = queryField(target, "h") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const name_buf = try self.allocator.dupe(u8, encoded_name);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer freeUser(self.allocator, user);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "", &.{});
+            if (std.mem.eql(u8, path, "/web/osu-addfavourite.php")) {
+                const set_id = std.fmt.parseInt(i32, queryField(target, "a") orelse return respond(req, .bad_request, "text/plain", "", &.{}), 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
+                if (set_id <= 0) return respond(req, .bad_request, "text/plain", "", &.{});
+                return respond(req, .ok, "text/plain", if (try self.store.addFavourite(user.id, set_id)) "Added favourite!" else "You've already favourited this beatmap!", &.{});
+            }
+            const ids = if (std.mem.eql(u8, path, "/web/osu-getfriends.php")) try self.store.friendIds(self.allocator, user.id) else try self.store.favouriteSetIds(self.allocator, user.id);
+            defer self.allocator.free(ids);
+            const response = try intLines(self.allocator, ids);
+            defer self.allocator.free(response);
+            return respond(req, .ok, "text/plain", response, &.{});
+        }
         if ((std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php")) and req.head.method == .GET) {
             const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
             const password = queryField(target, "h") orelse return respond(req, .unauthorized, "text/plain", "", &.{});

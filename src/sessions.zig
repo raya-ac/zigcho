@@ -18,6 +18,11 @@ pub const Session = struct {
     info_len: usize = 0,
     login_time: i64,
     last_seen: i64,
+    friend_ids: std.ArrayList(i32) = .empty,
+    block_non_friend_dms: bool = false,
+    presence_filter: u8 = 0,
+    away_message: [512]u8 = [_]u8{0} ** 512,
+    away_message_len: usize = 0,
     queue: std.ArrayList(u8) = .empty,
     queue_overflowed: bool = false,
     is_bot: bool = false,
@@ -33,6 +38,20 @@ pub const Session = struct {
 
     pub fn info(self: *const Session) []const u8 {
         return self.info_text[0..self.info_len];
+    }
+    pub fn away(self: *const Session) []const u8 {
+        return self.away_message[0..self.away_message_len];
+    }
+    pub fn isFriend(self: *const Session, user_id: i32) bool {
+        return std.mem.indexOfScalar(i32, self.friend_ids.items, user_id) != null;
+    }
+    pub fn addFriend(self: *Session, allocator: std.mem.Allocator, user_id: i32) !void {
+        if (self.isFriend(user_id)) return;
+        try self.friend_ids.append(allocator, user_id);
+    }
+    pub fn removeFriend(self: *Session, user_id: i32) void {
+        const index = std.mem.indexOfScalar(i32, self.friend_ids.items, user_id) orelse return;
+        _ = self.friend_ids.orderedRemove(index);
     }
     pub fn joined(self: *const Session, name: []const u8) bool {
         if (std.mem.eql(u8, name, "#osu")) return self.joined_osu;
@@ -82,6 +101,7 @@ pub const Sessions = struct {
     pub fn deinit(self: *Sessions) void {
         for (&self.matches) |*entry| if (entry.*) |*match| match.deinit();
         for (self.items.items) |s| {
+            s.friend_ids.deinit(self.allocator);
             s.queue.deinit(self.allocator);
             self.allocator.free(s.user.name);
             self.allocator.free(s.user.safe_name);
@@ -100,6 +120,13 @@ pub const Sessions = struct {
         _ = std.fmt.bufPrint(&s.token, "{x}", .{random}) catch unreachable;
         try self.items.append(self.allocator, s);
         return s;
+    }
+    pub fn createWithSocial(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool) !*Session {
+        errdefer self.allocator.free(friend_ids);
+        const session = try self.create(user, utc_offset, longitude, latitude);
+        session.friend_ids = .fromOwnedSlice(friend_ids);
+        session.block_non_friend_dms = block_non_friend_dms;
+        return session;
     }
     pub fn createBot(self: *Sessions, user: domain.User) !*Session {
         if (self.byUser(user.id)) |old| self.remove(old);
@@ -165,6 +192,7 @@ pub const Sessions = struct {
         };
         for (self.items.items, 0..) |s, i| if (s == target) {
             _ = self.items.swapRemove(i);
+            s.friend_ids.deinit(self.allocator);
             s.queue.deinit(self.allocator);
             self.allocator.free(s.user.name);
             self.allocator.free(s.user.safe_name);

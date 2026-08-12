@@ -238,7 +238,7 @@ fn loginFailure(allocator: std.mem.Allocator, token_text: []const u8, notificati
     return .{ .allocator = allocator, .token = token, .body = try allocator.dupe(u8, out.bytes()) };
 }
 
-fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, matched_user_ids: []const i32) !LoginCapture {
+fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool, matched_user_ids: []const i32) !LoginCapture {
     var user_owned = true;
     errdefer if (user_owned) {
         allocator.free(user.name);
@@ -246,7 +246,7 @@ fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sess
     };
     for (matched_user_ids) |matched_user_id| if (sessions.byUser(matched_user_id)) |matched| removeSessionLocked(allocator, sessions, matched);
     if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
-    const session = try sessions.create(user, utc, longitude, latitude);
+    const session = try sessions.createWithSocial(user, utc, longitude, latitude, friend_ids, block_non_friend_dms);
     user_owned = false;
     errdefer sessions.remove(session);
     const token = try allocator.dupe(u8, &session.token);
@@ -305,6 +305,11 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         user.restricted = true;
         std.log.warn("stable login restricted exact hardware match: user_id={d} matches={any}", .{ user.id, enforcement.matched_user_ids });
     }
+    const response_friend_ids = try store.friendIds(allocator, user.id);
+    defer allocator.free(response_friend_ids);
+    const session_friend_ids = try allocator.dupe(i32, response_friend_ids);
+    var friends_transferred = false;
+    defer if (!friends_transferred) allocator.free(session_friend_ids);
     std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
@@ -316,7 +321,8 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     sessions.mutex.lockUncancelable(sessions.io);
     pruneExpiredLocked(allocator, sessions);
     user_transferred = true;
-    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, enforcement.matched_user_ids) catch |err| {
+    friends_transferred = true;
+    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, session_friend_ids, parsed.pm_private, enforcement.matched_user_ids) catch |err| {
         sessions.mutex.unlock(sessions.io);
         return err;
     };
@@ -344,6 +350,7 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     try protocol.writeChannel(&out, "#osu", "general", capture.osu_count);
     try protocol.writeChannel(&out, "#announce", "updates", capture.announce_count);
     try out.packetEmpty(.channel_info_end);
+    try out.packetIntList(.friends_list, response_friend_ids);
     for (capture.sessions.items, 0..) |*other, index| if (index != own_index and !other.user.restricted) {
         try presence(&out, other);
         try stats(&out, store, other);
@@ -813,6 +820,44 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             try stats(&event, store, session);
             try sessions.broadcast(event.bytes(), session);
         },
+        .friend_add => {
+            const friend_id = packetUserId(packet.payload) orelse continue;
+            if (friend_id == session.user.id or friend_id == 3 or session.isFriend(friend_id)) continue;
+            if (sessions.byUser(friend_id) == null) {
+                const found = (try store.userById(allocator, friend_id)) orelse continue;
+                allocator.free(found.name);
+                allocator.free(found.safe_name);
+            }
+            try session.friend_ids.ensureUnusedCapacity(allocator, 1);
+            _ = try store.addFriend(session.user.id, friend_id);
+            session.friend_ids.appendAssumeCapacity(friend_id);
+        },
+        .friend_remove => {
+            const friend_id = packetUserId(packet.payload) orelse continue;
+            if (friend_id == 3) continue;
+            _ = try store.removeFriend(session.user.id, friend_id);
+            session.removeFriend(friend_id);
+        },
+        .receive_updates => {
+            if (packet.payload.len != @sizeOf(i32)) continue;
+            const value = std.mem.readInt(i32, packet.payload[0..4], .little);
+            if (value >= 0 and value <= 2) session.presence_filter = @intCast(value);
+        },
+        .set_away_message => {
+            var p: protocol.PayloadReader = .{ .data = packet.payload };
+            _ = try p.string();
+            const message = try p.string();
+            _ = try p.string();
+            _ = try p.int(i32);
+            if (message.len > session.away_message.len or std.mem.indexOfScalar(u8, message, 0) != null or !std.unicode.utf8ValidateSlice(message)) continue;
+            session.away_message_len = message.len;
+            @memcpy(session.away_message[0..message.len], message);
+        },
+        .toggle_block_non_friend_dms => {
+            if (packet.payload.len != @sizeOf(i32)) continue;
+            const value = std.mem.readInt(i32, packet.payload[0..4], .little);
+            if (value == 0 or value == 1) session.block_non_friend_dms = value == 1;
+        },
         .send_public_message, .send_private_message => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             _ = try p.string();
@@ -850,6 +895,15 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             if (packet.id == .send_private_message) {
                 if (sessions.byName(target_name)) |target| {
                     if (!target.is_bot) {
+                        if (target.block_non_friend_dms and !target.isFriend(session.user.id)) {
+                            const start = try out.begin(.user_dm_blocked);
+                            try out.string("");
+                            try out.string("");
+                            try out.string(target.user.name);
+                            try out.int(i32, 0);
+                            out.finish(start);
+                            continue;
+                        }
                         if (target.user.silence_end > now or target.user.restricted) {
                             var blocked = protocol.Writer.init(allocator);
                             defer blocked.deinit();
@@ -861,6 +915,9 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                             blocked.finish(start);
                             try out.raw(blocked.bytes());
                             continue;
+                        }
+                        if (target.action == 1 and target.away().len != 0) {
+                            try protocol.writeMessage(&out, target.user.name, target.away(), session.user.name, target.user.id);
                         }
                         try queuePacket(target, allocator, message.bytes());
                     }
@@ -1279,6 +1336,10 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             const count = try p.int(u16);
             var i: usize = 0;
             while (i < count) : (i += 1) if (sessions.byUser(try p.int(i32))) |s| try presence(&out, s);
+        },
+        .user_presence_request_all => {
+            if (packet.payload.len != @sizeOf(i32)) continue;
+            for (sessions.items.items) |target| if (!target.user.restricted) try presence(&out, target);
         },
         .start_spectating => {
             const target_id = packetUserId(packet.payload) orelse continue;

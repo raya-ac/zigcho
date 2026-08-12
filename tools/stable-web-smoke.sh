@@ -55,7 +55,51 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
 expect_status "$code" 201 register_player
 player_id=$(jq -er '.id' "$response")
 
-sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id);"
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/users" \
+  --data-urlencode 'name=social player' --data-urlencode 'email=social-player@example.test' --data-urlencode 'password_md5=00000000000000000000000000000000')
+expect_status "$code" 201 register_social_player
+social_player_id=$(jq -er '.id' "$response")
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/users" \
+  --data-urlencode 'name=social friend' --data-urlencode 'email=social-friend@example.test' --data-urlencode 'password_md5=11111111111111111111111111111111')
+expect_status "$code" 201 register_social_friend
+social_friend_id=$(jq -er '.id' "$response")
+
+sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; INSERT INTO friends(user_id,friend_id) VALUES($social_player_id,$social_friend_id); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id);"
+
+stable_login_body="social player
+00000000000000000000000000000000
+b20260811|0|0|11111111111111111111111111111111:1.2.3.:22222222222222222222222222222222:33333333333333333333333333333333:44444444444444444444444444444444:|1"
+code=$(curl --silent --show-error --dump-header "$headers" --output "$response" --write-out '%{http_code}' --request POST "$origin/" \
+  --header 'User-Agent: osu!' --data-binary "$stable_login_body")
+expect_status "$code" 200 stable_social_login
+grep -qi '^osu-token: [0-9a-f]\{64\}' "$headers" || fail missing_stable_token
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-getfriends.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000')
+expect_status "$code" 200 stable_get_friends
+grep -qx '3' "$response" || fail missing_kai_friend
+grep -qx "$social_friend_id" "$response" || fail missing_social_friend
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-getfavourites.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000')
+expect_status "$code" 200 stable_get_empty_favourites
+[ ! -s "$response" ] || fail expected_empty_favourites
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-addfavourite.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000' --data-urlencode 'a=9001')
+expect_status "$code" 200 stable_add_favourite
+grep -qx 'Added favourite!' "$response" || fail invalid_add_favourite_response
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-addfavourite.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000' --data-urlencode 'a=9001')
+expect_status "$code" 200 stable_add_duplicate_favourite
+grep -qx "You've already favourited this beatmap!" "$response" || fail invalid_duplicate_favourite_response
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/osu-getfavourites.php" \
+  --data-urlencode 'u=social player' --data-urlencode 'h=00000000000000000000000000000000')
+expect_status "$code" 200 stable_get_favourites
+grep -qx '9001' "$response" || fail missing_favourite
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/appeals" \
   --header 'Origin: https://evil.test' --data-urlencode 'username=restricted player' --data-urlencode 'password=StablePass123!' \

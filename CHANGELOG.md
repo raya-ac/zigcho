@@ -1,5 +1,13 @@
 # changelog
 
+## 2026-08-13 — stable social state actually survives a reconnect
+
+friends are real stored relationships now. they are directional, kai stays in every player's list as ID 3, and login sends the complete Stable friends packet before the client starts asking for people again. add and remove packets update PostgreSQL even when the other player is offline.
+
+the private-message switch works too. a player blocking non-friend DMs gets Stable's proper blocked packet, friends still get through, and an AFK player can send their away reply without eating the original message. presence-all restores every unrestricted online player and the client's friends-only update choice is kept on the session.
+
+the old friends and favourites web routes are no longer empty placeholders. they require the real online Stable account, return the stored IDs, keep duplicate favourites idempotent, and use the exact response text the client expects.
+
 ## 2026-08-13 — stable scoring is pinned across every mode now
 
 Stable PP has fixed snapshots for osu!, taiko, catch, and mania across no-mod, HD, HR, DT, miss, and FC paths. the stored-score matrix keeps vanilla, relax, and autopilot stats separate and proves failed plays only add the aggregates they are meant to add.

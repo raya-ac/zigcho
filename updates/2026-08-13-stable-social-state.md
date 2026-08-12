@@ -8,6 +8,8 @@ the legacy friends and favourites pages are backed by the account now. they only
 
 I caught the stats display while this was still held back too. switching to Relax or Autopilot updated everyone else but did not return the same `user_stats` packet to the player who changed mods, so their own client could drop back to the no-mod display. it now returns the chosen stats immediately and the test walks vanilla to Relax to Autopilot and back.
 
-the local client-shaped smoke logs in through Bancho before touching any of those routes. the suite is at 102/102 locally, with all 105 tests running when the three real PostgreSQL fixtures are connected. the exact Linux gate follows before this commit can go live.
+the local client-shaped smoke logs in through Bancho before touching any of those routes. the suite passed 102/102 locally and 105/105 in Debug and ReleaseSafe with all three real PostgreSQL fixtures connected. the exact x86_64 Linux build passed too.
 
-that is phase 3 of 5 done once the public checks pass. Stable is around 97% now. the remaining work is media/account/proxy packet cleanup, then the long soak, restart, restore, rollback, and load gate. lazer and BSS are still parked.
+`40bc007` is live with `372c321` kept as rollback. the 1.82 GB backup restored cleanly at schema 17, all 21 public hosts passed, Layerline and zigcho are active with zero restarts, and the installed Stable client reconnected and loaded its next map normally.
+
+that is phase 3 of 5 done. Stable is around 97% now. native Zig PP is next, then the remaining media/account/proxy cleanup and the long soak, restart, restore, rollback, and load gate. lazer and BSS are still parked.

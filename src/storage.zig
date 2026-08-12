@@ -1147,9 +1147,10 @@ pub const Store = struct {
         return stmt.?;
     }
 
-    fn writeSiteScores(writer: *std.Io.Writer, scores: *c.sqlite3_stmt) !void {
+    fn writeSiteScores(writer: *std.Io.Writer, scores: *c.sqlite3_stmt, include_weight: bool) !void {
         try writer.writeByte('[');
         var first = true;
+        var position: usize = 0;
         while (c.sqlite3_step(scores) == c.SQLITE_ROW) {
             if (!first) try writer.writeByte(',');
             first = false;
@@ -1161,7 +1162,14 @@ pub const Store = struct {
             try jsonString(writer, std.mem.span(c.sqlite3_column_text(scores, 13)));
             try writer.writeAll(",\"version\":");
             try jsonString(writer, std.mem.span(c.sqlite3_column_text(scores, 14)));
-            try writer.print(",\"status\":{d}}}", .{c.sqlite3_column_int(scores, 15)});
+            try writer.print(",\"status\":{d}", .{c.sqlite3_column_int(scores, 15)});
+            if (include_weight) {
+                const percentage = 100.0 * std.math.pow(f64, 0.95, @floatFromInt(position));
+                const weighted_pp = c.sqlite3_column_double(scores, 2) * percentage / 100.0;
+                try writer.print(",\"weight\":{{\"percentage\":{d:.2},\"pp\":{d:.2}}}", .{ percentage, weighted_pp });
+            }
+            try writer.writeByte('}');
+            position += 1;
         }
         try writer.writeByte(']');
     }
@@ -1201,11 +1209,11 @@ pub const Store = struct {
             try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ c.sqlite3_column_int(stats, 0), c.sqlite3_column_int64(stats, 1), c.sqlite3_column_int64(stats, 2), c.sqlite3_column_int(stats, 3), c.sqlite3_column_int(stats, 4), c.sqlite3_column_int(stats, 5), c.sqlite3_column_int64(stats, 6), c.sqlite3_column_double(stats, 7), c.sqlite3_column_int(stats, 8), c.sqlite3_column_int(stats, 9) });
         }
         try output.writer.writeAll("],\"pinned_scores\":");
-        try writeSiteScores(&output.writer, pinned);
+        try writeSiteScores(&output.writer, pinned, false);
         try output.writer.writeAll(",\"top_scores\":");
-        try writeSiteScores(&output.writer, top);
+        try writeSiteScores(&output.writer, top, true);
         try output.writer.writeAll(",\"recent_scores\":");
-        try writeSiteScores(&output.writer, recent);
+        try writeSiteScores(&output.writer, recent, false);
         try output.writer.writeByte('}');
         var list = output.toArrayList();
         return try list.toOwnedSlice(allocator);

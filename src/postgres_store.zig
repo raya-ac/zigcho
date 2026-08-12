@@ -1441,7 +1441,7 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    fn writeSiteScores(writer: *std.Io.Writer, scores: *postgres.Result) !void {
+    fn writeSiteScores(writer: *std.Io.Writer, scores: *postgres.Result, include_weight: bool) !void {
         try writer.writeByte('[');
         for (0..scores.rows()) |row| {
             if (row != 0) try writer.writeByte(',');
@@ -1453,7 +1453,13 @@ pub const Store = struct {
             try jsonString(writer, scores.value(row, 13));
             try writer.writeAll(",\"version\":");
             try jsonString(writer, scores.value(row, 14));
-            try writer.print(",\"status\":{d}}}", .{try scores.int(i8, row, 15)});
+            try writer.print(",\"status\":{d}", .{try scores.int(i8, row, 15)});
+            if (include_weight) {
+                const percentage = 100.0 * std.math.pow(f64, 0.95, @floatFromInt(row));
+                const weighted_pp = try scores.float(f64, row, 2) * percentage / 100.0;
+                try writer.print(",\"weight\":{{\"percentage\":{d:.2},\"pp\":{d:.2}}}", .{ percentage, weighted_pp });
+            }
+            try writer.writeByte('}');
         }
         try writer.writeByte(']');
     }
@@ -1491,11 +1497,11 @@ pub const Store = struct {
             try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ try stats.int(u8, row, 0), try stats.int(i64, row, 1), try stats.int(i64, row, 2), try stats.int(i32, row, 3), try stats.int(i32, row, 4), try stats.int(i32, row, 5), try stats.int(i64, row, 6), try stats.float(f64, row, 7), try stats.int(i32, row, 8), try stats.int(i32, row, 9) });
         }
         try output.writer.writeAll("],\"pinned_scores\":");
-        try writeSiteScores(&output.writer, &pinned);
+        try writeSiteScores(&output.writer, &pinned, false);
         try output.writer.writeAll(",\"top_scores\":");
-        try writeSiteScores(&output.writer, &top);
+        try writeSiteScores(&output.writer, &top, true);
         try output.writer.writeAll(",\"recent_scores\":");
-        try writeSiteScores(&output.writer, &recent);
+        try writeSiteScores(&output.writer, &recent, false);
         try output.writer.writeByte('}');
         var list = output.toArrayList();
         return try list.toOwnedSlice(allocator);
@@ -1883,6 +1889,7 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"weight\":{\"percentage\":100.00,\"pp\":26.80}") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
     var relax = score;
     relax.online_checksum = "cccccccccccccccccccccccccccccccc";

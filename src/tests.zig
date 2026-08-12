@@ -929,6 +929,12 @@ test "profile pins replace the selected map and keep three per stable score slic
     try std.testing.expectEqual(@as(usize, 5), recent.len);
     try std.testing.expectEqual(replacement_id, top[0].object.get("id").?.integer);
     try std.testing.expectEqual(replacement_id, recent[0].object.get("id").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), top[0].object.get("weight").?.object.get("percentage").?.float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 99.0), top[0].object.get("weight").?.object.get("pp").?.float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 95.0), top[1].object.get("weight").?.object.get("percentage").?.float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 90.25), top[2].object.get("weight").?.object.get("percentage").?.float, 0.001);
+    try std.testing.expect(pinned[0].object.get("weight") == null);
+    try std.testing.expect(recent[0].object.get("weight") == null);
     for (pinned) |item| try std.testing.expect(item.object.get("id").?.integer != score_ids[0]);
 }
 

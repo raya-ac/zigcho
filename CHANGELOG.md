@@ -8,6 +8,8 @@ the private-message switch works too. a player blocking non-friend DMs gets Stab
 
 the old friends and favourites web routes are no longer empty placeholders. they require the real online Stable account, return the stored IDs, keep duplicate favourites idempotent, and use the exact response text the client expects.
 
+switching vanilla, Relax, or Autopilot now returns the new `user_stats` packet to the player who changed it as well as everyone watching them. the client no longer falls back to displaying the no-mod slice until its next refresh.
+
 ## 2026-08-13 — stable scoring is pinned across every mode now
 
 Stable PP has fixed snapshots for osu!, taiko, catch, and mania across no-mod, HD, HR, DT, miss, and FC paths. the stored-score matrix keeps vanilla, relax, and autopilot stats separate and proves failed plays only add the aggregates they are meant to add.

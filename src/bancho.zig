@@ -818,6 +818,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             var event = protocol.Writer.init(allocator);
             defer event.deinit();
             try stats(&event, store, session);
+            try out.raw(event.bytes());
             try sessions.broadcast(event.bytes(), session);
         },
         .friend_add => {

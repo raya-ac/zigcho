@@ -76,13 +76,17 @@ fn clientIntPacket(allocator: std.mem.Allocator, id: protocol.ClientPacket, valu
 }
 
 fn clientActionPacket(allocator: std.mem.Allocator, action: u8) ![]u8 {
+    return clientActionModsPacket(allocator, action, 0, 0);
+}
+
+fn clientActionModsPacket(allocator: std.mem.Allocator, action: u8, mods: i32, mode: u8) ![]u8 {
     var payload = protocol.Writer.init(allocator);
     defer payload.deinit();
     try payload.byte(action);
     try payload.string("");
     try payload.string("");
-    try payload.int(i32, 0);
-    try payload.byte(0);
+    try payload.int(i32, mods);
+    try payload.byte(mode);
     try payload.int(i32, 0);
     return clientPayloadPacket(allocator, .change_action, payload.bytes());
 }
@@ -207,6 +211,29 @@ fn expectPresenceUsers(data: []const u8, included: []const i32, excluded: []cons
         for (excluded) |user_id| try std.testing.expect(actual != user_id);
     }
     for (found[0..included.len]) |present| try std.testing.expect(present);
+}
+
+fn expectStatsPacket(data: []const u8, user_id: i32, expected_mods: i32, expected_mode: u8, expected_pp: u16) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.user_stats)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        if (try payload.int(i32) != user_id) continue;
+        _ = try payload.byte();
+        _ = try payload.string();
+        _ = try payload.string();
+        try std.testing.expectEqual(expected_mods, try payload.int(i32));
+        try std.testing.expectEqual(expected_mode, try payload.byte());
+        _ = try payload.int(i32);
+        _ = try payload.int(i64);
+        _ = try payload.int(u32);
+        _ = try payload.int(i32);
+        _ = try payload.int(i64);
+        _ = try payload.int(i32);
+        try std.testing.expectEqual(expected_pp, try payload.int(u16));
+        return;
+    }
+    return error.MissingPacket;
 }
 
 fn expectMessageText(data: []const u8, expected: []const u8) !void {
@@ -1272,6 +1299,50 @@ test "a stopped client cannot grow its outgoing queue past the cap" {
     try std.testing.expectEqual(@as(usize, 0), stopped.queue.items.len);
     try std.testing.expect((try bancho.pollByToken(std.testing.allocator, &store, &sessions, &token, "")) == null);
     try std.testing.expect(sessions.byUser(1) == null);
+}
+
+test "stable mod changes immediately return the selected stats slice to the player" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/mod-stats-update.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
+            "(40,'player','player',x'00',x'00'),(41,'observer','observer',x'00',x'00');" ++
+            "INSERT INTO stats(user_id,mode,pp) VALUES" ++
+            "(40,0,100),(40,4,400),(40,8,800),(41,0,1);",
+    );
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const player = try sessions.create((try store.userById(std.testing.allocator, 40)).?, 0, 0, 0);
+    const observer = try sessions.create((try store.userById(std.testing.allocator, 41)).?, 0, 0, 0);
+
+    const relax = try clientActionModsPacket(std.testing.allocator, 0, 1 << 7, 0);
+    defer std.testing.allocator.free(relax);
+    const relax_self = try bancho.poll(std.testing.allocator, &store, &sessions, player, relax);
+    defer std.testing.allocator.free(relax_self);
+    try expectStatsPacket(relax_self, 40, 1 << 7, 0, 400);
+    const relax_observer = try bancho.poll(std.testing.allocator, &store, &sessions, observer, "");
+    defer std.testing.allocator.free(relax_observer);
+    try expectStatsPacket(relax_observer, 40, 1 << 7, 0, 400);
+
+    const autopilot = try clientActionModsPacket(std.testing.allocator, 0, 1 << 13, 0);
+    defer std.testing.allocator.free(autopilot);
+    const autopilot_self = try bancho.poll(std.testing.allocator, &store, &sessions, player, autopilot);
+    defer std.testing.allocator.free(autopilot_self);
+    try expectStatsPacket(autopilot_self, 40, 1 << 13, 0, 800);
+    const autopilot_observer = try bancho.poll(std.testing.allocator, &store, &sessions, observer, "");
+    defer std.testing.allocator.free(autopilot_observer);
+    try expectStatsPacket(autopilot_observer, 40, 1 << 13, 0, 800);
+
+    const vanilla = try clientActionModsPacket(std.testing.allocator, 0, 0, 0);
+    defer std.testing.allocator.free(vanilla);
+    const vanilla_self = try bancho.poll(std.testing.allocator, &store, &sessions, player, vanilla);
+    defer std.testing.allocator.free(vanilla_self);
+    try expectStatsPacket(vanilla_self, 40, 0, 0, 100);
 }
 
 test "stable friends and favourites stay directional and always include kai" {

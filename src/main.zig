@@ -11,6 +11,7 @@ const stable_score = @import("stable_score.zig");
 const stable_response = @import("stable_response.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("pp.zig");
+const screenshot = @import("screenshot.zig");
 const status_page = @embedFile("status.html");
 const form_urlencoded = @import("form_urlencoded.zig");
 const registration = @import("registration.zig");
@@ -199,9 +200,10 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/appeals")) return rate_limit.appeal;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-screenshot.php")) return rate_limit.media_upload;
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return rate_limit.authenticated;
         if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
-        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
+        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/ss/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
@@ -213,6 +215,7 @@ const App = struct {
         if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return 20 * 1024 * 1024;
+        if (std.mem.eql(u8, path, "/web/osu-screenshot.php")) return screenshot.max_bytes + 256 * 1024;
         if (std.mem.eql(u8, path, "/")) return 1024 * 1024;
         return 64 * 1024;
     }
@@ -650,6 +653,15 @@ const App = struct {
             const set = (try self.store.lazerBeatmapSet(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(set);
             return respond(req, .ok, "application/json", set, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/ss/")) {
+            const requested = screenshot.parsePath(path) orelse return respond(req, .not_found, "application/json", "{\"status\":\"Screenshot not found.\"}", &.{});
+            const image = (try self.store.screenshot(self.allocator, requested.token, requested.kind.extension())) orelse return respond(req, .not_found, "application/json", "{\"status\":\"Screenshot not found.\"}", &.{});
+            defer self.allocator.free(image);
+            return respond(req, .ok, requested.kind.contentType(), image, &.{
+                .{ .name = "cache-control", .value = "public, max-age=31536000, immutable" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            });
         }
         if (req.head.method == .GET and (isAvatarHost(host_owned) or std.mem.startsWith(u8, path, "/avatars/") or std.mem.startsWith(u8, path, "/avatar/"))) {
             if (avatarUserId(path)) |user_id| {
@@ -1112,6 +1124,49 @@ const App = struct {
             const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes }, placed, before_stats, after_stats, performance.pp);
             defer self.allocator.free(response_body);
             return respond(req, .ok, "text/plain", response_body, &.{});
+        }
+        if (std.mem.eql(u8, path, "/web/osu-screenshot.php") and req.head.method == .POST) {
+            const content_type = content_type_owned orelse return respond(req, .bad_request, "text/plain", "Invalid file type", &.{});
+            const boundary = multipart.boundaryFromContentType(content_type) catch return respond(req, .bad_request, "text/plain", "Invalid file type", &.{});
+            var form = multipart.parse(self.allocator, body, boundary) catch return respond(req, .bad_request, "text/plain", "Invalid file type", &.{});
+            defer form.deinit();
+            const username_part = form.first("u") orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            const password = (form.first("p") orelse return respond(req, .unauthorized, "text/plain", "", &.{})).data;
+            const endpoint_version = std.fmt.parseInt(u8, (form.first("v") orelse return respond(req, .bad_request, "text/plain", "Invalid file type", &.{})).data, 10) catch return respond(req, .bad_request, "text/plain", "Invalid file type", &.{});
+            const upload = form.first("ss") orelse return respond(req, .bad_request, "text/plain", "Invalid file type", &.{});
+            if (upload.filename == null) return respond(req, .bad_request, "text/plain", "Invalid file type", &.{});
+            const name_buf = try self.allocator.dupe(u8, username_part.data);
+            defer self.allocator.free(name_buf);
+            for (name_buf) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const name = std.Uri.percentDecodeInPlace(name_buf);
+            const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
+            defer self.allocator.free(user.name);
+            defer self.allocator.free(user.safe_name);
+            if (!self.userOnline(user.id)) return respond(req, .unauthorized, "text/plain", "", &.{});
+            const kind = screenshot.detect(upload.data) catch |err| return switch (err) {
+                error.FileTooLarge => respond(req, .bad_request, "text/plain", "Screenshot file too large.", &.{}),
+                else => respond(req, .bad_request, "text/plain", "Invalid file type", &.{}),
+            };
+            if (endpoint_version != 1) std.log.warn("stable screenshot used unexpected endpoint version: user_id={d} version={d}", .{ user.id, endpoint_version });
+            var token_value: [8]u8 = undefined;
+            var stored = false;
+            for (0..8) |_| {
+                token_value = try screenshot.generateToken(self.store.io);
+                if (self.store.putScreenshot(user.id, &token_value, kind.extension(), upload.data) catch |err| switch (err) {
+                    error.ScreenshotQuotaExceeded => return respond(req, .bad_request, "text/plain", "Screenshot storage full.", &.{}),
+                    else => return err,
+                }) {
+                    stored = true;
+                    break;
+                }
+            }
+            if (!stored) return respond(req, .service_unavailable, "text/plain", "", &.{});
+            var filename_buf: [13]u8 = undefined;
+            const filename = try std.fmt.bufPrint(&filename_buf, "{s}.{s}", .{ &token_value, kind.extension() });
+            std.log.info("event=stable_screenshot_uploaded user_id={d} filename={s} bytes={d}", .{ user.id, filename, upload.data.len });
+            return respond(req, .ok, "text/plain", filename, &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-getreplay.php") and req.head.method == .GET) {
             const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});

@@ -1,5 +1,13 @@
 # changelog
 
+## 2026-08-13 — stable screenshots stop falling into a 404
+
+Stable's screenshot upload now follows the client contract. the account has to be logged into Bancho, the multipart image is capped at 4 MiB, and only real PNG or JFIF data is accepted. each account stops at 1,000 files or 256 MiB. a successful upload returns the short filename Stable expects and `/ss/{filename}` serves those exact bytes back with the right image type.
+
+screenshots live in PostgreSQL instead of a random folder beside one release. schema 18 carries them through backups, restores, the SQLite rollback database, and the checked SQLite-to-PostgreSQL importer. uploads have their own rate limit and unknown names return a real 404.
+
+the HTTP smoke registered a fresh Stable account, logged it into Bancho, uploaded a PNG, and downloaded it again with the same SHA-256. the rough native PP draft is kept away from live scores until it can match the pinned engine on real maps; I am not replacing correct ranks with a calculator that only looks right on one fixture.
+
 ## 2026-08-13 — stable social state actually survives a reconnect
 
 friends are real stored relationships now. they are directional, kai stays in every player's list as ID 3, and login sends the complete Stable friends packet before the client starts asking for people again. add and remove packets update PostgreSQL even when the other player is offline.

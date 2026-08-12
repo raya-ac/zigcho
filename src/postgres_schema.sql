@@ -283,4 +283,13 @@ CREATE TABLE moderation_appeals (
 CREATE UNIQUE INDEX moderation_appeals_one_open ON moderation_appeals(user_id, kind) WHERE status='open';
 CREATE INDEX moderation_appeals_queue ON moderation_appeals(status, created_at, id);
 
-INSERT INTO schema_migrations(version) VALUES (17);
+CREATE TABLE screenshots (
+    token char(8) PRIMARY KEY,
+    extension text NOT NULL CHECK(extension IN ('jpeg','png')),
+    uploader_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    image bytea NOT NULL CHECK(octet_length(image) <= 4194304),
+    created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
+);
+CREATE INDEX screenshots_uploader_time ON screenshots(uploader_id, created_at DESC);
+
+INSERT INTO schema_migrations(version) VALUES (18);

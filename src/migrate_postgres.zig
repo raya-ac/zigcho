@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 17;
+const required_sqlite_version = 18;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -116,6 +116,10 @@ const moderation_appeals = [_]Column{
     .{ .name = "message", .kind = .text },    .{ .name = "status", .kind = .text },        .{ .name = "reviewer_id", .kind = .integer },
     .{ .name = "resolution", .kind = .text }, .{ .name = "created_at", .kind = .integer }, .{ .name = "resolved_at", .kind = .integer },
 };
+const screenshots = [_]Column{
+    .{ .name = "token", .kind = .text }, .{ .name = "extension", .kind = .text },     .{ .name = "uploader_id", .kind = .integer },
+    .{ .name = "image", .kind = .blob }, .{ .name = "created_at", .kind = .integer },
+};
 
 const tables = [_]Table{
     .{ .name = "users", .columns = &users, .identity = true },
@@ -139,6 +143,7 @@ const tables = [_]Table{
     .{ .name = "beatmap_hydration_failures", .columns = &beatmap_hydration_failures },
     .{ .name = "client_hardware", .columns = &client_hardware },
     .{ .name = "moderation_appeals", .columns = &moderation_appeals, .identity = true },
+    .{ .name = "screenshots", .columns = &screenshots },
 };
 
 fn sqliteError(db: *sqlite.sqlite3) void {
@@ -312,14 +317,16 @@ fn verifyCounts(allocator: std.mem.Allocator, source: *sqlite.sqlite3, target: *
         "coalesce((SELECT sum(length(replay)) FROM scores),0)+" ++
         "coalesce((SELECT sum(length(replay)) FROM lazer_scores),0)+" ++
         "coalesce((SELECT sum(length(token_hash)) FROM oauth_tokens),0)+" ++
-        "coalesce((SELECT sum(length(osz_file)) FROM beatmap_archives),0)");
+        "coalesce((SELECT sum(length(osz_file)) FROM beatmap_archives),0)+" ++
+        "coalesce((SELECT sum(length(image)) FROM screenshots),0)");
     const target_blob_bytes = try pgInt(target, allocator, "SELECT " ++
         "coalesce((SELECT sum(octet_length(password_hash)+octet_length(password_salt)) FROM zigcho.users),0)+" ++
         "coalesce((SELECT sum(octet_length(osu_file)) FROM zigcho.beatmaps),0)+" ++
         "coalesce((SELECT sum(octet_length(replay)) FROM zigcho.scores),0)+" ++
         "coalesce((SELECT sum(octet_length(replay)) FROM zigcho.lazer_scores),0)+" ++
         "coalesce((SELECT sum(octet_length(token_hash)) FROM zigcho.oauth_tokens),0)+" ++
-        "coalesce((SELECT sum(octet_length(osz_file)) FROM zigcho.beatmap_archives),0)");
+        "coalesce((SELECT sum(octet_length(osz_file)) FROM zigcho.beatmap_archives),0)+" ++
+        "coalesce((SELECT sum(octet_length(image)) FROM zigcho.screenshots),0)");
     if (source_blob_bytes != target_blob_bytes) return error.PostgresParityFailed;
 }
 
@@ -384,7 +391,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 21), tables.len);
+    try std.testing.expectEqual(@as(usize, 22), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
-    try std.testing.expectEqualStrings("moderation_appeals", tables[tables.len - 1].name);
+    try std.testing.expectEqualStrings("screenshots", tables[tables.len - 1].name);
 }

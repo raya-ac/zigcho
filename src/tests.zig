@@ -25,12 +25,14 @@ const migrate_postgres = @import("migrate_postgres.zig");
 const postgres_store = @import("postgres_store.zig");
 const webhook = @import("webhook.zig");
 const web_auth = @import("web_auth.zig");
+const screenshot = @import("screenshot.zig");
 
 comptime {
     _ = postgres;
     _ = migrate_postgres;
     _ = postgres_store;
     _ = web_auth;
+    _ = screenshot;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -765,6 +767,24 @@ test "accounts keep one assigned default avatar" {
     try std.testing.expect(user_avatar == 1 or user_avatar == 2);
     try std.testing.expectEqual(user_avatar, (try store.avatarForUser(user_id)).?);
     try std.testing.expect((try store.avatarForUser(999_999)) == null);
+}
+
+test "stable screenshots survive storage with exact type isolation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/screenshots.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("screenshot test", "screenshot-test@example.invalid", "00000000000000000000000000000000");
+    const png = "\x89PNG\r\n\x1a\nbodyIEND\xaeB`\x82";
+    try std.testing.expect(try store.putScreenshot(user_id, "Ab1_-xyZ", "png", png));
+    try std.testing.expect(!try store.putScreenshot(user_id, "Ab1_-xyZ", "png", "collision"));
+    const stored = (try store.screenshot(std.testing.allocator, "Ab1_-xyZ", "png")).?;
+    defer std.testing.allocator.free(stored);
+    try std.testing.expectEqualSlices(u8, png, stored);
+    try std.testing.expect((try store.screenshot(std.testing.allocator, "Ab1_-xyZ", "jpeg")) == null);
 }
 
 test "Akatsuki ranks map into local leaderboard states" {

@@ -4,6 +4,7 @@ const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
 const stable_mods = @import("stable_mods.zig");
+const screenshot_contract = @import("screenshot.zig");
 pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -121,6 +122,7 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_017.sql"));
         }
+        if (version < 18) try self.exec(@embedFile("migration_018.sql"));
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -1993,6 +1995,42 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, score_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        return @as(?[]u8, try allocator.dupe(u8, ptr[0..len]));
+    }
+
+    pub fn putScreenshot(self: *Store, user_id: i32, token: []const u8, extension: []const u8, image: []const u8) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var quota: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*),coalesce(sum(length(image)),0) FROM screenshots WHERE uploader_id=?1", -1, &quota, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(quota);
+        _ = c.sqlite3_bind_int(quota, 1, user_id);
+        if (c.sqlite3_step(quota) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        const file_count: usize = @intCast(c.sqlite3_column_int64(quota, 0));
+        const byte_count: usize = @intCast(c.sqlite3_column_int64(quota, 1));
+        if (!screenshot_contract.quotaAllows(file_count, byte_count, image.len)) return error.ScreenshotQuotaExceeded;
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO screenshots(token,extension,uploader_id,image) VALUES(?1,?2,?3,?4)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, token.ptr, @intCast(token.len), null);
+        _ = c.sqlite3_bind_text(stmt, 2, extension.ptr, @intCast(extension.len), null);
+        _ = c.sqlite3_bind_int(stmt, 3, user_id);
+        _ = c.sqlite3_bind_blob(stmt, 4, image.ptr, @intCast(image.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) == 1;
+    }
+
+    pub fn screenshot(self: *Store, allocator: std.mem.Allocator, token: []const u8, extension: []const u8) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT image FROM screenshots WHERE token=?1 AND extension=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, token.ptr, @intCast(token.len), null);
+        _ = c.sqlite3_bind_text(stmt, 2, extension.ptr, @intCast(extension.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));

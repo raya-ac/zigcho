@@ -7,6 +7,7 @@ const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
 const performance_calculator = @import("pp.zig");
 const stable_mods = @import("stable_mods.zig");
+const screenshot_contract = @import("screenshot.zig");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
 pub const HardwareEnforcement = sqlite_storage.HardwareEnforcement;
@@ -90,7 +91,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -138,6 +139,16 @@ pub const Store = struct {
                     "CREATE TABLE zigcho.beatmap_hydration_failures(md5 char(32) PRIMARY KEY,set_id integer NOT NULL,attempts smallint NOT NULL DEFAULT 1 CHECK(attempts BETWEEN 1 AND 32),next_retry_at bigint NOT NULL,last_error text NOT NULL,updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint));" ++
                     "CREATE INDEX beatmap_hydration_retry ON zigcho.beatmap_hydration_failures(next_retry_at,updated_at);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(17);" ++
+                    "COMMIT",
+            );
+        }
+        if (version <= 17) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "CREATE TABLE zigcho.screenshots(token char(8) PRIMARY KEY,extension text NOT NULL CHECK(extension IN ('jpeg','png')),uploader_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,image bytea NOT NULL CHECK(octet_length(image)<=4194304),created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint));" ++
+                    "CREATE INDEX screenshots_uploader_time ON zigcho.screenshots(uploader_id,created_at DESC);" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(18);" ++
                     "COMMIT",
             );
         }
@@ -1823,6 +1834,39 @@ pub const Store = struct {
         return try postgres.decodeBytea(allocator, result.value(0, 0));
     }
 
+    pub fn putScreenshot(self: *Store, user_id: i32, token: []const u8, extension: []const u8, image: []const u8) !bool {
+        var user_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const encoded = try postgres.encodeBytea(self.allocator, image);
+        defer self.allocator.free(encoded);
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var locked_user = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.users WHERE id=$1 FOR UPDATE", &.{user});
+        defer locked_user.deinit();
+        if (locked_user.rows() == 0) return error.UserNotFound;
+        var quota = try postgres.queryParams(self.allocator, lease.conn, "SELECT count(*),coalesce(sum(octet_length(image)),0) FROM zigcho.screenshots WHERE uploader_id=$1", &.{user});
+        defer quota.deinit();
+        const file_count = try quota.int(usize, 0, 0);
+        const byte_count = try quota.int(usize, 0, 1);
+        if (!screenshot_contract.quotaAllows(file_count, byte_count, image.len)) return error.ScreenshotQuotaExceeded;
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.screenshots(token,extension,uploader_id,image) VALUES($1,$2,$3,$4) ON CONFLICT(token) DO NOTHING RETURNING 1", &.{ token, extension, user, encoded });
+        defer result.deinit();
+        const inserted = result.rows() == 1;
+        try postgres.exec(lease.conn, "COMMIT");
+        return inserted;
+    }
+
+    pub fn screenshot(self: *Store, allocator: std.mem.Allocator, token: []const u8, extension: []const u8) !?[]u8 {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT image FROM zigcho.screenshots WHERE token=$1 AND extension=$2", &.{ token, extension });
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return try postgres.decodeBytea(allocator, result.value(0, 0));
+    }
+
     pub fn ppSnapshot(self: *Store, score_id: i64) !?PpSnapshot {
         var id_buf: [24]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{score_id});
@@ -1891,16 +1935,16 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates beatmap cache controls through seventeen" {
+test "postgres runtime migrates stable media through eighteen" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 17), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 18), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -1908,6 +1952,7 @@ test "postgres runtime migrates beatmap cache controls through seventeen" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 5));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 6));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 7));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 8));
 }
 
 test "postgres account auth stats and token slice" {
@@ -1924,6 +1969,12 @@ test "postgres account auth stats and token slice" {
         std.testing.allocator.free(user.safe_name);
     }
     try std.testing.expectEqual(user_id, user.id);
+    const screenshot_png = "\x89PNG\r\n\x1a\nbodyIEND\xaeB`\x82";
+    try std.testing.expect(try store.putScreenshot(user_id, "Ab1_-xyZ", "png", screenshot_png));
+    try std.testing.expect(!try store.putScreenshot(user_id, "Ab1_-xyZ", "png", "collision"));
+    const stored_screenshot = (try store.screenshot(std.testing.allocator, "Ab1_-xyZ", "png")).?;
+    defer std.testing.allocator.free(stored_screenshot);
+    try std.testing.expectEqualSlices(u8, screenshot_png, stored_screenshot);
     try store.updateCountry(user_id, .{ 'A', 'U' });
     const stats = (try store.statsForUser(user_id, 0)).?;
     try std.testing.expectEqual(@as(i32, 0), stats.pp);

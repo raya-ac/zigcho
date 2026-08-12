@@ -1,0 +1,36 @@
+osu file format v14
+
+[General]
+AudioFilename: synthetic.mp3
+Mode: 1
+
+[Metadata]
+Title:Zigcho Taiko Fixture
+Artist:Zigcho
+Creator:Ari
+Version:Oni
+BeatmapID:900000011
+BeatmapSetID:900000010
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+OverallDifficulty:7
+ApproachRate:8
+SliderMultiplier:1.4
+SliderTickRate:1
+
+[TimingPoints]
+0,500,4,2,1,60,1,0
+
+[HitObjects]
+256,192,1000,1,0,0:0:0:0:
+256,192,1500,1,2,0:0:0:0:
+256,192,2000,1,8,0:0:0:0:
+256,192,2500,1,4,0:0:0:0:
+256,192,3000,1,0,0:0:0:0:
+256,192,3500,1,2,0:0:0:0:
+256,192,4000,1,8,0:0:0:0:
+256,192,4500,1,4,0:0:0:0:
+256,192,5000,1,0,0:0:0:0:
+256,192,5500,1,2,0:0:0:0:

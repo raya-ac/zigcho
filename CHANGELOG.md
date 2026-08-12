@@ -1,5 +1,11 @@
 # changelog
 
+## 2026-08-13 — stable scoring is pinned across every mode now
+
+Stable PP has fixed snapshots for osu!, taiko, catch, and mania across no-mod, HD, HR, DT, miss, and FC paths. the stored-score matrix keeps vanilla, relax, and autopilot stats separate and proves failed plays only add the aggregates they are meant to add.
+
+BNs can put a complete set straight into pending, qualified, ranked, approved, or loved from `/np` chat commands or the staff site. the decision works from any previous status, repairs mixed-status sets, freezes every difficulty together, rebuilds stored player stats, and keeps its written history.
+
 ## 2026-08-13 — map downloads stop hammering the same broken set
 
 beatmap hydration has durable retry state now. failed upstream work backs off from 30 seconds to six hours and stays backed off across a restart. the `.osz` cache has a 2 GiB default ceiling and evicts the least recently used replaceable archives instead of growing inside PostgreSQL forever.

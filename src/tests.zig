@@ -746,7 +746,7 @@ test "stable score response reports the committed one based leaderboard rank" {
     try std.testing.expect(std.mem.indexOf(u8, response, "rankBefore:8|rankAfter:7") != null);
 }
 
-test "beatmap ranking requires two nominators and changes the whole stable status" {
+test "beatmap ranking records nominations and lets BNs set every stable status" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -795,7 +795,6 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     const first = try store.nominateBeatmapSet(first_bn, &hash, "clean first review");
     try std.testing.expectEqual(@as(u32, 1), first.nominations);
     try std.testing.expectError(error.BeatmapAlreadyNominated, store.nominateBeatmapSet(first_bn, &hash, "duplicate"));
-    try std.testing.expectError(error.NotEnoughNominations, store.applyBeatmapRankAction(first_bn, &hash, .qualify, "too early"));
     const second = try store.nominateBeatmapSet(second_bn, &hash, "clean second review");
     try std.testing.expectEqual(@as(u32, 2), second.nominations);
 
@@ -821,6 +820,15 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     try std.testing.expect(placed.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), placed.rank);
     try std.testing.expect(webhook.shouldAnnounceScore(placed, 26.8));
+
+    const loved = try store.applyBeatmapRankAction(first_bn, &hash, .love, "this set belongs in loved");
+    try std.testing.expectEqual(@as(i8, 6), loved.status);
+    const approved = try store.applyBeatmapRankAction(second_bn, &hash, .approve, "move the loved set to approved");
+    try std.testing.expectEqual(@as(i8, 4), approved.status);
+    const direct_pending = try store.applyBeatmapRankAction(first_bn, &hash, .pending, "send approved back to pending");
+    try std.testing.expectEqual(@as(i8, 2), direct_pending.status);
+    const direct_ranked = try store.applyBeatmapRankAction(second_bn, &hash, .rank, "rank directly from pending");
+    try std.testing.expectEqual(@as(i8, 3), direct_ranked.status);
     var worse_score = pending_score;
     worse_score.online_checksum = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     worse_score.total_score = 900_000;
@@ -868,7 +876,7 @@ test "beatmap ranking requires two nominators and changes the whole stable statu
     try std.testing.expectEqual(@as(i8, 3), (try store.beatmapRankContext(&hash)).?.status);
 
     const rolled_back = try store.applyBeatmapRankAction(first_bn, &hash, .rollback, "bad ranking metadata");
-    try std.testing.expectEqual(@as(i8, 5), rolled_back.status);
+    try std.testing.expectEqual(@as(i8, 2), rolled_back.status);
     try std.testing.expectEqual(@as(i32, 0), (try store.statsForUser(requester, 0)).?.pp);
     const vetoed = try store.applyBeatmapRankAction(first_bn, &hash, .veto, "send it back through review");
     try std.testing.expectEqual(@as(i8, 2), vetoed.status);
@@ -1562,6 +1570,32 @@ test "stable ranking commands enforce bn and admin boundaries" {
     defer std.testing.allocator.free(rank_reply);
     try std.testing.expect(std.mem.indexOf(u8, rank_reply, "is ranked now") != null);
 
+    const love = try clientMessagePacket(std.testing.allocator, .send_private_message, "first_bn", "!love move ranked to loved", "kai", 31);
+    defer std.testing.allocator.free(love);
+    const love_reply = try bancho.poll(std.testing.allocator, &store, &sessions, first_bn, love);
+    defer std.testing.allocator.free(love_reply);
+    try std.testing.expect(std.mem.indexOf(u8, love_reply, "is loved now") != null);
+
+    const approved = try clientMessagePacket(std.testing.allocator, .send_private_message, "second_bn", "!mapstatus approved this should be approved", "kai", 32);
+    defer std.testing.allocator.free(approved);
+    const approved_reply = try bancho.poll(std.testing.allocator, &store, &sessions, second_bn, approved);
+    defer std.testing.allocator.free(approved_reply);
+    try std.testing.expect(std.mem.indexOf(u8, approved_reply, "is approved now") != null);
+
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(900000002,900000000,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','Zigcho','Zigcho Fixture','Mixed','Ari',2)");
+    const mixed_loved = try clientMessagePacket(std.testing.allocator, .send_private_message, "first_bn", "!mapstatus loved fix the mixed set", "kai", 31);
+    defer std.testing.allocator.free(mixed_loved);
+    const mixed_reply = try bancho.poll(std.testing.allocator, &store, &sessions, first_bn, mixed_loved);
+    defer std.testing.allocator.free(mixed_reply);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_reply, "is loved now") != null);
+    var status_stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT min(status),max(status),min(status_frozen) FROM beatmaps WHERE set_id=900000000", -1, &status_stmt, null));
+    defer _ = storage.c.sqlite3_finalize(status_stmt);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(status_stmt));
+    try std.testing.expectEqual(@as(c_int, 6), storage.c.sqlite3_column_int(status_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 6), storage.c.sqlite3_column_int(status_stmt, 1));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(status_stmt, 2));
+
     const denied_rollback = try clientMessagePacket(std.testing.allocator, .send_private_message, "first_bn", "!rollback not allowed", "kai", 31);
     defer std.testing.allocator.free(denied_rollback);
     const denied_rollback_reply = try bancho.poll(std.testing.allocator, &store, &sessions, first_bn, denied_rollback);
@@ -1572,7 +1606,7 @@ test "stable ranking commands enforce bn and admin boundaries" {
     defer std.testing.allocator.free(rollback);
     const rollback_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, rollback);
     defer std.testing.allocator.free(rollback_reply);
-    try std.testing.expect(std.mem.indexOf(u8, rollback_reply, "is qualified now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rollback_reply, "is approved now") != null);
 }
 
 test "server roles map to stable privileges and login always grants supporter" {
@@ -3020,6 +3054,108 @@ test "pinned performance engine calculates the synthetic stable fixture" {
     try std.testing.expectEqual(@as(u32, 10), result.max_combo);
 }
 
+test "stable performance fixtures lock every ruleset and common mod path" {
+    const Fixture = struct { mode: u8, map: []const u8, perfect_geki: u32 };
+    const fixtures = [_]Fixture{
+        .{ .mode = 0, .map = @embedFile("testdata/synthetic-standard.osu"), .perfect_geki = 0 },
+        .{ .mode = 1, .map = @embedFile("testdata/synthetic-taiko.osu"), .perfect_geki = 0 },
+        .{ .mode = 2, .map = @embedFile("testdata/synthetic-catch.osu"), .perfect_geki = 0 },
+        .{ .mode = 3, .map = @embedFile("testdata/synthetic-mania.osu"), .perfect_geki = 10 },
+    };
+    const expected_fc = [_]f64{ 26.895763, 13.168693, 2.549130, 0.740225 };
+    const expected_miss = [_]f64{ 4.889811, 10.017056, 1.273185, 0.370112 };
+    const expected_hr = [_]f64{ 58.466484, 19.190285, 5.138172, 0.740225 };
+    const expected_hd = [_]f64{ 29.196351, 14.156509, 3.058956, 0.740225 };
+    const expected_dt = [_]f64{ 56.075908, 19.565074, 3.316334, 0.616461 };
+    const expected_stars = [_]f64{ 1.806515, 0.279849, 0.511245, 0.488839 };
+    for (fixtures, 0..) |fixture, index| {
+        const full_combo = try pp.calculate(fixture.map, .{
+            .mode = fixture.mode,
+            .lazer = 0,
+            .mods = 0,
+            .max_combo = 10,
+            .n_geki = fixture.perfect_geki,
+            .n_katu = 0,
+            .n300 = if (fixture.mode == 3) 0 else 10,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        const missed = try pp.calculate(fixture.map, .{
+            .mode = fixture.mode,
+            .lazer = 0,
+            .mods = 0,
+            .max_combo = 9,
+            .n_geki = if (fixture.mode == 3) 9 else 0,
+            .n_katu = 0,
+            .n300 = if (fixture.mode == 3) 0 else 9,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 1,
+            .legacy_total_score = 800_000,
+        });
+        const hard_rock = try pp.calculate(fixture.map, .{
+            .mode = fixture.mode,
+            .lazer = 0,
+            .mods = 16,
+            .max_combo = 10,
+            .n_geki = fixture.perfect_geki,
+            .n_katu = 0,
+            .n300 = if (fixture.mode == 3) 0 else 10,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        const hidden = try pp.calculate(fixture.map, .{
+            .mode = fixture.mode,
+            .lazer = 0,
+            .mods = 8,
+            .max_combo = 10,
+            .n_geki = fixture.perfect_geki,
+            .n_katu = 0,
+            .n300 = if (fixture.mode == 3) 0 else 10,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        const double_time = try pp.calculate(fixture.map, .{
+            .mode = fixture.mode,
+            .lazer = 0,
+            .mods = 64,
+            .max_combo = 10,
+            .n_geki = fixture.perfect_geki,
+            .n_katu = 0,
+            .n300 = if (fixture.mode == 3) 0 else 10,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        try std.testing.expectApproxEqAbs(expected_fc[index], full_combo.pp, 0.0001);
+        try std.testing.expectApproxEqAbs(expected_miss[index], missed.pp, 0.0001);
+        try std.testing.expectApproxEqAbs(expected_hr[index], hard_rock.pp, 0.0001);
+        try std.testing.expectApproxEqAbs(expected_hd[index], hidden.pp, 0.0001);
+        try std.testing.expectApproxEqAbs(expected_dt[index], double_time.pp, 0.0001);
+        try std.testing.expectApproxEqAbs(expected_stars[index], full_combo.stars, 0.0001);
+        try std.testing.expect(missed.pp < full_combo.pp);
+    }
+    try std.testing.expectEqual(@as(?u8, 0), stable_score.statsMode(0, 0));
+    try std.testing.expectEqual(@as(?u8, 1), stable_score.statsMode(1, 0));
+    try std.testing.expectEqual(@as(?u8, 2), stable_score.statsMode(2, 0));
+    try std.testing.expectEqual(@as(?u8, 3), stable_score.statsMode(3, 0));
+    try std.testing.expectEqual(@as(?u8, 4), stable_score.statsMode(0, 128));
+    try std.testing.expectEqual(@as(?u8, 5), stable_score.statsMode(1, 128));
+    try std.testing.expectEqual(@as(?u8, 6), stable_score.statsMode(2, 128));
+    try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(3, 128));
+    try std.testing.expectEqual(@as(?u8, 8), stable_score.statsMode(0, 8192));
+    try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(1, 8192));
+    try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(2, 8192));
+    try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(3, 8192));
+}
+
 test "beatmap metadata parser owns the import contract" {
     const map = @embedFile("testdata/synthetic-standard.osu");
     const metadata = try beatmap.parse(map);
@@ -3170,6 +3306,123 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i32, 15), relax_stats.play_time);
     try std.testing.expectApproxEqAbs(@as(f64, 1), relax_stats.accuracy, 0.0001);
     try std.testing.expectEqual(@as(i32, 10), relax_stats.max_combo);
+}
+
+test "stable score storage keeps every supported ruleset and namespace isolated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/mode-matrix.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(1,0),(1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8)");
+
+    const fixture_maps = [_][]const u8{
+        @embedFile("testdata/synthetic-standard.osu"),
+        @embedFile("testdata/synthetic-taiko.osu"),
+        @embedFile("testdata/synthetic-catch.osu"),
+        @embedFile("testdata/synthetic-mania.osu"),
+    };
+    var hashes: [fixture_maps.len][32]u8 = undefined;
+    for (fixture_maps, 0..) |contents, index| {
+        const metadata = try beatmap.parse(contents);
+        hashes[index] = beatmap.md5(contents);
+        try store.upsertBeatmap(metadata, &hashes[index], 3, 1.0, 10, contents);
+    }
+
+    const cases = [_]struct { mode: u8, mods: i32, stats_mode: u8 }{
+        .{ .mode = 0, .mods = 0, .stats_mode = 0 },
+        .{ .mode = 1, .mods = 0, .stats_mode = 1 },
+        .{ .mode = 2, .mods = 0, .stats_mode = 2 },
+        .{ .mode = 3, .mods = 0, .stats_mode = 3 },
+        .{ .mode = 0, .mods = 128, .stats_mode = 4 },
+        .{ .mode = 1, .mods = 128, .stats_mode = 5 },
+        .{ .mode = 2, .mods = 128, .stats_mode = 6 },
+        .{ .mode = 0, .mods = 8192, .stats_mode = 8 },
+    };
+    for (cases, 0..) |case, index| {
+        var checksum_buf: [32]u8 = undefined;
+        @memset(&checksum_buf, @intCast('a' + index));
+        const passed_score: stable_score.Submission = .{
+            .map_md5 = &hashes[case.mode],
+            .username = "ari",
+            .online_checksum = &checksum_buf,
+            .n300 = 10,
+            .n100 = 0,
+            .n50 = 0,
+            .ngeki = 0,
+            .nkatu = 0,
+            .nmiss = 0,
+            .total_score = 1_000_000 + @as(i64, case.stats_mode) * 1_000,
+            .max_combo = 10,
+            .perfect = true,
+            .grade = "X",
+            .mods = case.mods,
+            .passed = true,
+            .mode = case.mode,
+            .client_time = "260809000000",
+            .client_flags = "0",
+        };
+        _ = try store.insertStableScore(1, passed_score, 100.0 + @as(f64, @floatFromInt(case.stats_mode)), "replay", 12_000);
+        const after_pass = (try store.statsForUser(1, case.stats_mode)).?;
+        try std.testing.expectEqual(passed_score.total_score, after_pass.ranked_score);
+        try std.testing.expectEqual(passed_score.total_score, after_pass.total_score);
+        try std.testing.expectEqual(@as(i32, 1), after_pass.plays);
+        try std.testing.expectEqual(@as(i32, 12), after_pass.play_time);
+        try std.testing.expectEqual(@as(i64, 10), after_pass.total_hits);
+        try std.testing.expectEqual(@as(i32, 10), after_pass.max_combo);
+
+        var failed_checksum: [32]u8 = undefined;
+        @memset(&failed_checksum, @intCast('k' + index));
+        var failed_score = passed_score;
+        failed_score.online_checksum = &failed_checksum;
+        failed_score.total_score = 200_000;
+        failed_score.n300 = 4;
+        failed_score.n100 = 3;
+        failed_score.nmiss = 9;
+        failed_score.max_combo = 99;
+        failed_score.perfect = false;
+        failed_score.grade = "F";
+        failed_score.passed = false;
+        _ = try store.insertStableScore(1, failed_score, 999.0, "", 45_000);
+        const after_fail = (try store.statsForUser(1, case.stats_mode)).?;
+        try std.testing.expectEqual(after_pass.ranked_score, after_fail.ranked_score);
+        try std.testing.expectEqual(after_pass.total_score + 200_000, after_fail.total_score);
+        try std.testing.expectEqual(after_pass.pp, after_fail.pp);
+        try std.testing.expectEqual(after_pass.accuracy, after_fail.accuracy);
+        try std.testing.expectEqual(after_pass.max_combo, after_fail.max_combo);
+        try std.testing.expectEqual(@as(i32, 2), after_fail.plays);
+        try std.testing.expectEqual(@as(i32, 57), after_fail.play_time);
+        try std.testing.expectEqual(@as(i64, 17), after_fail.total_hits);
+    }
+
+    var unsupported = stable_score.Submission{
+        .map_md5 = &hashes[3],
+        .username = "ari",
+        .online_checksum = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 128,
+        .passed = true,
+        .mode = 3,
+        .client_time = "260809000000",
+        .client_flags = "0",
+    };
+    try std.testing.expectError(error.UnsupportedModMode, store.insertStableScore(1, unsupported, 100.0, "", 12_000));
+    unsupported.map_md5 = &hashes[1];
+    unsupported.mode = 1;
+    unsupported.mods = 8192;
+    unsupported.online_checksum = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
+    try std.testing.expectError(error.UnsupportedModMode, store.insertStableScore(1, unsupported, 100.0, "", 12_000));
 }
 
 test "stable ratings persist one vote per player and keep protocol states distinct" {

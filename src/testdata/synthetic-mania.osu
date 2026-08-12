@@ -1,0 +1,36 @@
+osu file format v14
+
+[General]
+AudioFilename: synthetic.mp3
+Mode: 3
+
+[Metadata]
+Title:Zigcho Mania Fixture
+Artist:Zigcho
+Creator:Ari
+Version:4K
+BeatmapID:900000031
+BeatmapSetID:900000030
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+OverallDifficulty:8
+ApproachRate:5
+SliderMultiplier:1.4
+SliderTickRate:1
+
+[TimingPoints]
+0,500,4,2,1,60,1,0
+
+[HitObjects]
+64,192,1000,1,0,0:0:0:0:
+192,192,1250,1,0,0:0:0:0:
+320,192,1500,1,0,0:0:0:0:
+448,192,1750,1,0,0:0:0:0:
+64,192,2000,128,0,2500:0:0:0:0:
+192,192,2250,1,0,0:0:0:0:
+320,192,2500,1,0,0:0:0:0:
+448,192,2750,128,0,3250:0:0:0:0:
+192,192,3000,1,0,0:0:0:0:
+320,192,3500,1,0,0:0:0:0:

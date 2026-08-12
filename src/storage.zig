@@ -568,38 +568,23 @@ pub const Store = struct {
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
         var context = try self.rankContextLocked(map_md5);
-        var status_stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT min(status),max(status) FROM beatmaps WHERE set_id=?1", -1, &status_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(status_stmt);
-        _ = c.sqlite3_bind_int(status_stmt, 1, context.set_id);
-        if (c.sqlite3_step(status_stmt) != c.SQLITE_ROW or c.sqlite3_column_int(status_stmt, 0) != c.sqlite3_column_int(status_stmt, 1)) return error.InconsistentBeatmapSet;
         const current = context.status;
         var target: i8 = current;
         const action_name: []const u8 = switch (action) {
+            .pending => "pending",
             .qualify => "qualify",
             .rank => "rank",
+            .approve => "approve",
             .love => "love",
             .veto => "veto",
             .rollback => "rollback",
         };
         switch (action) {
-            .qualify => {
-                if (current != @intFromEnum(domain.RankedStatus.pending)) return error.InvalidBeatmapTransition;
-                if (context.nominations < 2) return error.NotEnoughNominations;
-                target = @intFromEnum(domain.RankedStatus.qualified);
-            },
-            .rank => {
-                if (current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
-                target = @intFromEnum(domain.RankedStatus.ranked);
-            },
-            .love => {
-                if (current != @intFromEnum(domain.RankedStatus.pending) and current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
-                target = @intFromEnum(domain.RankedStatus.loved);
-            },
-            .veto => {
-                if (current != @intFromEnum(domain.RankedStatus.pending) and current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
-                target = @intFromEnum(domain.RankedStatus.pending);
-            },
+            .pending, .veto => target = @intFromEnum(domain.RankedStatus.pending),
+            .qualify => target = @intFromEnum(domain.RankedStatus.qualified),
+            .rank => target = @intFromEnum(domain.RankedStatus.ranked),
+            .approve => target = @intFromEnum(domain.RankedStatus.approved),
+            .love => target = @intFromEnum(domain.RankedStatus.loved),
             .rollback => {
                 var previous: ?*c.sqlite3_stmt = null;
                 if (c.sqlite3_prepare_v2(self.db, "SELECT from_status FROM beatmap_rank_events WHERE set_id=?1 AND from_status!=to_status ORDER BY id DESC LIMIT 1", -1, &previous, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -615,8 +600,8 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(update, 1, target);
         _ = c.sqlite3_bind_int(update, 2, context.set_id);
         if (c.sqlite3_step(update) != c.SQLITE_DONE or c.sqlite3_changes(self.db) == 0) return error.BeatmapNotFound;
-        if (action == .veto or action == .rollback or action == .rank or action == .love) try self.clearBeatmapNominationsLocked(context.set_id);
-        if (action == .rank or action == .love) try self.resolveBeatmapRequestsLocked(context.set_id);
+        if (action != .qualify) try self.clearBeatmapNominationsLocked(context.set_id);
+        if (action == .rank or action == .approve or action == .love) try self.resolveBeatmapRequestsLocked(context.set_id);
         try self.rebuildScoreStats(false);
         try self.insertBeatmapRankEventLocked(context.set_id, actor_id, action_name, current, target, reason);
         try self.exec("COMMIT");

@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Mode = enum(u8) { osu, taiko, @"catch", mania };
 pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, ranked = 3, approved = 4, qualified = 5, loved = 6 };
-pub const BeatmapRankAction = enum { qualify, rank, love, veto, rollback };
+pub const BeatmapRankAction = enum { pending, qualify, rank, approve, love, veto, rollback };
 pub const BeatmapRankContext = struct {
     map_id: i32,
     set_id: i32,

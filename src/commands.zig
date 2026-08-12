@@ -37,9 +37,9 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
     if (std.ascii.eqlIgnoreCase(cmd, "help") or std.ascii.eqlIgnoreCase(cmd, "h")) {
         var message: []const u8 = "player: /np !with <mods acc% misses> !pin !unpin !roll [max] !online !stats [name] !request !mapstate";
         if (has(sender, moderator)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes";
-        if (isNominator(sender)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | bn: !requests !nominate !veto !qualify !rank !love";
-        if (has(sender, administrator)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock";
-        if (has(sender, developer)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !veto !qualify !rank !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock | dev: !addpriv !rmpriv";
+        if (isNominator(sender)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | bn: !requests !nominate !mapstatus !veto !qualify !rank !approve !love";
+        if (has(sender, administrator)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !mapstatus !veto !qualify !rank !approve !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock";
+        if (has(sender, developer)) message = "player: /np !with !pin !unpin !roll !online !stats !request !mapstate | mod: !user !silence !unsilence !kick !addnote !notes | bn: !requests !nominate !mapstatus !veto !qualify !rank !approve !love | admin: !rollback !restrict !unrestrict !announce !alert !lock !unlock | dev: !addpriv !rmpriv";
         try reply(allocator, sessions, sender, reply_target, out, message);
         return .handled;
     }
@@ -53,7 +53,8 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
     if (std.ascii.eqlIgnoreCase(cmd, "mapstate")) return try mapStateCommand(allocator, store, sessions, sender, args, reply_target, out);
     if (std.ascii.eqlIgnoreCase(cmd, "requests")) return try rankQueueCommand(allocator, store, sessions, sender, args, reply_target, out);
     if (std.ascii.eqlIgnoreCase(cmd, "nominate")) return try nominateCommand(allocator, store, sessions, sender, args, reply_target, out);
-    if (std.ascii.eqlIgnoreCase(cmd, "veto") or std.ascii.eqlIgnoreCase(cmd, "qualify") or std.ascii.eqlIgnoreCase(cmd, "rank") or std.ascii.eqlIgnoreCase(cmd, "love") or std.ascii.eqlIgnoreCase(cmd, "rollback"))
+    if (std.ascii.eqlIgnoreCase(cmd, "mapstatus")) return try mapStatusCommand(allocator, store, sessions, sender, args, reply_target, out);
+    if (std.ascii.eqlIgnoreCase(cmd, "pending") or std.ascii.eqlIgnoreCase(cmd, "veto") or std.ascii.eqlIgnoreCase(cmd, "qualify") or std.ascii.eqlIgnoreCase(cmd, "rank") or std.ascii.eqlIgnoreCase(cmd, "approve") or std.ascii.eqlIgnoreCase(cmd, "love") or std.ascii.eqlIgnoreCase(cmd, "rollback"))
         return try rankActionCommand(allocator, store, sessions, sender, cmd, args, reply_target, out);
     if (std.ascii.eqlIgnoreCase(cmd, "roll")) {
         const maximum = if (args.len == 0) 100 else std.fmt.parseInt(u16, args, 10) catch 100;
@@ -314,8 +315,35 @@ fn rankActionCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
         try reply(allocator, sessions, sender, target, out, "do /np first so i know what map you're on");
         return .handled;
     };
-    const action: domain.BeatmapRankAction = if (std.ascii.eqlIgnoreCase(command, "qualify")) .qualify else if (std.ascii.eqlIgnoreCase(command, "rank")) .rank else if (std.ascii.eqlIgnoreCase(command, "love")) .love else if (std.ascii.eqlIgnoreCase(command, "veto")) .veto else .rollback;
+    const action: domain.BeatmapRankAction = if (std.ascii.eqlIgnoreCase(command, "pending")) .pending else if (std.ascii.eqlIgnoreCase(command, "qualify")) .qualify else if (std.ascii.eqlIgnoreCase(command, "rank")) .rank else if (std.ascii.eqlIgnoreCase(command, "approve")) .approve else if (std.ascii.eqlIgnoreCase(command, "love")) .love else if (std.ascii.eqlIgnoreCase(command, "veto")) .veto else .rollback;
     const context = store.applyBeatmapRankAction(sender.user.id, md5, action, args) catch |err| return try replyRankError(allocator, sessions, sender, target, out, err);
+    var buf: [192]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "set {d} is {s} now ({d} request(s), {d}/2 nominations)", .{ context.set_id, rankStatusName(context.status), context.requests, context.nominations });
+    try reply(allocator, sessions, sender, target, out, message);
+    return .handled;
+}
+
+fn mapStatusCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, args: []const u8, target: []const u8, out: *protocol.Writer) !CommandResult {
+    if (!isNominator(sender)) return try denied(allocator, sessions, sender, target, out);
+    const separator = std.mem.indexOfScalar(u8, args, ' ') orelse {
+        try reply(allocator, sessions, sender, target, out, "usage: !mapstatus <pending|ranked|approved|qualified|loved> <reason> after /np");
+        return .handled;
+    };
+    const wanted = args[0..separator];
+    const reason = std.mem.trim(u8, args[separator + 1 ..], " \t");
+    if (reason.len == 0 or reason.len > 512) {
+        try reply(allocator, sessions, sender, target, out, "give a reason under 512 characters");
+        return .handled;
+    }
+    const action: domain.BeatmapRankAction = if (std.ascii.eqlIgnoreCase(wanted, "pending")) .pending else if (std.ascii.eqlIgnoreCase(wanted, "ranked")) .rank else if (std.ascii.eqlIgnoreCase(wanted, "approved")) .approve else if (std.ascii.eqlIgnoreCase(wanted, "qualified")) .qualify else if (std.ascii.eqlIgnoreCase(wanted, "loved")) .love else {
+        try reply(allocator, sessions, sender, target, out, "status must be pending, ranked, approved, qualified, or loved");
+        return .handled;
+    };
+    const md5 = currentMap(sender) orelse {
+        try reply(allocator, sessions, sender, target, out, "do /np first so i know what map you're on");
+        return .handled;
+    };
+    const context = store.applyBeatmapRankAction(sender.user.id, md5, action, reason) catch |err| return try replyRankError(allocator, sessions, sender, target, out, err);
     var buf: [192]u8 = undefined;
     const message = try std.fmt.bufPrint(&buf, "set {d} is {s} now ({d} request(s), {d}/2 nominations)", .{ context.set_id, rankStatusName(context.status), context.requests, context.nominations });
     try reply(allocator, sessions, sender, target, out, message);

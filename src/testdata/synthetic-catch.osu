@@ -1,0 +1,36 @@
+osu file format v14
+
+[General]
+AudioFilename: synthetic.mp3
+Mode: 2
+
+[Metadata]
+Title:Zigcho Catch Fixture
+Artist:Zigcho
+Creator:Ari
+Version:Rain
+BeatmapID:900000021
+BeatmapSetID:900000020
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:5
+OverallDifficulty:7
+ApproachRate:8
+SliderMultiplier:1.4
+SliderTickRate:1
+
+[TimingPoints]
+0,500,4,2,1,60,1,0
+
+[HitObjects]
+64,192,1000,1,0,0:0:0:0:
+128,192,1500,1,0,0:0:0:0:
+192,192,2000,1,0,0:0:0:0:
+256,192,2500,1,0,0:0:0:0:
+320,192,3000,1,0,0:0:0:0:
+384,192,3500,1,0,0:0:0:0:
+448,192,4000,1,0,0:0:0:0:
+384,192,4500,1,0,0:0:0:0:
+256,192,5000,1,0,0:0:0:0:
+128,192,5500,1,0,0:0:0:0:

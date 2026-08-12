@@ -98,6 +98,17 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
   --data-urlencode 'set_id=9001' --data-urlencode 'action=nominate' --data-urlencode 'reason=smoke nomination')
 expect_status "$code" 200 ranking_nominate
 
+for rank_action in love approve pending qualify rank; do
+  code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/ranking" \
+    --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+    --data-urlencode 'set_id=9001' --data-urlencode "action=$rank_action" --data-urlencode "reason=smoke direct $rank_action status")
+  expect_status "$code" 200 "ranking_direct_$rank_action"
+done
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/ranking" --header "Cookie: $cookie")
+expect_status "$code" 200 staff_ranking_after_direct_statuses
+jq -e '[.history[] | select(.set_id == 9001) | .action] | index("love") != null and index("approve") != null and index("pending") != null and index("qualify") != null and index("rank") != null' "$response" >/dev/null || fail missing_direct_ranking_history
+
 encoded_player=$(printf '%s' 'restricted player' | jq -sRr @uri)
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/moderation?user=$encoded_player" --header "Cookie: $cookie")
 expect_status "$code" 200 moderation_lookup

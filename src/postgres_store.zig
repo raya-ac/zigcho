@@ -943,34 +943,23 @@ pub const Store = struct {
         var locked = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,status FROM zigcho.beatmaps WHERE set_id=$1 FOR UPDATE", &.{set});
         defer locked.deinit();
         if (locked.rows() == 0) return error.BeatmapNotFound;
-        for (0..locked.rows()) |row| if (try locked.int(i8, row, 1) != context.status) return error.InconsistentBeatmapSet;
         const current = context.status;
         var target: i8 = current;
         const action_name: []const u8 = switch (action) {
+            .pending => "pending",
             .qualify => "qualify",
             .rank => "rank",
+            .approve => "approve",
             .love => "love",
             .veto => "veto",
             .rollback => "rollback",
         };
         switch (action) {
-            .qualify => {
-                if (current != @intFromEnum(domain.RankedStatus.pending)) return error.InvalidBeatmapTransition;
-                if (context.nominations < 2) return error.NotEnoughNominations;
-                target = @intFromEnum(domain.RankedStatus.qualified);
-            },
-            .rank => {
-                if (current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
-                target = @intFromEnum(domain.RankedStatus.ranked);
-            },
-            .love => {
-                if (current != @intFromEnum(domain.RankedStatus.pending) and current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
-                target = @intFromEnum(domain.RankedStatus.loved);
-            },
-            .veto => {
-                if (current != @intFromEnum(domain.RankedStatus.pending) and current != @intFromEnum(domain.RankedStatus.qualified)) return error.InvalidBeatmapTransition;
-                target = @intFromEnum(domain.RankedStatus.pending);
-            },
+            .pending, .veto => target = @intFromEnum(domain.RankedStatus.pending),
+            .qualify => target = @intFromEnum(domain.RankedStatus.qualified),
+            .rank => target = @intFromEnum(domain.RankedStatus.ranked),
+            .approve => target = @intFromEnum(domain.RankedStatus.approved),
+            .love => target = @intFromEnum(domain.RankedStatus.loved),
             .rollback => {
                 var previous = try postgres.queryParams(self.allocator, lease.conn, "SELECT from_status FROM zigcho.beatmap_rank_events WHERE set_id=$1 AND from_status!=to_status ORDER BY id DESC LIMIT 1", &.{set});
                 defer previous.deinit();
@@ -983,12 +972,12 @@ pub const Store = struct {
         var update = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmaps SET status=$1,status_frozen=true,last_update=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$2 RETURNING 1", &.{ status, set });
         defer update.deinit();
         if (update.rows() == 0) return error.BeatmapNotFound;
-        if (action == .veto or action == .rollback or action == .rank or action == .love) {
+        if (action != .qualify) {
             var cleared = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_nominations SET active=false,updated_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 AND active", &.{set});
             cleared.deinit();
             context.nominations = 0;
         }
-        if (action == .rank or action == .love) {
+        if (action == .rank or action == .approve or action == .love) {
             var resolved = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_rank_requests SET active=false,resolved_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 AND active", &.{set});
             resolved.deinit();
             context.requests = 0;
@@ -2055,6 +2044,29 @@ test "postgres account auth stats and token slice" {
     try std.testing.expectEqual(@as(i8, 5), qualified.status);
     const ranked = try store.applyBeatmapRankAction(second_id, "33333333333333333333333333333333", .rank, "postgres ranking");
     try std.testing.expectEqual(@as(i8, 3), ranked.status);
+    const loved = try store.applyBeatmapRankAction(user_id, "33333333333333333333333333333333", .love, "postgres direct loved status");
+    try std.testing.expectEqual(@as(i8, 6), loved.status);
+    const approved = try store.applyBeatmapRankAction(second_id, "33333333333333333333333333333333", .approve, "postgres direct approved status");
+    try std.testing.expectEqual(@as(i8, 4), approved.status);
+    const pending = try store.applyBeatmapRankAction(user_id, "33333333333333333333333333333333", .pending, "postgres direct pending status");
+    try std.testing.expectEqual(@as(i8, 2), pending.status);
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var mixed_map = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(4,3,$1,'queue artist','queue title','insane','mapper',4,20)", &.{"44444444444444444444444444444444"});
+        mixed_map.deinit();
+    }
+    const mixed_loved = try store.applyBeatmapRankAction(second_id, "33333333333333333333333333333333", .love, "postgres repair mixed set as loved");
+    try std.testing.expectEqual(@as(i8, 6), mixed_loved.status);
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var statuses = try postgres.query(lease.conn, "SELECT min(status),max(status),count(*) FROM zigcho.beatmaps WHERE set_id=3");
+        defer statuses.deinit();
+        try std.testing.expectEqual(@as(i32, 6), try statuses.int(i32, 0, 0));
+        try std.testing.expectEqual(@as(i32, 6), try statuses.int(i32, 0, 1));
+        try std.testing.expectEqual(@as(i64, 2), try statuses.int(i64, 0, 2));
+    }
     const rank_queue = try store.beatmapRankQueue(std.testing.allocator);
     defer std.testing.allocator.free(rank_queue);
     try std.testing.expect(std.mem.indexOf(u8, rank_queue, "set 3") == null);

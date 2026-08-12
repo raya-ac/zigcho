@@ -88,7 +88,7 @@ pub const Sync = struct {
 
     pub fn ensure(self: *Sync, store: *storage.Store, wanted_md5: []const u8, expected_set_id: ?i32) !bool {
         if (!validMd5(wanted_md5)) return false;
-        if (try store.beatmapHasFile(wanted_md5)) return true;
+        if (!try needsHydration(store, wanted_md5)) return true;
         const now = std.Io.Clock.real.now(self.io).toSeconds();
         if (!try store.hydrationRetryAllowed(wanted_md5, now)) {
             _ = self.backoff_skips.fetchAdd(1, .monotonic);
@@ -289,6 +289,10 @@ pub const Sync = struct {
         }
     }
 };
+
+pub fn needsHydration(store: *storage.Store, wanted_md5: []const u8) !bool {
+    return !try store.beatmapHasFile(wanted_md5);
+}
 
 fn fetchFn(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, limit: usize) ![]u8 {
     const buffer = try allocator.alloc(u8, limit);

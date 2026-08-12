@@ -969,7 +969,7 @@ const App = struct {
             const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            if (try self.store.beatmapForScore(map_md5) == null) {
+            if (try beatmap_sync.needsHydration(&self.store, map_md5)) {
                 std.debug.print("{s}  ┌─ LEADERBOARD ──────────────────────────────────{s}\n", .{ log.cyan, log.reset });
                 std.debug.print("{s}  │ {s}►{s} user : {s}{s}{s}\n", .{ log.cyan, log.dim, log.reset, log.green, user.name, log.reset });
                 std.debug.print("{s}  │ {s}►{s} map  : {s}{s}\n", .{ log.cyan, log.dim, log.reset, log.dim, map_md5 });

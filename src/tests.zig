@@ -1215,9 +1215,11 @@ test "metadata-only beatmaps stay eligible for hydration retry" {
     const hash = beatmap.md5(map);
     try store.upsertBeatmapMeta(metadata, &hash, 3, 1.0, 1);
     try std.testing.expect(!try store.beatmapHasFile(&hash));
+    try std.testing.expect(try beatmap_sync.needsHydration(&store, &hash));
 
     try store.upsertBeatmap(metadata, &hash, 3, 1.0, 1, map);
     try std.testing.expect(try store.beatmapHasFile(&hash));
+    try std.testing.expect(!try beatmap_sync.needsHydration(&store, &hash));
 }
 
 test "public chat does not echo through the server to its sender" {

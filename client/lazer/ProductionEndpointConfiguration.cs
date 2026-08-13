@@ -7,7 +7,8 @@ namespace osu.Game.Online
     {
         public ProductionEndpointConfiguration()
         {
-            WebsiteUrl = @"https://osu.kai.ovh";
+            RealtimeServicesAvailable = false;
+            WebsiteUrl = @"https://kai.ovh";
             APIUrl = @"https://api.kai.ovh";
             APIClientSecret = @"zigcho-lazer";
             APIClientID = "5";

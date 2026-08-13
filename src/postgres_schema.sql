@@ -224,14 +224,31 @@ CREATE TABLE lazer_scores (
     accuracy double precision NOT NULL,
     max_combo integer NOT NULL,
     passed boolean NOT NULL,
+    rank text NOT NULL DEFAULT 'F',
     mods_json jsonb NOT NULL,
     statistics_json jsonb NOT NULL,
+    maximum_statistics_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    pauses_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     rank_namespace text NOT NULL,
     client_version text,
     replay bytea,
     submitted_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
 );
 CREATE INDEX lazer_scores_board ON lazer_scores(beatmap_id, ruleset_id, rank_namespace, total_score DESC);
+
+CREATE TABLE lazer_score_tokens (
+    id bigint PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    beatmap_id integer NOT NULL REFERENCES beatmaps(id) ON DELETE CASCADE,
+    beatmap_hash char(32) NOT NULL,
+    ruleset_id smallint NOT NULL CHECK(ruleset_id BETWEEN 0 AND 3),
+    version_hash char(32) NOT NULL,
+    created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    expires_at bigint NOT NULL,
+    consumed_at bigint,
+    score_id bigint REFERENCES lazer_scores(id) ON DELETE SET NULL
+);
+CREATE INDEX lazer_score_tokens_user_expiry ON lazer_score_tokens(user_id, expires_at DESC);
 
 CREATE TABLE custom_mods (
     acronym text PRIMARY KEY,
@@ -341,4 +358,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1);
 
-INSERT INTO schema_migrations(version) VALUES (20);
+INSERT INTO schema_migrations(version) VALUES (21);

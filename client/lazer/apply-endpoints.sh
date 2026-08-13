@@ -13,4 +13,9 @@ fi
 
 cp "$script_dir/ProductionEndpointConfiguration.cs" "$checkout/osu.Game/Online/ProductionEndpointConfiguration.cs"
 cp "$script_dir/DevelopmentEndpointConfiguration.cs" "$checkout/osu.Game/Online/DevelopmentEndpointConfiguration.cs"
-echo "zigcho endpoints applied to $checkout"
+cp "$script_dir/TrustedDomainOnlineStore.cs" "$checkout/osu.Game/Online/TrustedDomainOnlineStore.cs"
+cp "$script_dir/TrustedDomainOnlineStoreTest.cs" "$checkout/osu.Game.Tests/TrustedDomainOnlineStoreTest.cs"
+cp "$script_dir/UnavailableRealtimeChatClient.cs" "$checkout/osu.Game/Online/Chat/UnavailableRealtimeChatClient.cs"
+cp "$script_dir/UnavailableRealtimeChatClientTest.cs" "$checkout/osu.Game.Tests/UnavailableRealtimeChatClientTest.cs"
+python3 "$script_dir/patch-unavailable-realtime.py" "$checkout"
+echo "zigcho endpoints and trusted resource domains applied to $checkout"

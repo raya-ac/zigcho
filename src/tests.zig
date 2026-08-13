@@ -3326,6 +3326,21 @@ test "lazer relax scores cannot enter vanilla namespace" {
     try std.testing.expectEqual(lazer.Namespace.relax, (try lazer.parseScore(parsed.value)).namespace);
 }
 
+test "lazer autopilot has its own standard-only stats namespace" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":0.98,\"max_combo\":5,\"passed\":true,\"mods\":[{\"acronym\":\"AP\"}],\"statistics\":{}}", .{});
+    defer parsed.deinit();
+    const input = try lazer.parseScore(parsed.value);
+    try std.testing.expectEqual(lazer.Namespace.autopilot, input.namespace);
+    try std.testing.expectEqual(@as(?u8, 8), lazer.statsMode(input));
+
+    const mania_rx = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":3,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[{\"acronym\":\"RX\"}],\"statistics\":{}}", .{});
+    defer mania_rx.deinit();
+    try std.testing.expectError(error.InvalidModMode, lazer.parseScore(mania_rx.value));
+    const taiko_ap = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":1,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[{\"acronym\":\"AP\"}],\"statistics\":{}}", .{});
+    defer taiko_ap.deinit();
+    try std.testing.expectError(error.InvalidModMode, lazer.parseScore(taiko_ap.value));
+}
+
 test "unknown lazer mods enter custom namespace" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":0.98,\"max_combo\":5,\"passed\":true,\"mods\":[{\"acronym\":\"WIGGLE\",\"settings\":{\"strength\":1.2}}],\"statistics\":{}}", .{});
     defer parsed.deinit();
@@ -3382,7 +3397,11 @@ test "lazer storage only accepts the typed score input" {
     const raw = "{\"beatmap_id\":75,\"ruleset_id\":0,\"total_score\":987654,\"legacy_total_score\":900000,\"accuracy\":0.985,\"max_combo\":321,\"passed\":true,\"mods\":[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}],\"statistics\":{},\"client_version\":\"2026.811.0\"}";
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), raw);
+    const mods_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "mods", "[]");
+    defer std.testing.allocator.free(mods_json);
+    const statistics_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "statistics", "{}");
+    defer std.testing.allocator.free(statistics_json);
+    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), mods_json, statistics_json, "{}", "[]");
     try std.testing.expect(id > 0);
 
     var stmt: ?*storage.c.sqlite3_stmt = null;
@@ -3399,6 +3418,175 @@ test "lazer storage only accepts the typed score input" {
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 6));
     try std.testing.expectEqualStrings("custom", std.mem.span(storage.c.sqlite3_column_text(stmt, 7)));
     try std.testing.expectEqualStrings("2026.811.0", std.mem.span(storage.c.sqlite3_column_text(stmt, 8)));
+}
+
+test "official lazer solo score paths match the pinned client contract" {
+    const create = lazer.parseSoloScorePath("/api/v2/beatmaps/75/solo/scores").?;
+    try std.testing.expectEqual(@as(i32, 75), create.beatmap_id);
+    try std.testing.expect(create.token_id == null);
+    const submit = lazer.parseSoloScorePath("/api/v2/beatmaps/75/solo/scores/123456789").?;
+    try std.testing.expectEqual(@as(i64, 123456789), submit.token_id.?);
+    try std.testing.expect(lazer.parseSoloScorePath("/api/v2/beatmaps/75/solo/scores/") == null);
+    try std.testing.expect(lazer.parseSoloScorePath("/api/v2/beatmaps/75/solo/scores/1/replay") == null);
+    try std.testing.expect(lazer.parseSoloScorePath("/api/v2/beatmaps/nope/solo/scores") == null);
+    try std.testing.expectEqual(@as(i32, 75), lazer.parseLeaderboardPath("/api/v2/beatmaps/75/scores").?.beatmap_id);
+    try std.testing.expect(lazer.parseLeaderboardPath("/api/v2/beatmaps/75/solo/scores") == null);
+    try std.testing.expect(lazer.parseLeaderboardPath("/api/v2/beatmaps/nope/scores") == null);
+}
+
+test "lazer ruleset profile paths match the pinned client contract" {
+    const osu = lazer.parseUserPath("/api/v2/users/4/osu").?;
+    try std.testing.expectEqualStrings("4", osu.lookup);
+    try std.testing.expectEqual(@as(u8, 0), osu.ruleset_id);
+    const fruits = lazer.parseUserPath("/api/v2/users/raya/fruits").?;
+    try std.testing.expectEqualStrings("raya", fruits.lookup);
+    try std.testing.expectEqual(@as(u8, 2), fruits.ruleset_id);
+    try std.testing.expectEqual(@as(u8, 3), lazer.parseUserPath("/api/v2/users/4/mania").?.ruleset_id);
+    try std.testing.expectEqual(@as(u8, 0), lazer.parseUserPath("/api/v2/users/4/").?.ruleset_id);
+    try std.testing.expectEqual(@as(u8, 0), lazer.parseUserPath("/api/v2/users/4").?.ruleset_id);
+    try std.testing.expect(lazer.parseUserPath("/api/v2/users/4/catch") == null);
+    try std.testing.expect(lazer.parseUserPath("/api/v2/users/4/osu/extra") == null);
+    try std.testing.expect(lazer.parseUserPath("/api/v2/users//osu") == null);
+}
+
+test "official lazer score bodies allow omitted mods and reject hostile counters" {
+    const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[1000,2000]}", .{});
+    defer valid.deinit();
+    const input = try lazer.parseSoloScore(valid.value, 75);
+    try std.testing.expectEqual(@as(i64, 75), input.beatmap_id);
+    try std.testing.expectEqual(@as(?i64, 900000), input.legacy_total_score);
+    try std.testing.expect(input.mods == null);
+    try std.testing.expectEqual(lazer.Namespace.vanilla, input.namespace);
+
+    const invalid = [_][]const u8{
+        "{\"rank\":\"SSS\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[]}",
+        "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":100000001},\"maximum_statistics\":{},\"pauses\":[]}",
+        "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"made_up\":1},\"maximum_statistics\":{},\"pauses\":[]}",
+        "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[-1]}",
+    };
+    for (invalid) |fixture| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidScore, lazer.parseSoloScore(parsed.value, 75));
+    }
+    const invalid_mod = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"mods\":[{\"acronym\":\"RX\",\"settings\":1}],\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[]}", .{});
+    defer invalid_mod.deinit();
+    try std.testing.expectError(error.InvalidMod, lazer.parseSoloScore(invalid_mod.value, 75));
+}
+
+test "lazer solo score tokens are user bound expiring and single use" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-score-token.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00'); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper')");
+
+    const raw = "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"mods\":[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\",\"settings\":{\"strength\":1.25}}],\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const score = try lazer.parseSoloScore(parsed.value, 75);
+    const mods_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "mods", "[]");
+    defer std.testing.allocator.free(mods_json);
+    const statistics_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "statistics", "{}");
+    defer std.testing.allocator.free(statistics_json);
+    const maximum_statistics_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "maximum_statistics", "{}");
+    defer std.testing.allocator.free(maximum_statistics_json);
+    const pauses_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "pauses", "[]");
+    defer std.testing.allocator.free(pauses_json);
+
+    try std.testing.expectError(error.BeatmapHashMismatch, store.createLazerScoreToken(1, 75, "ffffffffffffffffffffffffffffffff", 0, "11111111111111111111111111111111"));
+    try std.testing.expectError(error.BeatmapNotFound, store.createLazerScoreToken(1, 76, "0123456789abcdef0123456789abcdef", 0, "11111111111111111111111111111111"));
+    const token = try store.createLazerScoreToken(1, 75, "0123456789ABCDEF0123456789ABCDEF", 0, "11111111111111111111111111111111");
+    try std.testing.expectError(error.ForeignLazerScoreToken, store.submitLazerScoreToken(2, 75, token, score, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    var wrong_ruleset = score;
+    wrong_ruleset.ruleset_id = 1;
+    try std.testing.expectError(error.LazerScoreTokenMismatch, store.submitLazerScoreToken(1, 75, token, wrong_ruleset, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    const score_id = try store.submitLazerScoreToken(1, 75, token, score, mods_json, statistics_json, maximum_statistics_json, pauses_json);
+    try std.testing.expect(score_id > 0);
+    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(1, 75, token, score, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerScoreToken(1, 75, token + 2, score, mods_json, statistics_json, "{}", "[]"));
+
+    var row: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT mods_json,statistics_json FROM lazer_scores WHERE id=?1", -1, &row, null));
+    _ = storage.c.sqlite3_bind_int64(row, 1, score_id);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(row));
+    try std.testing.expectEqualStrings(mods_json, std.mem.span(storage.c.sqlite3_column_text(row, 0)));
+    try std.testing.expectEqualStrings(statistics_json, std.mem.span(storage.c.sqlite3_column_text(row, 1)));
+    _ = storage.c.sqlite3_finalize(row);
+
+    const leaderboard = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, 50);
+    defer std.testing.allocator.free(leaderboard);
+    var parsed_leaderboard = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, leaderboard, .{});
+    defer parsed_leaderboard.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_leaderboard.value.object.get("score_count").?.integer);
+    const listed = parsed_leaderboard.value.object.get("scores").?.array.items[0].object;
+    try std.testing.expectEqual(score_id, listed.get("id").?.integer);
+    try std.testing.expectEqualStrings("A", listed.get("rank").?.string);
+    try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_leaderboard.value.object.get("user_score").?.object.get("position").?.integer);
+
+    const expired = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
+    var expire_buf: [160]u8 = undefined;
+    const expire_sql = try std.fmt.bufPrintZ(&expire_buf, "UPDATE lazer_score_tokens SET expires_at=0 WHERE id={d}", .{expired});
+    try store.exec(expire_sql);
+    try std.testing.expectError(error.LazerScoreTokenExpired, store.submitLazerScoreToken(1, 75, expired, score, mods_json, statistics_json, "{}", "[]"));
+
+    var version_stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
+    defer _ = storage.c.sqlite3_finalize(version_stmt);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
+    try std.testing.expectEqual(@as(c_int, 21), storage.c.sqlite3_column_int(version_stmt, 0));
+}
+
+test "lazer v2 submission updates one stats slice without overwriting the account" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-v2-stats.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
+            "INSERT INTO stats(user_id,mode,ranked_score,total_score,pp,plays,total_hits,accuracy,max_combo) VALUES" ++
+            "(1,0,5000,10000,424,7,700,0.9353,228),(1,1,777,888,12,3,99,0.8,44);" ++
+            "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3)",
+    );
+    const raw = "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const input = try lazer.parseSoloScore(parsed.value, 75);
+    const token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "11111111111111111111111111111111");
+    _ = try store.submitLazerScoreToken(1, 75, token, input, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
+
+    const osu = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 992654), osu.ranked_score);
+    try std.testing.expectEqual(@as(i64, 997654), osu.total_score);
+    try std.testing.expectEqual(@as(i32, 424), osu.pp);
+    try std.testing.expectEqual(@as(i32, 8), osu.plays);
+    try std.testing.expectEqual(@as(i64, 1000), osu.total_hits);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9353), osu.accuracy, 0.000001);
+    try std.testing.expectEqual(@as(i32, 321), osu.max_combo);
+    const taiko = (try store.statsForUser(1, 1)).?;
+    try std.testing.expectEqual(@as(i64, 777), taiko.ranked_score);
+    try std.testing.expectEqual(@as(i64, 888), taiko.total_score);
+    try std.testing.expectEqual(@as(i32, 3), taiko.plays);
+
+    var failed = input;
+    failed.passed = false;
+    failed.rank = "F";
+    failed.total_score = 100;
+    failed.max_combo = 999;
+    const failed_token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
+    _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
+    const after_fail = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 992654), after_fail.ranked_score);
+    try std.testing.expectEqual(@as(i64, 997754), after_fail.total_score);
+    try std.testing.expectEqual(@as(i32, 9), after_fail.plays);
+    try std.testing.expectEqual(@as(i32, 321), after_fail.max_combo);
 }
 
 test "Rijndael-256 matches the py3rijndael block fixture" {
@@ -3891,6 +4079,13 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqualStrings("ranked", parsed_set.value.object.get("status").?.string);
     try std.testing.expect(!parsed_set.value.object.get("availability").?.object.get("download_disabled").?.bool);
     try std.testing.expectEqual(@as(usize, 1), parsed_set.value.object.get("beatmaps").?.array.items.len);
+    const lazer_lookup = (try store.lazerBeatmapLookup(std.testing.allocator, null, &hash)).?;
+    defer std.testing.allocator.free(lazer_lookup);
+    const parsed_lookup = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_lookup, .{});
+    defer parsed_lookup.deinit();
+    try std.testing.expectEqual(@as(i64, 900000001), parsed_lookup.value.object.get("id").?.integer);
+    try std.testing.expectEqualStrings("ranked", parsed_lookup.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("ranked", parsed_lookup.value.object.get("beatmapset").?.object.get("status").?.string);
     const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "Fixture", 0, 0);
     defer std.testing.allocator.free(lazer_search);
     const parsed_search = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_search, .{});

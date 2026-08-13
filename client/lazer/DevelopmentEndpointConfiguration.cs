@@ -7,8 +7,9 @@ namespace osu.Game.Online
     {
         public DevelopmentEndpointConfiguration()
         {
-            WebsiteUrl = @"https://osu.kai.ovh";
-            APIUrl = @"https://api.kai.ovh";
+            RealtimeServicesAvailable = false;
+            WebsiteUrl = @"https://kai.ovh";
+            APIUrl = @"http://127.0.0.1:18095";
             APIClientSecret = @"zigcho-lazer";
             APIClientID = "5";
             SpectatorUrl = @"https://spectator.kai.ovh/spectator";

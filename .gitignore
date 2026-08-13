@@ -4,5 +4,6 @@
 /*.db-shm
 /*.db-wal
 /work/
+/artifacts/
 /pp/target/
 .DS_Store

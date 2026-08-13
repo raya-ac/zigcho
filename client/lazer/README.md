@@ -15,3 +15,17 @@ work/dotnet/dotnet publish work/osu-client/osu.Desktop/osu.Desktop.csproj \
 The local Debug endpoint is deliberately loopback HTTP so it can sit in front of an SSH tunnel without changing production routing. Start that QA bundle through `client/lazer/run-local-debug.sh`; it enables insecure requests only after checking that the checked-in API host is exactly `127.0.0.1`. Production still uses HTTPS and the normal framework restriction.
 
 The current macOS app is an ad-hoc signed QA build. It is enough for real TLS compatibility work on this machine. It is not a public macOS release; distribution still needs a proper app identity, Developer ID signing, notarization, update metadata, and a clean player data path.
+
+## windows x64
+
+Windows has its own repeatable production build now. The PowerShell path applies the same pinned endpoint and resource patches, publishes a self-contained `win-x64` Release build, removes debug symbols, writes both project revisions into the package, includes both MIT licences, and checks every file before the zip is accepted.
+
+```powershell
+./client/lazer/build-windows.ps1 `
+  -Checkout work/osu-client `
+  -OutputDirectory artifacts/lazer
+```
+
+The result is `zigcho-lazer-0.1.0-alpha.1-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
+
+This is a portable alpha, not a signed installer. Open `app/osu!.exe` after extracting the whole folder. Windows SmartScreen may warn until the executable has an Authenticode certificate. Realtime chat, multiplayer, and spectating are still missing, so the package stays marked as a prerelease even though the REST login, beatmap, profile, leaderboard, and solo score paths are connected.

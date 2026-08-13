@@ -1,0 +1,59 @@
+name: lazer windows client
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - client/lazer/**
+      - .github/workflows/lazer-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: 12df2e4ff254975f4b66ae9efda808837ee9beea
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: install python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: apply and test the client changes
+        shell: pwsh
+        run: |
+          ./client/lazer/apply-endpoints.ps1 -Checkout work/osu-client
+          dotnet test work/osu-client/osu.Game.Tests/osu.Game.Tests.csproj -c Release --filter "FullyQualifiedName~TrustedDomainOnlineStoreTest|FullyQualifiedName~UnavailableRealtimeChatClientTest"
+
+      - name: build and verify the portable client
+        shell: pwsh
+        run: ./client/lazer/build-windows.ps1 -Checkout work/osu-client -OutputDirectory artifacts/lazer
+
+      - name: upload the Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-lazer-windows-x64
+          path: |
+            artifacts/lazer/*.zip
+            artifacts/lazer/*.sha256
+          if-no-files-found: error
+          retention-days: 30

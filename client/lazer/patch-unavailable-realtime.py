@@ -20,6 +20,9 @@ def replace_once(path: Path, old: str, new: str) -> None:
 checkout = Path(sys.argv[1])
 api_access = checkout / "osu.Game/Online/API/APIAccess.cs"
 endpoint = checkout / "osu.Game/Online/EndpointConfiguration.cs"
+desktop_program = checkout / "osu.Desktop/Program.cs"
+desktop_project = checkout / "osu.Desktop/osu.Desktop.csproj"
+osu_game = checkout / "osu.Game/OsuGame.cs"
 
 replace_once(
     api_access,
@@ -51,3 +54,41 @@ replace_once(
         public bool RealtimeServicesAvailable { get; set; } = true;
 """,
 )
+
+# Keep the custom client away from an installed official lazer client. This changes
+# both its storage directory and IPC pipe, and also prevents the official updater
+# from replacing a zigcho build after startup.
+replace_once(
+    desktop_program,
+    '        private const string base_game_name = @"osu-development";',
+    '        private const string base_game_name = @"zigcho-lazer-development";',
+)
+replace_once(
+    desktop_program,
+    '        private const string base_game_name = @"osu";',
+    '        private const string base_game_name = @"zigcho-lazer";',
+)
+replace_once(
+    desktop_program,
+    """        public static void Main(string[] args)
+        {
+            // IMPORTANT DON'T IGNORE: For general sanity, velopack's setup needs to run before anything else.""",
+    """        public static void Main(string[] args)
+        {
+            Environment.SetEnvironmentVariable("OSU_EXTERNAL_UPDATE_PROVIDER", "zigcho");
+
+            // IMPORTANT DON'T IGNORE: For general sanity, velopack's setup needs to run before anything else.""",
+)
+replace_once(
+    osu_game,
+    '        public const string IPC_PIPE_NAME = "osu-lazer-debug";',
+    '        public const string IPC_PIPE_NAME = "zigcho-lazer-debug";',
+)
+replace_once(
+    osu_game,
+    '        public const string IPC_PIPE_NAME = "osu-lazer";',
+    '        public const string IPC_PIPE_NAME = "zigcho-lazer";',
+)
+replace_once(desktop_project, "    <AssemblyTitle>osu!(lazer)</AssemblyTitle>", "    <AssemblyTitle>zigcho lazer</AssemblyTitle>")
+replace_once(desktop_project, "    <Product>osu!(lazer)</Product>", "    <Product>zigcho lazer</Product>")
+replace_once(desktop_project, "    <Title>osu!</Title>", "    <Title>zigcho lazer</Title>")

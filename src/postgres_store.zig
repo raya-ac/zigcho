@@ -5,7 +5,7 @@ const sqlite_storage = @import("storage.zig");
 const stable_score = @import("stable_score.zig");
 const beatmap = @import("beatmap.zig");
 const lazer = @import("lazer.zig");
-const performance_calculator = @import("pp.zig");
+const performance_calculator = @import("exact_pp.zig");
 const stable_mods = @import("stable_mods.zig");
 const screenshot_contract = @import("screenshot.zig");
 const media_contract = @import("media_contract.zig");
@@ -1338,7 +1338,15 @@ pub const Store = struct {
     }
 
     fn rebuildRankedStats(allocator: std.mem.Allocator, conn: *postgres.c.PGconn) !void {
-        var reset = try postgres.query(conn, "UPDATE zigcho.stats st SET ranked_score=coalesce((SELECT sum(s.score) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=st.user_id AND CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END=st.mode AND s.passed AND s.best AND b.status IN(3,4)),0),max_combo=coalesce((SELECT max(s.max_combo) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=st.user_id AND CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END=st.mode AND s.passed AND b.status>=3),0),pp=0,accuracy=0");
+        const internal_mode = "CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END";
+        var reset = try postgres.query(conn, "UPDATE zigcho.stats st SET " ++
+            "total_score=coalesce((SELECT sum(s.score) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)," ++
+            "plays=coalesce((SELECT count(*) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)," ++
+            "play_time=coalesce((SELECT sum(s.time_elapsed/1000) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)," ++
+            "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN(1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)," ++
+            "ranked_score=coalesce((SELECT sum(s.score) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode AND s.passed AND s.best AND b.status IN(3,4)),0)," ++
+            "max_combo=coalesce((SELECT max(s.max_combo) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode AND s.passed AND b.status>=3),0)," ++
+            "pp=0,accuracy=0");
         reset.deinit();
         var keys = try postgres.query(conn, "SELECT user_id,mode FROM zigcho.stats ORDER BY user_id,mode");
         defer keys.deinit();
@@ -1415,7 +1423,7 @@ pub const Store = struct {
         var best = try postgres.query(
             lease.conn,
             "UPDATE zigcho.scores SET best=false;" ++
-                "WITH ordered AS (SELECT id,row_number() OVER(PARTITION BY user_id,map_md5,mode,rank_namespace ORDER BY CASE WHEN rank_namespace='vanilla' THEN score::double precision ELSE pp END DESC,id ASC) AS place FROM zigcho.scores WHERE passed) " ++
+                "WITH ordered AS (SELECT id,row_number() OVER(PARTITION BY user_id,map_md5,mode,rank_namespace ORDER BY CASE WHEN rank_namespace IN('vanilla','scorev2') THEN score::double precision ELSE pp END DESC,id ASC) AS place FROM zigcho.scores WHERE passed) " ++
                 "UPDATE zigcho.scores SET best=true WHERE id IN(SELECT id FROM ordered WHERE place=1)",
         );
         best.deinit();
@@ -1915,7 +1923,7 @@ pub const Store = struct {
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{score_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.best,(SELECT count(*) FROM zigcho.scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed AND o.best AND ((pb.rank_namespace='vanilla' AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace!='vanilla' AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.scores pb ON pb.user_id=s.user_id AND pb.map_md5=s.map_md5 AND pb.mode=s.mode AND pb.rank_namespace=s.rank_namespace AND pb.passed AND pb.best WHERE s.id=$1 AND s.passed AND b.status>=3", &.{id});
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.best,(SELECT count(*) FROM zigcho.scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed AND o.best AND ((pb.rank_namespace IN('vanilla','scorev2') AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace IN('relax','autopilot') AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.scores pb ON pb.user_id=s.user_id AND pb.map_md5=s.map_md5 AND pb.mode=s.mode AND pb.rank_namespace=s.rank_namespace AND pb.passed AND pb.best WHERE s.id=$1 AND s.passed AND b.status>=3", &.{id});
         defer result.deinit();
         if (result.rows() == 0) return null;
         return .{ .submitted_is_best = try result.boolean(0, 0), .rank = try result.int(i32, 0, 1) };
@@ -1938,6 +1946,8 @@ pub const Store = struct {
     pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {
         const stats_mode = stable_score.statsMode(score.mode, score.mods) orelse return error.UnsupportedModMode;
         const namespace = score.rankNamespace();
+        const uses_pp = stable_mods.usesPpMetric(namespace);
+        const updates_player_stats = stable_mods.updatesPlayerStats(namespace);
         const replay_encoded = try postgres.encodeBytea(self.allocator, replay_data);
         defer self.allocator.free(replay_encoded);
 
@@ -1976,9 +1986,11 @@ pub const Store = struct {
         defer lease.release();
         try postgres.exec(lease.conn, "BEGIN");
         errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
-        var stats_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.stats WHERE user_id=$1 AND mode=$2 FOR UPDATE", &.{ user, stats_mode_text });
-        defer stats_lock.deinit();
-        if (stats_lock.rows() == 0) return error.DatabaseQueryFailed;
+        if (updates_player_stats) {
+            var stats_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.stats WHERE user_id=$1 AND mode=$2 FOR UPDATE", &.{ user, stats_mode_text });
+            defer stats_lock.deinit();
+            if (stats_lock.rows() == 0) return error.DatabaseQueryFailed;
+        }
 
         var previous_best_id: i64 = 0;
         var previous_best_score: i64 = 0;
@@ -1990,7 +2002,6 @@ pub const Store = struct {
             previous_best_score = try previous.int(i64, 0, 1);
             previous_best_pp = try previous.float(f64, 0, 2);
         }
-        const uses_pp = !std.mem.eql(u8, namespace, "vanilla");
         const is_best = score.passed and if (uses_pp) pp_value > previous_best_pp else score.total_score > previous_best_score;
         const perfect = if (score.perfect) "true" else "false";
         const passed = if (score.passed) "true" else "false";
@@ -2014,20 +2025,22 @@ pub const Store = struct {
         const map_status = try map.int(i32, 0, 0);
         const leaderboard = map_status >= 3;
         const ranked = map_status == 3 or map_status == 4;
-        const ranked_delta: i64 = if (is_best and ranked) score.total_score - previous_best_score else 0;
-        const total_hits: i64 = @as(i64, score.n300) + score.n100 + score.n50 + if (score.mode == 1 or score.mode == 3) @as(i64, score.ngeki) + score.nkatu else 0;
-        var ranked_buf: [32]u8 = undefined;
-        var seconds_buf: [24]u8 = undefined;
-        var hits_buf: [32]u8 = undefined;
-        const ranked_text = try std.fmt.bufPrint(&ranked_buf, "{d}", .{ranked_delta});
-        const seconds = try std.fmt.bufPrint(&seconds_buf, "{d}", .{time_elapsed_ms / 1000});
-        const hits = try std.fmt.bufPrint(&hits_buf, "{d}", .{total_hits});
-        var update_stats = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.stats SET total_score=total_score+$1,ranked_score=ranked_score+$2,plays=plays+1,play_time=play_time+$3,total_hits=total_hits+$4,max_combo=CASE WHEN $5::boolean THEN greatest(max_combo,$6) ELSE max_combo END WHERE user_id=$7 AND mode=$8", &.{ score_text, ranked_text, seconds, hits, if (score.passed and leaderboard) "true" else "false", combo, user, stats_mode_text });
-        update_stats.deinit();
+        if (updates_player_stats) {
+            const ranked_delta: i64 = if (is_best and ranked) score.total_score - previous_best_score else 0;
+            const total_hits: i64 = @as(i64, score.n300) + score.n100 + score.n50 + if (score.mode == 1 or score.mode == 3) @as(i64, score.ngeki) + score.nkatu else 0;
+            var ranked_buf: [32]u8 = undefined;
+            var seconds_buf: [24]u8 = undefined;
+            var hits_buf: [32]u8 = undefined;
+            const ranked_text = try std.fmt.bufPrint(&ranked_buf, "{d}", .{ranked_delta});
+            const seconds = try std.fmt.bufPrint(&seconds_buf, "{d}", .{time_elapsed_ms / 1000});
+            const hits = try std.fmt.bufPrint(&hits_buf, "{d}", .{total_hits});
+            var update_stats = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.stats SET total_score=total_score+$1,ranked_score=ranked_score+$2,plays=plays+1,play_time=play_time+$3,total_hits=total_hits+$4,max_combo=CASE WHEN $5::boolean THEN greatest(max_combo,$6) ELSE max_combo END WHERE user_id=$7 AND mode=$8", &.{ score_text, ranked_text, seconds, hits, if (score.passed and leaderboard) "true" else "false", combo, user, stats_mode_text });
+            update_stats.deinit();
+        }
         var update_map = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmaps SET plays=plays+1,passes=passes+$1 WHERE md5=$2", &.{ if (score.passed) "1" else "0", score.map_md5 });
         update_map.deinit();
 
-        if (is_best and ranked) {
+        if (updates_player_stats and is_best and ranked) {
             var weighted = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.pp,s.accuracy FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.passed AND s.best AND s.rank_namespace=$3 AND b.status IN (3,4) ORDER BY s.pp DESC,s.id ASC", &.{ user, mode, namespace });
             defer weighted.deinit();
             var total_pp: f64 = 0;
@@ -2551,6 +2564,27 @@ test "postgres account auth stats and token slice" {
     recalc_score.total_score = 777_777;
     const recalc_score_id = try store.insertStableScore(user_id, recalc_score, 1, "recalc replay", 12_000);
     try std.testing.expectEqual(@as(u64, 1), try store.recalculatePerformance(std.testing.allocator));
+    const before_scorev2 = (try store.statsForUser(user_id, 0)).?;
+    var scorev2 = recalc_score;
+    scorev2.online_checksum = "ffffffffffffffffffffffffffffffff";
+    scorev2.total_score = 2_000_000;
+    scorev2.max_combo = 999;
+    scorev2.mods = stable_mods.score_v2;
+    const scorev2_id = try store.insertStableScore(user_id, scorev2, 1, "scorev2 replay", 30_000);
+    try std.testing.expectEqualDeep(before_scorev2, (try store.statsForUser(user_id, 0)).?);
+    const scorev2_placement = (try store.scoreLeaderboardPlacement(scorev2_id)).?;
+    try std.testing.expect(scorev2_placement.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 0), scorev2_placement.rank);
+    {
+        var user_id_buf: [24]u8 = undefined;
+        const user_id_text = try std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var corrupt = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.stats SET ranked_score=1,total_score=2,pp=3,plays=4,play_time=5,total_hits=6,accuracy=0.7,max_combo=8 WHERE user_id=$1 AND mode=0", &.{user_id_text});
+        corrupt.deinit();
+    }
+    try std.testing.expectEqual(@as(u64, 2), try store.recalculatePerformance(std.testing.allocator));
+    try std.testing.expectEqualDeep(before_scorev2, (try store.statsForUser(user_id, 0)).?);
     const recalculated = (try store.ppSnapshot(recalc_score_id)).?;
     try std.testing.expect(recalculated.score > 1);
     {
@@ -2558,7 +2592,7 @@ test "postgres account auth stats and token slice" {
         defer lease.release();
         var recalc_audit = try postgres.query(lease.conn, "SELECT count(*) FROM zigcho.audit_log WHERE action='operations.pp_recalc' AND target='scores'");
         defer recalc_audit.deinit();
-        try std.testing.expectEqual(@as(i64, 1), try recalc_audit.int(i64, 0, 0));
+        try std.testing.expectEqual(@as(i64, 2), try recalc_audit.int(i64, 0, 0));
     }
     const pruned = try store.pruneBeatmapArchives(1);
     try std.testing.expectEqual(@as(i64, 1), pruned.entries);

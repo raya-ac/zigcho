@@ -1,0 +1,19 @@
+[package]
+name = "zigcho-pp"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+akatsuki-pp = { git = "https://github.com/osuAkatsuki/akatsuki-pp-rs", rev = "591de0db4948f2c504ca6e2ca3db442f09103ef1" }
+rosu-map = "=0.2.1"
+rosu-pp = "=4.0.1"
+
+[profile.release]
+codegen-units = 16
+lto = "off"
+panic = "unwind"
+strip = "debuginfo"

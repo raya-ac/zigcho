@@ -1,6 +1,6 @@
 const std = @import("std");
 const beatmap = @import("beatmap.zig");
-const pp = @import("pp.zig");
+const pp = @import("exact_pp.zig");
 const storage = @import("storage.zig");
 
 pub fn main(init: std.process.Init) !void {

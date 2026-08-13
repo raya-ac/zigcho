@@ -46,6 +46,14 @@ pub fn namespace(mods: i32) []const u8 {
     return "vanilla";
 }
 
+pub fn usesPpMetric(namespace_name: []const u8) bool {
+    return std.mem.eql(u8, namespace_name, "relax") or std.mem.eql(u8, namespace_name, "autopilot");
+}
+
+pub fn updatesPlayerStats(namespace_name: []const u8) bool {
+    return !std.mem.eql(u8, namespace_name, "scorev2");
+}
+
 pub fn parseCompact(value: []const u8) ?i32 {
     if (value.len == 0 or value.len % 2 != 0) return null;
     var mods: i32 = 0;
@@ -210,4 +218,13 @@ test "stable mod labels suppress implied bits" {
     try std.testing.expectEqualStrings("NC", shortString(&buffer, double_time | nightcore));
     try std.testing.expectEqualStrings("PF", shortString(&buffer, sudden_death | perfect));
     try std.testing.expectEqualStrings("HDRX", shortString(&buffer, hidden | relax));
+}
+
+test "stable scorev2 has a score board but no player stats slice" {
+    const scorev2_namespace = namespace(score_v2);
+    try std.testing.expectEqualStrings("scorev2", scorev2_namespace);
+    try std.testing.expect(!usesPpMetric(scorev2_namespace));
+    try std.testing.expect(!updatesPlayerStats(scorev2_namespace));
+    try std.testing.expect(usesPpMetric(namespace(relax)));
+    try std.testing.expect(updatesPlayerStats(namespace(relax)));
 }

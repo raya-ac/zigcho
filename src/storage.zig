@@ -164,18 +164,18 @@ pub const Store = struct {
         try self.exec(
             "UPDATE scores SET best=0;" ++
                 "WITH ordered AS (" ++
-                "SELECT id,row_number() OVER (PARTITION BY user_id,map_md5,mode,rank_namespace ORDER BY CASE WHEN rank_namespace='vanilla' THEN CAST(score AS REAL) ELSE pp END DESC,id ASC) AS place " ++
+                "SELECT id,row_number() OVER (PARTITION BY user_id,map_md5,mode,rank_namespace ORDER BY CASE WHEN rank_namespace IN('vanilla','scorev2') THEN CAST(score AS REAL) ELSE pp END DESC,id ASC) AS place " ++
                 "FROM scores WHERE passed=1" ++
                 ") UPDATE scores SET best=1 WHERE id IN (SELECT id FROM ordered WHERE place=1);",
         );
         const internal_mode = "CASE WHEN (s.mods & 8192)!=0 THEN s.mode+8 WHEN (s.mods & 128)!=0 THEN s.mode+4 ELSE s.mode END";
         const rebuild_sql = "UPDATE stats SET " ++
-            "total_score=coalesce((SELECT sum(s.score) FROM scores s WHERE s.user_id=stats.user_id AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "plays=coalesce((SELECT count(*) FROM scores s WHERE s.user_id=stats.user_id AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "play_time=coalesce((SELECT sum(s.time_elapsed/1000) FROM scores s WHERE s.user_id=stats.user_id AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN (1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM scores s WHERE s.user_id=stats.user_id AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "max_combo=coalesce((SELECT max(s.max_combo) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND b.status>=3),0)," ++
-            "ranked_score=coalesce((SELECT sum(s.score) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND s.best=1 AND b.status IN (3,4)),0)," ++
+            "total_score=coalesce((SELECT sum(s.score) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
+            "plays=coalesce((SELECT count(*) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
+            "play_time=coalesce((SELECT sum(s.time_elapsed/1000) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
+            "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN (1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
+            "max_combo=coalesce((SELECT max(s.max_combo) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND b.status>=3),0)," ++
+            "ranked_score=coalesce((SELECT sum(s.score) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND s.best=1 AND b.status IN (3,4)),0)," ++
             "pp=0,accuracy=0";
         try self.exec(rebuild_sql);
 
@@ -2129,7 +2129,7 @@ pub const Store = struct {
     pub fn scoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT s.best,(SELECT count(*) FROM scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed=1 AND o.best=1 AND ((pb.rank_namespace='vanilla' AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace!='vanilla' AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN scores pb ON pb.user_id=s.user_id AND pb.map_md5=s.map_md5 AND pb.mode=s.mode AND pb.rank_namespace=s.rank_namespace AND pb.passed=1 AND pb.best=1 WHERE s.id=?1 AND s.passed=1 AND b.status>=3";
+        const sql = "SELECT s.best,(SELECT count(*) FROM scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed=1 AND o.best=1 AND ((pb.rank_namespace IN('vanilla','scorev2') AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace IN('relax','autopilot') AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN scores pb ON pb.user_id=s.user_id AND pb.map_md5=s.map_md5 AND pb.mode=s.mode AND pb.rank_namespace=s.rank_namespace AND pb.passed=1 AND pb.best=1 WHERE s.id=?1 AND s.passed=1 AND b.status>=3";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -2180,7 +2180,8 @@ pub const Store = struct {
             previous_best_pp = c.sqlite3_column_double(best_stmt, 2);
         }
         _ = c.sqlite3_finalize(best_stmt);
-        const uses_pp_metric = !std.mem.eql(u8, namespace, "vanilla");
+        const uses_pp_metric = stable_mods.usesPpMetric(namespace);
+        const updates_player_stats = stable_mods.updatesPlayerStats(namespace);
         const is_best = score.passed and if (uses_pp_metric) pp_value > previous_best_pp else score.total_score > previous_best_score;
         const stats_mode = stable_score.statsMode(score.mode, score.mods) orelse return error.UnsupportedModMode;
         const sql = "INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)";
@@ -2227,21 +2228,23 @@ pub const Store = struct {
         const map_status = c.sqlite3_column_int(status_stmt, 0);
         const has_leaderboard = map_status >= 3;
         const awards_ranked_pp = map_status == 3 or map_status == 4;
-        const ranked_delta: i64 = if (is_best and awards_ranked_pp) score.total_score - previous_best_score else 0;
-        const total_hits: i64 = @as(i64, score.n300) + score.n100 + score.n50 + if (score.mode == 1 or score.mode == 3) @as(i64, score.ngeki) + score.nkatu else 0;
-        const update_stats = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?2,plays=plays+1,play_time=play_time+?3,total_hits=total_hits+?4,max_combo=CASE WHEN ?5=1 THEN max(max_combo,?6) ELSE max_combo END WHERE user_id=?7 AND mode=?8";
-        var stats_stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, update_stats, -1, &stats_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(stats_stmt);
-        _ = c.sqlite3_bind_int64(stats_stmt, 1, score.total_score);
-        _ = c.sqlite3_bind_int64(stats_stmt, 2, ranked_delta);
-        _ = c.sqlite3_bind_int64(stats_stmt, 3, time_elapsed_ms / 1000);
-        _ = c.sqlite3_bind_int64(stats_stmt, 4, total_hits);
-        _ = c.sqlite3_bind_int(stats_stmt, 5, @intFromBool(score.passed and has_leaderboard));
-        _ = c.sqlite3_bind_int(stats_stmt, 6, score.max_combo);
-        _ = c.sqlite3_bind_int(stats_stmt, 7, user_id);
-        _ = c.sqlite3_bind_int(stats_stmt, 8, stats_mode);
-        if (c.sqlite3_step(stats_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        if (updates_player_stats) {
+            const ranked_delta: i64 = if (is_best and awards_ranked_pp) score.total_score - previous_best_score else 0;
+            const total_hits: i64 = @as(i64, score.n300) + score.n100 + score.n50 + if (score.mode == 1 or score.mode == 3) @as(i64, score.ngeki) + score.nkatu else 0;
+            const update_stats = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?2,plays=plays+1,play_time=play_time+?3,total_hits=total_hits+?4,max_combo=CASE WHEN ?5=1 THEN max(max_combo,?6) ELSE max_combo END WHERE user_id=?7 AND mode=?8";
+            var stats_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, update_stats, -1, &stats_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stats_stmt);
+            _ = c.sqlite3_bind_int64(stats_stmt, 1, score.total_score);
+            _ = c.sqlite3_bind_int64(stats_stmt, 2, ranked_delta);
+            _ = c.sqlite3_bind_int64(stats_stmt, 3, time_elapsed_ms / 1000);
+            _ = c.sqlite3_bind_int64(stats_stmt, 4, total_hits);
+            _ = c.sqlite3_bind_int(stats_stmt, 5, @intFromBool(score.passed and has_leaderboard));
+            _ = c.sqlite3_bind_int(stats_stmt, 6, score.max_combo);
+            _ = c.sqlite3_bind_int(stats_stmt, 7, user_id);
+            _ = c.sqlite3_bind_int(stats_stmt, 8, stats_mode);
+            if (c.sqlite3_step(stats_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
         const update_map = "UPDATE beatmaps SET plays=plays+1,passes=passes+?1 WHERE md5=?2";
         var map_stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, update_map, -1, &map_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -2249,7 +2252,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(map_stmt, 1, @intFromBool(score.passed));
         _ = c.sqlite3_bind_text(map_stmt, 2, score.map_md5.ptr, @intCast(score.map_md5.len), null);
         if (c.sqlite3_step(map_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        if (is_best and awards_ranked_pp) {
+        if (updates_player_stats and is_best and awards_ranked_pp) {
             const pp_sql = "SELECT s.pp,s.accuracy FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.passed=1 AND s.best=1 AND s.rank_namespace=?3 AND b.status IN (3,4) ORDER BY s.pp DESC,s.id ASC";
             var pp_stmt: ?*c.sqlite3_stmt = null;
             if (c.sqlite3_prepare_v2(self.db, pp_sql, -1, &pp_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;

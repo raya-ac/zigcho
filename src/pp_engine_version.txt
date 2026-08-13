@@ -1,1 +1,1 @@
-stable-2026.08.13.1
+stable-rosu-4.0.1-akatsuki-591de0d.1

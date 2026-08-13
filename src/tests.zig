@@ -7,9 +7,11 @@ const rijndael = @import("rijndael.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
+const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
 const rate_limit = @import("rate_limit.zig");
-const pp = @import("pp.zig");
+const pp = @import("exact_pp.zig");
+const native_pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
 const storage = @import("runtime_storage.zig");
 const form_urlencoded = @import("form_urlencoded.zig");
@@ -329,7 +331,7 @@ fn loginAllocationRun(allocator: std.mem.Allocator, context: *LoginAllocationCon
 }
 
 fn ppAllocationRun(allocator: std.mem.Allocator, _: void) !void {
-    const result = try pp.calculateWithAllocator(allocator, @embedFile("testdata/synthetic-standard.osu"), .{
+    const result = try native_pp.calculateWithAllocator(allocator, @embedFile("testdata/synthetic-standard.osu"), .{
         .mode = 0,
         .lazer = 0,
         .mods = 0,
@@ -3606,8 +3608,8 @@ test "pinned performance engine calculates the synthetic stable fixture" {
         .misses = 0,
         .legacy_total_score = 1_000_000,
     });
-    try std.testing.expectApproxEqAbs(@as(f64, 26.90), result.pp, 0.05);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.8065), result.stars, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 26.797973284), result.pp, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.793060769), result.stars, 0.0001);
     try std.testing.expectEqual(@as(u32, 10), result.max_combo);
 }
 
@@ -3619,12 +3621,12 @@ test "stable performance fixtures lock every ruleset and common mod path" {
         .{ .mode = 2, .map = @embedFile("testdata/synthetic-catch.osu"), .perfect_geki = 0 },
         .{ .mode = 3, .map = @embedFile("testdata/synthetic-mania.osu"), .perfect_geki = 10 },
     };
-    const expected_fc = [_]f64{ 26.895763, 13.168693, 2.549130, 0.740225 };
-    const expected_miss = [_]f64{ 4.889811, 10.017056, 1.273185, 0.370112 };
-    const expected_hr = [_]f64{ 58.466484, 19.190285, 5.138172, 0.740225 };
-    const expected_hd = [_]f64{ 29.196351, 14.156509, 3.058956, 0.740225 };
-    const expected_dt = [_]f64{ 56.075908, 19.565074, 3.316334, 0.616461 };
-    const expected_stars = [_]f64{ 1.806515, 0.279849, 0.511245, 0.488839 };
+    const expected_fc = [_]f64{ 26.797973284, 15.285055735, 2.549129656, 0.740224547 };
+    const expected_miss = [_]f64{ 4.974535079, 5.721262823, 1.335003302, 0.370112274 };
+    const expected_hr = [_]f64{ 58.137599685, 46.303420330, 5.138172491, 0.740224547 };
+    const expected_hd = [_]f64{ 29.124396934, 16.420406956, 3.058955588, 0.740224547 };
+    const expected_dt = [_]f64{ 55.280056660, 49.244979734, 3.316334352, 0.616461172 };
+    const expected_stars = [_]f64{ 1.793060769, 0.641015657, 0.511244829, 0.488838504 };
     const expected_max_combo = [_]u32{ 10, 10, 10, 20 };
     for (fixtures, 0..) |fixture, index| {
         const full_combo = try pp.calculate(fixture.map, .{
@@ -3717,7 +3719,7 @@ test "stable performance fixtures lock every ruleset and common mod path" {
 
 test "native performance combo counts sliders spinners and converted objects" {
     const map = @embedFile("testdata/synthetic-slider-combo.osu");
-    const expected = [_]u32{ 7, 1, 6, 33 };
+    const expected = [_]u32{ 7, 1, 3, 33 };
     for (expected, 0..) |max_combo, mode| {
         const result = try pp.calculate(map, .{
             .mode = @intCast(mode),
@@ -3789,6 +3791,42 @@ test "native stable performance fixtures lock relax and autopilot" {
         .misses = 0,
         .legacy_total_score = 1_000_000,
     }));
+}
+
+test "exact stable calculator locks the live scorev2 map and partial play" {
+    const map = @embedFile("testdata/disco-prince-normal.osu");
+    const full_combo = try pp.calculate(map, .{
+        .mode = 0,
+        .lazer = 0,
+        .mods = 1 << 29,
+        .max_combo = 314,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 194,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_005_340,
+    });
+    try std.testing.expectApproxEqAbs(@as(f64, 36.685654210), full_combo.pp, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.626949895), full_combo.stars, 0.0001);
+    try std.testing.expectEqual(@as(u32, 314), full_combo.max_combo);
+
+    const failed_prefix = try pp.calculate(map, .{
+        .mode = 0,
+        .lazer = 0,
+        .mods = 1 << 29,
+        .max_combo = 40,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 50,
+        .n100 = 4,
+        .n50 = 0,
+        .misses = 6,
+        .legacy_total_score = 65_000,
+    });
+    try std.testing.expect(failed_prefix.stars < full_combo.stars);
+    try std.testing.expect(failed_prefix.pp < full_combo.pp);
 }
 
 test "native performance engine survives every allocation failure" {
@@ -3945,6 +3983,33 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i32, 15), relax_stats.play_time);
     try std.testing.expectApproxEqAbs(@as(f64, 1), relax_stats.accuracy, 0.0001);
     try std.testing.expectEqual(@as(i32, 10), relax_stats.max_combo);
+
+    const before_scorev2 = (try store.statsForUser(1, 0)).?;
+    var scorev2 = score;
+    scorev2.online_checksum = "dddddddddddddddddddddddddddddddd";
+    scorev2.total_score = 2_000_000;
+    scorev2.max_combo = 999;
+    scorev2.mods = stable_mods.score_v2;
+    const scorev2_id = try store.insertStableScore(1, scorev2, 1.0, "scorev2 replay", 30_000);
+    const scorev2_placement = (try store.scoreLeaderboardPlacement(scorev2_id)).?;
+    try std.testing.expect(scorev2_placement.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 0), scorev2_placement.rank);
+    const after_scorev2 = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqualDeep(before_scorev2, after_scorev2);
+
+    var lower_scorev2 = scorev2;
+    lower_scorev2.online_checksum = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    lower_scorev2.total_score = 1_500_000;
+    const lower_scorev2_id = try store.insertStableScore(1, lower_scorev2, 999.0, "lower scorev2 replay", 30_000);
+    const lower_placement = (try store.scoreLeaderboardPlacement(lower_scorev2_id)).?;
+    try std.testing.expect(!lower_placement.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 0), lower_placement.rank);
+    try std.testing.expectEqualDeep(before_scorev2, (try store.statsForUser(1, 0)).?);
+
+    try store.exec("UPDATE stats SET ranked_score=1,total_score=2,pp=3,plays=4,play_time=5,total_hits=6,accuracy=0.7,max_combo=8 WHERE user_id=1 AND mode=0");
+    _ = try store.applyBeatmapRankAction(1, &hash, .rank, "rebuild scorev2 isolation");
+    const rebuilt = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqualDeep(before_scorev2, rebuilt);
 }
 
 test "stable score storage keeps every supported ruleset and namespace isolated" {

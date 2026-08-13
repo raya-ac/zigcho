@@ -9,6 +9,7 @@ use rosu_pp::{
     Beatmap as RosuBeatmap, Performance as RosuPerformance, any::ScoreState as RosuScoreState,
     model::mode::GameMode as RosuGameMode,
 };
+use rosu_mods::{GameMod, GameModSimple, GameMods, GameMode, serde::GameModSeed};
 
 const RELAX: u32 = 1 << 7;
 const AUTOPILOT: u32 = 1 << 13;
@@ -94,6 +95,7 @@ fn calculate_vanilla(
     map_bytes: &[u8],
     input: &ZigchoPpInput,
     passed: u32,
+    lazer_mods: Option<GameMods>,
 ) -> Result<ZigchoPpOutput, ()> {
     let map = RosuBeatmap::from_bytes(map_bytes).map_err(|_| ())?;
     let mode = rosu_mode(input.mode).ok_or(())?;
@@ -110,10 +112,14 @@ fn calculate_vanilla(
         misses: input.misses,
         legacy_total_score: (input.legacy_total_score > 0).then_some(input.legacy_total_score),
     };
-    let attributes = RosuPerformance::new(&map)
+    let performance = RosuPerformance::new(&map)
         .try_mode(mode)
-        .map_err(|_| ())?
-        .mods(input.mods)
+        .map_err(|_| ())?;
+    let performance = match lazer_mods {
+        Some(mods) => performance.mods(mods),
+        None => performance.mods(input.mods),
+    };
+    let attributes = performance
         .lazer(input.lazer != 0)
         .passed_objects(passed)
         .state(state)
@@ -165,8 +171,39 @@ fn calculate(map_bytes: &[u8], input: &ZigchoPpInput) -> Result<ZigchoPpOutput, 
     if input.mods & (RELAX | AUTOPILOT) != 0 {
         calculate_custom(map_bytes, input, passed)
     } else {
-        calculate_vanilla(map_bytes, input, passed)
+        calculate_vanilla(map_bytes, input, passed, None)
     }
+}
+
+fn parse_lazer_mods(bytes: &[u8], mode: u8) -> Result<GameMods, ()> {
+    let mode = match mode {
+        0 => GameMode::Osu,
+        1 => GameMode::Taiko,
+        2 => GameMode::Catch,
+        3 => GameMode::Mania,
+        _ => return Err(()),
+    };
+    let simple: Vec<GameModSimple> = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let mut mods = GameMods::new();
+    for item in simple {
+        let gamemod = item
+            .try_as_mod(GameModSeed::Mode {
+                mode,
+                deny_unknown_fields: true,
+            })
+            .map_err(|_| ())?;
+        if matches!(
+            gamemod,
+            GameMod::UnknownOsu(_)
+                | GameMod::UnknownTaiko(_)
+                | GameMod::UnknownCatch(_)
+                | GameMod::UnknownMania(_)
+        ) {
+            return Err(());
+        }
+        mods.insert(gamemod);
+    }
+    Ok(mods)
 }
 
 /// Returns zero on success. Any non-zero result means the score must not be ranked.
@@ -189,6 +226,47 @@ pub unsafe extern "C" fn zigcho_pp_calculate(
         let map_bytes = unsafe { slice::from_raw_parts(map_ptr, map_len) };
         let input = unsafe { &*input };
         calculate(map_bytes, input)
+    });
+
+    match result {
+        Ok(Ok(value)) => {
+            unsafe { output.write(value) };
+            0
+        }
+        Ok(Err(())) => 2,
+        Err(_) => 3,
+    }
+}
+
+/// Lazer counterpart to `zigcho_pp_calculate`. The mod array is the exact
+/// object/settings JSON sent by the client so modern rate and difficulty
+/// settings are not collapsed into legacy bitflags.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zigcho_lazer_pp_calculate(
+    map_ptr: *const u8,
+    map_len: usize,
+    mods_ptr: *const u8,
+    mods_len: usize,
+    input: *const ZigchoPpInput,
+    output: *mut ZigchoPpOutput,
+) -> i32 {
+    if map_ptr.is_null()
+        || map_len == 0
+        || mods_ptr.is_null()
+        || mods_len == 0
+        || input.is_null()
+        || output.is_null()
+    {
+        return 1;
+    }
+
+    let result = catch_unwind(|| {
+        let map_bytes = unsafe { slice::from_raw_parts(map_ptr, map_len) };
+        let mods_bytes = unsafe { slice::from_raw_parts(mods_ptr, mods_len) };
+        let input = unsafe { &*input };
+        let passed = passed_objects(input).ok_or(())?;
+        let mods = parse_lazer_mods(mods_bytes, input.mode)?;
+        calculate_vanilla(map_bytes, input, passed, Some(mods))
     });
 
     match result {

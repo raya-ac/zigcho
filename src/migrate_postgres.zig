@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 21;
+const required_sqlite_version = 22;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -91,11 +91,13 @@ const beatmap_rank_events = [_]Column{
     .{ .name = "reason", .kind = .text }, .{ .name = "created_at", .kind = .integer },
 };
 const lazer_scores = [_]Column{
-    .{ .name = "id", .kind = .integer },          .{ .name = "user_id", .kind = .integer },      .{ .name = "beatmap_id", .kind = .integer },
-    .{ .name = "ruleset_id", .kind = .integer },  .{ .name = "total_score", .kind = .integer },  .{ .name = "legacy_total_score", .kind = .integer },
-    .{ .name = "accuracy", .kind = .real },       .{ .name = "max_combo", .kind = .integer },    .{ .name = "passed", .kind = .boolean },
-    .{ .name = "mods_json", .kind = .text },      .{ .name = "statistics_json", .kind = .text }, .{ .name = "rank_namespace", .kind = .text },
-    .{ .name = "client_version", .kind = .text }, .{ .name = "replay", .kind = .blob },          .{ .name = "submitted_at", .kind = .integer },
+    .{ .name = "id", .kind = .integer },          .{ .name = "user_id", .kind = .integer },              .{ .name = "beatmap_id", .kind = .integer },
+    .{ .name = "ruleset_id", .kind = .integer },  .{ .name = "total_score", .kind = .integer },          .{ .name = "legacy_total_score", .kind = .integer },
+    .{ .name = "accuracy", .kind = .real },       .{ .name = "max_combo", .kind = .integer },            .{ .name = "passed", .kind = .boolean },
+    .{ .name = "mods_json", .kind = .text },      .{ .name = "statistics_json", .kind = .text },         .{ .name = "rank_namespace", .kind = .text },
+    .{ .name = "client_version", .kind = .text }, .{ .name = "replay", .kind = .blob },                  .{ .name = "submitted_at", .kind = .integer },
+    .{ .name = "rank", .kind = .text },           .{ .name = "maximum_statistics_json", .kind = .text }, .{ .name = "pauses_json", .kind = .text },
+    .{ .name = "pp", .kind = .real },             .{ .name = "best", .kind = .boolean },
 };
 const lazer_score_tokens = [_]Column{
     .{ .name = "id", .kind = .integer },         .{ .name = "user_id", .kind = .integer },    .{ .name = "beatmap_id", .kind = .integer },

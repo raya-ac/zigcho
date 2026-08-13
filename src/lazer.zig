@@ -53,6 +53,66 @@ pub fn totalHits(input: ScoreInput) i64 {
     return total;
 }
 
+pub const PerformanceState = struct {
+    mods: u32,
+    max_combo: u32,
+    large_tick_hits: u32,
+    small_tick_hits: u32,
+    slider_end_hits: u32,
+    n_geki: u32,
+    n_katu: u32,
+    n300: u32,
+    n100: u32,
+    n50: u32,
+    misses: u32,
+    legacy_total_score: u32,
+};
+
+fn statistic(input: ScoreInput, name: []const u8) u32 {
+    const value = input.statistics.get(name) orelse return 0;
+    return @intCast(value.integer);
+}
+
+fn legacyModBit(acronym: []const u8) ?u32 {
+    const names = [_][]const u8{ "NF", "EZ", "TD", "HD", "HR", "SD", "DT", "RX", "HT", "NC", "FL", "AT", "SO", "AP", "PF", "4K", "5K", "6K", "7K", "8K", "FI", "RD", "CN", "TP", "9K", "CO", "1K", "3K", "2K", "V2", "MR" };
+    for (names, 0..) |name, index| if (std.mem.eql(u8, acronym, name)) {
+        var bit = @as(u32, 1) << @intCast(index);
+        if (std.mem.eql(u8, acronym, "NC")) bit |= @as(u32, 1) << 6;
+        if (std.mem.eql(u8, acronym, "PF")) bit |= @as(u32, 1) << 5;
+        return bit;
+    };
+    return null;
+}
+
+pub fn performanceState(input: ScoreInput) !?PerformanceState {
+    if (input.namespace == .custom) return null;
+    var mods: u32 = 0;
+    if (input.mods) |list| for (list.items) |item| {
+        const acronym = item.object.get("acronym").?.string;
+        if (legacyModBit(acronym)) |bit| {
+            mods |= bit;
+        } else if (input.namespace == .relax or input.namespace == .autopilot) {
+            // Akatsuki's RX/AP calculator only accepts the legacy mod surface.
+            // Do not silently rank a new lazer mod after dropping its settings.
+            return error.UnsupportedPerformanceMod;
+        }
+    };
+    return .{
+        .mods = mods,
+        .max_combo = @intCast(input.max_combo),
+        .large_tick_hits = statistic(input, "large_tick_hit"),
+        .small_tick_hits = statistic(input, "small_tick_hit"),
+        .slider_end_hits = statistic(input, "slider_tail_hit"),
+        .n_geki = statistic(input, "perfect"),
+        .n_katu = if (input.ruleset_id == 2) statistic(input, "small_tick_miss") else statistic(input, "good"),
+        .n300 = statistic(input, "great"),
+        .n100 = if (input.ruleset_id == 2) statistic(input, "large_tick_hit") else statistic(input, "ok"),
+        .n50 = if (input.ruleset_id == 2) statistic(input, "small_tick_hit") else statistic(input, "meh"),
+        .misses = statistic(input, "miss"),
+        .legacy_total_score = @intCast(@min(input.legacy_total_score orelse input.total_score, std.math.maxInt(u32))),
+    };
+}
+
 pub fn validAcronym(acronym: []const u8) bool {
     if (acronym.len < 2 or acronym.len > 8) return false;
     for (acronym) |c| if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c)) return false;
@@ -213,6 +273,7 @@ pub const LeaderboardScore = struct {
     ruleset_id: i32,
     total_score: i64,
     total_score_without_mods: i64,
+    pp: f64,
     accuracy: f64,
     max_combo: i32,
     passed: bool,
@@ -226,7 +287,7 @@ pub const LeaderboardScore = struct {
 };
 
 pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !void {
-    try writer.print("{{\"id\":{d},\"user_id\":{d},\"beatmap_id\":{d},\"ruleset_id\":{d},\"passed\":{s},\"total_score\":{d},\"total_score_without_mods\":{d},\"accuracy\":{d},\"max_combo\":{d},\"rank\":", .{
+    try writer.print("{{\"id\":{d},\"user_id\":{d},\"beatmap_id\":{d},\"ruleset_id\":{d},\"passed\":{s},\"total_score\":{d},\"total_score_without_mods\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"rank\":", .{
         score.id,
         score.user_id,
         score.beatmap_id,
@@ -234,6 +295,7 @@ pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !v
         if (score.passed) "true" else "false",
         score.total_score,
         score.total_score_without_mods,
+        score.pp,
         score.accuracy,
         score.max_combo,
     });

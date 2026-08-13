@@ -36,6 +36,33 @@ fn freeUser(allocator: std.mem.Allocator, user: domain.User) void {
     allocator.free(user.safe_name);
 }
 
+fn lazerPerformance(allocator: std.mem.Allocator, store: *storage.Store, input: lazer.ScoreInput, mods_json: []const u8) !f64 {
+    const state = (try lazer.performanceState(input)) orelse return 0;
+    const map_file = (try store.beatmapFileById(allocator, @intCast(input.beatmap_id))) orelse return error.BeatmapPayloadMissing;
+    defer allocator.free(map_file);
+    const performance_input: pp.Input = .{
+        .mode = @intCast(input.ruleset_id),
+        .lazer = 1,
+        .mods = state.mods,
+        .max_combo = state.max_combo,
+        .large_tick_hits = state.large_tick_hits,
+        .small_tick_hits = state.small_tick_hits,
+        .slider_end_hits = state.slider_end_hits,
+        .n_geki = state.n_geki,
+        .n_katu = state.n_katu,
+        .n300 = state.n300,
+        .n100 = state.n100,
+        .n50 = state.n50,
+        .misses = state.misses,
+        .legacy_total_score = state.legacy_total_score,
+    };
+    const performance = if (input.namespace == .vanilla)
+        try pp.calculateLazer(map_file, mods_json, performance_input)
+    else
+        try pp.calculate(map_file, performance_input);
+    return performance.pp;
+}
+
 fn intLines(allocator: std.mem.Allocator, values: []const i32) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -1013,7 +1040,8 @@ const App = struct {
                 defer self.allocator.free(maximum_statistics_json);
                 const pauses_json = try lazer.jsonField(self.allocator, parsed.value.object, "pauses", "[]");
                 defer self.allocator.free(pauses_json);
-                const score_id = self.store.submitLazerScoreToken(user.id, solo_path.beatmap_id, token_id, score, mods_json, statistics_json, maximum_statistics_json, pauses_json) catch |err| return switch (err) {
+                const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+                const score_id = self.store.submitLazerScoreToken(user.id, solo_path.beatmap_id, token_id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json) catch |err| return switch (err) {
                     error.InvalidLazerScoreToken, error.ForeignLazerScoreToken, error.LazerScoreTokenExpired => respond(req, .unauthorized, "application/json", "{\"error\":\"invalid or expired score token\"}", &.{}),
                     error.LazerScoreTokenUsed => respond(req, .conflict, "application/json", "{\"error\":\"score token already used\"}", &.{}),
                     error.LazerScoreTokenMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match submission\"}", &.{}),
@@ -1082,7 +1110,8 @@ const App = struct {
             const pauses_json = try lazer.jsonField(self.allocator, parsed.value.object, "pauses", "[]");
             defer self.allocator.free(pauses_json);
             const ns_name = @tagName(score.namespace);
-            const id = try self.store.insertLazerScore(user.id, score, mods_json, statistics_json, maximum_statistics_json, pauses_json);
+            const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+            const id = try self.store.insertLazerScore(user.id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json);
             var out: [192]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"user_id\":{d},\"rank_namespace\":\"{s}\",\"ranked\":false}}", .{ id, user.id, ns_name });
             return respond(req, .created, "application/json", json, &.{});

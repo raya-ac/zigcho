@@ -102,7 +102,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -196,6 +196,18 @@ pub const Store = struct {
                     "CREATE TABLE zigcho.lazer_score_tokens(id bigint PRIMARY KEY,user_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,beatmap_id integer NOT NULL REFERENCES zigcho.beatmaps(id) ON DELETE CASCADE,beatmap_hash char(32) NOT NULL,ruleset_id smallint NOT NULL CHECK(ruleset_id BETWEEN 0 AND 3),version_hash char(32) NOT NULL,created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),expires_at bigint NOT NULL,consumed_at bigint,score_id bigint REFERENCES zigcho.lazer_scores(id) ON DELETE SET NULL);" ++
                     "CREATE INDEX lazer_score_tokens_user_expiry ON zigcho.lazer_score_tokens(user_id,expires_at DESC);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(21);" ++
+                    "COMMIT",
+            );
+        }
+        if (version <= 21) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "ALTER TABLE zigcho.lazer_scores ADD COLUMN pp double precision NOT NULL DEFAULT 0;" ++
+                    "ALTER TABLE zigcho.lazer_scores ADD COLUMN best boolean NOT NULL DEFAULT false;" ++
+                    "WITH ranked AS (SELECT id,row_number() OVER (PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY CASE WHEN rank_namespace IN ('relax','autopilot') AND pp>0 THEN pp ELSE total_score::double precision END DESC,id ASC) place FROM zigcho.lazer_scores WHERE passed) UPDATE zigcho.lazer_scores scores SET best=true FROM ranked WHERE scores.id=ranked.id AND ranked.place=1;" ++
+                    "CREATE INDEX lazer_scores_user_best ON zigcho.lazer_scores(user_id,ruleset_id,rank_namespace,beatmap_id,best);" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(22);" ++
                     "COMMIT",
             );
         }
@@ -1936,7 +1948,7 @@ pub const Store = struct {
             "WHERE s.beatmap_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY total_score DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
             "SELECT position,score_count,id,user_id,(SELECT name FROM zigcho.users WHERE id=board.user_id),(SELECT country FROM zigcho.users WHERE id=board.user_id)," ++
-            "beatmap_id,ruleset_id,total_score,coalesce(legacy_total_score,total_score),accuracy,max_combo,passed,rank,mods_json::text,statistics_json::text," ++
+            "beatmap_id,ruleset_id,total_score,coalesce(legacy_total_score,total_score),pp,accuracy,max_combo,passed,rank,mods_json::text,statistics_json::text," ++
             "maximum_statistics_json::text,pauses_json::text,to_char(to_timestamp(submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),status " ++
             "FROM board WHERE position<=$4 OR user_id=$5 ORDER BY position";
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, namespace_name, limit_text, requester });
@@ -1960,16 +1972,17 @@ pub const Store = struct {
                 .ruleset_id = try result.int(i32, row, 7),
                 .total_score = try result.int(i64, row, 8),
                 .total_score_without_mods = try result.int(i64, row, 9),
-                .accuracy = try result.float(f64, row, 10),
-                .max_combo = try result.int(i32, row, 11),
-                .passed = try result.boolean(row, 12),
-                .rank = result.value(row, 13),
-                .mods_json = result.value(row, 14),
-                .statistics_json = result.value(row, 15),
-                .maximum_statistics_json = result.value(row, 16),
-                .pauses_json = result.value(row, 17),
-                .ended_at = result.value(row, 18),
-                .ranked = (try result.int(i32, row, 19)) == 3 or (try result.int(i32, row, 19)) == 4,
+                .pp = try result.float(f64, row, 10),
+                .accuracy = try result.float(f64, row, 11),
+                .max_combo = try result.int(i32, row, 12),
+                .passed = try result.boolean(row, 13),
+                .rank = result.value(row, 14),
+                .mods_json = result.value(row, 15),
+                .statistics_json = result.value(row, 16),
+                .maximum_statistics_json = result.value(row, 17),
+                .pauses_json = result.value(row, 18),
+                .ended_at = result.value(row, 19),
+                .ranked = (try result.int(i32, row, 20)) == 3 or (try result.int(i32, row, 20)) == 4,
             };
             if (position <= limit) {
                 if (written != 0) try scores.writer.writeByte(',');
@@ -1998,17 +2011,17 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
-    pub fn insertLazerScore(self: *Store, user_id: i32, input: lazer.ScoreInput, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8) !i64 {
+    pub fn insertLazerScore(self: *Store, user_id: i32, input: lazer.ScoreInput, pp_value: f64, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8) !i64 {
         var lease = self.pool.acquire();
         defer lease.release();
         try postgres.exec(lease.conn, "BEGIN");
         errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
-        const score_id = try self.insertLazerScoreWithConnection(lease.conn, user_id, input, mods_json, statistics_json, maximum_statistics_json, pauses_json);
+        const score_id = try self.insertLazerScoreWithConnection(lease.conn, user_id, input, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json);
         try postgres.exec(lease.conn, "COMMIT");
         return score_id;
     }
 
-    fn insertLazerScoreWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, input: lazer.ScoreInput, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8) !i64 {
+    fn insertLazerScoreWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, input: lazer.ScoreInput, pp_value: f64, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8) !i64 {
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
         const user = try param(&buffers, &cursor, user_id);
@@ -2018,17 +2031,34 @@ pub const Store = struct {
         const legacy_total_score: ?[]const u8 = if (input.legacy_total_score) |value| try param(&buffers, &cursor, value) else null;
         const accuracy = try param(&buffers, &cursor, input.accuracy);
         const max_combo = try param(&buffers, &cursor, input.max_combo);
+        const pp_text = try param(&buffers, &cursor, pp_value);
         const passed = if (input.passed) "true" else "false";
         const rank = input.rank orelse if (input.passed) "D" else "F";
         const namespace = @tagName(input.namespace);
-        var result = try postgres.queryParams(self.allocator, conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,client_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15) RETURNING id", &.{ user, beatmap_id, ruleset_id, total_score, legacy_total_score, accuracy, max_combo, passed, rank, mods_json, statistics_json, maximum_statistics_json, pauses_json, namespace, input.client_version });
+        const best_sql = if (input.namespace == .relax or input.namespace == .autopilot)
+            "SELECT id,pp FROM zigcho.lazer_scores WHERE user_id=$1 AND beatmap_id=$2 AND ruleset_id=$3 AND rank_namespace=$4 AND best FOR UPDATE"
+        else
+            "SELECT id,total_score::double precision FROM zigcho.lazer_scores WHERE user_id=$1 AND beatmap_id=$2 AND ruleset_id=$3 AND rank_namespace=$4 AND best FOR UPDATE";
+        var previous = try postgres.queryParams(self.allocator, conn, best_sql, &.{ user, beatmap_id, ruleset_id, namespace });
+        defer previous.deinit();
+        const previous_best_id: i64 = if (previous.rows() == 0) 0 else try previous.int(i64, 0, 0);
+        const previous_metric: f64 = if (previous.rows() == 0) 0 else try previous.float(f64, 0, 1);
+        const current_metric: f64 = if (input.namespace == .relax or input.namespace == .autopilot) pp_value else @floatFromInt(input.total_score);
+        const is_best = input.passed and (previous_best_id == 0 or current_metric > previous_metric);
+        var result = try postgres.queryParams(self.allocator, conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,client_version,pp,best) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16,$17) RETURNING id", &.{ user, beatmap_id, ruleset_id, total_score, legacy_total_score, accuracy, max_combo, passed, rank, mods_json, statistics_json, maximum_statistics_json, pauses_json, namespace, input.client_version, pp_text, if (is_best) "true" else "false" });
         defer result.deinit();
         const score_id = try result.int(i64, 0, 0);
-        try self.updateLazerStatsWithConnection(conn, user_id, score_id, input);
+        if (is_best and previous_best_id != 0) {
+            var previous_buffer: [32]u8 = undefined;
+            const previous_id = try std.fmt.bufPrint(&previous_buffer, "{d}", .{previous_best_id});
+            var unset = try postgres.queryParams(self.allocator, conn, "UPDATE zigcho.lazer_scores SET best=false WHERE id=$1", &.{previous_id});
+            unset.deinit();
+        }
+        try self.updateLazerStatsWithConnection(conn, user_id, score_id, input, is_best);
         return score_id;
     }
 
-    fn updateLazerStatsWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, score_id: i64, input: lazer.ScoreInput) !void {
+    fn updateLazerStatsWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, score_id: i64, input: lazer.ScoreInput, is_best: bool) !void {
         const stats_mode = lazer.statsMode(input) orelse return;
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
@@ -2058,6 +2088,36 @@ pub const Store = struct {
         update.deinit();
         var map_update = try postgres.queryParams(self.allocator, conn, "UPDATE zigcho.beatmaps SET plays=plays+1,passes=passes+$1 WHERE id=$2", &.{ if (input.passed) "1" else "0", beatmap_id });
         map_update.deinit();
+        if (input.passed and is_best and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceWithConnection(conn, user_id, @intCast(input.ruleset_id), stats_mode, namespace);
+    }
+
+    fn rebuildCombinedPerformanceWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, ruleset_id: u8, stats_mode: u8, namespace: []const u8) !void {
+        var buffers: [32][64]u8 = undefined;
+        var cursor: usize = 0;
+        const user = try param(&buffers, &cursor, user_id);
+        const ruleset = try param(&buffers, &cursor, ruleset_id);
+        const mode = try param(&buffers, &cursor, stats_mode);
+        var result = try postgres.queryParams(self.allocator, conn, "WITH candidates AS (" ++
+            "SELECT b.id beatmap_id,s.pp,s.accuracy,0 source,s.id score_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) " ++
+            "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,1,s.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4))," ++
+            "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
+            "SELECT pp,accuracy FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC", &.{ user, ruleset, namespace });
+        defer result.deinit();
+        var total_pp: f64 = 0;
+        var weighted_accuracy: f64 = 0;
+        var weight: f64 = 1;
+        for (0..result.rows()) |row| {
+            total_pp += try result.float(f64, row, 0) * weight;
+            weighted_accuracy += try result.float(f64, row, 1) * weight;
+            weight *= 0.95;
+        }
+        const score_count: u32 = @intCast(result.rows());
+        const bonus_pp = 416.6667 * (1.0 - std.math.pow(f64, 0.9994, @floatFromInt(score_count)));
+        const accuracy = if (score_count == 0) 0 else weighted_accuracy / (20.0 * (1.0 - std.math.pow(f64, 0.95, @floatFromInt(score_count))));
+        const total = try param(&buffers, &cursor, @as(i64, @intFromFloat(@round(total_pp + bonus_pp))));
+        const accuracy_text = try param(&buffers, &cursor, accuracy);
+        var update = try postgres.queryParams(self.allocator, conn, "UPDATE zigcho.stats SET pp=$1,accuracy=$2 WHERE user_id=$3 AND mode=$4", &.{ total, accuracy_text, user, mode });
+        update.deinit();
     }
 
     pub fn createLazerScoreToken(self: *Store, user_id: i32, beatmap_id: i32, beatmap_hash: []const u8, ruleset_id: i64, version_hash: []const u8) !i64 {
@@ -2089,7 +2149,7 @@ pub const Store = struct {
         return token_id;
     }
 
-    pub fn submitLazerScoreToken(self: *Store, user_id: i32, beatmap_id: i32, token_id: i64, input: lazer.ScoreInput, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8) !i64 {
+    pub fn submitLazerScoreToken(self: *Store, user_id: i32, beatmap_id: i32, token_id: i64, input: lazer.ScoreInput, pp_value: f64, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8) !i64 {
         const now = std.Io.Clock.real.now(self.io).toSeconds();
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
@@ -2109,7 +2169,7 @@ pub const Store = struct {
         if (try token.int(i32, 0, 1) != beatmap_id or try token.int(i64, 0, 2) != input.ruleset_id) return error.LazerScoreTokenMismatch;
         if (try token.int(i64, 0, 3) <= now) return error.LazerScoreTokenExpired;
         if (!token.isNull(0, 4)) return error.LazerScoreTokenUsed;
-        const score_id = try self.insertLazerScoreWithConnection(lease.conn, user_id, input, mods_json, statistics_json, maximum_statistics_json, pauses_json);
+        const score_id = try self.insertLazerScoreWithConnection(lease.conn, user_id, input, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json);
         var score_buffer: [32]u8 = undefined;
         const score_text = try std.fmt.bufPrint(&score_buffer, "{d}", .{score_id});
         var consume = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.lazer_score_tokens SET consumed_at=$1,score_id=$2 WHERE id=$3 AND user_id=$4 AND beatmap_id=$5 AND ruleset_id=$6 AND consumed_at IS NULL RETURNING 1", &.{ now_text, score_text, token_text, user_text, map_text, ruleset_text });
@@ -2225,6 +2285,9 @@ pub const Store = struct {
             previous_best_score = try previous.int(i64, 0, 1);
             previous_best_pp = try previous.float(f64, 0, 2);
         }
+        var lazer_previous = try postgres.queryParams(self.allocator, lease.conn, "SELECT max(l.total_score) FROM zigcho.lazer_scores l JOIN zigcho.beatmaps b ON b.id=l.beatmap_id WHERE l.user_id=$1 AND b.md5=$2 AND l.ruleset_id=$3 AND l.rank_namespace=$4 AND l.passed", &.{ user, score.map_md5, mode, namespace });
+        defer lazer_previous.deinit();
+        const previous_ranked_score = if (lazer_previous.isNull(0, 0)) previous_best_score else @max(previous_best_score, try lazer_previous.int(i64, 0, 0));
         const is_best = score.passed and if (uses_pp) pp_value > previous_best_pp else score.total_score > previous_best_score;
         const perfect = if (score.perfect) "true" else "false";
         const passed = if (score.passed) "true" else "false";
@@ -2249,7 +2312,7 @@ pub const Store = struct {
         const leaderboard = map_status >= 3;
         const ranked = map_status == 3 or map_status == 4;
         if (updates_player_stats) {
-            const ranked_delta: i64 = if (is_best and ranked) score.total_score - previous_best_score else 0;
+            const ranked_delta: i64 = if (is_best and ranked and score.total_score > previous_ranked_score) score.total_score - previous_ranked_score else 0;
             const total_hits: i64 = @as(i64, score.n300) + score.n100 + score.n50 + if (score.mode == 1 or score.mode == 3) @as(i64, score.ngeki) + score.nkatu else 0;
             var ranked_buf: [32]u8 = undefined;
             var seconds_buf: [24]u8 = undefined;
@@ -2264,25 +2327,7 @@ pub const Store = struct {
         update_map.deinit();
 
         if (updates_player_stats and is_best and ranked) {
-            var weighted = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.pp,s.accuracy FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.passed AND s.best AND s.rank_namespace=$3 AND b.status IN (3,4) ORDER BY s.pp DESC,s.id ASC", &.{ user, mode, namespace });
-            defer weighted.deinit();
-            var total_pp: f64 = 0;
-            var weighted_accuracy: f64 = 0;
-            var weight: f64 = 1;
-            for (0..weighted.rows()) |row| {
-                total_pp += try weighted.float(f64, row, 0) * weight;
-                weighted_accuracy += try weighted.float(f64, row, 1) * weight;
-                weight *= 0.95;
-            }
-            const count: f64 = @floatFromInt(weighted.rows());
-            const bonus_pp = 416.6667 * (1.0 - std.math.pow(f64, 0.9994, count));
-            const bonus_accuracy = 1.0 / (20.0 * (1.0 - std.math.pow(f64, 0.95, count)));
-            var player_pp_buf: [32]u8 = undefined;
-            var player_acc_buf: [64]u8 = undefined;
-            const player_pp = try std.fmt.bufPrint(&player_pp_buf, "{d}", .{@as(i64, @intFromFloat(@round(total_pp + bonus_pp)))});
-            const player_accuracy = try std.fmt.bufPrint(&player_acc_buf, "{d}", .{weighted_accuracy * bonus_accuracy});
-            var update_pp = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.stats SET pp=$1,accuracy=$2 WHERE user_id=$3 AND mode=$4", &.{ player_pp, player_accuracy, user, stats_mode_text });
-            update_pp.deinit();
+            try self.rebuildCombinedPerformanceWithConnection(lease.conn, user_id, score.mode, stats_mode, namespace);
         }
         try postgres.exec(lease.conn, "COMMIT");
         return score_id;
@@ -2400,7 +2445,7 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates lazer score tokens through twenty one" {
+test "postgres runtime migrates lazer ranked performance through twenty two" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -2408,16 +2453,16 @@ test "postgres runtime migrates lazer score tokens through twenty one" {
         try old_store.migrate();
         var previous = old_store.pool.acquire();
         defer previous.release();
-        try postgres.exec(previous.conn, "DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json; UPDATE zigcho.schema_migrations SET version=20 WHERE version=21");
+        try postgres.exec(previous.conn, "DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; UPDATE zigcho.schema_migrations SET version=20 WHERE version=22");
     }
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 21), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 22), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -2430,6 +2475,7 @@ test "postgres runtime migrates lazer score tokens through twenty one" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 10));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 11));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 12));
+    try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 13));
     const kai = (try store.userById(std.testing.allocator, 3)).?;
     defer {
         std.testing.allocator.free(kai.name);
@@ -2655,8 +2701,8 @@ test "postgres account auth stats and token slice" {
     defer std.testing.allocator.free(statistics_json);
     const lazer_input = try lazer.parseScore(parsed_lazer.value);
     const lazer_token = try store.createLazerScoreToken(user_id, 2, second_md5, 0, "11111111111111111111111111111111");
-    try std.testing.expect(try store.submitLazerScoreToken(user_id, 2, lazer_token, lazer_input, mods_json, statistics_json, "{}", "[]") > 0);
-    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(user_id, 2, lazer_token, lazer_input, mods_json, statistics_json, "{}", "[]"));
+    try std.testing.expect(try store.submitLazerScoreToken(user_id, 2, lazer_token, lazer_input, 0, mods_json, statistics_json, "{}", "[]") > 0);
+    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(user_id, 2, lazer_token, lazer_input, 0, mods_json, statistics_json, "{}", "[]"));
     try std.testing.expectEqual(Store.BeatmapRating.can_rate, try store.rateBeatmap(user_id, second_md5, null));
     const vote = try store.rateBeatmap(user_id, second_md5, 8);
     try std.testing.expectApproxEqAbs(@as(f64, 8), vote.already_voted, 0.001);

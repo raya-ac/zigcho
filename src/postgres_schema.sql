@@ -229,12 +229,15 @@ CREATE TABLE lazer_scores (
     statistics_json jsonb NOT NULL,
     maximum_statistics_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     pauses_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    pp double precision NOT NULL DEFAULT 0,
+    best boolean NOT NULL DEFAULT false,
     rank_namespace text NOT NULL,
     client_version text,
     replay bytea,
     submitted_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
 );
 CREATE INDEX lazer_scores_board ON lazer_scores(beatmap_id, ruleset_id, rank_namespace, total_score DESC);
+CREATE INDEX lazer_scores_user_best ON lazer_scores(user_id, ruleset_id, rank_namespace, beatmap_id, best);
 
 CREATE TABLE lazer_score_tokens (
     id bigint PRIMARY KEY,
@@ -358,4 +361,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1);
 
-INSERT INTO schema_migrations(version) VALUES (21);
+INSERT INTO schema_migrations(version) VALUES (22);

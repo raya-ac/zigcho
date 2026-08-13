@@ -9,6 +9,7 @@ database="$work/zigcho.db"
 response="$work/response"
 server_log="$work/server.log"
 server_pid=
+repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 
 cleanup() {
   if [ -n "$server_pid" ]; then
@@ -47,7 +48,7 @@ for name in lazer-one lazer-two; do
   expect_status "$code" 201 "register_$name"
 done
 
-sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,400,0);"
+sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,10,0,readfile('$repo/src/testdata/synthetic-standard.osu'));"
 
 oauth() {
   curl --silent --show-error --request POST "$origin/oauth/token" \
@@ -119,7 +120,7 @@ expect_status "$code" 409 reject_token_reuse
 [ "$(sqlite3 "$database" "SELECT mods_json FROM lazer_scores WHERE id=$score_id")" = '[{"acronym":"RX"},{"acronym":"WIGGLE","settings":{"strength":1.25}}]' ] || fail mods_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT statistics_json FROM lazer_scores WHERE id=$score_id")" = '{"great":300,"miss":2}' ] || fail statistics_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT rank_namespace FROM lazer_scores WHERE id=$score_id")" = custom ] || fail custom_namespace_missing
-[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 21 ] || fail schema_not_migrated
+[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 22 ] || fail schema_not_migrated
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=WIGGLE&limit=50' custom_leaderboard
 jq -e --argjson id "$score_id" '
@@ -132,7 +133,7 @@ jq -e --argjson id "$score_id" '
   .user_score.position == 1
 ' "$response" >/dev/null || fail invalid_custom_leaderboard_contract
 
-vanilla_body='{"rank":"S","total_score":123456,"total_score_without_mods":123456,"accuracy":0.99,"max_combo":250,"ruleset_id":0,"passed":true,"mods":[],"statistics":{"great":300,"ok":1,"miss":1},"maximum_statistics":{"great":302},"pauses":[]}'
+vanilla_body='{"rank":"S","total_score":123456,"total_score_without_mods":123456,"accuracy":0.9,"max_combo":8,"ruleset_id":0,"passed":true,"mods":[],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[]}'
 vanilla_token=$(create_score_token "$token_one")
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/beatmaps/75/solo/scores/$vanilla_token" \
   --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$vanilla_body")
@@ -145,6 +146,7 @@ jq -e --argjson id "$vanilla_score_id" '
   .scores[0].id == $id and
   .scores[0].ranked == true and
   .scores[0].total_score == 123456 and
+  .scores[0].pp > 0 and
   .user_score.score.id == $id
 ' "$response" >/dev/null || fail invalid_vanilla_leaderboard_contract
 
@@ -153,10 +155,10 @@ jq -e '
   .statistics_rulesets.osu.play_count == 1 and
   .statistics_rulesets.osu.total_score == 123456 and
   .statistics_rulesets.osu.ranked_score == 123456 and
-  .statistics_rulesets.osu.total_hits == 301 and
-  .statistics_rulesets.osu.maximum_combo == 250 and
-  .statistics_rulesets.osu.pp == 0 and
-  .statistics_rulesets.osu.hit_accuracy == 0 and
+  .statistics_rulesets.osu.total_hits == 9 and
+  .statistics_rulesets.osu.maximum_combo == 8 and
+  .statistics_rulesets.osu.pp > 0 and
+  .statistics_rulesets.osu.hit_accuracy == 90 and
   .statistics_rulesets.taiko.play_count == 0 and
   .statistics_rulesets.taiko.total_score == 0
 ' "$response" >/dev/null || fail v2_score_overwrote_stats

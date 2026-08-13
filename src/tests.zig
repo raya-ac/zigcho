@@ -3401,7 +3401,7 @@ test "lazer storage only accepts the typed score input" {
     defer std.testing.allocator.free(mods_json);
     const statistics_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "statistics", "{}");
     defer std.testing.allocator.free(statistics_json);
-    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), mods_json, statistics_json, "{}", "[]");
+    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), 0, mods_json, statistics_json, "{}", "[]");
     try std.testing.expect(id > 0);
 
     var stmt: ?*storage.c.sqlite3_stmt = null;
@@ -3474,6 +3474,53 @@ test "official lazer score bodies allow omitted mods and reject hostile counters
     try std.testing.expectError(error.InvalidMod, lazer.parseSoloScore(invalid_mod.value, 75));
 }
 
+test "lazer performance state maps official hit results and legacy mods" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"mods\":[{\"acronym\":\"HD\"},{\"acronym\":\"NC\"}],\"statistics\":{\"great\":300,\"ok\":10,\"meh\":2,\"miss\":1,\"large_tick_hit\":40,\"small_tick_hit\":20,\"slider_tail_hit\":15},\"maximum_statistics\":{\"great\":313},\"pauses\":[]}", .{});
+    defer parsed.deinit();
+    const input = try lazer.parseSoloScore(parsed.value, 75);
+    const state = (try lazer.performanceState(input)).?;
+    try std.testing.expectEqual((@as(u32, 1) << 3) | (@as(u32, 1) << 6) | (@as(u32, 1) << 9), state.mods);
+    try std.testing.expectEqual(@as(u32, 300), state.n300);
+    try std.testing.expectEqual(@as(u32, 10), state.n100);
+    try std.testing.expectEqual(@as(u32, 2), state.n50);
+    try std.testing.expectEqual(@as(u32, 1), state.misses);
+    try std.testing.expectEqual(@as(u32, 40), state.large_tick_hits);
+    try std.testing.expectEqual(@as(u32, 20), state.small_tick_hits);
+    try std.testing.expectEqual(@as(u32, 15), state.slider_end_hits);
+
+    const output = try pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"HD\"},{\"acronym\":\"NC\"}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = state.mods,
+        .max_combo = state.max_combo,
+        .large_tick_hits = state.large_tick_hits,
+        .small_tick_hits = state.small_tick_hits,
+        .slider_end_hits = state.slider_end_hits,
+        .n_geki = state.n_geki,
+        .n_katu = state.n_katu,
+        .n300 = state.n300,
+        .n100 = state.n100,
+        .n50 = state.n50,
+        .misses = state.misses,
+        .legacy_total_score = state.legacy_total_score,
+    });
+    try std.testing.expect(output.pp > 0);
+    try std.testing.expect(output.stars > 0);
+    try std.testing.expectError(error.PerformanceCalculationFailed, pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"WIGGLE\"}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = 0,
+        .max_combo = 1,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 1,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1,
+    }));
+}
+
 test "lazer solo score tokens are user bound expiring and single use" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3500,14 +3547,14 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectError(error.BeatmapHashMismatch, store.createLazerScoreToken(1, 75, "ffffffffffffffffffffffffffffffff", 0, "11111111111111111111111111111111"));
     try std.testing.expectError(error.BeatmapNotFound, store.createLazerScoreToken(1, 76, "0123456789abcdef0123456789abcdef", 0, "11111111111111111111111111111111"));
     const token = try store.createLazerScoreToken(1, 75, "0123456789ABCDEF0123456789ABCDEF", 0, "11111111111111111111111111111111");
-    try std.testing.expectError(error.ForeignLazerScoreToken, store.submitLazerScoreToken(2, 75, token, score, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    try std.testing.expectError(error.ForeignLazerScoreToken, store.submitLazerScoreToken(2, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json));
     var wrong_ruleset = score;
     wrong_ruleset.ruleset_id = 1;
-    try std.testing.expectError(error.LazerScoreTokenMismatch, store.submitLazerScoreToken(1, 75, token, wrong_ruleset, mods_json, statistics_json, maximum_statistics_json, pauses_json));
-    const score_id = try store.submitLazerScoreToken(1, 75, token, score, mods_json, statistics_json, maximum_statistics_json, pauses_json);
+    try std.testing.expectError(error.LazerScoreTokenMismatch, store.submitLazerScoreToken(1, 75, token, wrong_ruleset, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    const score_id = try store.submitLazerScoreToken(1, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json);
     try std.testing.expect(score_id > 0);
-    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(1, 75, token, score, mods_json, statistics_json, maximum_statistics_json, pauses_json));
-    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerScoreToken(1, 75, token + 2, score, mods_json, statistics_json, "{}", "[]"));
+    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(1, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerScoreToken(1, 75, token + 2, score, 0, mods_json, statistics_json, "{}", "[]"));
 
     var row: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT mods_json,statistics_json FROM lazer_scores WHERE id=?1", -1, &row, null));
@@ -3532,16 +3579,16 @@ test "lazer solo score tokens are user bound expiring and single use" {
     var expire_buf: [160]u8 = undefined;
     const expire_sql = try std.fmt.bufPrintZ(&expire_buf, "UPDATE lazer_score_tokens SET expires_at=0 WHERE id={d}", .{expired});
     try store.exec(expire_sql);
-    try std.testing.expectError(error.LazerScoreTokenExpired, store.submitLazerScoreToken(1, 75, expired, score, mods_json, statistics_json, "{}", "[]"));
+    try std.testing.expectError(error.LazerScoreTokenExpired, store.submitLazerScoreToken(1, 75, expired, score, 0, mods_json, statistics_json, "{}", "[]"));
 
     var version_stmt: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 21), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 22), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
-test "lazer v2 submission updates one stats slice without overwriting the account" {
+test "lazer submission updates ranked performance without overwriting another ruleset" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -3560,15 +3607,15 @@ test "lazer v2 submission updates one stats slice without overwriting the accoun
     defer parsed.deinit();
     const input = try lazer.parseSoloScore(parsed.value, 75);
     const token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "11111111111111111111111111111111");
-    _ = try store.submitLazerScoreToken(1, 75, token, input, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
+    _ = try store.submitLazerScoreToken(1, 75, token, input, 500, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
 
     const osu = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 992654), osu.ranked_score);
     try std.testing.expectEqual(@as(i64, 997654), osu.total_score);
-    try std.testing.expectEqual(@as(i32, 424), osu.pp);
+    try std.testing.expectEqual(@as(i32, 500), osu.pp);
     try std.testing.expectEqual(@as(i32, 8), osu.plays);
     try std.testing.expectEqual(@as(i64, 1000), osu.total_hits);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.9353), osu.accuracy, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.985), osu.accuracy, 0.000001);
     try std.testing.expectEqual(@as(i32, 321), osu.max_combo);
     const taiko = (try store.statsForUser(1, 1)).?;
     try std.testing.expectEqual(@as(i64, 777), taiko.ranked_score);
@@ -3581,12 +3628,179 @@ test "lazer v2 submission updates one stats slice without overwriting the accoun
     failed.total_score = 100;
     failed.max_combo = 999;
     const failed_token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
-    _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
+    _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, 100, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
     const after_fail = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 992654), after_fail.ranked_score);
     try std.testing.expectEqual(@as(i64, 997754), after_fail.total_score);
     try std.testing.expectEqual(@as(i32, 9), after_fail.plays);
     try std.testing.expectEqual(@as(i32, 321), after_fail.max_combo);
+    try std.testing.expectEqual(@as(i32, 500), after_fail.pp);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.985), after_fail.accuracy, 0.000001);
+}
+
+test "schema twenty two backfills the historical lazer best score" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-best-migration.db", .{tmp.sub_path});
+    {
+        var old_store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+        defer old_store.close();
+        try old_store.migrate();
+        try old_store.exec(
+            "DROP INDEX lazer_scores_user_best;" ++
+                "ALTER TABLE lazer_scores DROP COLUMN pp;" ++
+                "ALTER TABLE lazer_scores DROP COLUMN best;" ++
+                "PRAGMA user_version=21;" ++
+                "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
+                "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(75,75,'11111111111111111111111111111111','a','one','one','m',3);" ++
+                "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace) VALUES" ++
+                "(1,1,75,0,500,0.5,5,1,'[]','{}','vanilla'),(2,1,75,0,1000,1,10,1,'[]','{}','vanilla'),(3,1,75,0,2000,1,20,0,'[]','{}','vanilla')",
+        );
+    }
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT id,best FROM lazer_scores ORDER BY id", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    for ([_]c_int{ 0, 1, 0 }, 1..) |expected, id| {
+        try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(stmt));
+        try std.testing.expectEqual(@as(i64, @intCast(id)), storage.c.sqlite3_column_int64(stmt, 0));
+        try std.testing.expectEqual(expected, storage.c.sqlite3_column_int(stmt, 1));
+    }
+}
+
+test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-weighted-stats.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
+            "INSERT INTO stats(user_id,mode) VALUES(1,0);" ++
+            "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES" ++
+            "(75,75,'11111111111111111111111111111111','a','one','one','m',3)," ++
+            "(76,76,'22222222222222222222222222222222','a','two','two','m',3)," ++
+            "(77,77,'33333333333333333333333333333333','a','three','three','m',2)",
+    );
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":1000,\"total_score_without_mods\":1000,\"accuracy\":1,\"max_combo\":100,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":100},\"maximum_statistics\":{\"great\":100},\"pauses\":[]}", .{});
+    defer parsed.deinit();
+    var input = try lazer.parseSoloScore(parsed.value, 75);
+
+    const first_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const first_id = try store.submitLazerScoreToken(1, 75, first_token, input, 100, "[]", "{\"great\":100}", "{\"great\":100}", "[]");
+    input.beatmap_id = 76;
+    input.total_score = 2000;
+    input.accuracy = 0.9;
+    const second_token = try store.createLazerScoreToken(1, 76, "22222222222222222222222222222222", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    _ = try store.submitLazerScoreToken(1, 76, second_token, input, 200, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]");
+    const weighted = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i32, 295), weighted.pp);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9487179487), weighted.accuracy, 0.000001);
+
+    input.beatmap_id = 75;
+    input.total_score = 900;
+    input.accuracy = 0.5;
+    const lower_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "cccccccccccccccccccccccccccccccc");
+    const lower_id = try store.submitLazerScoreToken(1, 75, lower_token, input, 500, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]");
+    const after_lower = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(weighted.pp, after_lower.pp);
+    try std.testing.expectApproxEqAbs(weighted.accuracy, after_lower.accuracy, 0.000001);
+
+    input.passed = false;
+    input.rank = "F";
+    input.total_score = 5000;
+    const failed_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "dddddddddddddddddddddddddddddddd");
+    _ = try store.submitLazerScoreToken(1, 75, failed_token, input, 999, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]");
+    const after_fail = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(weighted.pp, after_fail.pp);
+    try std.testing.expectApproxEqAbs(weighted.accuracy, after_fail.accuracy, 0.000001);
+
+    input.passed = true;
+    input.rank = "A";
+    input.beatmap_id = 77;
+    input.total_score = 9000;
+    input.accuracy = 1;
+    const unranked_token = try store.createLazerScoreToken(1, 77, "33333333333333333333333333333333", 0, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    _ = try store.submitLazerScoreToken(1, 77, unranked_token, input, 1000, "[]", "{\"great\":100}", "{\"great\":100}", "[]");
+    const after_unranked = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(weighted.pp, after_unranked.pp);
+    try std.testing.expectApproxEqAbs(weighted.accuracy, after_unranked.accuracy, 0.000001);
+
+    var best_rows: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT id,pp,best FROM lazer_scores WHERE id IN(?1,?2) ORDER BY id", -1, &best_rows, null));
+    defer _ = storage.c.sqlite3_finalize(best_rows);
+    _ = storage.c.sqlite3_bind_int64(best_rows, 1, first_id);
+    _ = storage.c.sqlite3_bind_int64(best_rows, 2, lower_id);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(best_rows));
+    try std.testing.expectEqual(first_id, storage.c.sqlite3_column_int64(best_rows, 0));
+    try std.testing.expectApproxEqAbs(@as(f64, 100), storage.c.sqlite3_column_double(best_rows, 1), 0.001);
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(best_rows, 2));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(best_rows));
+    try std.testing.expectEqual(lower_id, storage.c.sqlite3_column_int64(best_rows, 0));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(best_rows, 2));
+}
+
+test "stable and lazer share one ranked performance result per map" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/shared-client-performance.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
+            "INSERT INTO stats(user_id,mode) VALUES(1,0);" ++
+            "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES" ++
+            "(75,75,'11111111111111111111111111111111','a','one','one','m',3)",
+    );
+    const stable_input: stable_score.Submission = .{
+        .map_md5 = "11111111111111111111111111111111",
+        .username = "ari",
+        .online_checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .n300 = 100,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1000,
+        .max_combo = 100,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260813000000",
+        .client_flags = "0",
+    };
+    _ = try store.insertStableScore(1, stable_input, 300, "stable replay", 10_000);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":1500,\"total_score_without_mods\":1500,\"accuracy\":0.9,\"max_combo\":90,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":90,\"miss\":10},\"maximum_statistics\":{\"great\":100},\"pauses\":[]}", .{});
+    defer parsed.deinit();
+    const lazer_input = try lazer.parseSoloScore(parsed.value, 75);
+    const token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 100, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]");
+    const after_lazer = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1500), after_lazer.ranked_score);
+    try std.testing.expectEqual(@as(i64, 2500), after_lazer.total_score);
+    try std.testing.expectEqual(@as(i32, 300), after_lazer.pp);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), after_lazer.accuracy, 0.000001);
+
+    var later_stable = stable_input;
+    later_stable.online_checksum = "cccccccccccccccccccccccccccccccc";
+    later_stable.total_score = 1200;
+    _ = try store.insertStableScore(1, later_stable, 400, "later stable replay", 10_000);
+    const after_stable = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1500), after_stable.ranked_score);
+    try std.testing.expectEqual(@as(i64, 3700), after_stable.total_score);
+    try std.testing.expectEqual(@as(i32, 400), after_stable.pp);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), after_stable.accuracy, 0.000001);
 }
 
 test "Rijndael-256 matches the py3rijndael block fixture" {

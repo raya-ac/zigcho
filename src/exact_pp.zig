@@ -30,6 +30,7 @@ const relax: u32 = 1 << 7;
 const autopilot: u32 = 1 << 13;
 
 extern fn zigcho_pp_calculate(map_ptr: [*]const u8, map_len: usize, input: *const Input, output: *Output) c_int;
+extern fn zigcho_lazer_pp_calculate(map_ptr: [*]const u8, map_len: usize, mods_ptr: [*]const u8, mods_len: usize, input: *const Input, output: *Output) c_int;
 
 pub fn calculate(map: []const u8, input: Input) !Output {
     if (map.len == 0 or input.mode > 3) return error.PerformanceCalculationFailed;
@@ -38,6 +39,15 @@ pub fn calculate(map: []const u8, input: Input) !Output {
     if (input.mods & relax != 0 and input.mods & autopilot != 0) return error.UnsupportedModMode;
     var output: Output = .{};
     if (zigcho_pp_calculate(map.ptr, map.len, &input, &output) != 0) return error.PerformanceCalculationFailed;
+    if (!std.math.isFinite(output.pp) or !std.math.isFinite(output.stars) or output.pp < 0 or output.stars < 0) return error.PerformanceCalculationFailed;
+    return output;
+}
+
+pub fn calculateLazer(map: []const u8, mods_json: []const u8, input: Input) !Output {
+    if (map.len == 0 or mods_json.len == 0 or input.mode > 3 or input.lazer == 0) return error.PerformanceCalculationFailed;
+    if (input.mods & (relax | autopilot) != 0) return error.UnsupportedModMode;
+    var output: Output = .{};
+    if (zigcho_lazer_pp_calculate(map.ptr, map.len, mods_json.ptr, mods_json.len, &input, &output) != 0) return error.PerformanceCalculationFailed;
     if (!std.math.isFinite(output.pp) or !std.math.isFinite(output.stars) or output.pp < 0 or output.stars < 0) return error.PerformanceCalculationFailed;
     return output;
 }

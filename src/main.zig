@@ -137,6 +137,7 @@ const App = struct {
     media_sync: beatmap_media.Sync,
     score_webhook: webhook.Webhook,
     anticheat: ?anticheat_plugin.Host,
+    anticheat_allow_sample_modulus: u32,
     avatar_store: r2.Storage,
     geo_client: std.http.Client,
     started_at: i64,
@@ -157,19 +158,25 @@ const App = struct {
         return evidence;
     }
 
-    fn observeStableEvidence(self: *App, user_id: i32, event_name: []const u8, event: anticheat_abi.EventV1) void {
+    fn observeStableEvidence(self: *App, user_id: i32, source: storage.AnticheatSource, event: anticheat_abi.EventV1) void {
         const host = if (self.anticheat) |*loaded| loaded else return;
         const decision = host.evaluate(event) catch |err| {
-            std.log.warn("event=anticheat_module_evaluation_failed module={s} source={s} user_id={d} error={t}", .{ host.name(), event_name, user_id, err });
+            std.log.warn("event=anticheat_module_evaluation_failed module={s} source={s} user_id={d} error={t}", .{ host.name(), source.text(), user_id, err });
             return;
         };
         if (decision.action == anticheat_abi.Action.allow) return;
-        var detail_buf: [512]u8 = undefined;
-        const detail = std.fmt.bufPrint(&detail_buf, "module={s} event={s} mode=observe action={d} reason={d} risk={d} confidence_bps={d} decision_flags={d} rule_revision={d} evidence={d} hardware_match_count={d}", .{
-            host.name(), event_name, decision.action, decision.reason, decision.risk_score, decision.confidence_bps, decision.flags, decision.rule_revision, event.evidence, event.hardware_match_count,
-        }) catch return;
-        self.store.recordAnticheatObservation(user_id, detail) catch |err| {
-            std.log.warn("event=anticheat_audit_write_failed source={s} user_id={d} error={t}", .{ event_name, user_id, err });
+        _ = self.store.recordAnticheatObservation(user_id, .{
+            .source = source,
+            .module = host.name(),
+            .action = decision.action,
+            .reason = decision.reason,
+            .risk_score = decision.risk_score,
+            .confidence_bps = decision.confidence_bps,
+            .evidence = event.evidence,
+            .decision_flags = decision.flags,
+            .rule_revision = decision.rule_revision,
+        }) catch |err| {
+            std.log.warn("event=anticheat_observation_write_failed source={s} user_id={d} error={t}", .{ source.text(), user_id, err });
         };
     }
 
@@ -178,7 +185,7 @@ const App = struct {
         var evidence: u64 = 0;
         if (result.hardware_match_count != 0) evidence |= anticheat_abi.Evidence.exact_hardware_match;
         if (result.running_under_wine) evidence |= anticheat_abi.Evidence.running_under_wine;
-        self.observeStableEvidence(result.user_id, "stable_login", .{
+        self.observeStableEvidence(result.user_id, .stable_login, .{
             .event_kind = anticheat_abi.EventKind.login,
             .client_family = anticheat_abi.ClientFamily.stable,
             .evidence = evidence,
@@ -192,7 +199,7 @@ const App = struct {
         if (flags & hq_flags != 0) evidence |= anticheat_abi.Evidence.high_confidence_client_flag;
         if (flags & (@as(u32, 1) << 19) != 0) evidence |= anticheat_abi.Evidence.registry_remnant;
         if (evidence == 0) return;
-        self.observeStableEvidence(user_id, "stable_lastfm", .{
+        self.observeStableEvidence(user_id, .stable_lastfm, .{
             .event_kind = anticheat_abi.EventKind.heartbeat,
             .client_family = anticheat_abi.ClientFamily.stable,
             .evidence = evidence,
@@ -247,24 +254,35 @@ const App = struct {
             std.log.warn("event=anticheat_module_evaluation_failed module={s} error={t}", .{ host.name(), err });
             return null;
         };
-        if (result.decision.action == anticheat_abi.Action.allow) return null;
-        std.log.warn("event=anticheat_observation module={s} action={d} reason={d} risk={d} confidence_bps={d} objects={d} clicks={d}", .{
+        if (result.decision.action != anticheat_abi.Action.allow) std.log.warn("event=anticheat_observation module={s} action={d} reason={d} risk={d} confidence_bps={d} objects={d} clicks={d}", .{
             host.name(), result.decision.action, result.decision.reason, result.decision.risk_score, result.decision.confidence_bps, result.objects_checked, result.matched_clicks,
         });
         return result;
     }
 
-    fn persistAnticheatObservation(self: *App, user_id: i32, score_id: i64, result: anticheat_abi.GameplayResultV1) void {
+    fn persistAnticheatObservation(self: *App, user_id: i32, score_id: i64, sample_weight: u32, result: anticheat_abi.GameplayResultV1) void {
         const host = if (self.anticheat) |*loaded| loaded else return;
-        var detail_buf: [768]u8 = undefined;
-        const detail = std.fmt.bufPrint(&detail_buf, "module={s} score_id={d} mode=observe action={d} reason={d} risk={d} confidence_bps={d} decision_flags={d} rule_revision={d} objects={d} clicks={d} mean_timing_milli={d} timing_stddev_milli={d} exact_timing_bps={d} center_hits_bps={d} mean_center_distance_milli={d} snaps={d}", .{
-            host.name(), score_id, result.decision.action, result.decision.reason, result.decision.risk_score, result.decision.confidence_bps, result.decision.flags, result.decision.rule_revision, result.objects_checked, result.matched_clicks, result.mean_abs_timing_error_milli, result.timing_stddev_milli, result.exact_timing_bps, result.center_hits_bps, result.mean_center_distance_milli, result.snap_events,
-        }) catch {
-            std.log.warn("event=anticheat_audit_format_failed score_id={d}", .{score_id});
-            return;
-        };
-        self.store.recordAnticheatObservation(user_id, detail) catch |err| {
-            std.log.warn("event=anticheat_audit_write_failed score_id={d} error={t}", .{ score_id, err });
+        _ = self.store.recordAnticheatObservation(user_id, .{
+            .source = .stable_score,
+            .module = host.name(),
+            .score_id = score_id,
+            .action = result.decision.action,
+            .sample_weight = sample_weight,
+            .reason = result.decision.reason,
+            .risk_score = result.decision.risk_score,
+            .confidence_bps = result.decision.confidence_bps,
+            .decision_flags = result.decision.flags,
+            .rule_revision = result.decision.rule_revision,
+            .objects_checked = result.objects_checked,
+            .matched_clicks = result.matched_clicks,
+            .mean_abs_timing_error_milli = result.mean_abs_timing_error_milli,
+            .timing_stddev_milli = result.timing_stddev_milli,
+            .exact_timing_bps = result.exact_timing_bps,
+            .center_hits_bps = result.center_hits_bps,
+            .mean_center_distance_milli = result.mean_center_distance_milli,
+            .snap_events = result.snap_events,
+        }) catch |err| {
+            std.log.warn("event=anticheat_observation_write_failed score_id={d} error={t}", .{ score_id, err });
         };
     }
 
@@ -990,6 +1008,31 @@ const App = struct {
                     return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
                 }
             }
+            if (std.mem.eql(u8, path, "/api/v1/staff/anticheat")) {
+                if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const json = try self.store.staffAnticheatJson(self.allocator);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const id_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"observation_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"observation required\"}", &no_store);
+                    defer self.allocator.free(id_text);
+                    const label_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"label"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"label required\"}", &no_store);
+                    defer self.allocator.free(label_text);
+                    const note = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"note"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"review note required\"}", &no_store);
+                    defer self.allocator.free(note);
+                    const observation_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid observation\"}", &no_store);
+                    const label = storage.AnticheatReviewLabel.parse(label_text) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid review label\"}", &no_store);
+                    if (!validWebText(note, 3, 1000)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid review note\"}", &no_store);
+                    self.store.reviewAnticheatObservation(staff_user.id, observation_id, label, note) catch |err| switch (err) {
+                        error.AnticheatObservationNotFound => return respond(req, .not_found, "application/json", "{\"error\":\"observation not found\"}", &no_store),
+                        else => return err,
+                    };
+                    std.log.info("event=staff_anticheat_review actor_id={d} observation_id={d} label={s}", .{ staff_user.id, observation_id, label.text() });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
             if (std.mem.eql(u8, path, "/api/v1/staff/audit") and req.head.method == .GET) {
                 if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
                 const json = try self.store.staffAuditJson(self.allocator);
@@ -1020,6 +1063,7 @@ const App = struct {
                 std.mem.eql(u8, path, "/api/v1/staff/ranking") or
                 std.mem.eql(u8, path, "/api/v1/staff/moderation") or
                 std.mem.eql(u8, path, "/api/v1/staff/appeals") or
+                std.mem.eql(u8, path, "/api/v1/staff/anticheat") or
                 std.mem.eql(u8, path, "/api/v1/staff/audit") or
                 std.mem.eql(u8, path, "/api/v1/staff/channels");
             return respond(req, if (known_staff_path) .method_not_allowed else .not_found, "application/json", if (known_staff_path) "{\"error\":\"method not allowed\"}" else "{\"error\":\"not found\"}", &no_store);
@@ -1844,7 +1888,10 @@ const App = struct {
                 std.log.warn("stable score insert failed: {t}", .{err});
                 return respond(req, .ok, "text/plain", "error: no", &.{});
             };
-            if (anticheat_observation) |observation| self.persistAnticheatObservation(user.id, score_id, observation);
+            if (anticheat_observation) |observation| {
+                const allow_sample = observation.decision.action == anticheat_abi.Action.allow and self.anticheat_allow_sample_modulus != 0 and @mod(score_id, @as(i64, self.anticheat_allow_sample_modulus)) == 0;
+                if (observation.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, observation);
+            }
             const after_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
             const placement = try self.store.scoreLeaderboardPlacement(score_id);
             bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods) catch {};
@@ -2201,6 +2248,7 @@ pub fn main(init: std.process.Init) !void {
         .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .anticheat = anticheat,
+        .anticheat_allow_sample_modulus = config.anticheat_allow_sample_modulus,
         .avatar_store = .{
             .endpoint = config.avatar_r2_endpoint,
             .bucket = config.avatar_r2_bucket,

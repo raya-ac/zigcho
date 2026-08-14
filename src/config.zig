@@ -4,6 +4,7 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
     score_webhook: []u8,
     anticheat_module_path: []u8,
+    anticheat_allow_sample_modulus: u32,
     avatar_r2_endpoint: []u8,
     avatar_r2_bucket: []u8,
     avatar_r2_access_key_id: []u8,
@@ -28,6 +29,7 @@ pub const Config = struct {
             .allocator = allocator,
             .score_webhook = score_webhook,
             .anticheat_module_path = anticheat_module_path,
+            .anticheat_allow_sample_modulus = 100,
             .avatar_r2_endpoint = avatar_r2_endpoint,
             .avatar_r2_bucket = avatar_r2_bucket,
             .avatar_r2_access_key_id = avatar_r2_access_key_id,
@@ -69,6 +71,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
         } else if (std.mem.eql(u8, key, "anticheat_module_path")) {
             if (value.len <= 4096 and std.mem.indexOfScalar(u8, value, 0) == null)
                 try result.replace(&result.anticheat_module_path, value);
+        } else if (std.mem.eql(u8, key, "anticheat_allow_sample_modulus")) {
+            const parsed = std.fmt.parseInt(u32, value, 10) catch continue;
+            if (parsed == 0 or (parsed >= 10 and parsed <= 100_000)) result.anticheat_allow_sample_modulus = parsed;
         } else if (std.mem.eql(u8, key, "avatar_r2_endpoint")) {
             try result.replace(&result.avatar_r2_endpoint, value);
         } else if (std.mem.eql(u8, key, "avatar_r2_bucket")) {

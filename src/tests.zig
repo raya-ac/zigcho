@@ -448,6 +448,7 @@ test "config values stay owned after the source buffer changes" {
         "osu_api_key=first-key\n" ++
             "score_webhook=https://discord.invalid/first\n" ++
             "anticheat_module_path=/opt/zigcho/private/anticheat.so\n" ++
+            "anticheat_allow_sample_modulus=250\n" ++
             "beatmap_cache_max_bytes=536870912\n" ++
             "beatmap_media_cache_max_bytes=268435456\n" ++
             "avatar_r2_endpoint=https://example.r2.cloudflarestorage.com\n" ++
@@ -464,6 +465,7 @@ test "config values stay owned after the source buffer changes" {
 
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
     try std.testing.expectEqualStrings("/opt/zigcho/private/anticheat.so", config.anticheat_module_path);
+    try std.testing.expectEqual(@as(u32, 250), config.anticheat_allow_sample_modulus);
     try std.testing.expectEqual(@as(u64, 536870912), config.beatmap_cache_max_bytes);
     try std.testing.expectEqual(@as(u64, 268435456), config.beatmap_media_cache_max_bytes);
     try std.testing.expectEqualStrings("https://example.r2.cloudflarestorage.com", config.avatar_r2_endpoint);
@@ -530,7 +532,7 @@ test "stable anticheat replay preparation frees every allocation failure path" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, anticheatReplayAllocationRun, .{});
 }
 
-test "anticheat observations use the existing bounded audit trail" {
+test "anticheat observations stay structured reviewable and non enforcing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -538,16 +540,88 @@ test "anticheat observations use the existing bounded audit trail" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
-    try store.recordAnticheatObservation(3, "module=private score_id=42 mode=observe action=1");
-    try std.testing.expectError(error.InvalidAuditDetail, store.recordAnticheatObservation(3, ""));
+    const player_id = try store.register("ac player", "ac-player@example.invalid", "00000000000000000000000000000000");
+    const reviewer_id = try store.register("ac reviewer", "ac-reviewer@example.invalid", "11111111111111111111111111111111");
+    var score_sql_buf: [1024]u8 = undefined;
+    const score_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(42,{d},'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,0,123456,100,0.98,500,300,20,1,0,0,0,1,1,x'00','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','vanilla',1,60000)", .{player_id});
+    try store.exec(score_sql);
+    const clean_sample_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(43,{d},'cccccccccccccccccccccccccccccccc',0,0,654321,125,0.99,600,320,10,0,0,0,0,1,1,x'00','dddddddddddddddddddddddddddddddd','vanilla',1,70000)", .{player_id});
+    try store.exec(clean_sample_sql);
+    const observation_id = try store.recordAnticheatObservation(player_id, .{
+        .source = .stable_score,
+        .module = "private-test",
+        .score_id = 42,
+        .action = 2,
+        .reason = 4101,
+        .risk_score = 670,
+        .confidence_bps = 9200,
+        .decision_flags = 1,
+        .rule_revision = 7,
+        .objects_checked = 80,
+        .matched_clicks = 80,
+        .mean_abs_timing_error_milli = 100,
+        .timing_stddev_milli = 25,
+        .exact_timing_bps = 9000,
+        .center_hits_bps = 8750,
+        .mean_center_distance_milli = 1200,
+        .snap_events = 12,
+    });
+    const clean_sample_id = try store.recordAnticheatObservation(player_id, .{
+        .source = .stable_score,
+        .module = "private-test",
+        .score_id = 43,
+        .action = 0,
+        .sample_weight = 100,
+        .reason = 0,
+        .risk_score = 0,
+        .confidence_bps = 0,
+        .rule_revision = 7,
+        .objects_checked = 80,
+        .matched_clicks = 77,
+        .mean_abs_timing_error_milli = 8_000,
+        .timing_stddev_milli = 12_000,
+        .exact_timing_bps = 1_250,
+        .center_hits_bps = 2_500,
+        .mean_center_distance_milli = 8_000,
+    });
+    try std.testing.expectError(error.InvalidAnticheatObservation, store.recordAnticheatObservation(player_id, .{ .source = .stable_score, .module = "private-test", .action = 1, .reason = 1, .risk_score = 1, .confidence_bps = 1 }));
 
     var stmt: ?*storage.c.sqlite3_stmt = null;
-    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT action,target,detail FROM audit_log WHERE action='anticheat.observe'", -1, &stmt, null));
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,review_label FROM anticheat_observations WHERE id=?1", -1, &stmt, null));
     defer _ = storage.c.sqlite3_finalize(stmt);
+    _ = storage.c.sqlite3_bind_int64(stmt, 1, observation_id);
     try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(stmt));
-    try std.testing.expectEqualStrings("anticheat.observe", std.mem.span(storage.c.sqlite3_column_text(stmt, 0)));
-    try std.testing.expectEqualStrings("user:3", std.mem.span(storage.c.sqlite3_column_text(stmt, 1)));
-    try std.testing.expectEqualStrings("module=private score_id=42 mode=observe action=1", std.mem.span(storage.c.sqlite3_column_text(stmt, 2)));
+    try std.testing.expectEqual(@as(i64, 42), storage.c.sqlite3_column_int64(stmt, 0));
+    try std.testing.expectEqualStrings("stable_score", std.mem.span(storage.c.sqlite3_column_text(stmt, 1)));
+    try std.testing.expectEqualStrings("private-test", std.mem.span(storage.c.sqlite3_column_text(stmt, 2)));
+    try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(stmt, 3));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 4));
+    try std.testing.expectEqual(@as(c_int, 4101), storage.c.sqlite3_column_int(stmt, 5));
+    try std.testing.expectEqual(@as(c_int, 670), storage.c.sqlite3_column_int(stmt, 6));
+    try std.testing.expectEqual(@as(c_int, 9200), storage.c.sqlite3_column_int(stmt, 7));
+    try std.testing.expectEqualStrings("pending", std.mem.span(storage.c.sqlite3_column_text(stmt, 8)));
+
+    const pending = try store.staffAnticheatJson(std.testing.allocator);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"pending\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"score_id\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"score_id\":43") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"sample_weight\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"exact_timing_bps\":9000") != null);
+
+    try std.testing.expectError(error.InvalidAnticheatReview, store.reviewAnticheatObservation(reviewer_id, observation_id, .clean, "x"));
+    try std.testing.expectError(error.AnticheatObservationNotFound, store.reviewAnticheatObservation(reviewer_id, 9999, .dismissed, "not this finding"));
+    try store.reviewAnticheatObservation(reviewer_id, observation_id, .clean, "verified clean replay fixture");
+    try store.reviewAnticheatObservation(reviewer_id, clean_sample_id, .clean, "verified ordinary sampled play");
+    const reviewed = try store.staffAnticheatJson(std.testing.allocator);
+    defer std.testing.allocator.free(reviewed);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed, "\"pending\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed, "\"review_label\":\"clean\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed, "\"reviewer\":\"ac reviewer\"") != null);
+    const player = (try store.userById(std.testing.allocator, player_id)).?;
+    defer std.testing.allocator.free(player.name);
+    defer std.testing.allocator.free(player.safe_name);
+    try std.testing.expect(!player.restricted);
 }
 
 test "beatmap hydration backoff and archive pruning stay bounded" {
@@ -3766,7 +3840,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 24), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 25), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer submission updates ranked performance without overwriting another ruleset" {

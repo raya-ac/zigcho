@@ -36,6 +36,69 @@ pub const HardwareEnforcement = struct {
     }
 };
 
+pub const AnticheatSource = enum {
+    stable_login,
+    stable_lastfm,
+    stable_score,
+
+    pub fn text(self: AnticheatSource) []const u8 {
+        return switch (self) {
+            .stable_login => "stable_login",
+            .stable_lastfm => "stable_lastfm",
+            .stable_score => "stable_score",
+        };
+    }
+};
+
+pub const AnticheatReviewLabel = enum {
+    clean,
+    uncertain,
+    cheat,
+    dismissed,
+
+    pub fn parse(value: []const u8) ?AnticheatReviewLabel {
+        inline for (std.meta.fields(AnticheatReviewLabel)) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn text(self: AnticheatReviewLabel) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const AnticheatObservation = struct {
+    source: AnticheatSource,
+    module: []const u8,
+    score_id: ?i64 = null,
+    action: u32,
+    sample_weight: u32 = 1,
+    reason: u32,
+    risk_score: u32,
+    confidence_bps: u32,
+    evidence: u64 = 0,
+    decision_flags: u64 = 0,
+    rule_revision: u32 = 0,
+    objects_checked: u32 = 0,
+    matched_clicks: u32 = 0,
+    mean_abs_timing_error_milli: u32 = 0,
+    timing_stddev_milli: u32 = 0,
+    exact_timing_bps: u32 = 0,
+    center_hits_bps: u32 = 0,
+    mean_center_distance_milli: u32 = 0,
+    snap_events: u32 = 0,
+};
+
+pub fn validateAnticheatObservation(user_id: i32, observation: AnticheatObservation) !void {
+    if (user_id <= 0 or observation.module.len == 0 or observation.module.len > 64 or !std.unicode.utf8ValidateSlice(observation.module)) return error.InvalidAnticheatObservation;
+    if (observation.score_id) |score_id| if (score_id <= 0) return error.InvalidAnticheatObservation;
+    if ((observation.source == .stable_score) != (observation.score_id != null)) return error.InvalidAnticheatObservation;
+    if (observation.action > 3 or observation.sample_weight == 0 or observation.sample_weight > 100_000 or observation.risk_score > 1000 or observation.confidence_bps > 10_000) return error.InvalidAnticheatObservation;
+    if (observation.evidence > std.math.maxInt(i64) or observation.decision_flags > std.math.maxInt(i64)) return error.InvalidAnticheatObservation;
+    if (observation.matched_clicks > observation.objects_checked or observation.snap_events > observation.objects_checked or observation.exact_timing_bps > 10_000 or observation.center_hits_bps > 10_000) return error.InvalidAnticheatObservation;
+}
+
 pub const Store = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
@@ -165,6 +228,12 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_024.sql"));
         }
+        if (version < 25) {
+            if (try self.hasAnticheatReviewSchema())
+                try self.exec("PRAGMA user_version=25")
+            else
+                try self.exec(@embedFile("migration_025.sql"));
+        }
     }
 
     fn hasLazerPerformanceColumns(self: *Store) !bool {
@@ -218,6 +287,26 @@ pub const Store = struct {
                 std.mem.eql(u8, name, "show_recent_scores")) found += 1;
         }
         return found == 8;
+    }
+
+    fn hasAnticheatReviewSchema(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(anticheat_observations)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var found: u8 = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const name = std.mem.span(c.sqlite3_column_text(stmt, 1));
+            if (std.mem.eql(u8, name, "source") or
+                std.mem.eql(u8, name, "module") or
+                std.mem.eql(u8, name, "sample_weight") or
+                std.mem.eql(u8, name, "risk_score") or
+                std.mem.eql(u8, name, "confidence_bps") or
+                std.mem.eql(u8, name, "review_label") or
+                std.mem.eql(u8, name, "reviewer_id") or
+                std.mem.eql(u8, name, "review_note") or
+                std.mem.eql(u8, name, "reviewed_at")) found += 1;
+        }
+        return found == 9;
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -461,11 +550,59 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
-    pub fn recordAnticheatObservation(self: *Store, user_id: i32, detail: []const u8) !void {
-        if (detail.len == 0 or detail.len > 768 or !std.unicode.utf8ValidateSlice(detail)) return error.InvalidAuditDetail;
+    pub fn recordAnticheatObservation(self: *Store, user_id: i32, observation: AnticheatObservation) !i64 {
+        try validateAnticheatObservation(user_id, observation);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "INSERT INTO anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        if (observation.score_id) |score_id|
+            _ = c.sqlite3_bind_int64(stmt, 2, score_id)
+        else
+            _ = c.sqlite3_bind_null(stmt, 2);
+        const source = observation.source.text();
+        _ = c.sqlite3_bind_text(stmt, 3, source.ptr, @intCast(source.len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, observation.module.ptr, @intCast(observation.module.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 5, observation.action);
+        _ = c.sqlite3_bind_int64(stmt, 6, observation.sample_weight);
+        _ = c.sqlite3_bind_int64(stmt, 7, observation.reason);
+        _ = c.sqlite3_bind_int64(stmt, 8, observation.risk_score);
+        _ = c.sqlite3_bind_int64(stmt, 9, observation.confidence_bps);
+        _ = c.sqlite3_bind_int64(stmt, 10, @intCast(observation.evidence));
+        _ = c.sqlite3_bind_int64(stmt, 11, @intCast(observation.decision_flags));
+        _ = c.sqlite3_bind_int64(stmt, 12, observation.rule_revision);
+        _ = c.sqlite3_bind_int64(stmt, 13, observation.objects_checked);
+        _ = c.sqlite3_bind_int64(stmt, 14, observation.matched_clicks);
+        _ = c.sqlite3_bind_int64(stmt, 15, observation.mean_abs_timing_error_milli);
+        _ = c.sqlite3_bind_int64(stmt, 16, observation.timing_stddev_milli);
+        _ = c.sqlite3_bind_int64(stmt, 17, observation.exact_timing_bps);
+        _ = c.sqlite3_bind_int64(stmt, 18, observation.center_hits_bps);
+        _ = c.sqlite3_bind_int64(stmt, 19, observation.mean_center_distance_milli);
+        _ = c.sqlite3_bind_int64(stmt, 20, observation.snap_events);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        const observation_id = c.sqlite3_last_insert_rowid(self.db);
+        var detail_buf: [512]u8 = undefined;
+        const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} rule_revision={d}", .{
+            observation_id,
+            observation.module,
+            source,
+            observation.score_id orelse 0,
+            observation.action,
+            observation.sample_weight,
+            observation.reason,
+            observation.risk_score,
+            observation.confidence_bps,
+            observation.evidence,
+            observation.rule_revision,
+        });
         try self.insertAuditLocked(3, "anticheat.observe", user_id, detail);
+        try self.exec("COMMIT");
+        return observation_id;
     }
 
     pub const RegistrationConflicts = struct { username: bool, email: bool };
@@ -1376,15 +1513,87 @@ pub const Store = struct {
         return out;
     }
 
+    pub fn staffAnticheatJson(self: *Store, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var pending_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*) FROM anticheat_observations WHERE review_label='pending'", -1, &pending_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(pending_stmt);
+        if (c.sqlite3_step(pending_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        const pending = c.sqlite3_column_int64(pending_stmt, 0);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at FROM anticheat_observations o JOIN users u ON u.id=o.user_id LEFT JOIN users reviewer ON reviewer.id=o.reviewer_id ORDER BY (o.review_label='pending') DESC,o.created_at DESC,o.id DESC LIMIT 250";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"pending\":{d},\"observations\":[", .{pending});
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{{\"id\":{d},\"user_id\":{d},\"user\":", .{ c.sqlite3_column_int64(stmt, 0), c.sqlite3_column_int(stmt, 1) });
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 2)), .{}, &output.writer);
+            try output.writer.print(",\"score_id\":{d},\"source\":", .{c.sqlite3_column_int64(stmt, 3)});
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 4)), .{}, &output.writer);
+            try output.writer.writeAll(",\"module\":");
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 5)), .{}, &output.writer);
+            try output.writer.print(",\"action\":{d},\"sample_weight\":{d},\"reason\":{d},\"risk\":{d},\"confidence_bps\":{d},\"evidence\":{d},\"decision_flags\":{d},\"rule_revision\":{d},\"objects\":{d},\"clicks\":{d},\"mean_timing_milli\":{d},\"timing_stddev_milli\":{d},\"exact_timing_bps\":{d},\"center_hits_bps\":{d},\"mean_center_distance_milli\":{d},\"snaps\":{d},\"review_label\":", .{
+                c.sqlite3_column_int64(stmt, 6),  c.sqlite3_column_int64(stmt, 7),  c.sqlite3_column_int64(stmt, 8),  c.sqlite3_column_int64(stmt, 9),
+                c.sqlite3_column_int64(stmt, 10), c.sqlite3_column_int64(stmt, 11), c.sqlite3_column_int64(stmt, 12), c.sqlite3_column_int64(stmt, 13),
+                c.sqlite3_column_int64(stmt, 14), c.sqlite3_column_int64(stmt, 15), c.sqlite3_column_int64(stmt, 16), c.sqlite3_column_int64(stmt, 17),
+                c.sqlite3_column_int64(stmt, 18), c.sqlite3_column_int64(stmt, 19), c.sqlite3_column_int64(stmt, 20), c.sqlite3_column_int64(stmt, 21),
+            });
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 22)), .{}, &output.writer);
+            try output.writer.writeAll(",\"reviewer\":");
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 23)), .{}, &output.writer);
+            try output.writer.writeAll(",\"review_note\":");
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 24)), .{}, &output.writer);
+            try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}}}", .{ c.sqlite3_column_int64(stmt, 25), c.sqlite3_column_int64(stmt, 26) });
+        }
+        try output.writer.writeAll("]}");
+        return output.toOwnedSlice();
+    }
+
+    pub fn reviewAnticheatObservation(self: *Store, actor_id: i32, observation_id: i64, label: AnticheatReviewLabel, note: []const u8) !void {
+        const trimmed = std.mem.trim(u8, note, " \t\r\n");
+        if (actor_id <= 0 or observation_id <= 0 or trimmed.len < 3 or trimmed.len > 1000 or !std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidAnticheatReview;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var lookup: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT user_id FROM anticheat_observations WHERE id=?1", -1, &lookup, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(lookup);
+        _ = c.sqlite3_bind_int64(lookup, 1, observation_id);
+        if (c.sqlite3_step(lookup) != c.SQLITE_ROW) return error.AnticheatObservationNotFound;
+        const user_id = c.sqlite3_column_int(lookup, 0);
+
+        var update: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE anticheat_observations SET review_label=?1,reviewer_id=?2,review_note=?3,reviewed_at=unixepoch() WHERE id=?4", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(update);
+        const label_text = label.text();
+        _ = c.sqlite3_bind_text(update, 1, label_text.ptr, @intCast(label_text.len), null);
+        _ = c.sqlite3_bind_int(update, 2, actor_id);
+        _ = c.sqlite3_bind_text(update, 3, trimmed.ptr, @intCast(trimmed.len), null);
+        _ = c.sqlite3_bind_int64(update, 4, observation_id);
+        if (c.sqlite3_step(update) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.DatabaseQueryFailed;
+        var detail_buf: [1120]u8 = undefined;
+        const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} label={s} note={s}", .{ observation_id, label_text, trimmed });
+        try self.insertAuditLocked(actor_id, "anticheat.review", user_id, detail);
+        try self.exec("COMMIT");
+    }
+
     pub fn staffOverviewJson(self: *Store, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "SELECT (SELECT count(*) FROM moderation_appeals WHERE status='open'),(SELECT count(DISTINCT set_id) FROM beatmap_rank_requests WHERE active=1),(SELECT count(*) FROM users WHERE restricted=1),(SELECT count(*) FROM users WHERE silence_end>unixepoch()),(SELECT count(*) FROM audit_log WHERE created_at>=unixepoch()-86400),(SELECT count(*) FROM client_hardware)";
+        const sql = "SELECT (SELECT count(*) FROM moderation_appeals WHERE status='open'),(SELECT count(DISTINCT set_id) FROM beatmap_rank_requests WHERE active=1),(SELECT count(*) FROM users WHERE restricted=1),(SELECT count(*) FROM users WHERE silence_end>unixepoch()),(SELECT count(*) FROM audit_log WHERE created_at>=unixepoch()-86400),(SELECT count(*) FROM client_hardware),(SELECT count(*) FROM anticheat_observations WHERE review_label='pending')";
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
-        return std.fmt.allocPrint(allocator, "{{\"open_appeals\":{d},\"ranking_sets\":{d},\"restricted_users\":{d},\"silenced_users\":{d},\"audit_24h\":{d},\"hardware_records\":{d}}}", .{ c.sqlite3_column_int64(stmt, 0), c.sqlite3_column_int64(stmt, 1), c.sqlite3_column_int64(stmt, 2), c.sqlite3_column_int64(stmt, 3), c.sqlite3_column_int64(stmt, 4), c.sqlite3_column_int64(stmt, 5) });
+        return std.fmt.allocPrint(allocator, "{{\"open_appeals\":{d},\"ranking_sets\":{d},\"restricted_users\":{d},\"silenced_users\":{d},\"audit_24h\":{d},\"hardware_records\":{d},\"anticheat_pending\":{d}}}", .{ c.sqlite3_column_int64(stmt, 0), c.sqlite3_column_int64(stmt, 1), c.sqlite3_column_int64(stmt, 2), c.sqlite3_column_int64(stmt, 3), c.sqlite3_column_int64(stmt, 4), c.sqlite3_column_int64(stmt, 5), c.sqlite3_column_int64(stmt, 6) });
     }
 
     pub fn staffRankingJson(self: *Store, allocator: std.mem.Allocator) ![]u8 {

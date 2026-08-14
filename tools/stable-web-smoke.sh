@@ -71,6 +71,9 @@ social_friend_id=$(jq -er '.id' "$response")
 
 sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; UPDATE users SET privileges=privileges|(1<<4) WHERE id=$social_player_id; INSERT INTO friends(user_id,friend_id) VALUES($social_player_id,$social_friend_id); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10),(9002,9002,'90029002900290029002900290029002','ranked artist','ranked title','ranked diff','ranked mapper',3,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id); INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,checksum,rank_namespace,best,time_elapsed) VALUES($social_player_id,'90029002900290029002900290029002',0,8,1000000,20,1,10,10,0,0,0,0,0,1,1,'smoke-score-checksum','vanilla',1,12000); INSERT INTO direct_messages(from_id,to_id,message) VALUES($social_friend_id,$social_player_id,'offline smoke hello'); INSERT INTO beatmap_archives(set_id,sha256,osz_file) VALUES(9002,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',x'6f737a20736d6f6b65');"
 score_id=$(sqlite3 "$database" "SELECT id FROM scores WHERE checksum='smoke-score-checksum'")
+sqlite3 "$database" "INSERT INTO anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,rule_revision,objects_checked,matched_clicks) VALUES($social_player_id,$score_id,'stable_score','smoke-private',0,100,0,0,0,7,10,9);"
+anticheat_observation_id=$(sqlite3 "$database" "SELECT id FROM anticheat_observations WHERE score_id=$score_id")
+anticheat_player_state=$(sqlite3 "$database" "SELECT restricted||':'||(SELECT total_score||':'||ranked_score||':'||plays FROM stats WHERE user_id=$social_player_id AND mode=0) FROM users WHERE id=$social_player_id")
 
 stable_login_body="social player
 00000000000000000000000000000000
@@ -190,7 +193,23 @@ cookie=$(sed -n 's/^set-cookie: \(__Host-kai-session=[^;]*\).*/\1/ip' "$headers"
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/overview" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_overview
-jq -e '.open_appeals == 1 and .ranking_sets == 1 and .restricted_users == 1' "$response" >/dev/null || fail invalid_overview
+jq -e '.open_appeals == 1 and .ranking_sets == 1 and .restricted_users == 1 and .anticheat_pending == 1' "$response" >/dev/null || fail invalid_overview
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/anticheat" --header "Cookie: $cookie")
+expect_status "$code" 200 staff_anticheat
+jq -e ".pending == 1 and (.observations[] | select(.id == $anticheat_observation_id and .score_id == $score_id and .action == 0 and .sample_weight == 100 and .review_label == \"pending\"))" "$response" >/dev/null || fail invalid_anticheat_queue
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header 'X-CSRF-Token: wrong' \
+  --data-urlencode "observation_id=$anticheat_observation_id" --data-urlencode 'label=clean' --data-urlencode 'note=verified ordinary smoke play')
+expect_status "$code" 403 anticheat_wrong_csrf
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode "observation_id=$anticheat_observation_id" --data-urlencode 'label=clean' --data-urlencode 'note=verified ordinary smoke play')
+expect_status "$code" 200 anticheat_review
+[ "$(sqlite3 "$database" "SELECT review_label FROM anticheat_observations WHERE id=$anticheat_observation_id")" = clean ] || fail anticheat_label_not_saved
+[ "$(sqlite3 "$database" "SELECT restricted||':'||(SELECT total_score||':'||ranked_score||':'||plays FROM stats WHERE user_id=$social_player_id AND mode=0) FROM users WHERE id=$social_player_id")" = "$anticheat_player_state" ] || fail anticheat_review_enforced_player_state
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/ranking" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_ranking

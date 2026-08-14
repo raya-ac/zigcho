@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 24;
+const required_sqlite_version = 25;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -16,13 +16,13 @@ const Table = struct {
 };
 
 const users = [_]Column{
-    .{ .name = "id", .kind = .integer },          .{ .name = "name", .kind = .text },          .{ .name = "safe_name", .kind = .text },
-    .{ .name = "password_hash", .kind = .blob },  .{ .name = "password_salt", .kind = .blob }, .{ .name = "email", .kind = .text },
-    .{ .name = "country", .kind = .text },        .{ .name = "privileges", .kind = .integer }, .{ .name = "silence_end", .kind = .integer },
-    .{ .name = "restricted", .kind = .boolean },  .{ .name = "created_at", .kind = .integer }, .{ .name = "last_login", .kind = .integer },
-    .{ .name = "avatar_key", .kind = .integer },  .{ .name = "bio", .kind = .text },           .{ .name = "preferred_mode", .kind = .integer },
-    .{ .name = "profile_source", .kind = .text }, .{ .name = "profile_title", .kind = .text },        .{ .name = "profile_pronouns", .kind = .text },
-    .{ .name = "profile_location", .kind = .text }, .{ .name = "profile_website", .kind = .text },   .{ .name = "profile_accent", .kind = .text },
+    .{ .name = "id", .kind = .integer },            .{ .name = "name", .kind = .text },                  .{ .name = "safe_name", .kind = .text },
+    .{ .name = "password_hash", .kind = .blob },    .{ .name = "password_salt", .kind = .blob },         .{ .name = "email", .kind = .text },
+    .{ .name = "country", .kind = .text },          .{ .name = "privileges", .kind = .integer },         .{ .name = "silence_end", .kind = .integer },
+    .{ .name = "restricted", .kind = .boolean },    .{ .name = "created_at", .kind = .integer },         .{ .name = "last_login", .kind = .integer },
+    .{ .name = "avatar_key", .kind = .integer },    .{ .name = "bio", .kind = .text },                   .{ .name = "preferred_mode", .kind = .integer },
+    .{ .name = "profile_source", .kind = .text },   .{ .name = "profile_title", .kind = .text },         .{ .name = "profile_pronouns", .kind = .text },
+    .{ .name = "profile_location", .kind = .text }, .{ .name = "profile_website", .kind = .text },       .{ .name = "profile_accent", .kind = .text },
     .{ .name = "show_country", .kind = .boolean },  .{ .name = "show_profile_stats", .kind = .boolean }, .{ .name = "show_recent_scores", .kind = .boolean },
 };
 const stats = [_]Column{
@@ -70,6 +70,21 @@ const direct_messages = [_]Column{
 const audit_log = [_]Column{
     .{ .name = "id", .kind = .integer },  .{ .name = "actor_id", .kind = .integer }, .{ .name = "action", .kind = .text },
     .{ .name = "target", .kind = .text }, .{ .name = "detail", .kind = .text },      .{ .name = "created_at", .kind = .integer },
+};
+const anticheat_observations = [_]Column{
+    .{ .name = "id", .kind = .integer },                  .{ .name = "user_id", .kind = .integer },
+    .{ .name = "score_id", .kind = .integer },            .{ .name = "source", .kind = .text },
+    .{ .name = "module", .kind = .text },                 .{ .name = "action", .kind = .integer },
+    .{ .name = "sample_weight", .kind = .integer },       .{ .name = "reason", .kind = .integer },
+    .{ .name = "risk_score", .kind = .integer },          .{ .name = "confidence_bps", .kind = .integer },
+    .{ .name = "evidence", .kind = .integer },            .{ .name = "decision_flags", .kind = .integer },
+    .{ .name = "rule_revision", .kind = .integer },       .{ .name = "objects_checked", .kind = .integer },
+    .{ .name = "matched_clicks", .kind = .integer },      .{ .name = "mean_abs_timing_error_milli", .kind = .integer },
+    .{ .name = "timing_stddev_milli", .kind = .integer }, .{ .name = "exact_timing_bps", .kind = .integer },
+    .{ .name = "center_hits_bps", .kind = .integer },     .{ .name = "mean_center_distance_milli", .kind = .integer },
+    .{ .name = "snap_events", .kind = .integer },         .{ .name = "review_label", .kind = .text },
+    .{ .name = "reviewer_id", .kind = .integer },         .{ .name = "review_note", .kind = .text },
+    .{ .name = "reviewed_at", .kind = .integer },         .{ .name = "created_at", .kind = .integer },
 };
 const chat_messages = [_]Column{
     .{ .name = "id", .kind = .integer },   .{ .name = "sender_id", .kind = .integer },  .{ .name = "target", .kind = .text },
@@ -162,6 +177,7 @@ const tables = [_]Table{
     .{ .name = "beatmap_comments", .columns = &beatmap_comments, .identity = true },
     .{ .name = "direct_messages", .columns = &direct_messages, .identity = true },
     .{ .name = "audit_log", .columns = &audit_log, .identity = true },
+    .{ .name = "anticheat_observations", .columns = &anticheat_observations, .identity = true },
     .{ .name = "chat_messages", .columns = &chat_messages, .identity = true },
     .{ .name = "chat_channels", .columns = &chat_channels },
     .{ .name = "beatmap_rank_requests", .columns = &beatmap_rank_requests, .identity = true },
@@ -433,7 +449,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 27), tables.len);
+    try std.testing.expectEqual(@as(usize, 28), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("user_avatars", tables[tables.len - 1].name);
 }

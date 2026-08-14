@@ -35,6 +35,7 @@ const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
 const r2 = @import("r2.zig");
 const site_replay = @import("site_replay.zig");
+const status_page = @embedFile("status.html");
 
 comptime {
     _ = postgres;
@@ -870,6 +871,15 @@ test "website profile settings and private avatar metadata stay account scoped" 
     try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"recent_scores\":[]") != null);
     try std.testing.expect(try store.deleteCustomAvatar(user_id));
     try std.testing.expect((try store.customAvatarForUser(std.testing.allocator, user_id)) == null);
+}
+
+test "website profile plays keep an accessible score details dialog" {
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "<dialog class=\"score-dialog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "aria-labelledby=\"score-dialog-title\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "data-score-detail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "bindScoreDetails()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "scoreDialogTrigger") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "download replay ↓") != null);
 }
 
 test "stable screenshots survive storage with exact type isolation" {

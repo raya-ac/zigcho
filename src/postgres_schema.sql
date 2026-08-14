@@ -22,7 +22,15 @@ CREATE TABLE users (
     avatar_key smallint NOT NULL DEFAULT 1 CHECK (avatar_key IN (1, 2)),
     bio text NOT NULL DEFAULT '' CHECK (length(bio) <= 500),
     preferred_mode smallint NOT NULL DEFAULT 0 CHECK (preferred_mode BETWEEN 0 AND 3),
-    profile_source text NOT NULL DEFAULT 'all' CHECK (profile_source IN ('all', 'lazer', 'scorev2'))
+    profile_source text NOT NULL DEFAULT 'all' CHECK (profile_source IN ('all', 'lazer', 'scorev2')),
+    profile_title text NOT NULL DEFAULT '' CHECK (length(profile_title) <= 40),
+    profile_pronouns text NOT NULL DEFAULT '' CHECK (length(profile_pronouns) <= 32),
+    profile_location text NOT NULL DEFAULT '' CHECK (length(profile_location) <= 60),
+    profile_website text NOT NULL DEFAULT '' CHECK (length(profile_website) <= 200),
+    profile_accent text NOT NULL DEFAULT 'pink' CHECK (profile_accent IN ('pink', 'violet', 'blue', 'mint', 'gold', 'red')),
+    show_country boolean NOT NULL DEFAULT true,
+    show_profile_stats boolean NOT NULL DEFAULT true,
+    show_recent_scores boolean NOT NULL DEFAULT true
 );
 
 CREATE TABLE user_avatars (
@@ -372,4 +380,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1);
 
-INSERT INTO schema_migrations(version) VALUES (23);
+INSERT INTO schema_migrations(version) VALUES (24);

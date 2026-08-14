@@ -80,6 +80,17 @@ fn validWebText(value: []const u8, minimum: usize, maximum: usize) bool {
     return trimmed.len >= minimum and trimmed.len <= maximum and std.unicode.utf8ValidateSlice(trimmed);
 }
 
+fn validWebLine(value: []const u8, maximum: usize) bool {
+    return validWebText(value, 0, maximum) and std.mem.indexOfAny(u8, value, "\r\n") == null;
+}
+
+fn validProfileWebsite(value: []const u8) bool {
+    if (value.len == 0) return true;
+    if (value.len > 200 or !std.mem.startsWith(u8, value, "https://") or !std.unicode.utf8ValidateSlice(value)) return false;
+    for (value) |byte| if (std.ascii.isWhitespace(byte) or byte < 0x20 or byte == 0x7f or byte == '"' or byte == '\'' or byte == '<' or byte == '>') return false;
+    return value.len > "https://".len;
+}
+
 fn stableClientPrivileges(server: u32) u8 {
     var client: u8 = 1 << 2;
     if (server & 1 != 0) client |= 1 << 0;
@@ -306,7 +317,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-screenshot.php")) return rate_limit.media_upload;
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return rate_limit.authenticated;
         if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
-        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/ss/") or std.mem.startsWith(u8, path, "/beatmaps/") or std.mem.startsWith(u8, path, "/preview/") or std.mem.startsWith(u8, path, "/thumb/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
+        if (req.head.method == .GET and (std.mem.startsWith(u8, path, "/d/") or std.mem.startsWith(u8, path, "/ss/") or std.mem.startsWith(u8, path, "/replays/") or std.mem.startsWith(u8, path, "/beatmaps/") or std.mem.startsWith(u8, path, "/preview/") or std.mem.startsWith(u8, path, "/thumb/") or std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") or std.mem.startsWith(u8, path, "/api/v2/beatmaps/"))) return rate_limit.download;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
@@ -536,18 +547,42 @@ const App = struct {
                     if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
                     const bio_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"bio"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"bio required\"}", &no_store);
                     defer self.allocator.free(bio_value);
+                    const title_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_title"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"profile title required\"}", &no_store);
+                    defer self.allocator.free(title_value);
+                    const pronouns_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_pronouns"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"pronouns required\"}", &no_store);
+                    defer self.allocator.free(pronouns_value);
+                    const location_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_location"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"location required\"}", &no_store);
+                    defer self.allocator.free(location_value);
+                    const website_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_website"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"website required\"}", &no_store);
+                    defer self.allocator.free(website_value);
+                    const accent_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_accent"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"accent required\"}", &no_store);
+                    defer self.allocator.free(accent_value);
                     const mode_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"preferred_mode"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"main mode required\"}", &no_store);
                     defer self.allocator.free(mode_value);
                     const source_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_source"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"score view required\"}", &no_store);
                     defer self.allocator.free(source_value);
                     const avatar_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"avatar_key"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"default avatar required\"}", &no_store);
                     defer self.allocator.free(avatar_value);
+                    const show_country_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"show_country"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"country privacy required\"}", &no_store);
+                    defer self.allocator.free(show_country_value);
+                    const show_stats_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"show_profile_stats"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"stats privacy required\"}", &no_store);
+                    defer self.allocator.free(show_stats_value);
+                    const show_recent_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"show_recent_scores"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"recent plays privacy required\"}", &no_store);
+                    defer self.allocator.free(show_recent_value);
                     const bio = std.mem.trim(u8, bio_value, " \t\r\n");
+                    const profile_title = std.mem.trim(u8, title_value, " \t\r\n");
+                    const profile_pronouns = std.mem.trim(u8, pronouns_value, " \t\r\n");
+                    const profile_location = std.mem.trim(u8, location_value, " \t\r\n");
+                    const profile_website = std.mem.trim(u8, website_value, " \t\r\n");
+                    const profile_accent = domain.parseProfileAccent(accent_value) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid profile accent\"}", &no_store);
                     const preferred_mode = std.fmt.parseInt(u8, mode_value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid main mode\"}", &no_store);
                     const profile_source = domain.parseSiteScoreSource(source_value) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid score view\"}", &no_store);
                     const avatar_key = std.fmt.parseInt(u8, avatar_value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid default avatar\"}", &no_store);
-                    if (!validWebText(bio, 0, 500) or preferred_mode > 3 or (avatar_key != 1 and avatar_key != 2)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid profile settings\"}", &no_store);
-                    try self.store.updateSiteProfile(user.id, bio, preferred_mode, profile_source, avatar_key);
+                    const show_country = std.mem.eql(u8, show_country_value, "1");
+                    const show_profile_stats = std.mem.eql(u8, show_stats_value, "1");
+                    const show_recent_scores = std.mem.eql(u8, show_recent_value, "1");
+                    if ((!show_country and !std.mem.eql(u8, show_country_value, "0")) or (!show_profile_stats and !std.mem.eql(u8, show_stats_value, "0")) or (!show_recent_scores and !std.mem.eql(u8, show_recent_value, "0")) or !validWebText(bio, 0, 500) or !validWebLine(profile_title, 40) or !validWebLine(profile_pronouns, 32) or !validWebLine(profile_location, 60) or !validProfileWebsite(profile_website) or preferred_mode > 3 or (avatar_key != 1 and avatar_key != 2)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid profile settings\"}", &no_store);
+                    try self.store.updateSiteProfile(user.id, .{ .bio = bio, .title = profile_title, .pronouns = profile_pronouns, .location = profile_location, .website = profile_website, .accent = profile_accent, .preferred_mode = preferred_mode, .profile_source = profile_source, .avatar_key = avatar_key, .show_country = show_country, .show_profile_stats = show_profile_stats, .show_recent_scores = show_recent_scores });
                     const json = (try self.store.siteAccountJson(self.allocator, user.id)).?;
                     defer self.allocator.free(json);
                     std.log.info("event=website_profile_updated user_id={d}", .{user.id});
@@ -893,6 +928,31 @@ const App = struct {
             const set = (try self.store.lazerBeatmapSet(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(set);
             return respond(req, .ok, "application/json", set, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/beatmaps/") and std.mem.endsWith(u8, path, "/leaderboard")) {
+            const id_text = path["/api/v1/beatmaps/".len .. path.len - "/leaderboard".len];
+            if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap\"}", &.{});
+            const map_id = std.fmt.parseInt(i32, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap\"}", &.{});
+            const source = domain.parseSiteScoreSource(queryField(target, "source") orelse "all") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid source\"}", &.{});
+            const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
+            if (map_id <= 0 or !domain.validSiteMode(source, mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid leaderboard\"}", &.{});
+            const board = (try self.store.siteBeatmapLeaderboard(self.allocator, map_id, source, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found for that ruleset\"}", &.{});
+            defer self.allocator.free(board);
+            return respond(req, .ok, "application/json", board, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/replays/stable/")) {
+            const id_text = path["/replays/stable/".len..];
+            if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
+            const score_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
+            const replay = (try self.store.siteReplay(self.allocator, score_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
+            defer self.allocator.free(replay);
+            var disposition_buf: [96]u8 = undefined;
+            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"kai-score-{d}.osr\"", .{score_id});
+            return respond(req, .ok, "application/octet-stream", replay, &.{
+                .{ .name = "content-disposition", .value = disposition },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            });
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/ss/")) {
             const requested = screenshot.parsePath(path) orelse return respond(req, .not_found, "application/json", "{\"status\":\"Screenshot not found.\"}", &.{});
@@ -1752,7 +1812,7 @@ const App = struct {
             if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
-                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
             return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", status_page, &headers);

@@ -2,6 +2,21 @@ const std = @import("std");
 
 pub const Mode = enum(u8) { osu, taiko, @"catch", mania };
 pub const SiteScoreSource = enum { all, lazer, scorev2 };
+pub const ProfileAccent = enum { pink, violet, blue, mint, gold, red };
+pub const SiteProfileSettings = struct {
+    bio: []const u8,
+    title: []const u8,
+    pronouns: []const u8,
+    location: []const u8,
+    website: []const u8,
+    accent: ProfileAccent,
+    preferred_mode: u8,
+    profile_source: SiteScoreSource,
+    avatar_key: u8,
+    show_country: bool,
+    show_profile_stats: bool,
+    show_recent_scores: bool,
+};
 pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, ranked = 3, approved = 4, qualified = 5, loved = 6 };
 pub const BeatmapRankAction = enum { pending, qualify, rank, approve, love, veto, rollback };
 pub const BeatmapRankContext = struct {
@@ -79,6 +94,13 @@ pub fn parseSiteScoreSource(value: []const u8) ?SiteScoreSource {
     if (std.mem.eql(u8, value, "all")) return .all;
     if (std.mem.eql(u8, value, "lazer")) return .lazer;
     if (std.mem.eql(u8, value, "scorev2")) return .scorev2;
+    return null;
+}
+
+pub fn parseProfileAccent(value: []const u8) ?ProfileAccent {
+    inline for (std.meta.tags(ProfileAccent)) |accent| {
+        if (std.mem.eql(u8, value, @tagName(accent))) return accent;
+    }
     return null;
 }
 

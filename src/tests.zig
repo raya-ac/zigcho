@@ -34,6 +34,7 @@ const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
 const r2 = @import("r2.zig");
+const site_replay = @import("site_replay.zig");
 
 comptime {
     _ = postgres;
@@ -47,6 +48,7 @@ comptime {
     _ = user_json;
     _ = profile_avatar;
     _ = r2;
+    _ = site_replay;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -821,7 +823,20 @@ test "website profile settings and private avatar metadata stay account scoped" 
     try store.migrate();
     const user_id = try store.register("site user", "site-user@example.invalid", "00000000000000000000000000000000");
 
-    try store.updateSiteProfile(user_id, "hello <kai> & friends", 3, .scorev2, 2);
+    try store.updateSiteProfile(user_id, .{
+        .bio = "hello <kai> & friends",
+        .title = "tiny mapper",
+        .pronouns = "she/her",
+        .location = "somewhere quiet",
+        .website = "https://kai.ovh",
+        .accent = .violet,
+        .preferred_mode = 3,
+        .profile_source = .scorev2,
+        .avatar_key = 2,
+        .show_country = false,
+        .show_profile_stats = false,
+        .show_recent_scores = false,
+    });
     const before_avatar = (try store.siteAccountJson(std.testing.allocator, user_id)).?;
     defer std.testing.allocator.free(before_avatar);
     var account = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, before_avatar, .{});
@@ -830,6 +845,9 @@ test "website profile settings and private avatar metadata stay account scoped" 
     try std.testing.expectEqualStrings("scorev2", account.value.object.get("profile_source").?.string);
     try std.testing.expectEqual(@as(i64, 3), account.value.object.get("preferred_mode").?.integer);
     try std.testing.expectEqual(@as(i64, 2), account.value.object.get("avatar_key").?.integer);
+    try std.testing.expectEqualStrings("tiny mapper", account.value.object.get("profile_title").?.string);
+    try std.testing.expectEqualStrings("violet", account.value.object.get("profile_accent").?.string);
+    try std.testing.expect(!account.value.object.get("show_country").?.bool);
     try std.testing.expect(!account.value.object.get("has_custom_avatar").?.bool);
 
     const etag: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
@@ -846,6 +864,10 @@ test "website profile settings and private avatar metadata stay account scoped" 
     try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"bio\":\"hello <kai> & friends\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"profile_source\":\"scorev2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"preferred_mode\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"country\":\"XX\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"profile_title\":\"tiny mapper\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"selected_stats\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"recent_scores\":[]") != null);
     try std.testing.expect(try store.deleteCustomAvatar(user_id));
     try std.testing.expect((try store.customAvatarForUser(std.testing.allocator, user_id)) == null);
 }
@@ -3639,7 +3661,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 23), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 24), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer submission updates ranked performance without overwriting another ruleset" {
@@ -4410,6 +4432,18 @@ test "ranked stable PP is stored and updates normal player stats" {
         .client_flags = "0",
     };
     const score_id = try store.insertStableScore(1, score, 26.80, "replay", 12_000);
+    const website_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 900000001, .all, 0)).?;
+    defer std.testing.allocator.free(website_board);
+    var parsed_website_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, website_board, .{});
+    defer parsed_website_board.deinit();
+    const website_first = parsed_website_board.value.object.get("scores").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 1), website_first.get("rank").?.integer);
+    try std.testing.expectEqual(score_id, website_first.get("id").?.integer);
+    try std.testing.expect(website_first.get("has_replay").?.bool);
+    const website_replay = (try store.siteReplay(std.testing.allocator, score_id)).?;
+    defer std.testing.allocator.free(website_replay);
+    try std.testing.expect(std.mem.indexOf(u8, website_replay, "replay") != null);
+    try std.testing.expectEqual(score_id, std.mem.readInt(i64, website_replay[website_replay.len - 8 ..][0..8], .little));
     const snapshot = (try store.ppSnapshot(score_id)).?;
     try std.testing.expectApproxEqAbs(@as(f64, 26.80), snapshot.score, 0.001);
     try std.testing.expectEqual(@as(i64, 27), snapshot.player);

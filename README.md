@@ -12,7 +12,7 @@ this is not connected to official osu! accounts. Stable and the custom lazer cli
 - the `kai` bot, player commands, staff tools, BN map ranking and audited moderation
 - PostgreSQL migrations, backups, restore drills, release rollback and bounded runtime caches
 - lazer account, profile, beatmap and ranked solo-score paths for the pinned custom client
-- a public site with rankings, profiles, player login, settings, bios and score-source filters
+- a public site with profiles, map leaderboards, replay downloads, player login and proper account settings
 - private custom avatars in Cloudflare R2, served through `a.kai.ovh/{user_id}`
 
 Stable is the complete public lane. lazer is still an alpha: ranked solo play works, but realtime and the final signed client releases are not finished.

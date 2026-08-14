@@ -8,6 +8,8 @@ pub fn canonicalPath(path: []const u8) []const u8 {
 pub fn websitePage(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/") or
         std.mem.eql(u8, path, "/rankings") or
+        std.mem.eql(u8, path, "/login") or
+        std.mem.eql(u8, path, "/settings") or
         std.mem.eql(u8, path, "/appeal") or
         std.mem.eql(u8, path, "/staff") or
         std.mem.eql(u8, path, "/users")) return true;
@@ -41,6 +43,8 @@ fn numericPage(path: []const u8, prefix: []const u8) bool {
 test "website pages stay limited to real browser routes" {
     try std.testing.expect(websitePage("/"));
     try std.testing.expect(websitePage("/users"));
+    try std.testing.expect(websitePage("/login"));
+    try std.testing.expect(websitePage("/settings"));
     try std.testing.expect(websitePage("/users/4"));
     try std.testing.expect(websitePage("/u/4"));
     try std.testing.expect(websitePage("/users/raya"));

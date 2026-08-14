@@ -28,6 +28,8 @@ const config_mod = @import("config.zig");
 const web_auth = @import("web_auth.zig");
 const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
+const profile_avatar = @import("profile_avatar.zig");
+const r2 = @import("r2.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
@@ -119,6 +121,7 @@ const App = struct {
     map_sync: beatmap_sync.Sync,
     media_sync: beatmap_media.Sync,
     score_webhook: webhook.Webhook,
+    avatar_store: r2.Storage,
     geo_client: std.http.Client,
     started_at: i64,
 
@@ -212,10 +215,6 @@ const App = struct {
         return if (custom) .custom else if (autopilot) .autopilot else if (relax) .relax else .vanilla;
     }
 
-    fn validSiteMode(mode: u8) bool {
-        return mode <= 6 or mode == 8;
-    }
-
     fn isAvatarHost(value: ?[]const u8) bool {
         const host = value orelse return false;
         const end = std.mem.findScalar(u8, host, ':') orelse host.len;
@@ -297,6 +296,8 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/users")) return rate_limit.registration;
         if (req.head.method == .POST and (std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke"))) return rate_limit.token;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/staff/session")) return rate_limit.web_session;
+        if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/session")) return rate_limit.web_session;
+        if ((req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/account")) or ((req.head.method == .PUT or req.head.method == .DELETE) and std.mem.eql(u8, path, "/api/v1/account/avatar"))) return rate_limit.web_action;
         if (req.head.method == .POST and std.mem.startsWith(u8, path, "/api/v1/staff/")) return rate_limit.web_action;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/appeals")) return rate_limit.appeal;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
@@ -314,7 +315,8 @@ const App = struct {
     }
 
     fn bodyLimit(path: []const u8) usize {
-        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
+        if (std.mem.eql(u8, path, "/api/v1/account/avatar")) return profile_avatar.max_bytes;
+        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/session") or std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (lazer.parseSoloScorePath(path) != null) return 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return 20 * 1024 * 1024;
@@ -465,6 +467,130 @@ const App = struct {
             var response_buf: [64]u8 = undefined;
             const response_json = try std.fmt.bufPrint(&response_buf, "{{\"ok\":true,\"id\":{d}}}", .{appeal_id});
             return respond(req, .created, "application/json", response_json, &no_store);
+        }
+        if (std.mem.eql(u8, path, "/api/v1/session")) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            if (req.head.method == .POST) {
+                if (!web_auth.sameOrigin(origin_owned, host_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid origin\"}", &no_store);
+                const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"username required\"}", &no_store);
+                defer self.allocator.free(name);
+                const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &no_store);
+                defer self.allocator.free(password);
+                const password_md5 = web_auth.passwordCredential(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                defer freeUser(self.allocator, user);
+                if (user.id == 3) return respond(req, .forbidden, "application/json", "{\"error\":\"account login unavailable\"}", &no_store);
+                const token = try self.store.issueToken(user.id, web_auth.player_scope, web_auth.player_lifetime_seconds);
+                const csrf = web_auth.csrfToken(&token);
+                const json = try web_auth.sessionJson(self.allocator, user, csrf);
+                defer self.allocator.free(json);
+                var cookie_buf: [256]u8 = undefined;
+                const cookie = try std.fmt.bufPrint(&cookie_buf, "{s}={s}; Path=/; Max-Age={d}; Secure; HttpOnly; SameSite=Strict", .{ web_auth.player_cookie_name, &token, web_auth.player_lifetime_seconds });
+                std.log.info("event=website_session_created user_id={d}", .{user.id});
+                return respond(req, .ok, "application/json", json, &.{
+                    .{ .name = "set-cookie", .value = cookie },
+                    .{ .name = "cache-control", .value = "no-store" },
+                    .{ .name = "pragma", .value = "no-cache" },
+                });
+            }
+            const token = web_auth.playerSessionToken(cookie_owned) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            if (req.head.method == .GET) {
+                const user = (try self.store.authenticateToken(self.allocator, token, web_auth.player_scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+                defer freeUser(self.allocator, user);
+                const csrf = web_auth.csrfToken(token);
+                const json = try web_auth.sessionJson(self.allocator, user, csrf);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+            if (req.head.method == .DELETE) {
+                if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+                _ = try self.store.revokeToken(token);
+                return respond(req, .no_content, "application/json", "", &.{
+                    .{ .name = "set-cookie", .value = "__Host-kai-account=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" },
+                    .{ .name = "cache-control", .value = "no-store" },
+                    .{ .name = "pragma", .value = "no-cache" },
+                });
+            }
+            return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+        }
+        if (std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/account/avatar")) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            const token = web_auth.playerSessionToken(cookie_owned) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            const user = (try self.store.authenticateToken(self.allocator, token, web_auth.player_scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
+            defer freeUser(self.allocator, user);
+            if (std.mem.eql(u8, path, "/api/v1/account")) {
+                if (req.head.method == .GET) {
+                    const json = (try self.store.siteAccountJson(self.allocator, user.id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"account not found\"}", &no_store);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+                    const bio_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"bio"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"bio required\"}", &no_store);
+                    defer self.allocator.free(bio_value);
+                    const mode_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"preferred_mode"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"main mode required\"}", &no_store);
+                    defer self.allocator.free(mode_value);
+                    const source_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"profile_source"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"score view required\"}", &no_store);
+                    defer self.allocator.free(source_value);
+                    const avatar_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"avatar_key"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"default avatar required\"}", &no_store);
+                    defer self.allocator.free(avatar_value);
+                    const bio = std.mem.trim(u8, bio_value, " \t\r\n");
+                    const preferred_mode = std.fmt.parseInt(u8, mode_value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid main mode\"}", &no_store);
+                    const profile_source = domain.parseSiteScoreSource(source_value) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid score view\"}", &no_store);
+                    const avatar_key = std.fmt.parseInt(u8, avatar_value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid default avatar\"}", &no_store);
+                    if (!validWebText(bio, 0, 500) or preferred_mode > 3 or (avatar_key != 1 and avatar_key != 2)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid profile settings\"}", &no_store);
+                    try self.store.updateSiteProfile(user.id, bio, preferred_mode, profile_source, avatar_key);
+                    const json = (try self.store.siteAccountJson(self.allocator, user.id)).?;
+                    defer self.allocator.free(json);
+                    std.log.info("event=website_profile_updated user_id={d}", .{user.id});
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            }
+            if ((req.head.method != .PUT and req.head.method != .DELETE) or !web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, if (req.head.method == .PUT or req.head.method == .DELETE) .forbidden else .method_not_allowed, "application/json", if (req.head.method == .PUT or req.head.method == .DELETE) "{\"error\":\"invalid request\"}" else "{\"error\":\"method not allowed\"}", &no_store);
+            if (req.head.method == .PUT) {
+                const image = profile_avatar.validate(content_type_owned, body) catch return respond(req, .bad_request, "application/json", "{\"error\":\"use a valid png, jpeg, or gif up to 2 mb and 4096 px\"}", &no_store);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+                const etag = std.fmt.bytesToHex(digest, .lower);
+                const extension = if (std.mem.eql(u8, image.content_type, "image/png")) "png" else if (std.mem.eql(u8, image.content_type, "image/gif")) "gif" else "jpg";
+                var object_key_buf: [128]u8 = undefined;
+                const object_key = try std.fmt.bufPrint(&object_key_buf, "{d}/{s}.{s}", .{ user.id, &etag, extension });
+                const previous = try self.store.customAvatarForUser(self.allocator, user.id);
+                defer if (previous) |avatar_value| {
+                    var avatar = avatar_value;
+                    avatar.deinit();
+                };
+                self.avatar_store.put(self.allocator, self.store.io, object_key, image.content_type, body) catch |err| {
+                    std.log.warn("event=website_avatar_upload_failed user_id={d} error={t}", .{ user.id, err });
+                    return respond(req, .bad_gateway, "application/json", "{\"error\":\"avatar storage is not available\"}", &no_store);
+                };
+                self.store.setCustomAvatar(user.id, object_key, image.content_type, etag) catch |err| {
+                    const replaces_existing_object = if (previous) |avatar| std.mem.eql(u8, avatar.object_key, object_key) else false;
+                    if (!replaces_existing_object) self.avatar_store.delete(self.allocator, self.store.io, object_key) catch {};
+                    return err;
+                };
+                if (previous) |avatar| if (!std.mem.eql(u8, avatar.object_key, object_key)) self.avatar_store.delete(self.allocator, self.store.io, avatar.object_key) catch |err| std.log.warn("event=website_avatar_old_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+                std.log.info("event=website_avatar_updated user_id={d} bytes={d} type={s}", .{ user.id, body.len, image.content_type });
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+            const previous = try self.store.customAvatarForUser(self.allocator, user.id);
+            defer if (previous) |avatar_value| {
+                var avatar = avatar_value;
+                avatar.deinit();
+            };
+            _ = try self.store.deleteCustomAvatar(user.id);
+            if (previous) |avatar| self.avatar_store.delete(self.allocator, self.store.io, avatar.object_key) catch |err| std.log.warn("event=website_avatar_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+            std.log.info("event=website_avatar_reset user_id={d}", .{user.id});
+            return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
         }
         if (std.mem.eql(u8, path, "/api/v1/staff/session")) {
             const no_store = [_]std.http.Header{
@@ -732,10 +858,11 @@ const App = struct {
             return respond(req, if (known_staff_path) .method_not_allowed else .not_found, "application/json", if (known_staff_path) "{\"error\":\"method not allowed\"}" else "{\"error\":\"not found\"}", &no_store);
         }
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v1/rankings")) {
+            const source = domain.parseSiteScoreSource(queryField(target, "source") orelse "all") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid source\"}", &.{});
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
-            if (!validSiteMode(mode) or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid rankings\"}", &.{});
-            const listing = try self.store.siteRankings(self.allocator, mode, offset);
+            if (!domain.validSiteMode(source, mode) or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid rankings\"}", &.{});
+            const listing = try self.store.siteRankings(self.allocator, source, mode, offset);
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
         }
@@ -753,9 +880,10 @@ const App = struct {
                 break :resolve found.id;
             };
             if (user_id <= 0) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const source = domain.parseSiteScoreSource(queryField(target, "source") orelse "all") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid source\"}", &.{});
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
-            if (!validSiteMode(mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
-            const profile = (try self.store.siteProfile(self.allocator, user_id, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            if (!domain.validSiteMode(source, mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
+            const profile = (try self.store.siteProfile(self.allocator, user_id, source, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
             defer self.allocator.free(profile);
             return respond(req, .ok, "application/json", profile, &.{});
         }
@@ -790,6 +918,24 @@ const App = struct {
         }
         if (req.head.method == .GET and (isAvatarHost(host_owned) or std.mem.startsWith(u8, path, "/avatars/") or std.mem.startsWith(u8, path, "/avatar/"))) {
             if (avatarUserId(path)) |user_id| {
+                if (try self.store.customAvatarForUser(self.allocator, user_id)) |avatar_value| {
+                    var avatar = avatar_value;
+                    defer avatar.deinit();
+                    const data = self.avatar_store.get(self.allocator, self.store.io, avatar.object_key, avatar.content_type) catch |err| {
+                        std.log.warn("event=website_avatar_download_failed user_id={d} error={t}", .{ user_id, err });
+                        return respond(req, .bad_gateway, "application/json", "{\"error\":\"avatar storage is not available\"}", &.{.{ .name = "cache-control", .value = "no-store" }});
+                    };
+                    defer self.allocator.free(data);
+                    var etag_buf: [66]u8 = undefined;
+                    const etag = try std.fmt.bufPrint(&etag_buf, "\"{s}\"", .{&avatar.etag});
+                    const custom_headers = [_]std.http.Header{
+                        .{ .name = "cache-control", .value = "public, max-age=300" },
+                        .{ .name = "etag", .value = etag },
+                        .{ .name = "x-content-type-options", .value = "nosniff" },
+                    };
+                    if (header(req, "if-none-match")) |current| if (std.mem.eql(u8, current, etag)) return respond(req, .not_modified, avatar.content_type, "", &custom_headers);
+                    return respond(req, .ok, avatar.content_type, data, &custom_headers);
+                }
                 const key = (try self.store.avatarForUser(user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"avatar not found\"}", &.{});
                 const cache_headers = [_]std.http.Header{
                     .{ .name = "cache-control", .value = "public, max-age=3600" },
@@ -1850,6 +1996,12 @@ pub fn main(init: std.process.Init) !void {
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.beatmap_cache_max_bytes),
         .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
+        .avatar_store = .{
+            .endpoint = config.avatar_r2_endpoint,
+            .bucket = config.avatar_r2_bucket,
+            .access_key_id = config.avatar_r2_access_key_id,
+            .secret_access_key = config.avatar_r2_secret_access_key,
+        },
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };

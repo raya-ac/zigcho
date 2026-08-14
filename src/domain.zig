@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Mode = enum(u8) { osu, taiko, @"catch", mania };
+pub const SiteScoreSource = enum { all, lazer, scorev2 };
 pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, ranked = 3, approved = 4, qualified = 5, loved = 6 };
 pub const BeatmapRankAction = enum { pending, qualify, rank, approve, love, veto, rollback };
 pub const BeatmapRankContext = struct {
@@ -73,6 +74,29 @@ pub const Score = struct {
     perfect: bool,
     passed: bool,
 };
+
+pub fn parseSiteScoreSource(value: []const u8) ?SiteScoreSource {
+    if (std.mem.eql(u8, value, "all")) return .all;
+    if (std.mem.eql(u8, value, "lazer")) return .lazer;
+    if (std.mem.eql(u8, value, "scorev2")) return .scorev2;
+    return null;
+}
+
+pub fn validSiteMode(source: SiteScoreSource, mode: u8) bool {
+    return switch (source) {
+        .all, .lazer => mode <= 6 or mode == 8,
+        .scorev2 => mode <= 3,
+    };
+}
+
+pub fn siteScoreMode(mode: u8) u8 {
+    return if (mode <= 3) mode else if (mode <= 6) mode - 4 else 0;
+}
+
+pub fn siteNamespace(source: SiteScoreSource, mode: u8) []const u8 {
+    if (source == .scorev2) return "scorev2";
+    return if (mode <= 3) "vanilla" else if (mode <= 6) "relax" else "autopilot";
+}
 
 pub fn safeName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     var out = try allocator.alloc(u8, name.len);

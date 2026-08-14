@@ -6,3 +6,4 @@ work
 *.db
 *.db-shm
 *.db-wal
+config.ini

@@ -19,7 +19,18 @@ CREATE TABLE users (
     restricted boolean NOT NULL DEFAULT false,
     created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
     last_login bigint,
-    avatar_key smallint NOT NULL DEFAULT 1 CHECK (avatar_key IN (1, 2))
+    avatar_key smallint NOT NULL DEFAULT 1 CHECK (avatar_key IN (1, 2)),
+    bio text NOT NULL DEFAULT '' CHECK (length(bio) <= 500),
+    preferred_mode smallint NOT NULL DEFAULT 0 CHECK (preferred_mode BETWEEN 0 AND 3),
+    profile_source text NOT NULL DEFAULT 'all' CHECK (profile_source IN ('all', 'lazer', 'scorev2'))
+);
+
+CREATE TABLE user_avatars (
+    user_id integer PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    object_key text NOT NULL UNIQUE CHECK (length(object_key) BETWEEN 1 AND 200),
+    content_type text NOT NULL CHECK (content_type IN ('image/png', 'image/jpeg', 'image/gif')),
+    etag char(64) NOT NULL,
+    updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
 );
 
 CREATE TABLE stats (
@@ -361,4 +372,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1);
 
-INSERT INTO schema_migrations(version) VALUES (22);
+INSERT INTO schema_migrations(version) VALUES (23);

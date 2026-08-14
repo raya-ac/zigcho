@@ -4,6 +4,9 @@ const domain = @import("domain.zig");
 pub const cookie_name = "__Host-kai-session";
 pub const scope = "web:staff";
 pub const lifetime_seconds: i64 = 8 * 60 * 60;
+pub const player_cookie_name = "__Host-kai-account";
+pub const player_scope = "web:account";
+pub const player_lifetime_seconds: i64 = 30 * 24 * 60 * 60;
 
 const nominator: u32 = 1 << 11;
 const moderator: u32 = 1 << 12;
@@ -43,18 +46,26 @@ pub fn passwordCredential(password: []const u8) ![32]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-pub fn sessionToken(cookie_header: ?[]const u8) ?[]const u8 {
+fn namedSessionToken(cookie_header: ?[]const u8, name: []const u8) ?[]const u8 {
     var cookies = std.mem.splitScalar(u8, cookie_header orelse return null, ';');
     while (cookies.next()) |raw| {
         const cookie = std.mem.trim(u8, raw, " \t");
         const separator = std.mem.findScalar(u8, cookie, '=') orelse continue;
-        if (!std.mem.eql(u8, cookie[0..separator], cookie_name)) continue;
+        if (!std.mem.eql(u8, cookie[0..separator], name)) continue;
         const value = cookie[separator + 1 ..];
         if (value.len != 64) return null;
         for (value) |char| if (!std.ascii.isHex(char)) return null;
         return value;
     }
     return null;
+}
+
+pub fn sessionToken(cookie_header: ?[]const u8) ?[]const u8 {
+    return namedSessionToken(cookie_header, cookie_name);
+}
+
+pub fn playerSessionToken(cookie_header: ?[]const u8) ?[]const u8 {
+    return namedSessionToken(cookie_header, player_cookie_name);
 }
 
 pub fn csrfToken(token: []const u8) [64]u8 {
@@ -148,6 +159,8 @@ test "host cookie parsing is exact and rejects malformed tokens" {
     try std.testing.expect(sessionToken("kai-session=" ++ token) == null);
     try std.testing.expect(sessionToken("__Host-kai-session=short") == null);
     try std.testing.expect(sessionToken("__Host-kai-session=zzzz456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == null);
+    try std.testing.expectEqualStrings(token, playerSessionToken("__Host-kai-account=" ++ token).?);
+    try std.testing.expect(playerSessionToken("__Host-kai-session=" ++ token) == null);
 }
 
 test "csrf is bound to the session token" {

@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 22;
+const required_sqlite_version = 23;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -16,11 +16,12 @@ const Table = struct {
 };
 
 const users = [_]Column{
-    .{ .name = "id", .kind = .integer },         .{ .name = "name", .kind = .text },          .{ .name = "safe_name", .kind = .text },
-    .{ .name = "password_hash", .kind = .blob }, .{ .name = "password_salt", .kind = .blob }, .{ .name = "email", .kind = .text },
-    .{ .name = "country", .kind = .text },       .{ .name = "privileges", .kind = .integer }, .{ .name = "silence_end", .kind = .integer },
-    .{ .name = "restricted", .kind = .boolean }, .{ .name = "created_at", .kind = .integer }, .{ .name = "last_login", .kind = .integer },
-    .{ .name = "avatar_key", .kind = .integer },
+    .{ .name = "id", .kind = .integer },          .{ .name = "name", .kind = .text },          .{ .name = "safe_name", .kind = .text },
+    .{ .name = "password_hash", .kind = .blob },  .{ .name = "password_salt", .kind = .blob }, .{ .name = "email", .kind = .text },
+    .{ .name = "country", .kind = .text },        .{ .name = "privileges", .kind = .integer }, .{ .name = "silence_end", .kind = .integer },
+    .{ .name = "restricted", .kind = .boolean },  .{ .name = "created_at", .kind = .integer }, .{ .name = "last_login", .kind = .integer },
+    .{ .name = "avatar_key", .kind = .integer },  .{ .name = "bio", .kind = .text },           .{ .name = "preferred_mode", .kind = .integer },
+    .{ .name = "profile_source", .kind = .text },
 };
 const stats = [_]Column{
     .{ .name = "user_id", .kind = .integer },     .{ .name = "mode", .kind = .integer },  .{ .name = "ranked_score", .kind = .integer },
@@ -142,6 +143,10 @@ const beatmap_media = [_]Column{
     .{ .name = "sha256", .kind = .text },              .{ .name = "data", .kind = .blob }, .{ .name = "fetched_at", .kind = .integer },
     .{ .name = "last_accessed_at", .kind = .integer },
 };
+const user_avatars = [_]Column{
+    .{ .name = "user_id", .kind = .integer }, .{ .name = "object_key", .kind = .text },    .{ .name = "content_type", .kind = .text },
+    .{ .name = "etag", .kind = .text },       .{ .name = "updated_at", .kind = .integer },
+};
 
 const tables = [_]Table{
     .{ .name = "users", .columns = &users, .identity = true },
@@ -170,6 +175,7 @@ const tables = [_]Table{
     .{ .name = "moderation_appeals", .columns = &moderation_appeals, .identity = true },
     .{ .name = "screenshots", .columns = &screenshots },
     .{ .name = "beatmap_media", .columns = &beatmap_media },
+    .{ .name = "user_avatars", .columns = &user_avatars },
 };
 
 fn sqliteError(db: *sqlite.sqlite3) void {
@@ -425,7 +431,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 26), tables.len);
+    try std.testing.expectEqual(@as(usize, 27), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
-    try std.testing.expectEqualStrings("beatmap_media", tables[tables.len - 1].name);
+    try std.testing.expectEqualStrings("user_avatars", tables[tables.len - 1].name);
 }

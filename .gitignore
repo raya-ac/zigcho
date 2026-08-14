@@ -6,4 +6,5 @@
 /work/
 /artifacts/
 /pp/target/
+/config.ini
 .DS_Store

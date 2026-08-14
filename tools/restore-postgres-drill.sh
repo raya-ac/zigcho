@@ -3,7 +3,7 @@ set -eu
 
 backup_dir=${ZIGCHO_BACKUP_DIR:-/var/backups/zigcho}
 admin_url=${ZIGCHO_POSTGRES_ADMIN_URL:-dbname=postgres}
-expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-20}
+expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-23}
 cd /
 
 case "$backup_dir" in

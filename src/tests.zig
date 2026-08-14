@@ -32,6 +32,8 @@ const media_contract = @import("media_contract.zig");
 const beatmap_media = @import("beatmap_media.zig");
 const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
+const profile_avatar = @import("profile_avatar.zig");
+const r2 = @import("r2.zig");
 
 comptime {
     _ = postgres;
@@ -43,6 +45,8 @@ comptime {
     _ = beatmap_media;
     _ = proxy;
     _ = user_json;
+    _ = profile_avatar;
+    _ = r2;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -436,6 +440,10 @@ test "config values stay owned after the source buffer changes" {
             "score_webhook=https://discord.invalid/first\n" ++
             "beatmap_cache_max_bytes=536870912\n" ++
             "beatmap_media_cache_max_bytes=268435456\n" ++
+            "avatar_r2_endpoint=https://example.r2.cloudflarestorage.com\n" ++
+            "avatar_r2_bucket=avatars\n" ++
+            "avatar_r2_access_key_id=test-access\n" ++
+            "avatar_r2_secret_access_key=test-secret\n" ++
             "osu_api_key=final-key\n",
     );
     var config = try config_mod.parse(std.testing.allocator, source);
@@ -447,6 +455,10 @@ test "config values stay owned after the source buffer changes" {
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
     try std.testing.expectEqual(@as(u64, 536870912), config.beatmap_cache_max_bytes);
     try std.testing.expectEqual(@as(u64, 268435456), config.beatmap_media_cache_max_bytes);
+    try std.testing.expectEqualStrings("https://example.r2.cloudflarestorage.com", config.avatar_r2_endpoint);
+    try std.testing.expectEqualStrings("avatars", config.avatar_r2_bucket);
+    try std.testing.expectEqualStrings("test-access", config.avatar_r2_access_key_id);
+    try std.testing.expectEqualStrings("test-secret", config.avatar_r2_secret_access_key);
 }
 
 test "beatmap hydration backoff and archive pruning stay bounded" {
@@ -799,6 +811,45 @@ test "accounts keep one assigned default avatar" {
     try std.testing.expect((try store.avatarForUser(999_999)) == null);
 }
 
+test "website profile settings and private avatar metadata stay account scoped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/site-account.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("site user", "site-user@example.invalid", "00000000000000000000000000000000");
+
+    try store.updateSiteProfile(user_id, "hello <kai> & friends", 3, .scorev2, 2);
+    const before_avatar = (try store.siteAccountJson(std.testing.allocator, user_id)).?;
+    defer std.testing.allocator.free(before_avatar);
+    var account = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, before_avatar, .{});
+    defer account.deinit();
+    try std.testing.expectEqualStrings("hello <kai> & friends", account.value.object.get("bio").?.string);
+    try std.testing.expectEqualStrings("scorev2", account.value.object.get("profile_source").?.string);
+    try std.testing.expectEqual(@as(i64, 3), account.value.object.get("preferred_mode").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), account.value.object.get("avatar_key").?.integer);
+    try std.testing.expect(!account.value.object.get("has_custom_avatar").?.bool);
+
+    const etag: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
+    try store.setCustomAvatar(user_id, "4/0123456789abcdef.png", "image/png", etag);
+    var avatar = (try store.customAvatarForUser(std.testing.allocator, user_id)).?;
+    defer avatar.deinit();
+    try std.testing.expectEqualStrings("4/0123456789abcdef.png", avatar.object_key);
+    try std.testing.expectEqualStrings("image/png", avatar.content_type);
+    try std.testing.expectEqualStrings(&etag, &avatar.etag);
+    try std.testing.expect(avatar.updated_at > 0);
+
+    const public_profile = (try store.siteProfile(std.testing.allocator, user_id, .scorev2, 3)).?;
+    defer std.testing.allocator.free(public_profile);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"bio\":\"hello <kai> & friends\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"profile_source\":\"scorev2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_profile, "\"preferred_mode\":3") != null);
+    try std.testing.expect(try store.deleteCustomAvatar(user_id));
+    try std.testing.expect((try store.customAvatarForUser(std.testing.allocator, user_id)) == null);
+}
+
 test "stable screenshots survive storage with exact type isolation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1113,29 +1164,32 @@ test "beatmap ranking records nominations and lets BNs set every stable status" 
     failed_score.grade = "F";
     _ = try store.insertStableScore(requester, failed_score, 0, "", 8_000);
     try std.testing.expectEqual(pending_score_id, try store.setScorePinned(requester, &hash, 0, 0, "vanilla", true));
-    const site_rankings = try store.siteRankings(std.testing.allocator, 0, 0);
+    const site_rankings = try store.siteRankings(std.testing.allocator, .all, 0, 0);
     defer std.testing.allocator.free(site_rankings);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"source\":\"all\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"name\":\"requester\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"pp\":27") != null);
-    const site_profile = (try store.siteProfile(std.testing.allocator, requester, 0)).?;
+    const site_profile = (try store.siteProfile(std.testing.allocator, requester, .all, 0)).?;
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"XX\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "Zigcho Fixture") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_mode\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_source\":\"all\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"namespace\":\"vanilla\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"client\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
-    const empty_autopilot_profile = (try store.siteProfile(std.testing.allocator, requester, 8)).?;
+    const empty_autopilot_profile = (try store.siteProfile(std.testing.allocator, requester, .all, 8)).?;
     defer std.testing.allocator.free(empty_autopilot_profile);
     try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"selected_mode\":8") != null);
     try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"pinned_scores\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"top_scores\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"recent_scores\":[]") != null);
-    try std.testing.expect((try store.siteProfile(std.testing.allocator, 999_999, 0)) == null);
+    try std.testing.expect((try store.siteProfile(std.testing.allocator, 999_999, .all, 0)) == null);
     const ranked_board = try store.stableLeaderboard(std.testing.allocator, viewer, &hash, 0, 0, 0);
     defer std.testing.allocator.free(ranked_board);
     try std.testing.expect(std.mem.startsWith(u8, ranked_board, "2|false|"));
@@ -1233,7 +1287,7 @@ test "profile pins replace the selected map and keep three per stable score slic
     try std.testing.expectEqual(score_ids[1], try store.setScorePinned(user_id, hashes[1], 0, 0, "vanilla", false));
     try std.testing.expectEqual(score_ids[3], try store.setScorePinned(user_id, hashes[3], 0, 0, "vanilla", true));
 
-    const profile = (try store.siteProfile(std.testing.allocator, user_id, 0)).?;
+    const profile = (try store.siteProfile(std.testing.allocator, user_id, .all, 0)).?;
     defer std.testing.allocator.free(profile);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, profile, .{});
     defer parsed.deinit();
@@ -1298,7 +1352,7 @@ test "profile pins select and retain exact mod scores on the same map" {
     try std.testing.expectEqual(hard_rock_id, try store.setScorePinned(user_id, &hash, 0, 1 << 4, "vanilla", true));
     try std.testing.expectError(error.NoPassedScore, store.setScorePinned(user_id, &hash, 0, 1 << 6, "vanilla", true));
 
-    const profile = (try store.siteProfile(std.testing.allocator, user_id, 0)).?;
+    const profile = (try store.siteProfile(std.testing.allocator, user_id, .all, 0)).?;
     defer std.testing.allocator.free(profile);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, profile, .{});
     defer parsed.deinit();
@@ -1314,7 +1368,7 @@ test "profile pins select and retain exact mod scores on the same map" {
     try std.testing.expect(saw_hidden and saw_hard_rock);
 
     try std.testing.expectEqual(hidden_id, try store.setScorePinned(user_id, &hash, 0, 1 << 3, "vanilla", false));
-    const after_unpin = (try store.siteProfile(std.testing.allocator, user_id, 0)).?;
+    const after_unpin = (try store.siteProfile(std.testing.allocator, user_id, .all, 0)).?;
     defer std.testing.allocator.free(after_unpin);
     const after = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, after_unpin, .{});
     defer after.deinit();
@@ -3585,7 +3639,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 22), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 23), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer submission updates ranked performance without overwriting another ruleset" {
@@ -3743,6 +3797,26 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(best_rows));
     try std.testing.expectEqual(lower_id, storage.c.sqlite3_column_int64(best_rows, 0));
     try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(best_rows, 2));
+
+    const lazer_rankings = try store.siteRankings(std.testing.allocator, .lazer, 0, 0);
+    defer std.testing.allocator.free(lazer_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"source\":\"lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"name\":\"ari\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"pp\":295") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"plays\":5") != null);
+
+    const lazer_profile = (try store.siteProfile(std.testing.allocator, 1, .lazer, 0)).?;
+    defer std.testing.allocator.free(lazer_profile);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_source\":\"lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":3000,\"total_score\":17900,\"pp\":295,\"plays\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"mods_json\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"passed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"pinned_scores\":[]") != null);
+
+    const shared_profile = (try store.siteProfile(std.testing.allocator, 1, .all, 0)).?;
+    defer std.testing.allocator.free(shared_profile);
+    try std.testing.expect(std.mem.indexOf(u8, shared_profile, "\"client\":\"lazer\"") != null);
 }
 
 test "stable and lazer share one ranked performance result per map" {
@@ -4414,6 +4488,20 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expect(!lower_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), lower_placement.rank);
     try std.testing.expectEqualDeep(before_scorev2, (try store.statsForUser(1, 0)).?);
+
+    const scorev2_rankings = try store.siteRankings(std.testing.allocator, .scorev2, 0, 0);
+    defer std.testing.allocator.free(scorev2_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_rankings, "\"source\":\"scorev2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_rankings, "\"name\":\"ari\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_rankings, "\"plays\":2") != null);
+
+    const scorev2_profile = (try store.siteProfile(std.testing.allocator, 1, .scorev2, 0)).?;
+    defer std.testing.allocator.free(scorev2_profile);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"selected_source\":\"scorev2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"selected_stats\":{\"ranked_score\":2000000,\"total_score\":3500000,\"pp\":1,\"plays\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"namespace\":\"scorev2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"client\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"mods\":536870912") != null);
 
     try store.exec("UPDATE stats SET ranked_score=1,total_score=2,pp=3,plays=4,play_time=5,total_hits=6,accuracy=0.7,max_combo=8 WHERE user_id=1 AND mode=0");
     _ = try store.applyBeatmapRankAction(1, &hash, .rank, "rebuild scorev2 isolation");

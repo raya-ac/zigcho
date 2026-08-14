@@ -312,6 +312,13 @@ pub const Store = struct {
         result.deinit();
     }
 
+    pub fn recordAnticheatObservation(self: *Store, user_id: i32, detail: []const u8) !void {
+        if (detail.len == 0 or detail.len > 768 or !std.unicode.utf8ValidateSlice(detail)) return error.InvalidAuditDetail;
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try insertAudit(self.allocator, lease.conn, 3, "anticheat.observe", user_id, detail);
+    }
+
     pub fn recordClientHardware(self: *Store, user_id: i32, hardware: ClientHardware) !HardwareEnforcement {
         var matched: std.ArrayList(i32) = .empty;
         errdefer matched.deinit(self.allocator);
@@ -2781,6 +2788,16 @@ test "postgres account auth stats and token slice" {
     defer store.close();
     try store.migrate();
     const user_id = try store.register("ari", "ari@example.test", "00000000000000000000000000000000");
+    try store.recordAnticheatObservation(user_id, "module=private score_id=42 mode=observe action=1");
+    {
+        var audit_lease = store.pool.acquire();
+        defer audit_lease.release();
+        var target_buf: [32]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "user:{d}", .{user_id});
+        var audit = try postgres.queryParams(std.testing.allocator, audit_lease.conn, "SELECT count(*) FROM zigcho.audit_log WHERE action='anticheat.observe' AND target=$1 AND detail=$2", &.{ target, "module=private score_id=42 mode=observe action=1" });
+        defer audit.deinit();
+        try std.testing.expectEqual(@as(i64, 1), try audit.int(i64, 0, 0));
+    }
     try std.testing.expect((try store.registrationConflicts("ari", "ari@example.test")).username);
     try std.testing.expect((try store.avatarForUser(user_id)) != null);
     const user = (try store.authenticate(std.testing.allocator, "ari", "00000000000000000000000000000000")).?;

@@ -118,6 +118,11 @@ pub fn replayLengthAccepted(passed: bool, replay_len: usize) bool {
     return replay_len <= max_replay_size and (!passed or replay_len != 0);
 }
 
+pub fn clientFlags(value: []const u8) u32 {
+    const spaces: u32 = @intCast(@min(std.mem.count(u8, value, " "), @as(usize, std.math.maxInt(u32))));
+    return spaces & ~@as(u32, 4);
+}
+
 pub fn parse(data: []const u8) !Submission {
     var fields: [18][]const u8 = undefined;
     var it = std.mem.splitScalar(u8, data, ':');

@@ -9,6 +9,7 @@ const lazer = @import("lazer.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
+const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
@@ -30,6 +31,9 @@ const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
 const r2 = @import("r2.zig");
+const anticheat_abi = @import("anticheat_abi.zig");
+const anticheat_plugin = @import("anticheat_plugin.zig");
+const anticheat_replay = @import("anticheat_replay.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 
@@ -132,9 +136,137 @@ const App = struct {
     map_sync: beatmap_sync.Sync,
     media_sync: beatmap_media.Sync,
     score_webhook: webhook.Webhook,
+    anticheat: ?anticheat_plugin.Host,
     avatar_store: r2.Storage,
     geo_client: std.http.Client,
     started_at: i64,
+
+    fn anticheatNamespace(mods: i32) u32 {
+        if (mods & stable_mods.autopilot != 0) return anticheat_abi.Namespace.autopilot;
+        if (mods & stable_mods.relax != 0) return anticheat_abi.Namespace.relax;
+        if (mods & stable_mods.score_v2 != 0) return anticheat_abi.Namespace.score_v2;
+        return anticheat_abi.Namespace.vanilla;
+    }
+
+    fn stableScoreEvidence(score: stable_score.Submission) u64 {
+        const flags = stable_score.clientFlags(score.client_flags);
+        var evidence: u64 = 0;
+        if (flags & (1 << 1) != 0) evidence |= anticheat_abi.Evidence.rate_anomaly;
+        if (flags & ((1 << 4) | (1 << 5)) != 0) evidence |= anticheat_abi.Evidence.checksum_mismatch;
+        if (flags & ((1 << 8) | (1 << 9) | (1 << 11) | (1 << 12) | (1 << 13)) != 0) evidence |= anticheat_abi.Evidence.high_confidence_client_flag;
+        return evidence;
+    }
+
+    fn observeStableEvidence(self: *App, user_id: i32, event_name: []const u8, event: anticheat_abi.EventV1) void {
+        const host = if (self.anticheat) |*loaded| loaded else return;
+        const decision = host.evaluate(event) catch |err| {
+            std.log.warn("event=anticheat_module_evaluation_failed module={s} source={s} user_id={d} error={t}", .{ host.name(), event_name, user_id, err });
+            return;
+        };
+        if (decision.action == anticheat_abi.Action.allow) return;
+        var detail_buf: [512]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "module={s} event={s} mode=observe action={d} reason={d} risk={d} confidence_bps={d} decision_flags={d} rule_revision={d} evidence={d} hardware_match_count={d}", .{
+            host.name(), event_name, decision.action, decision.reason, decision.risk_score, decision.confidence_bps, decision.flags, decision.rule_revision, event.evidence, event.hardware_match_count,
+        }) catch return;
+        self.store.recordAnticheatObservation(user_id, detail) catch |err| {
+            std.log.warn("event=anticheat_audit_write_failed source={s} user_id={d} error={t}", .{ event_name, user_id, err });
+        };
+    }
+
+    fn observeStableLogin(self: *App, result: bancho.LoginResult) void {
+        if (result.user_id <= 0) return;
+        var evidence: u64 = 0;
+        if (result.hardware_match_count != 0) evidence |= anticheat_abi.Evidence.exact_hardware_match;
+        if (result.running_under_wine) evidence |= anticheat_abi.Evidence.running_under_wine;
+        self.observeStableEvidence(result.user_id, "stable_login", .{
+            .event_kind = anticheat_abi.EventKind.login,
+            .client_family = anticheat_abi.ClientFamily.stable,
+            .evidence = evidence,
+            .hardware_match_count = result.hardware_match_count,
+        });
+    }
+
+    fn observeStableLastFmFlags(self: *App, user_id: i32, flags: u32) void {
+        const hq_flags: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
+        var evidence: u64 = 0;
+        if (flags & hq_flags != 0) evidence |= anticheat_abi.Evidence.high_confidence_client_flag;
+        if (flags & (@as(u32, 1) << 19) != 0) evidence |= anticheat_abi.Evidence.registry_remnant;
+        if (evidence == 0) return;
+        self.observeStableEvidence(user_id, "stable_lastfm", .{
+            .event_kind = anticheat_abi.EventKind.heartbeat,
+            .client_family = anticheat_abi.ClientFamily.stable,
+            .evidence = evidence,
+        });
+    }
+
+    fn observeStableGameplay(self: *App, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32) ?anticheat_abi.GameplayResultV1 {
+        const host = if (self.anticheat) |*loaded| loaded else return null;
+        if (score.mode != 0 or replay.len == 0) return null;
+        var prepared = anticheat_replay.prepare(self.allocator, replay, map, @intCast(score.mods)) catch |err| {
+            std.log.warn("event=anticheat_replay_parse_failed user_id={d} error={t}", .{ user_id, err });
+            return null;
+        };
+        defer prepared.deinit();
+        const passed_hits_i64 = @as(i64, score.n300) + @as(i64, score.n100) + @as(i64, score.n50);
+        const accuracy_ppm: u32 = @intFromFloat(@round(@min(1.0, @max(0.0, score.accuracy())) * 1_000_000.0));
+        const pp_milli: u64 = @intFromFloat(@round(@min(performance.pp * 1000.0, @as(f64, @floatFromInt(std.math.maxInt(u64))))));
+        const event_flags = (if (score.passed) anticheat_abi.EventFlag.passed else 0) |
+            (if (score.passed) anticheat_abi.EventFlag.replay_required else 0);
+        const event: anticheat_abi.GameplayEventV1 = .{
+            .base = .{
+                .event_kind = anticheat_abi.EventKind.score,
+                .client_family = anticheat_abi.ClientFamily.stable,
+                .ruleset = score.mode,
+                .namespace = anticheatNamespace(score.mods),
+                .event_flags = event_flags,
+                .evidence = stableScoreEvidence(score),
+                .score = @intCast(score.total_score),
+                .pp_milli = pp_milli,
+                .accuracy_ppm = accuracy_ppm,
+                .max_combo = @intCast(score.max_combo),
+                .map_max_combo = performance.max_combo,
+                .n300 = @intCast(score.n300),
+                .n100 = @intCast(score.n100),
+                .n50 = @intCast(score.n50),
+                .nmiss = @intCast(score.nmiss),
+                .ngeki = @intCast(score.ngeki),
+                .nkatu = @intCast(score.nkatu),
+                .map_objects = prepared.map_object_count,
+                .elapsed_ms = elapsed_ms,
+                .map_duration_ms = prepared.map_duration_ms,
+            },
+            .mods = @intCast(score.mods),
+            .passed_hits = @intCast(@min(passed_hits_i64, @as(i64, std.math.maxInt(u32)))),
+            .hit_window_ms = prepared.hit_window_ms,
+            .frames = prepared.frames.ptr,
+            .frame_count = @intCast(prepared.frames.len),
+            .objects = prepared.objects.ptr,
+            .object_count = @intCast(prepared.objects.len),
+        };
+        const result = host.evaluateGameplay(event) catch |err| {
+            std.log.warn("event=anticheat_module_evaluation_failed module={s} error={t}", .{ host.name(), err });
+            return null;
+        };
+        if (result.decision.action == anticheat_abi.Action.allow) return null;
+        std.log.warn("event=anticheat_observation module={s} action={d} reason={d} risk={d} confidence_bps={d} objects={d} clicks={d}", .{
+            host.name(), result.decision.action, result.decision.reason, result.decision.risk_score, result.decision.confidence_bps, result.objects_checked, result.matched_clicks,
+        });
+        return result;
+    }
+
+    fn persistAnticheatObservation(self: *App, user_id: i32, score_id: i64, result: anticheat_abi.GameplayResultV1) void {
+        const host = if (self.anticheat) |*loaded| loaded else return;
+        var detail_buf: [768]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "module={s} score_id={d} mode=observe action={d} reason={d} risk={d} confidence_bps={d} decision_flags={d} rule_revision={d} objects={d} clicks={d} mean_timing_milli={d} timing_stddev_milli={d} exact_timing_bps={d} center_hits_bps={d} mean_center_distance_milli={d} snaps={d}", .{
+            host.name(), score_id, result.decision.action, result.decision.reason, result.decision.risk_score, result.decision.confidence_bps, result.decision.flags, result.decision.rule_revision, result.objects_checked, result.matched_clicks, result.mean_abs_timing_error_milli, result.timing_stddev_milli, result.exact_timing_bps, result.center_hits_bps, result.mean_center_distance_milli, result.snap_events,
+        }) catch {
+            std.log.warn("event=anticheat_audit_format_failed score_id={d}", .{score_id});
+            return;
+        };
+        self.store.recordAnticheatObservation(user_id, detail) catch |err| {
+            std.log.warn("event=anticheat_audit_write_failed score_id={d} error={t}", .{ score_id, err });
+        };
+    }
 
     fn header(req: *const std.http.Server.Request, wanted: []const u8) ?[]const u8 {
         var it = req.iterateHeaders();
@@ -1339,6 +1471,7 @@ const App = struct {
             const geo = if (client_ip_owned) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
             var result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer result.deinit();
+            self.observeStableLogin(result);
             const token_headers = [_]std.http.Header{
                 .{ .name = "cho-token", .value = result.token },
                 .{ .name = "osu-token", .value = result.token },
@@ -1498,6 +1631,7 @@ const App = struct {
             if (flags != 0) {
                 try self.store.recordLastFmFlag(user.id, flags);
             }
+            self.observeStableLastFmFlags(user.id, flags);
             std.log.info("lastfm: user_id={d} action={s} flags={d} b={s}", .{ user.id, action, flags, beatmap_or_flag });
             const hq_flags: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
             if (flags & hq_flags != 0) {
@@ -1702,12 +1836,15 @@ const App = struct {
                 .misses = @intCast(score.nmiss),
                 .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
+            const elapsed_ms = if (score.passed) score_time else fail_time;
+            const anticheat_observation = self.observeStableGameplay(user.id, score, replay.data, map_file, performance, elapsed_ms);
             const stats_mode = stable_score.statsMode(score.mode, score.mods) orelse return respond(req, .ok, "text/plain", "error: no", &.{});
             const before_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
-            const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, if (score.passed) score_time else fail_time) catch |err| {
+            const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, elapsed_ms) catch |err| {
                 std.log.warn("stable score insert failed: {t}", .{err});
                 return respond(req, .ok, "text/plain", "error: no", &.{});
             };
+            if (anticheat_observation) |observation| self.persistAnticheatObservation(user.id, score_id, observation);
             const after_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
             const placement = try self.store.scoreLeaderboardPlacement(score_id);
             bancho.publishStats(self.allocator, &self.store, &self.sessions, user.id, score.mode, score.mods) catch {};
@@ -2048,6 +2185,13 @@ pub fn main(init: std.process.Init) !void {
     try store.migrate();
     var config = try config_mod.load(allocator, init.io);
     defer config.deinit();
+    const anticheat: ?anticheat_plugin.Host = if (config.anticheat_module_path.len == 0)
+        null
+    else
+        anticheat_plugin.Host.open(config.anticheat_module_path) catch |err| blk: {
+            std.log.warn("event=anticheat_module_load_failed path={s} error={t}", .{ config.anticheat_module_path, err });
+            break :blk null;
+        };
     var app: App = .{
         .allocator = allocator,
         .store = store,
@@ -2056,6 +2200,7 @@ pub fn main(init: std.process.Init) !void {
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.beatmap_cache_max_bytes),
         .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
+        .anticheat = anticheat,
         .avatar_store = .{
             .endpoint = config.avatar_r2_endpoint,
             .bucket = config.avatar_r2_bucket,
@@ -2070,6 +2215,8 @@ pub fn main(init: std.process.Init) !void {
     const kai_session = try app.sessions.createBot(kai);
     kai_session.longitude = -21.9426; // reykjavik
     kai_session.latitude = 64.1466;
+    if (app.anticheat) |*loaded| std.log.info("event=anticheat_module_loaded module={s} abi={d} mode=observe", .{ loaded.name(), anticheat_abi.version });
+    defer if (app.anticheat) |*loaded| loaded.close();
     defer app.score_webhook.deinit();
     defer app.map_sync.deinit();
     defer app.geo_client.deinit();

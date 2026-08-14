@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Config = struct {
     allocator: std.mem.Allocator,
     score_webhook: []u8,
+    anticheat_module_path: []u8,
     avatar_r2_endpoint: []u8,
     avatar_r2_bucket: []u8,
     avatar_r2_access_key_id: []u8,
@@ -13,6 +14,8 @@ pub const Config = struct {
     pub fn empty(allocator: std.mem.Allocator) !Config {
         const score_webhook = try allocator.dupe(u8, "");
         errdefer allocator.free(score_webhook);
+        const anticheat_module_path = try allocator.dupe(u8, "");
+        errdefer allocator.free(anticheat_module_path);
         const avatar_r2_endpoint = try allocator.dupe(u8, "https://23309d0f8407c82c3bd8406673bf3bec.r2.cloudflarestorage.com");
         errdefer allocator.free(avatar_r2_endpoint);
         const avatar_r2_bucket = try allocator.dupe(u8, "avatar");
@@ -24,6 +27,7 @@ pub const Config = struct {
         return .{
             .allocator = allocator,
             .score_webhook = score_webhook,
+            .anticheat_module_path = anticheat_module_path,
             .avatar_r2_endpoint = avatar_r2_endpoint,
             .avatar_r2_bucket = avatar_r2_bucket,
             .avatar_r2_access_key_id = avatar_r2_access_key_id,
@@ -35,6 +39,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.score_webhook);
+        self.allocator.free(self.anticheat_module_path);
         self.allocator.free(self.avatar_r2_endpoint);
         self.allocator.free(self.avatar_r2_bucket);
         self.allocator.free(self.avatar_r2_access_key_id);
@@ -61,6 +66,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
         const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
         if (std.mem.eql(u8, key, "score_webhook")) {
             try result.replace(&result.score_webhook, value);
+        } else if (std.mem.eql(u8, key, "anticheat_module_path")) {
+            if (value.len <= 4096 and std.mem.indexOfScalar(u8, value, 0) == null)
+                try result.replace(&result.anticheat_module_path, value);
         } else if (std.mem.eql(u8, key, "avatar_r2_endpoint")) {
             try result.replace(&result.avatar_r2_endpoint, value);
         } else if (std.mem.eql(u8, key, "avatar_r2_bucket")) {

@@ -461,6 +461,13 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
+    pub fn recordAnticheatObservation(self: *Store, user_id: i32, detail: []const u8) !void {
+        if (detail.len == 0 or detail.len > 768 or !std.unicode.utf8ValidateSlice(detail)) return error.InvalidAuditDetail;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.insertAuditLocked(3, "anticheat.observe", user_id, detail);
+    }
+
     pub const RegistrationConflicts = struct { username: bool, email: bool };
 
     pub fn registrationConflicts(self: *Store, name: []const u8, email: []const u8) !RegistrationConflicts {

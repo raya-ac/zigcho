@@ -35,6 +35,9 @@ const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
 const r2 = @import("r2.zig");
 const site_replay = @import("site_replay.zig");
+const anticheat_abi = @import("anticheat_abi.zig");
+const anticheat_plugin = @import("anticheat_plugin.zig");
+const anticheat_replay = @import("anticheat_replay.zig");
 const status_page = @embedFile("status.html");
 
 comptime {
@@ -50,6 +53,9 @@ comptime {
     _ = profile_avatar;
     _ = r2;
     _ = site_replay;
+    _ = anticheat_abi;
+    _ = anticheat_plugin;
+    _ = anticheat_replay;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -441,6 +447,7 @@ test "config values stay owned after the source buffer changes" {
         u8,
         "osu_api_key=first-key\n" ++
             "score_webhook=https://discord.invalid/first\n" ++
+            "anticheat_module_path=/opt/zigcho/private/anticheat.so\n" ++
             "beatmap_cache_max_bytes=536870912\n" ++
             "beatmap_media_cache_max_bytes=268435456\n" ++
             "avatar_r2_endpoint=https://example.r2.cloudflarestorage.com\n" ++
@@ -456,12 +463,91 @@ test "config values stay owned after the source buffer changes" {
     std.testing.allocator.free(source);
 
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
+    try std.testing.expectEqualStrings("/opt/zigcho/private/anticheat.so", config.anticheat_module_path);
     try std.testing.expectEqual(@as(u64, 536870912), config.beatmap_cache_max_bytes);
     try std.testing.expectEqual(@as(u64, 268435456), config.beatmap_media_cache_max_bytes);
     try std.testing.expectEqualStrings("https://example.r2.cloudflarestorage.com", config.avatar_r2_endpoint);
     try std.testing.expectEqualStrings("avatars", config.avatar_r2_bucket);
     try std.testing.expectEqualStrings("test-access", config.avatar_r2_access_key_id);
     try std.testing.expectEqualStrings("test-secret", config.avatar_r2_secret_access_key);
+}
+
+const stable_replay_fixture =
+    "\x5d\x00\x00\x80\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x18\x1f" ++
+    "\x02\xc3\x47\xeb\xd6\xc5\x14\x32\x97\xb8\xe4\xb0\xd8\x28\x49\x7a" ++
+    "\xdb\x23\x77\xba\x2d\x49\xd7\x64\x79\x3b\x7a\x7e\x1f\x98\x91\x3b" ++
+    "\xaf\x1e\x18\xf7\x7f\xff\x11\xd4\x40\x00";
+
+const anticheat_map_fixture =
+    "osu file format v14\n" ++
+    "\n[General]\n" ++
+    "Mode:0\n" ++
+    "\n[Difficulty]\n" ++
+    "OverallDifficulty:5\n" ++
+    "\n[HitObjects]\n" ++
+    "128,100,1000,1,0,0:0:0:0:\n" ++
+    "256,200,2000,1,0,0:0:0:0:\n";
+
+test "stable anticheat replay decoding stays bounded and preserves input frames" {
+    var prepared = try anticheat_replay.prepare(std.testing.allocator, stable_replay_fixture, anticheat_map_fixture, stable_mods.hard_rock);
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 3), prepared.frames.len);
+    try std.testing.expectEqual(@as(i64, 0), prepared.frames[0].time_ms);
+    try std.testing.expectEqual(@as(i64, 1000), prepared.frames[1].time_ms);
+    try std.testing.expectEqual(@as(i64, 1001), prepared.frames[2].time_ms);
+    try std.testing.expectEqual(@as(u32, 4), prepared.frames[1].keys);
+    try std.testing.expectEqual(@as(usize, 1), prepared.objects.len);
+    try std.testing.expectEqual(@as(u32, 2), prepared.map_object_count);
+    try std.testing.expectEqual(@as(f32, 284), prepared.objects[0].y);
+    try std.testing.expectEqual(@as(u32, 130), prepared.hit_window_ms);
+    try std.testing.expectEqual(@as(u32, 2000), prepared.map_duration_ms);
+}
+
+test "stable anticheat replay parser rejects malformed or unbounded frames" {
+    const historical = try anticheat_replay.parseFrames(std.testing.allocator, "0|0|0|0,-1|0|0|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(historical);
+    try std.testing.expectEqual(@as(i64, 0), historical[0].time_ms);
+    try std.testing.expectEqual(@as(i64, 0), historical[1].time_ms);
+    try std.testing.expectError(error.InvalidReplay, anticheat_replay.parseFrames(std.testing.allocator, "0|0|0|0,1|0|0|0,-1|0|0|0,-12345|0|0|1,"));
+    try std.testing.expectError(error.InvalidReplay, anticheat_replay.parseFrames(std.testing.allocator, "0|nan|0|0,1|0|0|0,-12345|0|0|1,"));
+    try std.testing.expectError(error.InvalidReplay, anticheat_replay.parseFrames(std.testing.allocator, "0|0|0|0,86400001|0|0|0,-12345|0|0|1,"));
+    try std.testing.expectError(error.InvalidReplay, anticheat_replay.parseFrames(std.testing.allocator, "0|0|0|0,1|0|0|0"));
+}
+
+test "stable score client flags keep bancho compatible space encoding" {
+    try std.testing.expectEqual(@as(u32, 0), stable_score.clientFlags("b20260814"));
+    try std.testing.expectEqual(@as(u32, 2), stable_score.clientFlags("b20260814  "));
+    try std.testing.expectEqual(@as(u32, 0), stable_score.clientFlags("b20260814    "));
+    try std.testing.expectEqual(@as(u32, 8), stable_score.clientFlags("b20260814        "));
+}
+
+fn anticheatReplayAllocationRun(allocator: std.mem.Allocator) !void {
+    var prepared = try anticheat_replay.prepare(allocator, stable_replay_fixture, anticheat_map_fixture, 0);
+    defer prepared.deinit();
+}
+
+test "stable anticheat replay preparation frees every allocation failure path" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, anticheatReplayAllocationRun, .{});
+}
+
+test "anticheat observations use the existing bounded audit trail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/anticheat-audit.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.recordAnticheatObservation(3, "module=private score_id=42 mode=observe action=1");
+    try std.testing.expectError(error.InvalidAuditDetail, store.recordAnticheatObservation(3, ""));
+
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT action,target,detail FROM audit_log WHERE action='anticheat.observe'", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("anticheat.observe", std.mem.span(storage.c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expectEqualStrings("user:3", std.mem.span(storage.c.sqlite3_column_text(stmt, 1)));
+    try std.testing.expectEqualStrings("module=private score_id=42 mode=observe action=1", std.mem.span(storage.c.sqlite3_column_text(stmt, 2)));
 }
 
 test "beatmap hydration backoff and archive pruning stay bounded" {
@@ -567,6 +653,9 @@ test "login result owns its token after the session is replaced" {
     defer sessions.deinit();
     var result = try bancho.login(std.testing.allocator, &store, &sessions, ari_stable_login, .{ 'A', 'U' }, 138.6, -34.9);
     defer result.deinit();
+    try std.testing.expectEqual(user_id, result.user_id);
+    try std.testing.expectEqual(@as(u32, 0), result.hardware_match_count);
+    try std.testing.expect(!result.running_under_wine);
     const original_token = try std.testing.allocator.dupe(u8, result.token);
     defer std.testing.allocator.free(original_token);
 
@@ -711,11 +800,17 @@ test "an exact hardware login restricts both accounts and disconnects the matche
     const first_body = "first\n00000000000000000000000000000000\n" ++ stable_login_details;
     var first_login = try bancho.login(std.testing.allocator, &store, &sessions, first_body, .{ 'A', 'U' }, 0, 0);
     defer first_login.deinit();
+    try std.testing.expectEqual(first_id, first_login.user_id);
+    try std.testing.expectEqual(@as(u32, 0), first_login.hardware_match_count);
+    try std.testing.expect(!first_login.running_under_wine);
     try std.testing.expect(sessions.byUser(first_id) != null);
 
     const second_body = "second\n00000000000000000000000000000000\n" ++ stable_login_details;
     var second_login = try bancho.login(std.testing.allocator, &store, &sessions, second_body, .{ 'A', 'U' }, 0, 0);
     defer second_login.deinit();
+    try std.testing.expectEqual(second_id, second_login.user_id);
+    try std.testing.expectEqual(@as(u32, 1), second_login.hardware_match_count);
+    try std.testing.expect(!second_login.running_under_wine);
     try std.testing.expect(sessions.byUser(first_id) == null);
     try std.testing.expect(sessions.byUser(second_id).?.user.restricted);
     try expectPacket(second_login.body, .account_restricted);

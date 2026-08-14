@@ -13,6 +13,9 @@ pub const LoginResult = struct {
     allocator: std.mem.Allocator,
     token: []u8,
     body: []u8,
+    user_id: i32 = 0,
+    hardware_match_count: u32 = 0,
+    running_under_wine: bool = false,
 
     pub fn deinit(self: *LoginResult) void {
         self.allocator.free(self.token);
@@ -386,7 +389,14 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     errdefer allocator.free(result_token);
     const result_body = try allocator.dupe(u8, out.bytes());
     login_complete = true;
-    return .{ .allocator = allocator, .token = result_token, .body = result_body };
+    return .{
+        .allocator = allocator,
+        .token = result_token,
+        .body = result_body,
+        .user_id = capture.user_id,
+        .hardware_match_count = @intCast(@min(enforcement.matched_user_ids.len, std.math.maxInt(u32))),
+        .running_under_wine = parsed.hardware.running_under_wine,
+    };
 }
 
 fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, bytes: []const u8) !void {

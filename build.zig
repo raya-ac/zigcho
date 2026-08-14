@@ -104,4 +104,15 @@ pub fn build(b: *std.Build) void {
     tests.step.dependOn(&cargo.step);
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run all tests").dependOn(&run_tests.step);
+
+    const anticheat_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/anticheat_host_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const anticheat_smoke = b.addExecutable(.{ .name = "zigcho-anticheat-host-smoke", .root_module = anticheat_smoke_mod });
+    const run_anticheat_smoke = b.addRunArtifact(anticheat_smoke);
+    if (b.args) |args| run_anticheat_smoke.addArgs(args);
+    b.step("anticheat-smoke", "Load and exercise a private anticheat module").dependOn(&run_anticheat_smoke.step);
 }

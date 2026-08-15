@@ -80,6 +80,7 @@ def main() -> None:
         "runtime=win-x64\n"
         "self_contained=true\n"
         "client_lane=production\n"
+        "discord_room_party_id=clamped\n"
     ).encode()
     readme_text = (
         "zigcho!lazer for Windows x64\r\n"

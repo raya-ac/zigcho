@@ -81,7 +81,7 @@ def main() -> None:
             if sha256(package.read(package_name)) != value:
                 raise SystemExit(f"manifest checksum mismatch: {name}")
 
-        required_markers = ("https://api.kai.ovh", "zigcho-lazer", "zigcho!lazer", "OSU_EXTERNAL_UPDATE_PROVIDER", "clampLength(room.RoomID.ToString())")
+        required_markers = ("https://api.kai.ovh", "zigcho-lazer", "zigcho!lazer", "OSU_EXTERNAL_UPDATE_PROVIDER")
         markers_found = {marker: False for marker in required_markers}
         for name in names:
             if name.endswith("/"):
@@ -97,7 +97,12 @@ def main() -> None:
         version = package.read(f"{root}/VERSION.txt").decode("utf-8")
         if any(
             marker not in version
-            for marker in ("runtime=win-x64\n", "self_contained=true\n", "client_lane=production\n")
+            for marker in (
+                "runtime=win-x64\n",
+                "self_contained=true\n",
+                "client_lane=production\n",
+                "discord_room_party_id=clamped\n",
+            )
         ):
             raise SystemExit("Windows runtime metadata is incomplete")
 

@@ -486,7 +486,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
-        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/notifications") or std.mem.eql(u8, path, "/api/v2/friends") or std.mem.eql(u8, path, "/api/v2/blocks") or std.mem.eql(u8, path, "/api/v2/me/beatmapset-favourites") or std.mem.eql(u8, path, "/api/v2/chat/ack") or std.mem.startsWith(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/notifications") or std.mem.eql(u8, path, "/api/v2/friends") or std.mem.eql(u8, path, "/api/v2/blocks") or std.mem.eql(u8, path, "/api/v2/me/beatmapset-favourites") or std.mem.startsWith(u8, path, "/api/v2/chat/") or std.mem.startsWith(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
         return null;
     }
 
@@ -549,7 +549,7 @@ const App = struct {
             defer self.allocator.free(location);
             return respond(req, .permanent_redirect, "text/plain", "", &.{.{ .name = "location", .value = location }});
         }
-        const body: []u8 = if (req.head.method.requestHasBody()) b: {
+        const body: []u8 = if (req.head.method.requestHasBody() and lazer.parseChannelUserPath(path) == null) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
             break :b r.allocRemaining(self.allocator, .limited(bodyLimit(path))) catch |err| switch (err) {
                 error.StreamTooLong => return respond(req, .payload_too_large, "application/json", "{\"error\":\"request body too large\"}", &.{}),
@@ -1327,6 +1327,25 @@ const App = struct {
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         }
+        if (std.mem.eql(u8, path, "/api/v2/chat/channels")) {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            return respond(req, .ok, "application/json", lazer.channel_list_json, &.{});
+        }
+        if (lazer.parseChannelUserPath(path)) |channel_path| {
+            if (req.head.method != .PUT and req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (channel_path.user_id != user.id) return respond(req, .forbidden, "application/json", "{\"error\":\"channel user mismatch\"}", &.{});
+            return respond(req, .ok, "application/json", "{}", &.{});
+        }
+        if (lazer.parseChannelMessagesPath(path)) |_| {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            return respond(req, .ok, "application/json", "[]", &.{});
+        }
         if (std.mem.eql(u8, path, "/api/v2/chat/ack")) {
             if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -1371,9 +1390,15 @@ const App = struct {
             if (beatmap_id) |value| if (value <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap id\"}", &.{});
             if (checksum == null and beatmap_id == null) return respond(req, .bad_request, "application/json", "{\"error\":\"beatmap lookup required\"}", &.{});
             if (queryField(target, "filename")) |filename| if (filename.len > 1024) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid filename\"}", &.{});
-            const found = (try self.store.lazerBeatmapLookup(self.allocator, beatmap_id, checksum)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found\"}", &.{});
-            defer self.allocator.free(found);
-            return respond(req, .ok, "application/json", found, &.{});
+            var found = try self.store.lazerBeatmapLookup(self.allocator, beatmap_id, checksum);
+            if (found == null) if (beatmap_id) |id| {
+                _ = self.map_sync.ensureByBeatmapId(&self.store, id, checksum) catch |err|
+                    std.log.warn("event=lazer_beatmap_lookup_hydration_failed beatmap_id={d} error={t}", .{ id, err });
+                found = try self.store.lazerBeatmapLookup(self.allocator, id, null);
+            };
+            const response = found orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found\"}", &.{});
+            defer self.allocator.free(response);
+            return respond(req, .ok, "application/json", response, &.{});
         }
         if (req.head.method == .GET) if (lazer.parseLeaderboardPath(path)) |leaderboard_path| {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});

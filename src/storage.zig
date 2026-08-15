@@ -249,6 +249,7 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_026.sql"));
         }
+        try self.exec("INSERT OR IGNORE INTO chat_channels(name,topic,write_privileges) VALUES('#lazer','lazer chat',1)");
     }
 
     fn hasLazerPerformanceColumns(self: *Store) !bool {

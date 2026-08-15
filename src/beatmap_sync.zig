@@ -9,31 +9,36 @@ const map_limit = 16 * 1024 * 1024;
 const entry_limit = 4096;
 pub const max_concurrent_hydrations = 4;
 
-const NerinyanMap = struct {
-    id: i32,
-    beatmapset_id: i32,
-    version: []const u8,
-    checksum: ?[]const u8 = null,
-    mode_int: u8 = 0,
-    bpm: ?f64 = null,
-    ar: ?f64 = null,
-    accuracy: ?f64 = null,
-    cs: ?f64 = null,
-    drain: ?f64 = null,
-    total_length: ?i32 = null,
-    max_combo: ?u32 = null,
-    difficulty_rating: ?f64 = null,
+const CheesegullMap = struct {
+    ParentSetID: i32,
+    BeatmapID: i32,
+    TotalLength: i32 = 0,
+    DiffName: []const u8,
+    FileMD5: []const u8,
+    CS: ?f64 = null,
+    AR: ?f64 = null,
+    HP: ?f64 = null,
+    OD: ?f64 = null,
+    Mode: u8 = 0,
+    BPM: ?f64 = null,
+    MaxCombo: ?u32 = null,
+    DifficultyRating: ?f64 = null,
 };
 
-const NerinyanSet = struct {
-    id: i32,
-    beatmaps: []NerinyanMap,
-    ranked: i32,
-    artist: []const u8 = "",
-    title: []const u8 = "",
-    creator: []const u8 = "",
-    source: []const u8 = "",
-    tags: []const u8 = "",
+const CheesegullSet = struct {
+    SetID: i32,
+    ChildrenBeatmaps: []CheesegullMap,
+    RankedStatus: i32,
+    Artist: []const u8 = "",
+    Title: []const u8 = "",
+    Creator: []const u8 = "",
+    Source: ?[]const u8 = null,
+    Tags: ?[]const u8 = null,
+};
+
+const BeatmapIdentity = struct {
+    set_id: i32,
+    md5: [32]u8,
 };
 
 const RemoteMap = struct {
@@ -131,6 +136,45 @@ pub const Sync = struct {
         return false;
     }
 
+    pub fn ensureByBeatmapId(self: *Sync, store: *storage.Store, beatmap_id: i32, requested_md5: ?[]const u8) !bool {
+        if (beatmap_id <= 0) return false;
+        if (requested_md5) |value| if (!validMd5(value)) return false;
+
+        var key_buffer: [48]u8 = undefined;
+        const lookup_key = try std.fmt.bufPrint(&key_buffer, "id:{d}", .{beatmap_id});
+        const claim_owned = switch (self.claim(lookup_key) catch return false) {
+            .claimed => |value| value,
+            .duplicate => return false,
+            .at_capacity => return false,
+        };
+
+        _ = self.attempts.fetchAdd(1, .monotonic);
+        const identity = self.fetchBeatmapIdentity(beatmap_id) catch |err| {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            self.removeFromProgress(claim_owned);
+            return err;
+        };
+        const remote = self.fetchAndStoreMetadata(store, &identity.md5, identity.set_id) catch |err| {
+            self.recordFailure(store, &identity.md5, identity.set_id, err);
+            self.removeFromProgress(claim_owned);
+            return err;
+        };
+
+        const md5_owned = self.allocator.dupe(u8, &identity.md5) catch |err| {
+            self.recordFailure(store, &identity.md5, identity.set_id, err);
+            self.removeFromProgress(claim_owned);
+            return err;
+        };
+        const thread = std.Thread.spawn(.{}, backgroundLookupDownload, .{ self, store, claim_owned, md5_owned, identity.set_id, remote }) catch |err| {
+            self.allocator.free(md5_owned);
+            self.recordFailure(store, &identity.md5, identity.set_id, err);
+            self.removeFromProgress(claim_owned);
+            return err;
+        };
+        thread.detach();
+        return true;
+    }
+
     const Claim = union(enum) {
         claimed: []const u8,
         duplicate,
@@ -152,59 +196,77 @@ pub const Sync = struct {
         return .{ .claimed = md5_owned };
     }
 
+    fn fetchBeatmapIdentity(self: *Sync, beatmap_id: i32) !BeatmapIdentity {
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.direct/api/b/{d}", .{beatmap_id});
+        defer self.allocator.free(metadata_url);
+        const metadata_json = try fetchFn(&client, self.allocator, metadata_url, metadata_limit);
+        defer self.allocator.free(metadata_json);
+        const parsed = try std.json.parseFromSlice(CheesegullMap, self.allocator, metadata_json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.BeatmapID != beatmap_id or parsed.value.ParentSetID <= 0 or !validMd5(parsed.value.FileMD5)) return error.IdMismatch;
+        var identity: BeatmapIdentity = .{ .set_id = parsed.value.ParentSetID, .md5 = undefined };
+        @memcpy(&identity.md5, parsed.value.FileMD5);
+        return identity;
+    }
+
     fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !RemoteMap {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
         std.log.info("[hydrate] start md5={s} set={d}", .{ wanted_md5, set_id });
 
-        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://api.nerinyan.moe/v2/beatmapsets/{d}", .{set_id});
+        const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.direct/api/s/{d}", .{set_id});
         defer self.allocator.free(metadata_url);
         const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
             std.log.warn("[hydrate] metadata fetch failed: {t}", .{err});
             return err;
         };
         defer self.allocator.free(metadata_json);
-        const parsed = std.json.parseFromSlice(NerinyanSet, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
+        const parsed = std.json.parseFromSlice(CheesegullSet, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
             std.log.warn("[hydrate] metadata parse failed: {t}", .{err});
             return err;
         };
         defer parsed.deinit();
-        if (parsed.value.id != set_id or parsed.value.beatmaps.len == 0) return error.IdMismatch;
-        var remote: ?NerinyanMap = null;
-        for (parsed.value.beatmaps) |candidate| {
-            if (candidate.checksum) |checksum| if (std.ascii.eqlIgnoreCase(checksum, wanted_md5)) {
+        if (parsed.value.SetID != set_id or parsed.value.ChildrenBeatmaps.len == 0) return error.IdMismatch;
+        var remote: ?CheesegullMap = null;
+        for (parsed.value.ChildrenBeatmaps) |candidate| {
+            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set_id or !validMd5(candidate.FileMD5)) return error.IdMismatch;
+            if (std.ascii.eqlIgnoreCase(candidate.FileMD5, wanted_md5)) {
                 remote = candidate;
                 break;
-            };
+            }
         }
         const map_info = remote orelse return error.Md5NotFound;
-        if (map_info.id <= 0 or map_info.beatmapset_id != set_id) return error.IdMismatch;
 
-        const meta = beatmap.Metadata{
-            .id = map_info.id,
-            .set_id = map_info.beatmapset_id,
-            .mode = map_info.mode_int,
-            .artist = parsed.value.artist,
-            .title = parsed.value.title,
-            .version = map_info.version,
-            .creator = parsed.value.creator,
-            .source = parsed.value.source,
-            .tags = parsed.value.tags,
-            .hp = map_info.drain orelse 0,
-            .cs = map_info.cs orelse 0,
-            .od = map_info.accuracy orelse 0,
-            .ar = map_info.ar orelse 0,
-            .bpm = map_info.bpm orelse 0,
-            .total_length = map_info.total_length orelse 0,
-            .count_circles = 0,
-            .count_sliders = 0,
-            .count_spinners = 0,
-            .object_count = 0,
-        };
-        try store.upsertBeatmapMeta(meta, wanted_md5, localStatus(parsed.value.ranked), map_info.difficulty_rating orelse 0, map_info.max_combo orelse 0);
-        std.log.info("[hydrate] metadata ok — {s} - {s} [{s}] stars={d:.2}", .{ parsed.value.artist, parsed.value.title, map_info.version, map_info.difficulty_rating orelse 0 });
-        return .{ .approved = parsed.value.ranked, .beatmap_id = map_info.id };
+        for (parsed.value.ChildrenBeatmaps) |candidate| {
+            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set_id or !validMd5(candidate.FileMD5)) return error.IdMismatch;
+            const meta = beatmap.Metadata{
+                .id = candidate.BeatmapID,
+                .set_id = candidate.ParentSetID,
+                .mode = candidate.Mode,
+                .artist = parsed.value.Artist,
+                .title = parsed.value.Title,
+                .version = candidate.DiffName,
+                .creator = parsed.value.Creator,
+                .source = parsed.value.Source orelse "",
+                .tags = parsed.value.Tags orelse "",
+                .hp = candidate.HP orelse 0,
+                .cs = candidate.CS orelse 0,
+                .od = candidate.OD orelse 0,
+                .ar = candidate.AR orelse 0,
+                .bpm = candidate.BPM orelse 0,
+                .total_length = candidate.TotalLength,
+                .count_circles = 0,
+                .count_sliders = 0,
+                .count_spinners = 0,
+                .object_count = 0,
+            };
+            try store.upsertBeatmapMeta(meta, candidate.FileMD5, localStatus(parsed.value.RankedStatus), candidate.DifficultyRating orelse 0, candidate.MaxCombo orelse 0);
+        }
+        std.log.info("[hydrate] metadata ok — {s} - {s} [{s}] stars={d:.2}", .{ parsed.value.Artist, parsed.value.Title, map_info.DiffName, map_info.DifficultyRating orelse 0 });
+        return .{ .approved = parsed.value.RankedStatus, .beatmap_id = map_info.BeatmapID };
     }
 
     fn fetchArchive(self: *Sync, client: *std.http.Client, set_id: i32) ![]u8 {
@@ -226,6 +288,18 @@ pub const Sync = struct {
 
     fn backgroundDownload(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32, remote: RemoteMap) void {
         defer self.removeFromProgress(md5_owned);
+        self.downloadArchive(store, md5_owned, set_id, remote) catch |err| {
+            std.log.warn("[hydrate] download failed md5={s}: {t}", .{ md5_owned, err });
+            self.recordFailure(store, md5_owned, set_id, err);
+            return;
+        };
+        store.clearHydrationFailure(md5_owned) catch |err| std.log.warn("[hydrate] could not clear failure state md5={s}: {t}", .{ md5_owned, err });
+        _ = self.successes.fetchAdd(1, .monotonic);
+    }
+
+    fn backgroundLookupDownload(self: *Sync, store: *storage.Store, claim_owned: []const u8, md5_owned: []const u8, set_id: i32, remote: RemoteMap) void {
+        defer self.removeFromProgress(claim_owned);
+        defer self.allocator.free(md5_owned);
         self.downloadArchive(store, md5_owned, set_id, remote) catch |err| {
             std.log.warn("[hydrate] download failed md5={s}: {t}", .{ md5_owned, err });
             self.recordFailure(store, md5_owned, set_id, err);
@@ -347,6 +421,26 @@ test "beatmap hydration bounds distinct work and deduplicates maps" {
 
 test "beatmap hydration claims clean every induced allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, hydrationClaimAllocationRun, .{});
+}
+
+test "osu direct metadata keeps cheese gull map and set fields" {
+    const map_json =
+        \\{"ParentSetID":1593278,"BeatmapID":3314160,"TotalLength":245,"DiffName":"normal","FileMD5":"e74aaf07ca2a2f48b9fcb75892d2387c","CS":3.2,"AR":6,"HP":4,"OD":4,"Mode":0,"BPM":168,"MaxCombo":827,"DifficultyRating":2.20658}
+    ;
+    const parsed_map = try std.json.parseFromSlice(CheesegullMap, std.testing.allocator, map_json, .{ .ignore_unknown_fields = true });
+    defer parsed_map.deinit();
+    try std.testing.expectEqual(@as(i32, 3314160), parsed_map.value.BeatmapID);
+    try std.testing.expectEqual(@as(i32, 1593278), parsed_map.value.ParentSetID);
+    try std.testing.expectEqualStrings("e74aaf07ca2a2f48b9fcb75892d2387c", parsed_map.value.FileMD5);
+
+    const set_json =
+        \\{"SetID":1593278,"Title":"test title","Artist":"test artist","Creator":"mapper","Source":"","Tags":"tag one","RankedStatus":1,"ChildrenBeatmaps":[{"ParentSetID":1593278,"BeatmapID":3314160,"TotalLength":245,"DiffName":"normal","FileMD5":"e74aaf07ca2a2f48b9fcb75892d2387c","CS":3.2,"AR":6,"HP":4,"OD":4,"Mode":0,"BPM":168,"MaxCombo":827,"DifficultyRating":2.20658}]}
+    ;
+    const parsed_set = try std.json.parseFromSlice(CheesegullSet, std.testing.allocator, set_json, .{ .ignore_unknown_fields = true });
+    defer parsed_set.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_set.value.ChildrenBeatmaps.len);
+    try std.testing.expectEqual(@as(i8, 3), localStatus(parsed_set.value.RankedStatus));
+    try std.testing.expectEqualStrings("normal", parsed_set.value.ChildrenBeatmaps[0].DiffName);
 }
 
 pub fn needsHydration(store: *storage.Store, wanted_md5: []const u8) !bool {

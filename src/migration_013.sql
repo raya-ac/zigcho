@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS chat_channels (
 INSERT OR IGNORE INTO chat_channels(name,topic,write_privileges) VALUES
     ('#osu','general chat',1),
     ('#announce','updates',8192),
-    ('#lobby','multiplayer lobby',1);
+    ('#lobby','multiplayer lobby',1),
+    ('#lazer','lazer chat',1);
 
 COMMIT;
 PRAGMA user_version=13;

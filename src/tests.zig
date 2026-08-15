@@ -1639,6 +1639,7 @@ test "staff web data keeps appeals and moderation actions auditable" {
     const channels = try store.staffChannelsJson(std.testing.allocator);
     defer std.testing.allocator.free(channels);
     try std.testing.expect(std.mem.indexOf(u8, channels, "\"name\":\"#announce\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, channels, "\"name\":\"#lazer\"") != null);
 }
 
 test "Akatsuki archives only yield the exact MD5 map" {
@@ -2505,6 +2506,23 @@ test "lazer beatmap metadata is separate from archive downloads" {
     for (0..61) |_| try std.testing.expect((try limiter.checkAt("203.0.113.10", rate_limit.beatmap_metadata, 100)).allowed);
     for (0..60) |_| try std.testing.expect((try limiter.checkAt("203.0.113.10", rate_limit.download, 100)).allowed);
     try std.testing.expect(!(try limiter.checkAt("203.0.113.10", rate_limit.download, 100)).allowed);
+}
+
+test "lazer channel list and follow-up paths match the client contract" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer.channel_list_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("#osu", parsed.value.array.items[0].object.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, 8), parsed.value.array.items[1].object.get("type").?.integer);
+    try std.testing.expectEqualStrings("#lazer", parsed.value.array.items[3].object.get("name").?.string);
+
+    const join = lazer.parseChannelUserPath("/api/v2/chat/channels/4/users/37").?;
+    try std.testing.expectEqual(@as(i64, 4), join.channel_id);
+    try std.testing.expectEqual(@as(i32, 37), join.user_id);
+    try std.testing.expectEqual(@as(i64, 3), lazer.parseChannelMessagesPath("/api/v2/chat/channels/3/messages").?.channel_id);
+    try std.testing.expect(lazer.parseChannelUserPath("/api/v2/chat/channels/5/users/37") == null);
+    try std.testing.expect(lazer.parseChannelUserPath("/api/v2/chat/channels/4/users/37/extra") == null);
+    try std.testing.expect(lazer.parseChannelMessagesPath("/api/v2/chat/channels/0/messages") == null);
 }
 
 test "lazer registration fields are form decoded" {

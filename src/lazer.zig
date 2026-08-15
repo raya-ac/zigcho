@@ -264,6 +264,21 @@ pub const LeaderboardPath = struct {
     beatmap_id: i32,
 };
 
+pub const ChannelUserPath = struct {
+    channel_id: i64,
+    user_id: i32,
+};
+
+pub const ChannelMessagesPath = struct {
+    channel_id: i64,
+};
+
+pub const channel_list_json =
+    "[{\"channel_id\":1,\"name\":\"#osu\",\"description\":\"general chat\",\"type\":0,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}," ++
+    "{\"channel_id\":2,\"name\":\"#announce\",\"description\":\"updates\",\"type\":8,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}," ++
+    "{\"channel_id\":3,\"name\":\"#lobby\",\"description\":\"multiplayer lobby\",\"type\":0,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}," ++
+    "{\"channel_id\":4,\"name\":\"#lazer\",\"description\":\"lazer chat\",\"type\":0,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}]";
+
 pub const LeaderboardScore = struct {
     id: i64,
     user_id: i32,
@@ -370,6 +385,36 @@ pub fn parseLeaderboardPath(path: []const u8) ?LeaderboardPath {
     const beatmap_id = std.fmt.parseInt(i32, id_text, 10) catch return null;
     if (beatmap_id <= 0) return null;
     return .{ .beatmap_id = beatmap_id };
+}
+
+pub fn validChannelId(channel_id: i64) bool {
+    return channel_id >= 1 and channel_id <= 4;
+}
+
+pub fn parseChannelUserPath(path: []const u8) ?ChannelUserPath {
+    const prefix = "/api/v2/chat/channels/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const marker = "/users/";
+    const marker_at = std.mem.indexOf(u8, rest, marker) orelse return null;
+    if (marker_at == 0) return null;
+    const user_text = rest[marker_at + marker.len ..];
+    if (user_text.len == 0 or std.mem.indexOfScalar(u8, user_text, '/') != null) return null;
+    const channel_id = std.fmt.parseInt(i64, rest[0..marker_at], 10) catch return null;
+    const user_id = std.fmt.parseInt(i32, user_text, 10) catch return null;
+    if (!validChannelId(channel_id) or user_id <= 0) return null;
+    return .{ .channel_id = channel_id, .user_id = user_id };
+}
+
+pub fn parseChannelMessagesPath(path: []const u8) ?ChannelMessagesPath {
+    const prefix = "/api/v2/chat/channels/";
+    const suffix = "/messages";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const id_text = path[prefix.len .. path.len - suffix.len];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const channel_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    if (!validChannelId(channel_id)) return null;
+    return .{ .channel_id = channel_id };
 }
 
 pub fn validHash(value: []const u8) bool {

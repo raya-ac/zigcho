@@ -103,7 +103,7 @@ pub const Store = struct {
                     "CREATE INDEX chat_messages_target_time ON zigcho.chat_messages(target,created_at DESC);" ++
                     "CREATE INDEX chat_messages_sender_time ON zigcho.chat_messages(sender_id,created_at DESC);" ++
                     "CREATE TABLE zigcho.chat_channels(name text PRIMARY KEY,topic text NOT NULL,write_privileges bigint NOT NULL DEFAULT 1,locked boolean NOT NULL DEFAULT false,updated_by integer,updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint));" ++
-                    "INSERT INTO zigcho.chat_channels(name,topic,write_privileges) VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1);" ++
+                    "INSERT INTO zigcho.chat_channels(name,topic,write_privileges) VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
@@ -268,7 +268,7 @@ pub const Store = struct {
                     "COMMIT",
             );
         }
-        try postgres.exec(lease.conn, "INSERT INTO zigcho.chat_channels(name,topic,write_privileges) VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1) ON CONFLICT(name) DO NOTHING");
+        try postgres.exec(lease.conn, "INSERT INTO zigcho.chat_channels(name,topic,write_privileges) VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1) ON CONFLICT(name) DO NOTHING");
     }
 
     fn userFromResult(allocator: std.mem.Allocator, result: postgres.Result, row: usize) !domain.User {

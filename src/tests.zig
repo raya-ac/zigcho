@@ -2490,6 +2490,23 @@ test "lazer trailing slashes use the same API route" {
     try std.testing.expectEqualStrings("/", routing.canonicalPath("/"));
 }
 
+test "lazer beatmap metadata is separate from archive downloads" {
+    try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmaps/lookup"));
+    try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmaps/123/solo-scores"));
+    try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmapsets/search"));
+    try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmapsets/456"));
+    try std.testing.expect(!routing.lazerBeatmapMetadata("/api/v2/beatmapsets/456/download"));
+    try std.testing.expect(!routing.lazerBeatmapMetadata("/d/456"));
+    try std.testing.expectEqual(@as(u32, 6000), rate_limit.beatmap_metadata.limit);
+    try std.testing.expectEqual(@as(u32, 60), rate_limit.download.limit);
+
+    var limiter = rate_limit.Limiter.init(std.testing.allocator, std.testing.io);
+    defer limiter.deinit();
+    for (0..61) |_| try std.testing.expect((try limiter.checkAt("203.0.113.10", rate_limit.beatmap_metadata, 100)).allowed);
+    for (0..60) |_| try std.testing.expect((try limiter.checkAt("203.0.113.10", rate_limit.download, 100)).allowed);
+    try std.testing.expect(!(try limiter.checkAt("203.0.113.10", rate_limit.download, 100)).allowed);
+}
+
 test "lazer registration fields are form decoded" {
     const body = "user%5Busername%5D=zigcho+lazer&user%5Buser_email%5D=qa%2Bzigcho%40example.invalid&user%5Bpassword%5D=long%26safe%3Dpassword";
     const name = (try form_urlencoded.field(std.testing.allocator, body, &.{ "name", "user[username]" })).?;

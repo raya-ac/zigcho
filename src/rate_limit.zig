@@ -15,6 +15,7 @@ pub const login: Rule = .{ .name = "login", .limit = 30, .window_seconds = 60 };
 pub const score: Rule = .{ .name = "score", .limit = 120, .window_seconds = 60 };
 pub const media_upload: Rule = .{ .name = "media_upload", .limit = 20, .window_seconds = 60 * 60 };
 pub const authenticated: Rule = .{ .name = "authenticated", .limit = 600, .window_seconds = 60 };
+pub const beatmap_metadata: Rule = .{ .name = "beatmap_metadata", .limit = 6000, .window_seconds = 60 };
 pub const download: Rule = .{ .name = "download", .limit = 60, .window_seconds = 60 };
 
 pub const Decision = struct {

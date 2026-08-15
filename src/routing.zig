@@ -5,6 +5,14 @@ pub fn canonicalPath(path: []const u8) []const u8 {
     return path;
 }
 
+pub fn lazerBeatmapMetadata(path: []const u8) bool {
+    if (std.mem.eql(u8, path, "/api/v2/beatmaps/lookup")) return true;
+    if (std.mem.startsWith(u8, path, "/api/v2/beatmaps/")) return true;
+    if (std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return true;
+    return std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") and
+        !std.mem.endsWith(u8, path, "/download");
+}
+
 pub fn websitePage(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/") or
         std.mem.eql(u8, path, "/rankings") or

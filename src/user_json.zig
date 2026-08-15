@@ -74,13 +74,13 @@ pub fn meOwned(allocator: std.mem.Allocator, user: domain.User, stats: [4]?domai
     return output.toOwnedSlice();
 }
 
-pub fn profileOwned(allocator: std.mem.Allocator, user: domain.User, stats: ?domain.Stats) ![]u8 {
+pub fn profileOwned(allocator: std.mem.Allocator, user: domain.User, stats: ?domain.Stats, score_counts: domain.UserScoreCounts) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try writeUserCore(&output.writer, user);
     try output.writer.writeAll(",\"statistics\":");
     try writeStatistics(&output.writer, stats, user.restricted);
-    try output.writer.writeAll(",\"groups\":[],\"badges\":[],\"user_achievements\":[],\"monthly_playcounts\":[],\"replays_watched_counts\":[]}");
+    try output.writer.print(",\"scores_best_count\":{d},\"scores_first_count\":{d},\"scores_recent_count\":{d},\"scores_pinned_count\":{d},\"groups\":[],\"badges\":[],\"user_achievements\":[],\"monthly_playcounts\":[],\"replays_watched_counts\":[]}}", .{ score_counts.best, score_counts.firsts, score_counts.recent, score_counts.pinned });
     return output.toOwnedSlice();
 }
 
@@ -113,11 +113,12 @@ test "lazer profile JSON owns ruleset stats and role flags" {
         .privileges = (@as(u32, 1) << 4) | (@as(u32, 1) << 11) | (@as(u32, 1) << 13),
     };
     const stats: domain.Stats = .{ .pp = 424, .ranked_score = 3_442_127, .total_score = 9_000_000, .plays = 43, .play_time = 100, .total_hits = 1234, .accuracy = 0.9353, .max_combo = 228, .global_rank = 1 };
-    const profile = try profileOwned(std.testing.allocator, user, stats);
+    const profile = try profileOwned(std.testing.allocator, user, stats, .{ .best = 2, .firsts = 1, .recent = 4 });
     defer std.testing.allocator.free(profile);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, profile, .{});
     defer parsed.deinit();
     const object = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 2), object.get("scores_best_count").?.integer);
     try std.testing.expectEqualStrings("raya\"test", object.get("username").?.string);
     try std.testing.expect(object.get("is_supporter").?.bool);
     try std.testing.expect(object.get("is_bng").?.bool);

@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 26;
+const required_sqlite_version = 27;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -95,8 +95,16 @@ const anticheat_replay_fingerprints = [_]Column{
     .{ .name = "score_id", .kind = .integer }, .{ .name = "user_id", .kind = .integer }, .{ .name = "replay_sha256", .kind = .blob }, .{ .name = "created_at", .kind = .integer },
 };
 const chat_messages = [_]Column{
-    .{ .name = "id", .kind = .integer },   .{ .name = "sender_id", .kind = .integer },  .{ .name = "target", .kind = .text },
-    .{ .name = "message", .kind = .text }, .{ .name = "created_at", .kind = .integer },
+    .{ .name = "id", .kind = .integer },         .{ .name = "sender_id", .kind = .integer }, .{ .name = "target", .kind = .text },
+    .{ .name = "message", .kind = .text },       .{ .name = "is_action", .kind = .boolean }, .{ .name = "client_uuid", .kind = .text },
+    .{ .name = "created_at", .kind = .integer },
+};
+const lazer_channel_reads = [_]Column{
+    .{ .name = "user_id", .kind = .integer },      .{ .name = "channel_id", .kind = .integer },
+    .{ .name = "last_read_id", .kind = .integer }, .{ .name = "updated_at", .kind = .integer },
+};
+const user_blocks = [_]Column{
+    .{ .name = "user_id", .kind = .integer }, .{ .name = "blocked_id", .kind = .integer }, .{ .name = "created_at", .kind = .integer },
 };
 const chat_channels = [_]Column{
     .{ .name = "name", .kind = .text },      .{ .name = "topic", .kind = .text },         .{ .name = "write_privileges", .kind = .integer },
@@ -188,6 +196,8 @@ const tables = [_]Table{
     .{ .name = "anticheat_observations", .columns = &anticheat_observations, .identity = true },
     .{ .name = "anticheat_replay_fingerprints", .columns = &anticheat_replay_fingerprints },
     .{ .name = "chat_messages", .columns = &chat_messages, .identity = true },
+    .{ .name = "lazer_channel_reads", .columns = &lazer_channel_reads },
+    .{ .name = "user_blocks", .columns = &user_blocks },
     .{ .name = "chat_channels", .columns = &chat_channels },
     .{ .name = "beatmap_rank_requests", .columns = &beatmap_rank_requests, .identity = true },
     .{ .name = "beatmap_nominations", .columns = &beatmap_nominations },
@@ -458,7 +468,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 29), tables.len);
+    try std.testing.expectEqual(@as(usize, 31), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
     try std.testing.expectEqualStrings("user_avatars", tables[tables.len - 1].name);
 }

@@ -23,8 +23,8 @@ $Copies = @{
     "DevelopmentEndpointConfiguration.cs" = "osu.Game/Online/DevelopmentEndpointConfiguration.cs"
     "TrustedDomainOnlineStore.cs" = "osu.Game/Online/TrustedDomainOnlineStore.cs"
     "TrustedDomainOnlineStoreTest.cs" = "osu.Game.Tests/TrustedDomainOnlineStoreTest.cs"
-    "UnavailableRealtimeChatClient.cs" = "osu.Game/Online/Chat/UnavailableRealtimeChatClient.cs"
-    "UnavailableRealtimeChatClientTest.cs" = "osu.Game.Tests/UnavailableRealtimeChatClientTest.cs"
+    "PollingChatClient.cs" = "osu.Game/Online/Chat/PollingChatClient.cs"
+    "PollingChatClientTest.cs" = "osu.Game.Tests/PollingChatClientTest.cs"
 }
 
 foreach ($SourceName in $Copies.Keys) {

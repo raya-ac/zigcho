@@ -71,6 +71,13 @@ pub const Stats = struct {
     global_rank: i32 = 0,
 };
 
+pub const UserScoreCounts = struct {
+    best: i32 = 0,
+    firsts: i32 = 0,
+    recent: i32 = 0,
+    pinned: i32 = 0,
+};
+
 pub const Score = struct {
     user_id: i32,
     map_md5: []const u8,

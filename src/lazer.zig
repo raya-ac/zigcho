@@ -273,11 +273,41 @@ pub const ChannelMessagesPath = struct {
     channel_id: i64,
 };
 
-pub const channel_list_json =
-    "[{\"channel_id\":1,\"name\":\"#osu\",\"description\":\"general chat\",\"type\":0,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}," ++
-    "{\"channel_id\":2,\"name\":\"#announce\",\"description\":\"updates\",\"type\":8,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}," ++
-    "{\"channel_id\":3,\"name\":\"#lobby\",\"description\":\"multiplayer lobby\",\"type\":0,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}," ++
-    "{\"channel_id\":4,\"name\":\"#lazer\",\"description\":\"lazer chat\",\"type\":0,\"last_message_id\":null,\"last_read_id\":null,\"message_length_limit\":2000}]";
+pub const ChannelReadPath = struct {
+    channel_id: i64,
+    message_id: i64,
+};
+
+pub fn queryIds(allocator: std.mem.Allocator, target: []const u8, limit: usize) ![]i32 {
+    if (limit == 0) return error.InvalidQueryLimit;
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return error.MissingIds;
+    var ids: std.ArrayList(i32) = .empty;
+    errdefer ids.deinit(allocator);
+    var fields = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+    while (fields.next()) |field| {
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const key = field[0..equals];
+        if (!std.mem.eql(u8, key, "ids[]") and !std.ascii.eqlIgnoreCase(key, "ids%5b%5d")) continue;
+        if (ids.items.len == limit) return error.TooManyIds;
+        const id = std.fmt.parseInt(i32, field[equals + 1 ..], 10) catch return error.InvalidId;
+        if (id <= 0) return error.InvalidId;
+        if (std.mem.indexOfScalar(i32, ids.items, id) == null) try ids.append(allocator, id);
+    }
+    if (ids.items.len == 0) return error.MissingIds;
+    return ids.toOwnedSlice(allocator);
+}
+
+pub const ChatMessage = struct {
+    id: i64,
+    channel_id: i64,
+    sender_id: i32,
+    sender_name: []const u8,
+    sender_country: []const u8,
+    content: []const u8,
+    is_action: bool,
+    uuid: []const u8,
+    timestamp: []const u8,
+};
 
 pub const LeaderboardScore = struct {
     id: i64,
@@ -299,6 +329,27 @@ pub const LeaderboardScore = struct {
     pauses_json: []const u8,
     ended_at: []const u8,
     ranked: bool,
+    beatmap: ?BeatmapSummary = null,
+};
+
+pub const BeatmapSummary = struct {
+    id: i32,
+    set_id: i32,
+    status: []const u8,
+    checksum: []const u8,
+    ruleset_id: i32,
+    star_rating: f64,
+    version: []const u8,
+    artist: []const u8,
+    title: []const u8,
+    creator: []const u8,
+};
+
+pub const UserScoreKind = enum { best, firsts, recent, pinned };
+
+pub const UserScoresPath = struct {
+    user_id: i32,
+    kind: UserScoreKind,
 };
 
 pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !void {
@@ -329,7 +380,42 @@ pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !v
     try std.json.Stringify.value(score.username, .{}, writer);
     try writer.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":", .{score.user_id});
     try std.json.Stringify.value(score.country, .{}, writer);
-    try writer.writeAll(",\"is_active\":true,\"is_online\":false}}");
+    try writer.writeAll(",\"is_active\":true,\"is_online\":false}");
+    if (score.beatmap) |beatmap| {
+        try writer.print(",\"beatmap\":{{\"id\":{d},\"beatmapset_id\":{d},\"status\":", .{ beatmap.id, beatmap.set_id });
+        try std.json.Stringify.value(beatmap.status, .{}, writer);
+        try writer.writeAll(",\"checksum\":");
+        try std.json.Stringify.value(beatmap.checksum, .{}, writer);
+        try writer.print(",\"mode_int\":{d},\"difficulty_rating\":{d},\"version\":", .{ beatmap.ruleset_id, beatmap.star_rating });
+        try std.json.Stringify.value(beatmap.version, .{}, writer);
+        try writer.print(",\"beatmapset\":{{\"id\":{d},\"status\":", .{beatmap.set_id});
+        try std.json.Stringify.value(beatmap.status, .{}, writer);
+        try writer.writeAll(",\"artist\":");
+        try std.json.Stringify.value(beatmap.artist, .{}, writer);
+        try writer.writeAll(",\"artist_unicode\":");
+        try std.json.Stringify.value(beatmap.artist, .{}, writer);
+        try writer.writeAll(",\"title\":");
+        try std.json.Stringify.value(beatmap.title, .{}, writer);
+        try writer.writeAll(",\"title_unicode\":");
+        try std.json.Stringify.value(beatmap.title, .{}, writer);
+        try writer.writeAll(",\"creator\":");
+        try std.json.Stringify.value(beatmap.creator, .{}, writer);
+        try writer.writeAll("}}");
+    }
+    try writer.writeByte('}');
+}
+
+pub fn parseUserScoresPath(path: []const u8) ?UserScoresPath {
+    const prefix = "/api/v2/users/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const marker = "/scores/";
+    const marker_at = std.mem.indexOf(u8, rest, marker) orelse return null;
+    if (marker_at == 0 or std.mem.indexOfScalar(u8, rest[marker_at + marker.len ..], '/') != null) return null;
+    const user_id = std.fmt.parseInt(i32, rest[0..marker_at], 10) catch return null;
+    if (user_id <= 0) return null;
+    const kind = std.meta.stringToEnum(UserScoreKind, rest[marker_at + marker.len ..]) orelse return null;
+    return .{ .user_id = user_id, .kind = kind };
 }
 
 pub fn parseUserPath(path: []const u8) ?UserPath {
@@ -391,6 +477,68 @@ pub fn validChannelId(channel_id: i64) bool {
     return channel_id >= 1 and channel_id <= 4;
 }
 
+pub fn channelName(channel_id: i64) ?[]const u8 {
+    return switch (channel_id) {
+        1 => "#osu",
+        2 => "#announce",
+        3 => "#lobby",
+        4 => "#lazer",
+        else => null,
+    };
+}
+
+pub fn channelId(name: []const u8) ?i64 {
+    if (std.mem.eql(u8, name, "#osu")) return 1;
+    if (std.mem.eql(u8, name, "#announce")) return 2;
+    if (std.mem.eql(u8, name, "#lobby")) return 3;
+    if (std.mem.eql(u8, name, "#lazer")) return 4;
+    return null;
+}
+
+pub fn writeChatChannel(writer: *std.Io.Writer, channel_id: i64, last_message_id: ?i64, last_read_id: ?i64) !void {
+    const name = channelName(channel_id) orelse return error.UnknownChannel;
+    const description: []const u8 = switch (channel_id) {
+        1 => "general chat",
+        2 => "updates",
+        3 => "multiplayer lobby",
+        4 => "lazer chat",
+        else => unreachable,
+    };
+    try writer.print("{{\"channel_id\":{d},\"name\":", .{channel_id});
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(description, .{}, writer);
+    try writer.print(",\"type\":{d},\"last_message_id\":", .{if (channel_id == 2) @as(u8, 8) else 0});
+    if (last_message_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+    try writer.writeAll(",\"last_read_id\":");
+    if (last_read_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+    try writer.writeAll(",\"message_length_limit\":2000}");
+}
+
+pub fn validMessageUuid(uuid: []const u8) bool {
+    if (uuid.len != 36) return false;
+    for (uuid, 0..) |char, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (char != '-') return false;
+        } else if (!std.ascii.isHex(char)) return false;
+    }
+    return true;
+}
+
+pub fn writeChatMessage(writer: *std.Io.Writer, message: ChatMessage) !void {
+    try writer.print("{{\"message_id\":{d},\"channel_id\":{d},\"is_action\":{s},\"timestamp\":", .{ message.id, message.channel_id, if (message.is_action) "true" else "false" });
+    try std.json.Stringify.value(message.timestamp, .{}, writer);
+    try writer.writeAll(",\"content\":");
+    try std.json.Stringify.value(message.content, .{}, writer);
+    try writer.print(",\"sender_id\":{d},\"sender\":{{\"id\":{d},\"username\":", .{ message.sender_id, message.sender_id });
+    try std.json.Stringify.value(message.sender_name, .{}, writer);
+    try writer.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":", .{message.sender_id});
+    try std.json.Stringify.value(message.sender_country, .{}, writer);
+    try writer.writeAll(",\"is_active\":true},\"uuid\":");
+    try std.json.Stringify.value(message.uuid, .{}, writer);
+    try writer.writeByte('}');
+}
+
 pub fn parseChannelUserPath(path: []const u8) ?ChannelUserPath {
     const prefix = "/api/v2/chat/channels/";
     if (!std.mem.startsWith(u8, path, prefix)) return null;
@@ -415,6 +563,50 @@ pub fn parseChannelMessagesPath(path: []const u8) ?ChannelMessagesPath {
     const channel_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
     if (!validChannelId(channel_id)) return null;
     return .{ .channel_id = channel_id };
+}
+
+pub fn parseChannelPath(path: []const u8) ?i64 {
+    const prefix = "/api/v2/chat/channels/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const id_text = path[prefix.len..];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const channel_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    return if (validChannelId(channel_id)) channel_id else null;
+}
+
+pub fn parseChannelReadPath(path: []const u8) ?ChannelReadPath {
+    const prefix = "/api/v2/chat/channels/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const marker = "/mark-as-read/";
+    const marker_at = std.mem.indexOf(u8, rest, marker) orelse return null;
+    if (marker_at == 0) return null;
+    const message_text = rest[marker_at + marker.len ..];
+    if (message_text.len == 0 or std.mem.indexOfScalar(u8, message_text, '/') != null) return null;
+    const channel_id = std.fmt.parseInt(i64, rest[0..marker_at], 10) catch return null;
+    const message_id = std.fmt.parseInt(i64, message_text, 10) catch return null;
+    if (!validChannelId(channel_id) or message_id <= 0) return null;
+    return .{ .channel_id = channel_id, .message_id = message_id };
+}
+
+fn parsePositiveIdPath(path: []const u8, prefix: []const u8, suffix: []const u8) ?i32 {
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const id_text = path[prefix.len .. path.len - suffix.len];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const id = std.fmt.parseInt(i32, id_text, 10) catch return null;
+    return if (id > 0) id else null;
+}
+
+pub fn parseFriendPath(path: []const u8) ?i32 {
+    return parsePositiveIdPath(path, "/api/v2/friends/", "");
+}
+
+pub fn parseBlockPath(path: []const u8) ?i32 {
+    return parsePositiveIdPath(path, "/api/v2/blocks/", "");
+}
+
+pub fn parseFavouritePath(path: []const u8) ?i32 {
+    return parsePositiveIdPath(path, "/api/v2/beatmapsets/", "/favourites");
 }
 
 pub fn validHash(value: []const u8) bool {

@@ -1906,6 +1906,10 @@ test "stable friends and favourites stay directional and always include kai" {
     try std.testing.expect(!try store.addFriend(40, 41));
     try std.testing.expect(!try store.addFriend(40, 40));
     try std.testing.expect(!try store.addFriend(40, 3));
+    try std.testing.expect(!try store.friendsAreMutual(40, 41));
+    try std.testing.expect(try store.addFriend(41, 40));
+    try std.testing.expect(try store.friendsAreMutual(40, 41));
+    try std.testing.expect(try store.removeFriend(41, 40));
     const sender_friends = try store.friendIds(std.testing.allocator, 40);
     defer std.testing.allocator.free(sender_friends);
     try std.testing.expect(std.mem.indexOfScalar(i32, sender_friends, 41) != null);
@@ -1917,6 +1921,16 @@ test "stable friends and favourites stay directional and always include kai" {
     try std.testing.expect(!try store.removeFriend(40, 41));
     try std.testing.expect(!try store.removeFriend(40, 3));
 
+    try std.testing.expect(try store.addBlock(40, 41));
+    try std.testing.expect(!try store.addBlock(40, 41));
+    try std.testing.expect(!try store.addBlock(40, 40));
+    try std.testing.expect(!try store.addBlock(40, 3));
+    const blocks = try store.blockIds(std.testing.allocator, 40);
+    defer std.testing.allocator.free(blocks);
+    try std.testing.expectEqualSlices(i32, &.{41}, blocks);
+    try std.testing.expect(try store.removeBlock(40, 41));
+    try std.testing.expect(!try store.removeBlock(40, 41));
+
     try std.testing.expect(try store.addFavourite(40, 900000000));
     try std.testing.expect(!try store.addFavourite(40, 900000000));
     try std.testing.expect(try store.addFavourite(40, 900000001));
@@ -1924,6 +1938,9 @@ test "stable friends and favourites stay directional and always include kai" {
     const favourites = try store.favouriteSetIds(std.testing.allocator, 40);
     defer std.testing.allocator.free(favourites);
     try std.testing.expectEqualSlices(i32, &.{ 900000000, 900000001 }, favourites);
+    try std.testing.expect(try store.removeFavourite(40, 900000000));
+    try std.testing.expect(!try store.removeFavourite(40, 900000000));
+    try std.testing.expectError(error.InvalidBeatmapSet, store.removeFavourite(40, 0));
 }
 
 test "stable login owns friend state and restores private message privacy" {
@@ -2492,6 +2509,7 @@ test "lazer trailing slashes use the same API route" {
 }
 
 test "lazer beatmap metadata is separate from archive downloads" {
+    try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmaps"));
     try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmaps/lookup"));
     try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmaps/123/solo-scores"));
     try std.testing.expect(routing.lazerBeatmapMetadata("/api/v2/beatmapsets/search"));
@@ -2509,7 +2527,15 @@ test "lazer beatmap metadata is separate from archive downloads" {
 }
 
 test "lazer channel list and follow-up paths match the client contract" {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer.channel_list_json, .{});
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try output.writer.writeByte('[');
+    for (1..5) |channel_id| {
+        if (channel_id != 1) try output.writer.writeByte(',');
+        try lazer.writeChatChannel(&output.writer, @intCast(channel_id), null, null);
+    }
+    try output.writer.writeByte(']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
     try std.testing.expectEqualStrings("#osu", parsed.value.array.items[0].object.get("name").?.string);
@@ -2520,9 +2546,98 @@ test "lazer channel list and follow-up paths match the client contract" {
     try std.testing.expectEqual(@as(i64, 4), join.channel_id);
     try std.testing.expectEqual(@as(i32, 37), join.user_id);
     try std.testing.expectEqual(@as(i64, 3), lazer.parseChannelMessagesPath("/api/v2/chat/channels/3/messages").?.channel_id);
+    const read = lazer.parseChannelReadPath("/api/v2/chat/channels/3/mark-as-read/729").?;
+    try std.testing.expectEqual(@as(i64, 3), read.channel_id);
+    try std.testing.expectEqual(@as(i64, 729), read.message_id);
+    try std.testing.expectEqual(@as(i64, 4), lazer.parseChannelPath("/api/v2/chat/channels/4").?);
+    try std.testing.expectEqualStrings("#lazer", lazer.channelName(4).?);
+    try std.testing.expectEqual(@as(i64, 1), lazer.channelId("#osu").?);
+    try std.testing.expect(lazer.validMessageUuid("01234567-89ab-cdef-0123-456789abcdef"));
+    try std.testing.expect(!lazer.validMessageUuid("0123456789abcdef0123456789abcdef"));
     try std.testing.expect(lazer.parseChannelUserPath("/api/v2/chat/channels/5/users/37") == null);
     try std.testing.expect(lazer.parseChannelUserPath("/api/v2/chat/channels/4/users/37/extra") == null);
     try std.testing.expect(lazer.parseChannelMessagesPath("/api/v2/chat/channels/0/messages") == null);
+    try std.testing.expect(lazer.parseChannelReadPath("/api/v2/chat/channels/3/mark-as-read/0") == null);
+    try std.testing.expect(lazer.parseChannelReadPath("/api/v2/chat/channels/9/mark-as-read/1") == null);
+    try std.testing.expect(lazer.parseChannelPath("/api/v2/chat/channels/4/messages") == null);
+    try std.testing.expectEqual(@as(i32, 12), lazer.parseFriendPath("/api/v2/friends/12").?);
+    try std.testing.expectEqual(@as(i32, 13), lazer.parseBlockPath("/api/v2/blocks/13").?);
+    try std.testing.expectEqual(@as(i32, 14), lazer.parseFavouritePath("/api/v2/beatmapsets/14/favourites").?);
+    try std.testing.expect(lazer.parseFriendPath("/api/v2/friends/0") == null);
+    try std.testing.expect(lazer.parseBlockPath("/api/v2/blocks/13/extra") == null);
+    try std.testing.expect(lazer.parseFavouritePath("/api/v2/beatmapsets/nope/favourites") == null);
+
+    const ids = try lazer.queryIds(std.testing.allocator, "/api/v2/users/lookup/?ids[]=3&ids%5B%5D=4&ids[]=3&ruleset_id=0", 50);
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 4 }, ids);
+    try std.testing.expectError(error.InvalidId, lazer.queryIds(std.testing.allocator, "/api/v2/users?ids[]=nope", 50));
+    try std.testing.expectError(error.MissingIds, lazer.queryIds(std.testing.allocator, "/api/v2/users?ruleset_id=0", 50));
+    try std.testing.expectError(error.TooManyIds, lazer.queryIds(std.testing.allocator, "/api/v2/users?ids[]=1&ids[]=2", 1));
+}
+
+test "lazer public chat persists actions and deduplicates client uuids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-chat.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("chat player", "chat@example.test", "0123456789abcdef0123456789abcdef");
+
+    const uuid = "01234567-89ab-cdef-0123-456789abcdef";
+    const first = try store.recordLazerPublicMessage(std.testing.allocator, user_id, "#osu", "hello from lazer", false, uuid);
+    defer std.testing.allocator.free(first.json);
+    try std.testing.expect(first.inserted);
+    const parsed_first = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, first.json, .{});
+    defer parsed_first.deinit();
+    const first_id = parsed_first.value.object.get("message_id").?.integer;
+    try std.testing.expectEqualStrings(uuid, parsed_first.value.object.get("uuid").?.string);
+    try std.testing.expectEqualStrings("chat player", parsed_first.value.object.get("sender").?.object.get("username").?.string);
+
+    const duplicate = try store.recordLazerPublicMessage(std.testing.allocator, user_id, "#osu", "hello from lazer", false, uuid);
+    defer std.testing.allocator.free(duplicate.json);
+    try std.testing.expect(!duplicate.inserted);
+    try std.testing.expectError(error.ChatUuidConflict, store.recordLazerPublicMessage(std.testing.allocator, user_id, "#osu", "changed retry", false, uuid));
+
+    const action_uuid = "fedcba98-7654-3210-fedc-ba9876543210";
+    const action = try store.recordLazerPublicMessage(std.testing.allocator, user_id, "#lazer", "waves", true, action_uuid);
+    defer std.testing.allocator.free(action.json);
+    try std.testing.expect(action.inserted);
+    try std.testing.expectError(error.ChannelReadOnly, store.recordLazerPublicMessage(std.testing.allocator, user_id, "#announce", "nope", false, "11111111-2222-3333-4444-555555555555"));
+
+    const history = try store.lazerChatMessagesJson(std.testing.allocator, 1, 0, 50);
+    defer std.testing.allocator.free(history);
+    const parsed_history = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, history, .{});
+    defer parsed_history.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_history.value.array.items.len);
+    try std.testing.expectEqual(first_id, parsed_history.value.array.items[0].object.get("message_id").?.integer);
+
+    const updates = try store.lazerChatMessagesJson(std.testing.allocator, null, first_id, 100);
+    defer std.testing.allocator.free(updates);
+    const parsed_updates = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updates, .{});
+    defer parsed_updates.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_updates.value.array.items.len);
+    try std.testing.expect(parsed_updates.value.array.items[0].object.get("is_action").?.bool);
+
+    const channels_before = try store.lazerChannelListJson(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(channels_before);
+    const parsed_before = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, channels_before, .{});
+    defer parsed_before.deinit();
+    try std.testing.expectEqual(first_id, parsed_before.value.array.items[0].object.get("last_message_id").?.integer);
+    try std.testing.expect(parsed_before.value.array.items[0].object.get("last_read_id").? == .null);
+
+    try store.markLazerChannelRead(user_id, 1, first_id);
+    const channels_after = try store.lazerChannelListJson(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(channels_after);
+    const parsed_after = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, channels_after, .{});
+    defer parsed_after.deinit();
+    try std.testing.expectEqual(first_id, parsed_after.value.array.items[0].object.get("last_read_id").?.integer);
+    const action_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, action.json, .{});
+    defer action_parsed.deinit();
+    const action_id = action_parsed.value.object.get("message_id").?.integer;
+    try std.testing.expectError(error.ChatMessageNotFound, store.markLazerChannelRead(user_id, 1, action_id));
+    try std.testing.expectError(error.ChatMessageNotFound, store.markLazerChannelRead(user_id, 1, 999_999));
 }
 
 test "lazer registration fields are form decoded" {
@@ -3760,6 +3875,12 @@ test "lazer ruleset profile paths match the pinned client contract" {
     try std.testing.expect(lazer.parseUserPath("/api/v2/users/4/catch") == null);
     try std.testing.expect(lazer.parseUserPath("/api/v2/users/4/osu/extra") == null);
     try std.testing.expect(lazer.parseUserPath("/api/v2/users//osu") == null);
+    const best = lazer.parseUserScoresPath("/api/v2/users/4/scores/best").?;
+    try std.testing.expectEqual(@as(i32, 4), best.user_id);
+    try std.testing.expectEqual(lazer.UserScoreKind.best, best.kind);
+    try std.testing.expectEqual(lazer.UserScoreKind.recent, lazer.parseUserScoresPath("/api/v2/users/4/scores/recent").?.kind);
+    try std.testing.expect(lazer.parseUserScoresPath("/api/v2/users/4/scores/nope") == null);
+    try std.testing.expect(lazer.parseUserScoresPath("/api/v2/users/name/scores/best") == null);
 }
 
 test "official lazer score bodies allow omitted mods and reject hostile counters" {
@@ -3886,7 +4007,24 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(score_id, listed.get("id").?.integer);
     try std.testing.expectEqualStrings("A", listed.get("rank").?.string);
     try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
+    try std.testing.expect(!listed.get("ranked").?.bool);
     try std.testing.expectEqual(@as(i64, 1), parsed_leaderboard.value.object.get("user_score").?.object.get("position").?.integer);
+
+    const counts = try store.lazerUserScoreCounts(1, 0);
+    try std.testing.expectEqual(@as(i32, 0), counts.best);
+    try std.testing.expectEqual(@as(i32, 1), counts.recent);
+    const recent = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, 0, 50);
+    defer std.testing.allocator.free(recent);
+    const parsed_recent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, recent, .{});
+    defer parsed_recent.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_recent.value.array.items.len);
+    const recent_score = parsed_recent.value.array.items[0].object;
+    try std.testing.expectEqual(score_id, recent_score.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 75), recent_score.get("beatmap").?.object.get("id").?.integer);
+    try std.testing.expectEqualStrings("artist", recent_score.get("beatmap").?.object.get("beatmapset").?.object.get("artist").?.string);
+    const pinned = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .pinned, 0, 50);
+    defer std.testing.allocator.free(pinned);
+    try std.testing.expectEqualStrings("[]", pinned);
 
     const expired = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
     var expire_buf: [160]u8 = undefined;
@@ -3898,7 +4036,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 26), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 27), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer submission updates ranked performance without overwriting another ruleset" {

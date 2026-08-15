@@ -6,6 +6,7 @@ pub fn canonicalPath(path: []const u8) []const u8 {
 }
 
 pub fn lazerBeatmapMetadata(path: []const u8) bool {
+    if (std.mem.eql(u8, path, "/api/v2/beatmaps")) return true;
     if (std.mem.eql(u8, path, "/api/v2/beatmaps/lookup")) return true;
     if (std.mem.startsWith(u8, path, "/api/v2/beatmaps/")) return true;
     if (std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) return true;

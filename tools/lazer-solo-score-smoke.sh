@@ -72,20 +72,93 @@ auth_get /api/v2/blocks blocks
 jq -e '. == []' "$response" >/dev/null || fail invalid_blocks_contract
 auth_get /api/v2/me/beatmapset-favourites favourites
 jq -e '.beatmapset_ids == []' "$response" >/dev/null || fail invalid_favourites_contract
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/friends?target=5" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 200 add_friend
+jq -e '.user_relation.target_id == 5 and .user_relation.relation_type == "friend" and .user_relation.target.id == 5' "$response" >/dev/null || fail invalid_add_friend_contract
+auth_get /api/v2/friends friends_after_add
+jq -e 'any(.[]; .target_id == 5 and .relation_type == "friend")' "$response" >/dev/null || fail friend_not_added
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request DELETE "$origin/api/v2/friends/5" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 204 delete_friend
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/blocks?target=5" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 204 add_block
+auth_get /api/v2/blocks blocks_after_add
+jq -e 'any(.[]; .target_id == 5 and .relation_type == "block")' "$response" >/dev/null || fail block_not_added
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request DELETE "$origin/api/v2/blocks/5" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 204 delete_block
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/beatmapsets/75/favourites" \
+  --header "Authorization: Bearer $token_one" --data-urlencode 'action=favourite')
+expect_status "$code" 204 add_favourite
+auth_get /api/v2/me/beatmapset-favourites favourites_after_add
+jq -e '.beatmapset_ids == [75]' "$response" >/dev/null || fail favourite_not_added
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/beatmapsets/75/favourites" \
+  --header "Authorization: Bearer $token_one" --data-urlencode 'action=unfavourite')
+expect_status "$code" 204 delete_favourite
 auth_get '/api/v2/users/4/osu?key=id' profile_osu
 jq -e '.id == 4 and .statistics.play_count == 0 and .country_code == "XX"' "$response" >/dev/null || fail invalid_profile_contract
 auth_get '/api/v2/users/4/?key=id' profile_default_ruleset
 jq -e '.id == 4 and .statistics.play_count == 0' "$response" >/dev/null || fail invalid_default_profile_contract
 auth_get '/api/v2/users/lazer-one/mania?key=username' profile_mania
 jq -e '.id == 4 and .statistics.play_count == 0' "$response" >/dev/null || fail invalid_username_profile_contract
+auth_get '/api/v2/users/lookup/?ids[]=3&ids[]=4&ruleset_id=0' user_lookup_batch
+jq -e '.cursor == null and (.users | length) == 2 and .users[0].id == 3 and .users[1].id == 4' "$response" >/dev/null || fail invalid_user_lookup_batch_contract
 auth_get '/api/v2/beatmaps/lookup?checksum=0123456789abcdef0123456789abcdef' beatmap_lookup
 jq -e '.id == 75 and .status == "ranked" and .beatmapset.id == 75 and .beatmapset.status == "ranked"' "$response" >/dev/null || fail invalid_beatmap_lookup_contract
+auth_get '/api/v2/beatmaps/lookup?id=75&checksum=0123456789abcdef0123456789abcdef' beatmap_lookup_with_online_id
+jq -e '.id == 75 and .beatmapset.id == 75' "$response" >/dev/null || fail invalid_beatmap_online_id_contract
+auth_get '/api/v2/beatmaps/?ids[]=75' beatmap_lookup_batch
+jq -e '.cursor == null and (.beatmaps | length) == 1 and .beatmaps[0].id == 75' "$response" >/dev/null || fail invalid_beatmap_batch_contract
 auth_get /api/v2/tags tags
 jq -e '.tags == []' "$response" >/dev/null || fail invalid_tags_contract
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/chat/ack" \
   --header "Authorization: Bearer $token_one" --data-urlencode 'since=0')
 expect_status "$code" 200 chat_ack
 jq -e '.silences == []' "$response" >/dev/null || fail invalid_chat_ack_contract
+
+auth_get /api/v2/chat/channels chat_channels
+jq -e '
+  length == 4 and
+  .[0].channel_id == 1 and .[0].name == "#osu" and .[0].type == 0 and
+  .[1].channel_id == 2 and .[1].name == "#announce" and .[1].type == 8 and
+  .[2].channel_id == 3 and .[2].name == "#lobby" and
+  .[3].channel_id == 4 and .[3].name == "#lazer" and
+  all(.[]; .message_length_limit == 2000)
+' "$response" >/dev/null || fail invalid_chat_channel_list_contract
+auth_get /api/v2/chat/channels/4 chat_channel
+jq -e '.channel.channel_id == 4 and .channel.name == "#lazer" and .users == []' "$response" >/dev/null || fail invalid_chat_channel_contract
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/chat/channels/4/users/4" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 200 chat_join
+
+chat_uuid=01234567-89ab-cdef-0123-456789abcdef
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/chat/channels/4/messages" \
+  --header "Authorization: Bearer $token_one" --data-urlencode 'message=hello from lazer smoke' \
+  --data-urlencode 'is_action=false' --data-urlencode "uuid=$chat_uuid")
+expect_status "$code" 201 chat_post
+chat_message_id=$(jq -er '.message_id | select(. > 0)' "$response")
+jq -e --arg uuid "$chat_uuid" '.channel_id == 4 and .content == "hello from lazer smoke" and .uuid == $uuid and .sender.id == 4' "$response" >/dev/null || fail invalid_chat_post_contract
+
+auth_get /api/v2/chat/channels/4/messages chat_history
+jq -e --arg uuid "$chat_uuid" 'length == 1 and .[0].uuid == $uuid and .[0].channel_id == 4' "$response" >/dev/null || fail invalid_chat_history_contract
+auth_get "/api/v2/chat/messages?since=0" chat_poll
+jq -e --arg uuid "$chat_uuid" 'any(.[]; .uuid == $uuid and .channel_id == 4)' "$response" >/dev/null || fail invalid_chat_poll_contract
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/chat/channels/4/mark-as-read/$chat_message_id" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 200 chat_mark_read
+auth_get /api/v2/chat/channels chat_channels_after_read
+jq -e --argjson id "$chat_message_id" '.[3].last_message_id == $id and .[3].last_read_id == $id' "$response" >/dev/null || fail invalid_chat_read_state_contract
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request DELETE "$origin/api/v2/chat/channels/4/users/4" \
+  --header "Authorization: Bearer $token_one")
+expect_status "$code" 200 chat_leave
 
 create_score_token() {
   code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v2/beatmaps/75/solo/scores" \
@@ -120,7 +193,7 @@ expect_status "$code" 409 reject_token_reuse
 [ "$(sqlite3 "$database" "SELECT mods_json FROM lazer_scores WHERE id=$score_id")" = '[{"acronym":"RX"},{"acronym":"WIGGLE","settings":{"strength":1.25}}]' ] || fail mods_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT statistics_json FROM lazer_scores WHERE id=$score_id")" = '{"great":300,"miss":2}' ] || fail statistics_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT rank_namespace FROM lazer_scores WHERE id=$score_id")" = custom ] || fail custom_namespace_missing
-[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 26 ] || fail schema_not_migrated
+[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 27 ] || fail schema_not_migrated
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=WIGGLE&limit=50' custom_leaderboard
 jq -e --argjson id "$score_id" '
@@ -128,6 +201,7 @@ jq -e --argjson id "$score_id" '
   (.scores | length) == 1 and
   .scores[0].id == $id and
   .scores[0].rank == "A" and
+  .scores[0].ranked == false and
   .scores[0].mods[1].acronym == "WIGGLE" and
   .scores[0].maximum_statistics.great == 302 and
   .user_score.position == 1
@@ -162,6 +236,36 @@ jq -e '
   .statistics_rulesets.taiko.play_count == 0 and
   .statistics_rulesets.taiko.total_score == 0
 ' "$response" >/dev/null || fail v2_score_overwrote_stats
+
+auth_get '/api/v2/users/4/osu?key=id' profile_after_scores
+jq -e '
+  .scores_best_count == 1 and
+  .scores_first_count == 1 and
+  .scores_recent_count == 2 and
+  .scores_pinned_count == 0
+' "$response" >/dev/null || fail invalid_profile_score_counts
+
+auth_get '/api/v2/users/4/scores/best?mode=osu&offset=0&limit=50' profile_best_scores
+jq -e --argjson id "$vanilla_score_id" '
+  length == 1 and
+  .[0].id == $id and
+  .[0].ranked == true and
+  .[0].mods == [] and
+  .[0].beatmap.id == 75 and
+  .[0].beatmap.beatmapset.artist == "artist"
+' "$response" >/dev/null || fail invalid_profile_best_scores
+
+auth_get '/api/v2/users/4/scores/recent?mode=osu&offset=0&limit=50' profile_recent_scores
+jq -e --argjson custom "$score_id" --argjson vanilla "$vanilla_score_id" '
+  length == 2 and
+  any(.[]; .id == $custom and .ranked == false and .mods[0].acronym == "RX" and .mods[1].acronym == "WIGGLE") and
+  any(.[]; .id == $vanilla and .ranked == true and .mods == [])
+' "$response" >/dev/null || fail invalid_profile_recent_scores
+
+auth_get '/api/v2/users/4/scores/firsts?mode=osu&offset=0&limit=50' profile_first_scores
+jq -e --argjson id "$vanilla_score_id" 'length == 1 and .[0].id == $id' "$response" >/dev/null || fail invalid_profile_first_scores
+auth_get '/api/v2/users/4/scores/pinned?mode=osu&offset=0&limit=50' profile_pinned_scores
+jq -e '. == []' "$response" >/dev/null || fail invalid_profile_pinned_scores
 
 expired_token=$(create_score_token "$token_one")
 sqlite3 "$database" "UPDATE lazer_score_tokens SET expires_at=0 WHERE id=$expired_token"

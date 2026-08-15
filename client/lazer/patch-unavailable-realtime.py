@@ -10,11 +10,13 @@ def replace_once(path: Path, old: str, new: str) -> None:
     if new.encode() in normalized:
         return
     newline = b"\r\n" if data.count(b"\r\n") > data.count(b"\n") // 2 else b"\n"
-    old_bytes = old.encode().replace(b"\n", newline)
-    new_bytes = new.encode().replace(b"\n", newline)
-    if old_bytes not in data:
-        raise SystemExit(f"pinned client source changed: {path}")
-    path.write_bytes(data.replace(old_bytes, new_bytes, 1))
+    old_bytes = old.encode()
+    new_bytes = new.encode()
+    if old_bytes not in normalized:
+        marker = old.splitlines()[0].strip()
+        raise SystemExit(f"pinned client source changed near {marker!r}: {path}")
+    updated = normalized.replace(old_bytes, new_bytes, 1)
+    path.write_bytes(updated if newline == b"\n" else updated.replace(b"\n", newline))
 
 
 checkout = Path(sys.argv[1])
@@ -23,6 +25,7 @@ endpoint = checkout / "osu.Game/Online/EndpointConfiguration.cs"
 desktop_program = checkout / "osu.Desktop/Program.cs"
 desktop_project = checkout / "osu.Desktop/osu.Desktop.csproj"
 osu_game = checkout / "osu.Game/OsuGame.cs"
+beatmap_metadata_source = checkout / "osu.Game/Beatmaps/APIBeatmapMetadataSource.cs"
 
 replace_once(
     api_access,
@@ -36,12 +39,21 @@ replace_once(
     "            new HubClientConnector(clientName, endpoint, this, versionHash);",
     "            Endpoints.RealtimeServicesAvailable ? new HubClientConnector(clientName, endpoint, this, versionHash) : null;",
 )
-replace_once(
-    api_access,
-    "        public IChatClient GetChatClient() => new WebSocketChatClient(this);",
-    """        public IChatClient GetChatClient() =>
+if b"new UnavailableRealtimeChatClient()" in api_access.read_bytes():
+    replace_once(
+        api_access,
+        """        public IChatClient GetChatClient() =>
             Endpoints.RealtimeServicesAvailable ? new WebSocketChatClient(this) : new UnavailableRealtimeChatClient();""",
-)
+        """        public IChatClient GetChatClient() =>
+            Endpoints.RealtimeServicesAvailable ? new WebSocketChatClient(this) : new PollingChatClient(this);""",
+    )
+else:
+    replace_once(
+        api_access,
+        "        public IChatClient GetChatClient() => new WebSocketChatClient(this);",
+        """        public IChatClient GetChatClient() =>
+            Endpoints.RealtimeServicesAvailable ? new WebSocketChatClient(this) : new PollingChatClient(this);""",
+    )
 replace_once(
     endpoint,
     """    public class EndpointConfiguration
@@ -92,3 +104,12 @@ replace_once(
 replace_once(desktop_project, "    <AssemblyTitle>osu!(lazer)</AssemblyTitle>", "    <AssemblyTitle>zigcho lazer</AssemblyTitle>")
 replace_once(desktop_project, "    <Product>osu!(lazer)</Product>", "    <Product>zigcho lazer</Product>")
 replace_once(desktop_project, "    <Title>osu!</Title>", "    <Title>zigcho lazer</Title>")
+
+# The upstream gameplay metadata path omits an already-known online ID and sends
+# only checksum + filename. A cold zigcho cache cannot resolve a checksum back to
+# a set without an official API key, while the local realm already has the ID.
+replace_once(
+    beatmap_metadata_source,
+    "            var req = new GetBeatmapRequest(md5Hash: beatmapInfo.MD5Hash, filename: beatmapInfo.Path);",
+    "            var req = new GetBeatmapRequest(onlineId: beatmapInfo.OnlineID, md5Hash: beatmapInfo.MD5Hash, filename: beatmapInfo.Path);",
+)

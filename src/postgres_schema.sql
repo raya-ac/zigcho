@@ -236,10 +236,29 @@ CREATE TABLE chat_messages (
     sender_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     target text NOT NULL,
     message text NOT NULL,
+    is_action boolean NOT NULL DEFAULT false,
+    client_uuid text NOT NULL DEFAULT '' CHECK(length(client_uuid) IN (0,36)),
     created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
 );
 CREATE INDEX chat_messages_target_time ON chat_messages(target, created_at DESC);
 CREATE INDEX chat_messages_sender_time ON chat_messages(sender_id, created_at DESC);
+CREATE UNIQUE INDEX chat_messages_sender_uuid ON chat_messages(sender_id, client_uuid) WHERE client_uuid!='';
+
+CREATE TABLE lazer_channel_reads (
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel_id smallint NOT NULL CHECK(channel_id BETWEEN 1 AND 4),
+    last_read_id bigint NOT NULL DEFAULT 0,
+    updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY(user_id, channel_id)
+);
+
+CREATE TABLE user_blocks (
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY(user_id, blocked_id),
+    CHECK(user_id != blocked_id)
+);
 
 CREATE TABLE chat_channels (
     name text PRIMARY KEY,
@@ -434,4 +453,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (26);
+INSERT INTO schema_migrations(version) VALUES (27);

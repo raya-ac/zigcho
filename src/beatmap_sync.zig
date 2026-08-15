@@ -175,6 +175,31 @@ pub const Sync = struct {
         return true;
     }
 
+    /// Hydrate the metadata for a whole set without downloading its archive.
+    /// Set overlays need this before they know which individual difficulty will
+    /// be opened, while the later beatmap lookup remains responsible for the
+    /// bounded archive download.
+    pub fn ensureBySetId(self: *Sync, store: *storage.Store, set_id: i32) !bool {
+        if (set_id <= 0) return false;
+
+        var key_buffer: [48]u8 = undefined;
+        const lookup_key = try std.fmt.bufPrint(&key_buffer, "set:{d}", .{set_id});
+        const claim_owned = switch (self.claim(lookup_key) catch return false) {
+            .claimed => |value| value,
+            .duplicate => return false,
+            .at_capacity => return false,
+        };
+        defer self.removeFromProgress(claim_owned);
+
+        _ = self.attempts.fetchAdd(1, .monotonic);
+        _ = self.fetchAndStoreMetadata(store, null, set_id) catch |err| {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return err;
+        };
+        _ = self.successes.fetchAdd(1, .monotonic);
+        return true;
+    }
+
     const Claim = union(enum) {
         claimed: []const u8,
         duplicate,
@@ -211,11 +236,14 @@ pub const Sync = struct {
         return identity;
     }
 
-    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32) !RemoteMap {
+    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteMap {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
-        std.log.info("[hydrate] start md5={s} set={d}", .{ wanted_md5, set_id });
+        if (wanted_md5) |md5|
+            std.log.info("[hydrate] start md5={s} set={d}", .{ md5, set_id })
+        else
+            std.log.info("[hydrate] start set={d}", .{set_id});
 
         const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.direct/api/s/{d}", .{set_id});
         defer self.allocator.free(metadata_url);
@@ -230,13 +258,13 @@ pub const Sync = struct {
         };
         defer parsed.deinit();
         if (parsed.value.SetID != set_id or parsed.value.ChildrenBeatmaps.len == 0) return error.IdMismatch;
-        var remote: ?CheesegullMap = null;
+        var remote: ?CheesegullMap = if (wanted_md5 == null) parsed.value.ChildrenBeatmaps[0] else null;
         for (parsed.value.ChildrenBeatmaps) |candidate| {
             if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set_id or !validMd5(candidate.FileMD5)) return error.IdMismatch;
-            if (std.ascii.eqlIgnoreCase(candidate.FileMD5, wanted_md5)) {
+            if (wanted_md5) |md5| if (std.ascii.eqlIgnoreCase(candidate.FileMD5, md5)) {
                 remote = candidate;
                 break;
-            }
+            };
         }
         const map_info = remote orelse return error.Md5NotFound;
 

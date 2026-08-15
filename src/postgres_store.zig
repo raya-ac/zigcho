@@ -59,6 +59,7 @@ pub const Store = struct {
     pub const BeatmapRating = sqlite_storage.Store.BeatmapRating;
     pub const PpSnapshot = sqlite_storage.Store.PpSnapshot;
     pub const CustomAvatar = sqlite_storage.Store.CustomAvatar;
+    pub const LazerChatWrite = sqlite_storage.Store.LazerChatWrite;
     pub const directStatus = sqlite_storage.Store.directStatus;
     pub const stableStatus = sqlite_storage.Store.stableStatus;
     pub const lazerStatus = sqlite_storage.Store.lazerStatus;
@@ -107,7 +108,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -265,6 +266,19 @@ pub const Store = struct {
                     "CREATE INDEX anticheat_replay_fingerprints_hash ON zigcho.anticheat_replay_fingerprints(replay_sha256,user_id);" ++
                     "CREATE INDEX anticheat_replay_fingerprints_user ON zigcho.anticheat_replay_fingerprints(user_id,created_at DESC,score_id DESC);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(26);" ++
+                    "COMMIT",
+            );
+        }
+        if (version <= 26) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "ALTER TABLE zigcho.chat_messages ADD COLUMN is_action boolean NOT NULL DEFAULT false;" ++
+                    "ALTER TABLE zigcho.chat_messages ADD COLUMN client_uuid text NOT NULL DEFAULT '' CHECK(length(client_uuid) IN(0,36));" ++
+                    "CREATE UNIQUE INDEX chat_messages_sender_uuid ON zigcho.chat_messages(sender_id,client_uuid) WHERE client_uuid!='';" ++
+                    "CREATE TABLE zigcho.lazer_channel_reads(user_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,channel_id smallint NOT NULL CHECK(channel_id BETWEEN 1 AND 4),last_read_id bigint NOT NULL DEFAULT 0,updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),PRIMARY KEY(user_id,channel_id));" ++
+                    "CREATE TABLE zigcho.user_blocks(user_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,blocked_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),PRIMARY KEY(user_id,blocked_id),CHECK(user_id!=blocked_id));" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(27);" ++
                     "COMMIT",
             );
         }
@@ -665,6 +679,17 @@ pub const Store = struct {
         var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmaps WHERE set_id=$1 LIMIT 1", &.{set});
         defer result.deinit();
         return result.rows() != 0;
+    }
+
+    pub fn beatmapSetIdForMap(self: *Store, beatmap_id: i32) !?i32 {
+        var map_buf: [24]u8 = undefined;
+        const map = try std.fmt.bufPrint(&map_buf, "{d}", .{beatmap_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT set_id FROM zigcho.beatmaps WHERE id=$1", &.{map});
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return try result.int(i32, 0, 0);
     }
 
     pub fn putBeatmapMedia(self: *Store, set_id: i32, kind: media_contract.Kind, content_type: media_contract.ContentType, data: []const u8) !void {
@@ -1298,6 +1323,57 @@ pub const Store = struct {
         return result.rows() != 0;
     }
 
+    pub fn friendsAreMutual(self: *Store, user_id: i32, friend_id: i32) !bool {
+        var user_buf: [24]u8 = undefined;
+        var friend_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const friend = try std.fmt.bufPrint(&friend_buf, "{d}", .{friend_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT EXISTS(SELECT 1 FROM zigcho.friends WHERE user_id=$1 AND friend_id=$2)::int", &.{ friend, user });
+        defer result.deinit();
+        return try result.int(i32, 0, 0) != 0;
+    }
+
+    pub fn blockIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(allocator, lease.conn, "SELECT blocked_id FROM zigcho.user_blocks WHERE user_id=$1 ORDER BY blocked_id LIMIT 1000", &.{id});
+        defer result.deinit();
+        var list: std.ArrayList(i32) = .empty;
+        errdefer list.deinit(allocator);
+        for (0..result.rows()) |row| try list.append(allocator, try result.int(i32, row, 0));
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn addBlock(self: *Store, user_id: i32, blocked_id: i32) !bool {
+        if (user_id == blocked_id or blocked_id == 3) return false;
+        var user_buf: [24]u8 = undefined;
+        var blocked_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const blocked = try std.fmt.bufPrint(&blocked_buf, "{d}", .{blocked_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.user_blocks(user_id,blocked_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", &.{ user, blocked });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn removeBlock(self: *Store, user_id: i32, blocked_id: i32) !bool {
+        if (blocked_id == 3) return false;
+        var user_buf: [24]u8 = undefined;
+        var blocked_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const blocked = try std.fmt.bufPrint(&blocked_buf, "{d}", .{blocked_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.user_blocks WHERE user_id=$1 AND blocked_id=$2 RETURNING 1", &.{ user, blocked });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
     pub fn favouriteSetIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
         var id_buf: [24]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
@@ -1320,6 +1396,19 @@ pub const Store = struct {
         var lease = self.pool.acquire();
         defer lease.release();
         var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.favourites(user_id,set_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", &.{ user, set });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn removeFavourite(self: *Store, user_id: i32, set_id: i32) !bool {
+        if (set_id <= 0) return error.InvalidBeatmapSet;
+        var user_buf: [24]u8 = undefined;
+        var set_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.favourites WHERE user_id=$1 AND set_id=$2 RETURNING 1", &.{ user, set });
         defer result.deinit();
         return result.rows() != 0;
     }
@@ -1464,6 +1553,137 @@ pub const Store = struct {
         defer lease.release();
         var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.chat_messages(sender_id,target,message) VALUES($1,$2,$3)", &.{ id, target, message });
         result.deinit();
+    }
+
+    pub fn recordLazerPublicMessage(self: *Store, allocator: std.mem.Allocator, sender_id: i32, target: []const u8, message: []const u8, is_action: bool, uuid: []const u8) !LazerChatWrite {
+        const channel_id = lazer.channelId(target) orelse return error.UnknownChannel;
+        var id_buf: [24]u8 = undefined;
+        const sender = try std.fmt.bufPrint(&id_buf, "{d}", .{sender_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var access = try postgres.queryParams(self.allocator, lease.conn, "SELECT u.privileges,c.write_privileges,c.locked FROM zigcho.users u JOIN zigcho.chat_channels c ON c.name=$2 WHERE u.id=$1", &.{ sender, target });
+        defer access.deinit();
+        if (access.rows() == 0) return error.UnknownChannel;
+        const privileges = try access.int(u32, 0, 0);
+        const required = try access.int(u32, 0, 1);
+        if (try access.boolean(0, 2) or privileges & required == 0) return error.ChannelReadOnly;
+
+        var insert = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.chat_messages(sender_id,target,message,is_action,client_uuid) VALUES($1,$2,$3,$4,$5) ON CONFLICT(sender_id,client_uuid) WHERE client_uuid!='' DO NOTHING RETURNING 1", &.{ sender, target, message, if (is_action) "true" else "false", uuid });
+        const inserted = insert.rows() != 0;
+        insert.deinit();
+        var row = try postgres.queryParams(allocator, lease.conn, "SELECT m.id,m.target,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END FROM zigcho.chat_messages m JOIN zigcho.users u ON u.id=m.sender_id WHERE m.sender_id=$1 AND m.client_uuid=$2", &.{ sender, uuid });
+        defer row.deinit();
+        if (row.rows() != 1) return error.DatabaseQueryFailed;
+        if (!std.mem.eql(u8, row.value(0, 1), target) or !std.mem.eql(u8, row.value(0, 2), message) or (try row.boolean(0, 3)) != is_action) return error.ChatUuidConflict;
+
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try lazer.writeChatMessage(&output.writer, .{
+            .id = try row.int(i64, 0, 0),
+            .channel_id = channel_id,
+            .sender_id = sender_id,
+            .sender_name = row.value(0, 6),
+            .sender_country = row.value(0, 7),
+            .content = message,
+            .is_action = is_action,
+            .uuid = uuid,
+            .timestamp = row.value(0, 5),
+        });
+        return .{ .json = try output.toOwnedSlice(), .inserted = inserted };
+    }
+
+    pub fn lazerChatMessagesJson(self: *Store, allocator: std.mem.Allocator, channel_id: ?i64, since: i64, limit: u16) ![]u8 {
+        if (since < 0 or limit == 0 or limit > 100) return error.InvalidChatQuery;
+        const target = if (channel_id) |id| lazer.channelName(id) orelse return error.UnknownChannel else null;
+        var since_buf: [24]u8 = undefined;
+        var limit_buf: [8]u8 = undefined;
+        const since_text = try std.fmt.bufPrint(&since_buf, "{d}", .{since});
+        const limit_text = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        const sql = if (target != null and since == 0)
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM (SELECT * FROM zigcho.chat_messages WHERE target=$1 ORDER BY id DESC LIMIT $2::int) m JOIN zigcho.users u ON u.id=m.sender_id WHERE NOT u.restricted ORDER BY m.id"
+        else if (target != null)
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM zigcho.chat_messages m JOIN zigcho.users u ON u.id=m.sender_id WHERE m.target=$1 AND m.id>$2::bigint AND NOT u.restricted ORDER BY m.id LIMIT $3::int"
+        else if (since == 0)
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM (SELECT * FROM zigcho.chat_messages WHERE target IN('#osu','#announce','#lobby','#lazer') ORDER BY id DESC LIMIT $1::int) m JOIN zigcho.users u ON u.id=m.sender_id WHERE NOT u.restricted ORDER BY m.id"
+        else
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM zigcho.chat_messages m JOIN zigcho.users u ON u.id=m.sender_id WHERE m.target IN('#osu','#announce','#lobby','#lazer') AND m.id>$1::bigint AND NOT u.restricted ORDER BY m.id LIMIT $2::int";
+        var result = if (target) |name|
+            if (since == 0)
+                try postgres.queryParams(allocator, lease.conn, sql, &.{ name, limit_text })
+            else
+                try postgres.queryParams(allocator, lease.conn, sql, &.{ name, since_text, limit_text })
+        else if (since == 0)
+            try postgres.queryParams(allocator, lease.conn, sql, &.{limit_text})
+        else
+            try postgres.queryParams(allocator, lease.conn, sql, &.{ since_text, limit_text });
+        defer result.deinit();
+
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        var first = true;
+        for (0..result.rows()) |row| {
+            const message_channel_id = lazer.channelId(result.value(row, 1)) orelse continue;
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try lazer.writeChatMessage(&output.writer, .{
+                .id = try result.int(i64, row, 0),
+                .channel_id = message_channel_id,
+                .sender_id = try result.int(i32, row, 2),
+                .sender_name = result.value(row, 3),
+                .sender_country = result.value(row, 4),
+                .content = result.value(row, 5),
+                .is_action = try result.boolean(row, 6),
+                .uuid = result.value(row, 7),
+                .timestamp = result.value(row, 8),
+            });
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
+    pub fn lazerChannelListJson(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]u8 {
+        if (user_id <= 0) return error.InvalidUser;
+        var user_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        var channel_id: i64 = 1;
+        while (channel_id <= 4) : (channel_id += 1) {
+            if (channel_id != 1) try output.writer.writeByte(',');
+            var channel_buf: [24]u8 = undefined;
+            const channel = try std.fmt.bufPrint(&channel_buf, "{d}", .{channel_id});
+            const target = lazer.channelName(channel_id).?;
+            var result = try postgres.queryParams(allocator, lease.conn, "SELECT (SELECT max(id) FROM zigcho.chat_messages WHERE target=$1),(SELECT last_read_id FROM zigcho.lazer_channel_reads WHERE user_id=$2::int AND channel_id=$3::smallint)", &.{ target, user, channel });
+            defer result.deinit();
+            const last_message_id: ?i64 = if (result.isNull(0, 0)) null else try result.int(i64, 0, 0);
+            const last_read_id: ?i64 = if (result.isNull(0, 1)) null else try result.int(i64, 0, 1);
+            try lazer.writeChatChannel(&output.writer, channel_id, last_message_id, last_read_id);
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
+    pub fn markLazerChannelRead(self: *Store, user_id: i32, channel_id: i64, message_id: i64) !void {
+        const target = lazer.channelName(channel_id) orelse return error.UnknownChannel;
+        if (user_id <= 0 or message_id <= 0) return error.InvalidChatQuery;
+        var user_buf: [24]u8 = undefined;
+        var channel_buf: [24]u8 = undefined;
+        var message_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const channel = try std.fmt.bufPrint(&channel_buf, "{d}", .{channel_id});
+        const message = try std.fmt.bufPrint(&message_buf, "{d}", .{message_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.lazer_channel_reads(user_id,channel_id,last_read_id) SELECT $1::int,$2::smallint,$3::bigint WHERE EXISTS(SELECT 1 FROM zigcho.chat_messages WHERE id=$3::bigint AND target=$4) ON CONFLICT(user_id,channel_id) DO UPDATE SET last_read_id=greatest(zigcho.lazer_channel_reads.last_read_id,excluded.last_read_id),updated_at=extract(epoch FROM clock_timestamp())::bigint RETURNING 1", &.{ user, channel, message, target });
+        defer result.deinit();
+        if (result.rows() == 0) return error.ChatMessageNotFound;
     }
 
     pub fn beatmapRankContext(self: *Store, map_md5: []const u8) !?domain.BeatmapRankContext {
@@ -2391,6 +2611,93 @@ pub const Store = struct {
         }, frames));
     }
 
+    pub fn lazerUserScoreCounts(self: *Store, user_id: i32, ruleset_id: u8) !domain.UserScoreCounts {
+        var user_buf: [24]u8 = undefined;
+        var ruleset_buf: [4]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const ruleset = try std.fmt.bufPrint(&ruleset_buf, "{d}", .{ruleset_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        const sql =
+            "SELECT " ++
+            "(SELECT count(*) FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4))," ++
+            "(SELECT count(*) FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM zigcho.lazer_scores o JOIN zigcho.users ou ON ou.id=o.user_id WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed AND o.best AND NOT ou.restricted AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))))," ++
+            "(SELECT count(*) FROM zigcho.lazer_scores WHERE user_id=$1 AND ruleset_id=$2)";
+        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ user, ruleset });
+        defer result.deinit();
+        return .{
+            .best = try result.int(i32, 0, 0),
+            .firsts = try result.int(i32, 0, 1),
+            .recent = try result.int(i32, 0, 2),
+        };
+    }
+
+    pub fn lazerUserScoresJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, ruleset_id: u8, kind: lazer.UserScoreKind, offset: u16, limit: u8) ![]u8 {
+        if (limit == 0 or limit > 100) return error.InvalidScoreLimit;
+        if (kind == .pinned) return allocator.dupe(u8, "[]");
+        var buffers: [4][24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&buffers[0], "{d}", .{user_id});
+        const ruleset = try std.fmt.bufPrint(&buffers[1], "{d}", .{ruleset_id});
+        const limit_text = try std.fmt.bufPrint(&buffers[2], "{d}", .{limit});
+        const offset_text = try std.fmt.bufPrint(&buffers[3], "{d}", .{offset});
+        const columns =
+            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score),s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),b.status,b.set_id,b.md5,b.mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace " ++
+            "FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 ";
+        const sql = switch (kind) {
+            .best => columns ++ "AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4) ORDER BY s.pp DESC,s.id ASC LIMIT $3 OFFSET $4",
+            .firsts => columns ++ "AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM zigcho.lazer_scores o JOIN zigcho.users ou ON ou.id=o.user_id WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed AND o.best AND NOT ou.restricted AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))) ORDER BY s.submitted_at DESC,s.id DESC LIMIT $3 OFFSET $4",
+            .recent => columns ++ "ORDER BY s.submitted_at DESC,s.id DESC LIMIT $3 OFFSET $4",
+            .pinned => unreachable,
+        };
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ user, ruleset, limit_text, offset_text });
+        defer result.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        for (0..result.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            const status = try result.int(i32, row, 18);
+            const namespace_name = result.value(row, 27);
+            try lazer.writeLeaderboardScore(&output.writer, .{
+                .id = try result.int(i64, row, 0),
+                .user_id = try result.int(i32, row, 1),
+                .username = result.value(row, 2),
+                .country = result.value(row, 3),
+                .beatmap_id = try result.int(i32, row, 4),
+                .ruleset_id = try result.int(i32, row, 5),
+                .total_score = try result.int(i64, row, 6),
+                .total_score_without_mods = try result.int(i64, row, 7),
+                .pp = try result.float(f64, row, 8),
+                .accuracy = try result.float(f64, row, 9),
+                .max_combo = try result.int(i32, row, 10),
+                .passed = try result.boolean(row, 11),
+                .rank = result.value(row, 12),
+                .mods_json = result.value(row, 13),
+                .statistics_json = result.value(row, 14),
+                .maximum_statistics_json = result.value(row, 15),
+                .pauses_json = result.value(row, 16),
+                .ended_at = result.value(row, 17),
+                .ranked = (status == 3 or status == 4) and std.mem.eql(u8, namespace_name, "vanilla"),
+                .beatmap = .{
+                    .id = try result.int(i32, row, 4),
+                    .set_id = try result.int(i32, row, 19),
+                    .status = lazerStatus(status),
+                    .checksum = result.value(row, 20),
+                    .ruleset_id = try result.int(i32, row, 21),
+                    .star_rating = try result.float(f64, row, 22),
+                    .version = result.value(row, 23),
+                    .artist = result.value(row, 24),
+                    .title = result.value(row, 25),
+                    .creator = result.value(row, 26),
+                },
+            });
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
     pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, limit: u8) ![]u8 {
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
@@ -2442,7 +2749,7 @@ pub const Store = struct {
                 .maximum_statistics_json = result.value(row, 17),
                 .pauses_json = result.value(row, 18),
                 .ended_at = result.value(row, 19),
-                .ranked = (try result.int(i32, row, 20)) == 3 or (try result.int(i32, row, 20)) == 4,
+                .ranked = ((try result.int(i32, row, 20)) == 3 or (try result.int(i32, row, 20)) == 4) and namespace == .vanilla,
             };
             if (position <= limit) {
                 if (written != 0) try scores.writer.writeByte(',');
@@ -2905,7 +3212,7 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates through anticheat telemetry schema twenty six" {
+test "postgres runtime migrates through lazer chat schema twenty seven" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -2913,16 +3220,16 @@ test "postgres runtime migrates through anticheat telemetry schema twenty six" {
         try old_store.migrate();
         var previous = old_store.pool.acquire();
         defer previous.release();
-        try postgres.exec(previous.conn, "DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; UPDATE zigcho.schema_migrations SET version=20 WHERE version=26");
+        try postgres.exec(previous.conn, "DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; UPDATE zigcho.schema_migrations SET version=20 WHERE version=27");
     }
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')) FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 26), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 27), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -2941,6 +3248,9 @@ test "postgres runtime migrates through anticheat telemetry schema twenty six" {
     try std.testing.expectEqual(@as(i32, 3), try result.int(i32, 0, 16));
     try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 17));
     try std.testing.expectEqual(@as(i32, 8), try result.int(i32, 0, 18));
+    try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 19));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 20));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 21));
     const kai = (try store.userById(std.testing.allocator, 3)).?;
     defer {
         std.testing.allocator.free(kai.name);

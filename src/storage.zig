@@ -3970,6 +3970,26 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    pub fn lazerBeatmapSets(self: *Store, allocator: std.mem.Allocator, set_ids: []const i32) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll("{\"beatmapsets\":[");
+        var count: usize = 0;
+        for (set_ids) |set_id| {
+            var set_output: std.Io.Writer.Allocating = .init(allocator);
+            defer set_output.deinit();
+            if (!try self.appendLazerSet(&set_output.writer, set_id)) continue;
+            if (count != 0) try output.writer.writeByte(',');
+            try output.writer.writeAll(set_output.written());
+            count += 1;
+        }
+        try output.writer.print("],\"total\":{d},\"cursor\":null}}", .{count});
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
+
     pub fn stableLeaderboard(self: *Store, allocator: std.mem.Allocator, viewer: domain.User, map_md5: []const u8, mode: u8, board_type: u8, requested_mods: i32) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -4,9 +4,11 @@ const pp = @import("exact_pp.zig");
 const storage = @import("runtime_storage.zig");
 
 const metadata_limit = 256 * 1024;
+const search_limit = 8 * 1024 * 1024;
 const archive_limit = 128 * 1024 * 1024;
 const map_limit = 16 * 1024 * 1024;
 const entry_limit = 4096;
+const mapset_map_limit = 256;
 pub const max_concurrent_hydrations = 4;
 
 const CheesegullMap = struct {
@@ -42,9 +44,36 @@ const BeatmapIdentity = struct {
 };
 
 const RemoteMap = struct {
-    approved: i32,
+    md5: [32]u8,
     beatmap_id: i32,
 };
+
+const RemoteSet = struct {
+    allocator: std.mem.Allocator,
+    approved: i32,
+    requested_beatmap_id: i32,
+    maps: []RemoteMap,
+
+    fn deinit(self: RemoteSet) void {
+        self.allocator.free(self.maps);
+    }
+};
+
+pub const ExtractedOsu = struct {
+    md5: [32]u8,
+    contents: []u8,
+};
+
+pub fn freeExtractedOsu(allocator: std.mem.Allocator, files: []ExtractedOsu) void {
+    for (files) |file| allocator.free(file.contents);
+    allocator.free(files);
+}
+
+pub fn findExtractedOsu(files: []const ExtractedOsu, wanted_md5: []const u8) ?ExtractedOsu {
+    if (!validMd5(wanted_md5)) return null;
+    for (files) |file| if (std.ascii.eqlIgnoreCase(&file.md5, wanted_md5)) return file;
+    return null;
+}
 
 pub const Sync = struct {
     allocator: std.mem.Allocator,
@@ -128,6 +157,7 @@ pub const Sync = struct {
         };
 
         const thread = std.Thread.spawn(.{}, backgroundDownload, .{ self, store, md5_owned, set_id, remote }) catch {
+            remote.deinit();
             self.recordFailure(store, md5_owned, set_id, error.ThreadSpawnFailed);
             self.removeFromProgress(md5_owned);
             return false;
@@ -161,11 +191,13 @@ pub const Sync = struct {
         };
 
         const md5_owned = self.allocator.dupe(u8, &identity.md5) catch |err| {
+            remote.deinit();
             self.recordFailure(store, &identity.md5, identity.set_id, err);
             self.removeFromProgress(claim_owned);
             return err;
         };
         const thread = std.Thread.spawn(.{}, backgroundLookupDownload, .{ self, store, claim_owned, md5_owned, identity.set_id, remote }) catch |err| {
+            remote.deinit();
             self.allocator.free(md5_owned);
             self.recordFailure(store, &identity.md5, identity.set_id, err);
             self.removeFromProgress(claim_owned);
@@ -218,6 +250,7 @@ pub const Sync = struct {
             self.recordFailure(store, &identity.md5, identity.set_id, err);
             return err;
         };
+        defer remote.deinit();
         self.downloadArchive(store, &identity.md5, identity.set_id, remote) catch |err| {
             self.recordFailure(store, &identity.md5, identity.set_id, err);
             return err;
@@ -245,12 +278,45 @@ pub const Sync = struct {
         defer self.removeFromProgress(claim_owned);
 
         _ = self.attempts.fetchAdd(1, .monotonic);
-        _ = self.fetchAndStoreMetadata(store, null, set_id) catch |err| {
+        const remote = self.fetchAndStoreMetadata(store, null, set_id) catch |err| {
             _ = self.failures.fetchAdd(1, .monotonic);
             return err;
         };
+        remote.deinit();
         _ = self.successes.fetchAdd(1, .monotonic);
         return true;
+    }
+
+    /// Pull the public CheeseGull catalogue page and persist every difficulty
+    /// from each returned set. The returned ids preserve upstream relevance
+    /// order so Lazer does not depend on the order of the local cache.
+    pub fn searchSets(self: *Sync, store: *storage.Store, query: []const u8, mode: i8, offset: u16) ![]i32 {
+        if (query.len > 256 or mode < -1 or mode > 3) return error.InvalidSearch;
+
+        var url: std.Io.Writer.Allocating = .init(self.allocator);
+        defer url.deinit();
+        try url.writer.print("https://osu.direct/api/search?amount=50&offset={d}", .{offset});
+        if (mode >= 0) try url.writer.print("&mode={d}", .{mode});
+        try url.writer.print("&query={f}", .{std.fmt.alt(
+            @as(std.Uri.Component, .{ .raw = query }),
+            .formatEscaped,
+        )});
+
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        const json = try fetchFn(&client, self.allocator, url.written(), search_limit);
+        defer self.allocator.free(json);
+        const parsed = try std.json.parseFromSlice([]CheesegullSet, self.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.len > 50) return error.InvalidSearchResponse;
+
+        const ids = try self.allocator.alloc(i32, parsed.value.len);
+        errdefer self.allocator.free(ids);
+        for (parsed.value, 0..) |set, index| {
+            try self.storeSetMetadata(store, set);
+            ids[index] = set.SetID;
+        }
+        return ids;
     }
 
     const Claim = union(enum) {
@@ -289,7 +355,40 @@ pub const Sync = struct {
         return identity;
     }
 
-    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteMap {
+    fn storeSetMetadata(self: *Sync, store: *storage.Store, set: CheesegullSet) !void {
+        _ = self;
+        if (set.SetID <= 0 or set.ChildrenBeatmaps.len == 0 or set.ChildrenBeatmaps.len > mapset_map_limit) return error.IdMismatch;
+        for (set.ChildrenBeatmaps, 0..) |candidate, index| {
+            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set.SetID or !validMd5(candidate.FileMD5) or candidate.Mode > 3) return error.IdMismatch;
+            for (set.ChildrenBeatmaps[0..index]) |previous| {
+                if (previous.BeatmapID == candidate.BeatmapID or std.ascii.eqlIgnoreCase(previous.FileMD5, candidate.FileMD5)) return error.IdMismatch;
+            }
+            const meta = beatmap.Metadata{
+                .id = candidate.BeatmapID,
+                .set_id = candidate.ParentSetID,
+                .mode = candidate.Mode,
+                .artist = set.Artist,
+                .title = set.Title,
+                .version = candidate.DiffName,
+                .creator = set.Creator,
+                .source = set.Source orelse "",
+                .tags = set.Tags orelse "",
+                .hp = candidate.HP orelse 0,
+                .cs = candidate.CS orelse 0,
+                .od = candidate.OD orelse 0,
+                .ar = candidate.AR orelse 0,
+                .bpm = candidate.BPM orelse 0,
+                .total_length = candidate.TotalLength,
+                .count_circles = 0,
+                .count_sliders = 0,
+                .count_spinners = 0,
+                .object_count = 0,
+            };
+            try store.upsertBeatmapMeta(meta, candidate.FileMD5, localStatus(set.RankedStatus), candidate.DifficultyRating orelse 0, candidate.MaxCombo orelse 0);
+        }
+    }
+
+    fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteSet {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -310,44 +409,31 @@ pub const Sync = struct {
             return err;
         };
         defer parsed.deinit();
-        if (parsed.value.SetID != set_id or parsed.value.ChildrenBeatmaps.len == 0) return error.IdMismatch;
+        if (parsed.value.SetID != set_id or parsed.value.ChildrenBeatmaps.len == 0 or parsed.value.ChildrenBeatmaps.len > mapset_map_limit) return error.IdMismatch;
         var remote: ?CheesegullMap = if (wanted_md5 == null) parsed.value.ChildrenBeatmaps[0] else null;
         for (parsed.value.ChildrenBeatmaps) |candidate| {
-            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set_id or !validMd5(candidate.FileMD5)) return error.IdMismatch;
+            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set_id or !validMd5(candidate.FileMD5) or candidate.Mode > 3) return error.IdMismatch;
             if (wanted_md5) |md5| if (std.ascii.eqlIgnoreCase(candidate.FileMD5, md5)) {
                 remote = candidate;
                 break;
             };
         }
         const map_info = remote orelse return error.Md5NotFound;
+        try self.storeSetMetadata(store, parsed.value);
 
-        for (parsed.value.ChildrenBeatmaps) |candidate| {
-            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set_id or !validMd5(candidate.FileMD5)) return error.IdMismatch;
-            const meta = beatmap.Metadata{
-                .id = candidate.BeatmapID,
-                .set_id = candidate.ParentSetID,
-                .mode = candidate.Mode,
-                .artist = parsed.value.Artist,
-                .title = parsed.value.Title,
-                .version = candidate.DiffName,
-                .creator = parsed.value.Creator,
-                .source = parsed.value.Source orelse "",
-                .tags = parsed.value.Tags orelse "",
-                .hp = candidate.HP orelse 0,
-                .cs = candidate.CS orelse 0,
-                .od = candidate.OD orelse 0,
-                .ar = candidate.AR orelse 0,
-                .bpm = candidate.BPM orelse 0,
-                .total_length = candidate.TotalLength,
-                .count_circles = 0,
-                .count_sliders = 0,
-                .count_spinners = 0,
-                .object_count = 0,
-            };
-            try store.upsertBeatmapMeta(meta, candidate.FileMD5, localStatus(parsed.value.RankedStatus), candidate.DifficultyRating orelse 0, candidate.MaxCombo orelse 0);
+        const maps = try self.allocator.alloc(RemoteMap, parsed.value.ChildrenBeatmaps.len);
+        errdefer self.allocator.free(maps);
+        for (parsed.value.ChildrenBeatmaps, 0..) |candidate, index| {
+            maps[index] = .{ .md5 = undefined, .beatmap_id = candidate.BeatmapID };
+            @memcpy(&maps[index].md5, candidate.FileMD5);
         }
         std.log.info("[hydrate] metadata ok — {s} - {s} [{s}] stars={d:.2}", .{ parsed.value.Artist, parsed.value.Title, map_info.DiffName, map_info.DifficultyRating orelse 0 });
-        return .{ .approved = parsed.value.RankedStatus, .beatmap_id = map_info.BeatmapID };
+        return .{
+            .allocator = self.allocator,
+            .approved = parsed.value.RankedStatus,
+            .requested_beatmap_id = map_info.BeatmapID,
+            .maps = maps,
+        };
     }
 
     fn fetchArchive(self: *Sync, client: *std.http.Client, set_id: i32) ![]u8 {
@@ -367,8 +453,9 @@ pub const Sync = struct {
         self.allocator.free(md5);
     }
 
-    fn backgroundDownload(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32, remote: RemoteMap) void {
+    fn backgroundDownload(self: *Sync, store: *storage.Store, md5_owned: []const u8, set_id: i32, remote: RemoteSet) void {
         defer self.removeFromProgress(md5_owned);
+        defer remote.deinit();
         self.downloadArchive(store, md5_owned, set_id, remote) catch |err| {
             std.log.warn("[hydrate] download failed md5={s}: {t}", .{ md5_owned, err });
             self.recordFailure(store, md5_owned, set_id, err);
@@ -378,9 +465,10 @@ pub const Sync = struct {
         _ = self.successes.fetchAdd(1, .monotonic);
     }
 
-    fn backgroundLookupDownload(self: *Sync, store: *storage.Store, claim_owned: []const u8, md5_owned: []const u8, set_id: i32, remote: RemoteMap) void {
+    fn backgroundLookupDownload(self: *Sync, store: *storage.Store, claim_owned: []const u8, md5_owned: []const u8, set_id: i32, remote: RemoteSet) void {
         defer self.removeFromProgress(claim_owned);
         defer self.allocator.free(md5_owned);
+        defer remote.deinit();
         self.downloadArchive(store, md5_owned, set_id, remote) catch |err| {
             std.log.warn("[hydrate] download failed md5={s}: {t}", .{ md5_owned, err });
             self.recordFailure(store, md5_owned, set_id, err);
@@ -397,7 +485,7 @@ pub const Sync = struct {
             std.log.err("[hydrate] could not save failure state md5={s}: {t}", .{ md5, store_err });
     }
 
-    fn downloadArchive(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32, remote: RemoteMap) !void {
+    fn downloadArchive(self: *Sync, store: *storage.Store, wanted_md5: []const u8, set_id: i32, remote: RemoteSet) !void {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -409,36 +497,66 @@ pub const Sync = struct {
         defer self.allocator.free(archive);
         std.log.info("[hydrate] downloaded {d:.1} MB", .{@as(f64, @floatFromInt(archive.len)) / 1048576.0});
 
-        const osu_file = extractMatchingOsu(self.allocator, archive, wanted_md5) catch |err| {
+        const osu_files = extractAllOsu(self.allocator, archive) catch |err| {
             std.log.warn("[hydrate] extraction failed: {t}", .{err});
             return err;
         };
-        if (osu_file == null) return error.Md5NotInArchive;
-        defer self.allocator.free(osu_file.?);
+        defer freeExtractedOsu(self.allocator, osu_files);
 
-        const metadata = beatmap.parseWithIds(osu_file.?, remote.beatmap_id, set_id) catch |err| {
-            std.log.warn("[hydrate] .osu parse failed: {t}", .{err});
-            return err;
+        const PreparedMap = struct {
+            metadata: beatmap.Metadata,
+            md5: [32]u8,
+            stars: f64,
+            max_combo: u32,
+            contents: []const u8,
         };
-        if (metadata.id != remote.beatmap_id or metadata.set_id != set_id) return error.IdMismatch;
-        const attributes = pp.calculate(osu_file.?, .{
-            .mode = metadata.mode,
-            .lazer = 0,
-            .mods = 0,
-            .max_combo = metadata.object_count,
-            .n_geki = if (metadata.mode == 3) metadata.object_count else 0,
-            .n_katu = 0,
-            .n300 = metadata.object_count,
-            .n100 = 0,
-            .n50 = 0,
-            .misses = 0,
-            .legacy_total_score = 1_000_000,
-        }) catch |err| {
-            std.log.warn("[hydrate] PP calc failed: {t}", .{err});
-            return err;
-        };
-        std.log.info("[hydrate] complete — {s} [{s}] stars={d:.2} max_combo={d}", .{ metadata.artist, metadata.version, attributes.stars, attributes.max_combo });
-        try store.upsertBeatmap(metadata, wanted_md5, localStatus(remote.approved), attributes.stars, attributes.max_combo, osu_file.?);
+        const prepared = try self.allocator.alloc(PreparedMap, remote.maps.len);
+        defer self.allocator.free(prepared);
+
+        var requested_found = false;
+        for (remote.maps, 0..) |remote_map, index| {
+            const extracted = findExtractedOsu(osu_files, &remote_map.md5) orelse return error.MapsetIncomplete;
+
+            const metadata = beatmap.parseWithIds(extracted.contents, remote_map.beatmap_id, set_id) catch |err| {
+                std.log.warn("[hydrate] .osu parse failed map={d}: {t}", .{ remote_map.beatmap_id, err });
+                return err;
+            };
+            if (metadata.id != remote_map.beatmap_id or metadata.set_id != set_id) return error.IdMismatch;
+            const attributes = pp.calculate(extracted.contents, .{
+                .mode = metadata.mode,
+                .lazer = 0,
+                .mods = 0,
+                .max_combo = metadata.object_count,
+                .n_geki = if (metadata.mode == 3) metadata.object_count else 0,
+                .n_katu = 0,
+                .n300 = metadata.object_count,
+                .n100 = 0,
+                .n50 = 0,
+                .misses = 0,
+                .legacy_total_score = 1_000_000,
+            }) catch |err| {
+                std.log.warn("[hydrate] PP calc failed map={d}: {t}", .{ remote_map.beatmap_id, err });
+                return err;
+            };
+            prepared[index] = .{
+                .metadata = metadata,
+                .md5 = remote_map.md5,
+                .stars = attributes.stars,
+                .max_combo = attributes.max_combo,
+                .contents = extracted.contents,
+            };
+            if (remote_map.beatmap_id == remote.requested_beatmap_id) {
+                if (!std.ascii.eqlIgnoreCase(&remote_map.md5, wanted_md5)) return error.BeatmapHashMismatch;
+                requested_found = true;
+            }
+        }
+        if (!requested_found) return error.Md5NotInArchive;
+
+        for (prepared) |map| {
+            try store.upsertBeatmap(map.metadata, &map.md5, localStatus(remote.approved), map.stars, map.max_combo, map.contents);
+            std.log.info("[hydrate] stored map={d} — {s} [{s}] stars={d:.2} max_combo={d}", .{ map.metadata.id, map.metadata.artist, map.metadata.version, map.stars, map.max_combo });
+        }
+        std.log.info("[hydrate] complete set={d} maps={d}", .{ set_id, prepared.len });
 
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
@@ -608,8 +726,7 @@ fn unzipEntry(allocator: std.mem.Allocator, archive: []const u8, central: []cons
     return output;
 }
 
-pub fn extractMatchingOsu(allocator: std.mem.Allocator, archive: []const u8, wanted_md5: []const u8) !?[]u8 {
-    if (!validMd5(wanted_md5)) return null;
+pub fn extractAllOsu(allocator: std.mem.Allocator, archive: []const u8) ![]ExtractedOsu {
     const end_offset = std.mem.lastIndexOf(u8, archive, &std.zip.end_record_sig) orelse return error.InvalidBeatmapArchive;
     const end = try range(archive, end_offset, 22);
     const entry_count: usize = std.mem.readInt(u16, end[10..12], .little);
@@ -620,6 +737,12 @@ pub fn extractMatchingOsu(allocator: std.mem.Allocator, archive: []const u8, wan
     _ = try range(archive, central_offset, central_size);
     const central_end = std.math.add(usize, central_offset, central_size) catch return error.InvalidBeatmapArchive;
 
+    var files: std.ArrayList(ExtractedOsu) = .empty;
+    errdefer {
+        for (files.items) |file| allocator.free(file.contents);
+        files.deinit(allocator);
+    }
+    var total_size: usize = 0;
     var offset = central_offset;
     for (0..entry_count) |_| {
         const central = try range(archive, offset, 46);
@@ -630,13 +753,28 @@ pub fn extractMatchingOsu(allocator: std.mem.Allocator, archive: []const u8, wan
         const filename = try range(archive, offset + 46, name_len);
         const record_len = std.math.add(usize, 46 + name_len, extra_len + comment_entry_len) catch return error.InvalidBeatmapArchive;
         offset = std.math.add(usize, offset, record_len) catch return error.InvalidBeatmapArchive;
-        if (std.ascii.endsWithIgnoreCase(filename, ".osu")) {
-            const contents = try unzipEntry(allocator, archive, central);
-            const digest = beatmap.md5(contents);
-            if (std.ascii.eqlIgnoreCase(&digest, wanted_md5)) return contents;
+        if (!std.ascii.endsWithIgnoreCase(filename, ".osu")) continue;
+
+        const contents = try unzipEntry(allocator, archive, central);
+        const next_size = std.math.add(usize, total_size, contents.len) catch {
             allocator.free(contents);
+            return error.InvalidBeatmapArchive;
+        };
+        if (next_size > archive_limit) {
+            allocator.free(contents);
+            return error.InvalidBeatmapArchive;
         }
+        const digest = beatmap.md5(contents);
+        for (files.items) |existing| if (std.ascii.eqlIgnoreCase(&existing.md5, &digest)) {
+            allocator.free(contents);
+            return error.InvalidBeatmapArchive;
+        };
+        files.append(allocator, .{ .md5 = digest, .contents = contents }) catch |err| {
+            allocator.free(contents);
+            return err;
+        };
+        total_size = next_size;
     }
-    if (offset != central_end) return error.InvalidBeatmapArchive;
-    return null;
+    if (offset != central_end or files.items.len == 0) return error.InvalidBeatmapArchive;
+    return files.toOwnedSlice(allocator);
 }

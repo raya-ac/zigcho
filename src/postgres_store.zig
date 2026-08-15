@@ -1097,6 +1097,26 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    pub fn lazerBeatmapSets(self: *Store, allocator: std.mem.Allocator, set_ids: []const i32) ![]u8 {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll("{\"beatmapsets\":[");
+        var count: usize = 0;
+        for (set_ids) |set_id| {
+            var set_output: std.Io.Writer.Allocating = .init(allocator);
+            defer set_output.deinit();
+            if (!try self.appendLazerSet(lease.conn, &set_output.writer, set_id)) continue;
+            if (count != 0) try output.writer.writeByte(',');
+            try output.writer.writeAll(set_output.written());
+            count += 1;
+        }
+        try output.writer.print("],\"total\":{d},\"cursor\":null}}", .{count});
+        var list = output.toArrayList();
+        return list.toOwnedSlice(allocator);
+    }
+
     pub fn registrationConflicts(self: *Store, name: []const u8, email: []const u8) !RegistrationConflicts {
         const safe = try domain.safeName(self.allocator, name);
         defer self.allocator.free(safe);
@@ -3572,6 +3592,9 @@ test "postgres account auth stats and token slice" {
     const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "title two", 0, 0);
     defer std.testing.allocator.free(lazer_search);
     try std.testing.expect(std.mem.indexOf(u8, lazer_search, "\"beatmapsets\":[{") != null);
+    const ordered_lazer_sets = try store.lazerBeatmapSets(std.testing.allocator, &.{2});
+    defer std.testing.allocator.free(ordered_lazer_sets);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_lazer_sets, "\"beatmapsets\":[{\"id\":2") != null);
     const raw_lazer_score = "{\"beatmap_id\":2,\"ruleset_id\":0,\"total_score\":1234,\"accuracy\":0.98,\"max_combo\":25,\"passed\":true,\"mods\":[],\"statistics\":{},\"client_version\":\"2026.811.0\"}";
     const parsed_lazer = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw_lazer_score, .{});
     defer parsed_lazer.deinit();

@@ -442,6 +442,69 @@ fn storedZip(allocator: std.mem.Allocator, filename: []const u8, contents: []con
     return output.toOwnedSlice();
 }
 
+const StoredZipEntry = struct {
+    filename: []const u8,
+    contents: []const u8,
+};
+
+fn storedZipFiles(allocator: std.mem.Allocator, entries: []const StoredZipEntry) ![]u8 {
+    if (entries.len == 0 or entries.len > std.math.maxInt(u16)) return error.InvalidFixture;
+    const local_offsets = try allocator.alloc(u32, entries.len);
+    defer allocator.free(local_offsets);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    for (entries, 0..) |entry, index| {
+        local_offsets[index] = @intCast(output.written().len);
+        const crc = std.hash.Crc32.hash(entry.contents);
+        try writer.writeAll(&std.zip.local_file_header_sig);
+        try writer.writeInt(u16, 20, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u32, crc, .little);
+        try writer.writeInt(u32, @intCast(entry.contents.len), .little);
+        try writer.writeInt(u32, @intCast(entry.contents.len), .little);
+        try writer.writeInt(u16, @intCast(entry.filename.len), .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeAll(entry.filename);
+        try writer.writeAll(entry.contents);
+    }
+    const central_offset: u32 = @intCast(output.written().len);
+    for (entries, local_offsets) |entry, local_offset| {
+        const crc = std.hash.Crc32.hash(entry.contents);
+        try writer.writeAll(&std.zip.central_file_header_sig);
+        try writer.writeInt(u16, 20, .little);
+        try writer.writeInt(u16, 20, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u32, crc, .little);
+        try writer.writeInt(u32, @intCast(entry.contents.len), .little);
+        try writer.writeInt(u32, @intCast(entry.contents.len), .little);
+        try writer.writeInt(u16, @intCast(entry.filename.len), .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u32, 0, .little);
+        try writer.writeInt(u32, local_offset, .little);
+        try writer.writeAll(entry.filename);
+    }
+    const central_size: u32 = @intCast(output.written().len - central_offset);
+    try writer.writeAll(&std.zip.end_record_sig);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, @intCast(entries.len), .little);
+    try writer.writeInt(u16, @intCast(entries.len), .little);
+    try writer.writeInt(u32, central_size, .little);
+    try writer.writeInt(u32, central_offset, .little);
+    try writer.writeInt(u16, 0, .little);
+    return output.toOwnedSlice();
+}
+
 test "config values stay owned after the source buffer changes" {
     const source = try std.testing.allocator.dupe(
         u8,
@@ -1646,11 +1709,37 @@ test "Akatsuki archives only yield the exact MD5 map" {
     const map = @embedFile("testdata/synthetic-standard.osu");
     const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
     defer std.testing.allocator.free(archive);
+    const files = try beatmap_sync.extractAllOsu(std.testing.allocator, archive);
+    defer beatmap_sync.freeExtractedOsu(std.testing.allocator, files);
     const hash = beatmap.md5(map);
-    const extracted = (try beatmap_sync.extractMatchingOsu(std.testing.allocator, archive, &hash)).?;
-    defer std.testing.allocator.free(extracted);
-    try std.testing.expectEqualStrings(map, extracted);
-    try std.testing.expect((try beatmap_sync.extractMatchingOsu(std.testing.allocator, archive, "00000000000000000000000000000000")) == null);
+    const extracted = beatmap_sync.findExtractedOsu(files, &hash).?;
+    try std.testing.expectEqualStrings(map, extracted.contents);
+    try std.testing.expect(beatmap_sync.findExtractedOsu(files, "00000000000000000000000000000000") == null);
+}
+
+test "a pulled mapset extracts every current osu difficulty" {
+    const first = @embedFile("testdata/synthetic-standard.osu");
+    const second =
+        "osu file format v14\n" ++
+        "[General]\nMode:0\n" ++
+        "[Metadata]\nBeatmapID:900000002\nBeatmapSetID:900000000\nArtist:Zigcho\nTitle:Zigcho Fixture\nCreator:Ari\nVersion:Another Test\n" ++
+        "[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:7\nApproachRate:8\n" ++
+        "[TimingPoints]\n0,500,4,2,0,100,1,0\n" ++
+        "[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n";
+    const entries = [_]StoredZipEntry{
+        .{ .filename = "Zigcho [Tests].osu", .contents = first },
+        .{ .filename = "Zigcho [Another Test].osu", .contents = second },
+        .{ .filename = "audio.mp3", .contents = "not really audio" },
+    };
+    const archive = try storedZipFiles(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(archive);
+    const files = try beatmap_sync.extractAllOsu(std.testing.allocator, archive);
+    defer beatmap_sync.freeExtractedOsu(std.testing.allocator, files);
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    try std.testing.expectEqualStrings(first, files[0].contents);
+    try std.testing.expectEqualStrings(second, files[1].contents);
+    try std.testing.expectEqualSlices(u8, &beatmap.md5(first), &files[0].md5);
+    try std.testing.expectEqualSlices(u8, &beatmap.md5(second), &files[1].md5);
 }
 
 test "old beatmaps without embedded ids use trusted API ids" {
@@ -4843,6 +4932,21 @@ test "ranked stable PP is stored and updates normal player stats" {
     const parsed_search = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_search, .{});
     defer parsed_search.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_search.value.object.get("total").?.integer);
+    var other_metadata = metadata;
+    other_metadata.id = 900000003;
+    other_metadata.set_id = 900000002;
+    other_metadata.artist = "Other Artist";
+    other_metadata.title = "Other Set";
+    other_metadata.version = "Other Difficulty";
+    const other_hash = "1234567890abcdef1234567890abcdef";
+    try store.upsertBeatmapMeta(other_metadata, other_hash, 2, 2.5, 20);
+    const ordered_sets = try store.lazerBeatmapSets(std.testing.allocator, &.{ other_metadata.set_id, metadata.set_id });
+    defer std.testing.allocator.free(ordered_sets);
+    const parsed_ordered_sets = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ordered_sets, .{});
+    defer parsed_ordered_sets.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_ordered_sets.value.object.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, other_metadata.set_id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, metadata.set_id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[1].object.get("id").?.integer);
     const search = try store.stableSearch(std.testing.allocator, "Fixture", -1, 4, 0);
     defer std.testing.allocator.free(search);
     try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|0|10.0|"));

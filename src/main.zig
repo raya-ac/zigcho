@@ -1726,7 +1726,15 @@ const App = struct {
                 if (char.* == '+') char.* = ' ';
             }
             const query = std.Uri.percentDecodeInPlace(query_buf);
-            const listing = try self.store.lazerBeatmapSearch(self.allocator, query, mode, offset);
+            const upstream_ids: ?[]i32 = self.map_sync.searchSets(&self.store, query, mode, offset) catch |err| failed: {
+                std.log.warn("event=lazer_beatmap_search_upstream_failed mode={d} offset={d} error={t}", .{ mode, offset, err });
+                break :failed null;
+            };
+            defer if (upstream_ids) |ids| self.allocator.free(ids);
+            const listing = if (upstream_ids) |ids|
+                try self.store.lazerBeatmapSets(self.allocator, ids)
+            else
+                try self.store.lazerBeatmapSearch(self.allocator, query, mode, offset);
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
         }

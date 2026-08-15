@@ -63,7 +63,7 @@ auth_get() {
 }
 
 auth_get /api/v2/me/ me
-jq -e '.statistics_rulesets.osu.play_count == 0 and .avatar_url == "https://a.kai.ovh/4"' "$response" >/dev/null || fail invalid_me_contract
+jq -e '.statistics_rulesets.osu.play_count == 0 and .avatar_url == "https://a.kai.ovh/4" and .is_supporter == true and .support_level == 1' "$response" >/dev/null || fail invalid_me_contract
 auth_get /api/v2/notifications notifications
 jq -e '.has_more == false and .notifications == [] and (.notification_endpoint | startswith("wss://"))' "$response" >/dev/null || fail invalid_notifications_contract
 auth_get /api/v2/friends friends

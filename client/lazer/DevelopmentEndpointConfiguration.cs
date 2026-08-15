@@ -8,12 +8,13 @@ namespace osu.Game.Online
         public DevelopmentEndpointConfiguration()
         {
             RealtimeServicesAvailable = false;
+            MultiplayerServicesAvailable = true;
             WebsiteUrl = @"https://kai.ovh";
             APIUrl = @"http://127.0.0.1:18095";
             APIClientSecret = @"zigcho-lazer";
             APIClientID = "5";
             SpectatorUrl = @"https://spectator.kai.ovh/spectator";
-            MultiplayerUrl = @"https://spectator.kai.ovh/multiplayer";
+            MultiplayerUrl = @"http://127.0.0.1:18095/multiplayer";
             MetadataUrl = @"https://spectator.kai.ovh/metadata";
             BeatmapSubmissionServiceUrl = @"https://bss.kai.ovh";
         }

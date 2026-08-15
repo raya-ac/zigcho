@@ -19,6 +19,20 @@ def replace_once(path: Path, old: str, new: str) -> None:
     path.write_bytes(updated if newline == b"\n" else updated.replace(b"\n", newline))
 
 
+def replace_one_of(path: Path, old_values: tuple[str, ...], new: str) -> None:
+    data = path.read_bytes()
+    normalized = data.replace(b"\r\n", b"\n")
+    if new.encode() in normalized:
+        return
+    newline = b"\r\n" if data.count(b"\r\n") > data.count(b"\n") // 2 else b"\n"
+    for old in old_values:
+        if old.encode() in normalized:
+            updated = normalized.replace(old.encode(), new.encode(), 1)
+            path.write_bytes(updated if newline == b"\n" else updated.replace(b"\n", newline))
+            return
+    raise SystemExit(f"pinned client source changed near {old_values[0].strip()!r}: {path}")
+
+
 checkout = Path(sys.argv[1])
 api_access = checkout / "osu.Game/Online/API/APIAccess.cs"
 endpoint = checkout / "osu.Game/Online/EndpointConfiguration.cs"
@@ -36,10 +50,13 @@ replace_once(
                 ? setUpNotificationsClient()
                 : new DummyNotificationsClient { HandleMessage = _ => true };""",
 )
-replace_once(
+replace_one_of(
     api_access,
-    "            new HubClientConnector(clientName, endpoint, this, versionHash);",
-    "            Endpoints.RealtimeServicesAvailable ? new HubClientConnector(clientName, endpoint, this, versionHash) : null;",
+    (
+        "            new HubClientConnector(clientName, endpoint, this, versionHash);",
+        "            Endpoints.RealtimeServicesAvailable ? new HubClientConnector(clientName, endpoint, this, versionHash) : null;",
+    ),
+    "            ZigchoRealtimeServicePolicy.AllowsHub(Endpoints, endpoint) ? new HubClientConnector(clientName, endpoint, this, versionHash) : null;",
 )
 if b"new UnavailableRealtimeChatClient()" in api_access.read_bytes():
     replace_once(
@@ -66,6 +83,18 @@ replace_once(
         /// Whether websocket and SignalR services are available for this endpoint set.
         /// </summary>
         public bool RealtimeServicesAvailable { get; set; } = true;
+""",
+)
+replace_once(
+    endpoint,
+    """        public bool RealtimeServicesAvailable { get; set; } = true;
+""",
+    """        public bool RealtimeServicesAvailable { get; set; } = true;
+
+        /// <summary>
+        /// Whether the normal multiplayer SignalR hub is available independently.
+        /// </summary>
+        public bool MultiplayerServicesAvailable { get; set; }
 """,
 )
 

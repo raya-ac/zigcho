@@ -26,8 +26,8 @@ fn writeUserCore(writer: *std.Io.Writer, user: domain.User) !void {
     try std.json.Stringify.value(&user.country, .{}, writer);
     try writer.print(",\"is_active\":{s},\"is_online\":true,\"is_supporter\":{s},\"support_level\":{d},\"is_admin\":{s},\"is_gmt\":{s},\"is_qat\":false,\"is_bng\":{s},\"is_bot\":{s},\"pm_friends_only\":false", .{
         if (user.restricted) "false" else "true",
-        if (user.privileges & ((@as(u32, 1) << 4) | (@as(u32, 1) << 5)) != 0) "true" else "false",
-        @as(u8, if (user.privileges & (@as(u32, 1) << 5) != 0) 2 else if (user.privileges & (@as(u32, 1) << 4) != 0) 1 else 0),
+        "true",
+        @as(u8, if (user.privileges & (@as(u32, 1) << 5) != 0) 2 else 1),
         if (user.privileges & (@as(u32, 1) << 13) != 0) "true" else "false",
         if (user.privileges & (@as(u32, 1) << 12) != 0) "true" else "false",
         if (user.privileges & (@as(u32, 1) << 11) != 0) "true" else "false",
@@ -140,6 +140,7 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqual(@as(i64, 2), object.get("scores_best_count").?.integer);
     try std.testing.expectEqualStrings("raya\"test", object.get("username").?.string);
     try std.testing.expect(object.get("is_supporter").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), object.get("support_level").?.integer);
     try std.testing.expect(object.get("is_bng").?.bool);
     try std.testing.expect(object.get("is_admin").?.bool);
     try std.testing.expectEqual(@as(i64, 424), object.get("statistics").?.object.get("pp").?.integer);
@@ -151,4 +152,30 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     defer parsed_me.deinit();
     try std.testing.expectEqual(@as(i64, 43), parsed_me.value.object.get("statistics_rulesets").?.object.get("osu").?.object.get("play_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), parsed_me.value.object.get("statistics_rulesets").?.object.get("mania").?.object.get("play_count").?.integer);
+
+    const regular_user: domain.User = .{
+        .id = 5,
+        .name = "regular",
+        .safe_name = "regular",
+        .privileges = 3,
+    };
+    const regular_json = try meOwned(std.testing.allocator, regular_user, .{ null, null, null, null });
+    defer std.testing.allocator.free(regular_json);
+    var parsed_regular = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, regular_json, .{});
+    defer parsed_regular.deinit();
+    try std.testing.expect(parsed_regular.value.object.get("is_supporter").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), parsed_regular.value.object.get("support_level").?.integer);
+
+    const premium_user: domain.User = .{
+        .id = 6,
+        .name = "premium",
+        .safe_name = "premium",
+        .privileges = 3 | (@as(u32, 1) << 5),
+    };
+    const premium_json = try meOwned(std.testing.allocator, premium_user, .{ null, null, null, null });
+    defer std.testing.allocator.free(premium_json);
+    var parsed_premium = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, premium_json, .{});
+    defer parsed_premium.deinit();
+    try std.testing.expect(parsed_premium.value.object.get("is_supporter").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), parsed_premium.value.object.get("support_level").?.integer);
 }

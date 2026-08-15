@@ -6,6 +6,7 @@ const sqlite_storage = @import("storage.zig");
 const sessions_mod = @import("sessions.zig");
 const bancho = @import("bancho.zig");
 const lazer = @import("lazer.zig");
+const lazer_multiplayer = @import("lazer_multiplayer.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
@@ -132,6 +133,7 @@ const App = struct {
     allocator: std.mem.Allocator,
     store: storage.Store,
     sessions: sessions_mod.Sessions,
+    lazer_multiplayer: lazer_multiplayer.Manager,
     limiter: rate_limit.Limiter,
     map_sync: beatmap_sync.Sync,
     media_sync: beatmap_media.Sync,
@@ -525,6 +527,8 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/appeals")) return rate_limit.appeal;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if ((req.head.method == .POST or req.head.method == .PUT) and lazer.parseSoloScorePath(path) != null) return rate_limit.score;
+        if ((req.head.method == .POST or req.head.method == .PUT) and lazer_multiplayer.parseRoomScorePath(path) != null) return rate_limit.score;
+        if (std.mem.eql(u8, path, "/multiplayer") or std.mem.eql(u8, path, "/multiplayer/negotiate") or std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null) return rate_limit.authenticated;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-screenshot.php")) return rate_limit.media_upload;
         if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
@@ -542,6 +546,7 @@ const App = struct {
         if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/session") or std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (lazer.parseSoloScorePath(path) != null) return 1024 * 1024;
+        if (lazer_multiplayer.parseRoomScorePath(path) != null) return 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return 20 * 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php")) return 32 * 1024 * 1024;
         if (std.mem.eql(u8, path, "/web/osu-screenshot.php")) return screenshot.max_bytes + 256 * 1024;
@@ -595,6 +600,41 @@ const App = struct {
             const location = try std.fmt.allocPrint(self.allocator, "https://kai.ovh{s}", .{target});
             defer self.allocator.free(location);
             return respond(req, .permanent_redirect, "text/plain", "", &.{.{ .name = "location", .value = location }});
+        }
+        if (std.mem.eql(u8, path, "/multiplayer/negotiate")) {
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const json = try lazer_multiplayer.negotiateJson(self.allocator, self.store.io);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
+        if (std.mem.eql(u8, path, "/multiplayer")) {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const key = switch (req.upgradeRequested()) {
+                .websocket => |maybe_key| maybe_key orelse return respond(req, .bad_request, "application/json", "{\"error\":\"websocket key required\"}", &.{}),
+                else => return respond(req, .bad_request, "application/json", "{\"error\":\"websocket upgrade required\"}", &.{}),
+            };
+            var socket = try req.respondWebSocket(.{ .key = key });
+            try socket.flush();
+            self.lazer_multiplayer.serve(user, &socket) catch |err| {
+                std.log.info("event=lazer_multiplayer_connection_closed user_id={d} error={t}", .{ user.id, err });
+            };
+            return;
+        }
+        if (std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null) {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const room_id = lazer_multiplayer.parseRoomPath(path);
+            const json = (try self.lazer_multiplayer.roomsJson(self.allocator, room_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{});
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         const body_is_framed = req.head.content_length != null or req.head.transfer_encoding != .none;
         const body: []u8 = if (req.head.method.requestHasBody() and body_is_framed) b: {
@@ -1710,6 +1750,91 @@ const App = struct {
             }
             return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
         }
+        if (lazer_multiplayer.parseRoomScorePath(path)) |room_score_path| {
+            const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            const required_scope: []const u8 = if (req.head.method == .GET) "identify" else "scores:write";
+            const user = (try self.store.authenticateToken(self.allocator, auth[7..], required_scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"restricted\"}", &.{});
+            const score_context = self.lazer_multiplayer.scoreContext(user.id, room_score_path.room_id, room_score_path.playlist_item_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
+
+            if (room_score_path.token_id == null and req.head.method == .GET) {
+                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, 100);
+                defer self.allocator.free(board_json);
+                const parsed_board = std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{}) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
+                defer parsed_board.deinit();
+                const board = switch (parsed_board.value) {
+                    .object => |object| object,
+                    else => return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{}),
+                };
+                const scores = board.get("scores") orelse return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
+                const score_count: i64 = if (board.get("score_count")) |value| switch (value) {
+                    .integer => |integer| integer,
+                    else => 0,
+                } else 0;
+                var output: std.Io.Writer.Allocating = .init(self.allocator);
+                defer output.deinit();
+                try output.writer.writeAll("{\"scores\":");
+                try std.json.Stringify.value(scores, .{}, &output.writer);
+                try output.writer.print(",\"total\":{d},\"user_score\":", .{score_count});
+                if (board.get("user_score")) |own| switch (own) {
+                    .object => |object| if (object.get("score")) |score| try std.json.Stringify.value(score, .{}, &output.writer) else try output.writer.writeAll("null"),
+                    else => try output.writer.writeAll("null"),
+                } else try output.writer.writeAll("null");
+                try output.writer.writeAll(",\"params\":{},\"cursor_string\":null}");
+                return respond(req, .ok, "application/json", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
+            }
+
+            if (room_score_path.token_id == null and req.head.method == .POST) {
+                const version_hash = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"version_hash"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"version_hash required\"}", &.{});
+                defer self.allocator.free(version_hash);
+                const beatmap_hash = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"beatmap_hash"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"beatmap_hash required\"}", &.{});
+                defer self.allocator.free(beatmap_hash);
+                const beatmap_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"beatmap_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"beatmap_id required\"}", &.{});
+                defer self.allocator.free(beatmap_text);
+                const ruleset_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"ruleset_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"ruleset_id required\"}", &.{});
+                defer self.allocator.free(ruleset_text);
+                const beatmap_id = std.fmt.parseInt(i32, beatmap_text, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid beatmap_id\"}", &.{});
+                const ruleset_id = std.fmt.parseInt(u8, ruleset_text, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid ruleset_id\"}", &.{});
+                if (beatmap_id != score_context.beatmap_id or ruleset_id != score_context.ruleset_id or !lazer.validHash(version_hash) or !lazer.validHash(beatmap_hash)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match room\"}", &.{});
+                const pp_ready = self.map_sync.ensureFileByBeatmapId(&self.store, beatmap_id, beatmap_hash) catch |err| {
+                    std.log.warn("event=lazer_room_score_token_hydration_failed room_id={d} beatmap_id={d} error={t}", .{ room_score_path.room_id, beatmap_id, err });
+                    return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+                };
+                if (!pp_ready) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+                const token_id = self.store.createLazerScoreToken(user.id, beatmap_id, beatmap_hash, ruleset_id, version_hash) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"score token unavailable\"}", &.{});
+                var out: [96]u8 = undefined;
+                const json = try std.fmt.bufPrint(&out, "{{\"id\":{d}}}", .{token_id});
+                return respond(req, .created, "application/json", json, &.{});
+            }
+
+            if (room_score_path.token_id) |token_id| {
+                if (req.head.method != .PUT) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+                const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_json\"}", &.{});
+                defer parsed.deinit();
+                const score = lazer.parseSoloScore(parsed.value, score_context.beatmap_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
+                const mods_json = try lazer.jsonField(self.allocator, parsed.value.object, "mods", "[]");
+                defer self.allocator.free(mods_json);
+                const statistics_json = try lazer.jsonField(self.allocator, parsed.value.object, "statistics", "{}");
+                defer self.allocator.free(statistics_json);
+                const maximum_statistics_json = try lazer.jsonField(self.allocator, parsed.value.object, "maximum_statistics", "{}");
+                defer self.allocator.free(maximum_statistics_json);
+                const pauses_json = try lazer.jsonField(self.allocator, parsed.value.object, "pauses", "[]");
+                defer self.allocator.free(pauses_json);
+                const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+                const score_id = self.store.submitLazerScoreToken(user.id, score_context.beatmap_id, token_id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json) catch |err| return switch (err) {
+                    error.InvalidLazerScoreToken, error.ForeignLazerScoreToken, error.LazerScoreTokenExpired => respond(req, .unauthorized, "application/json", "{\"error\":\"invalid or expired score token\"}", &.{}),
+                    error.LazerScoreTokenUsed => respond(req, .conflict, "application/json", "{\"error\":\"score token already used\"}", &.{}),
+                    error.LazerScoreTokenMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match submission\"}", &.{}),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score submission failed\"}", &.{}),
+                };
+                var out: [128]u8 = undefined;
+                const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"position\":null}}", .{score_id});
+                return respond(req, .ok, "application/json", json, &.{});
+            }
+            return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+        }
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmapsets/search")) {
             const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             if (!std.mem.startsWith(u8, auth, "Bearer ")) return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -2568,6 +2693,7 @@ pub fn main(init: std.process.Init) !void {
         .allocator = allocator,
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
+        .lazer_multiplayer = lazer_multiplayer.Manager.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.beatmap_cache_max_bytes),
         .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
@@ -2594,6 +2720,7 @@ pub fn main(init: std.process.Init) !void {
     defer app.map_sync.deinit();
     defer app.geo_client.deinit();
     defer app.limiter.deinit();
+    defer app.lazer_multiplayer.deinit();
     defer app.sessions.deinit();
     const address = try std.Io.net.IpAddress.parse(bind, port);
     var listener = try address.listen(init.io, .{ .reuse_address = true });

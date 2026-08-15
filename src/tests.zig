@@ -3,6 +3,7 @@ const bancho = @import("bancho.zig");
 const protocol = @import("protocol.zig");
 const domain = @import("domain.zig");
 const lazer = @import("lazer.zig");
+const lazer_multiplayer = @import("lazer_multiplayer.zig");
 const rijndael = @import("rijndael.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");

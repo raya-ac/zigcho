@@ -208,8 +208,9 @@ pub const Sync = struct {
     }
 
     /// Score submission needs the actual .osu payload, not just the public
-    /// metadata row. Keep browsing asynchronous, but make score-token creation
-    /// wait for a bounded, verified archive hydration.
+    /// metadata row. Store the whole set's metadata, but fetch the selected
+    /// difficulty directly so a large archive cannot outlive lazer's ten-second
+    /// score-token timeout. The archive remains the verified fallback.
     pub fn ensureFileByBeatmapId(self: *Sync, store: *storage.Store, beatmap_id: i32, requested_md5: ?[]const u8) !bool {
         if (beatmap_id <= 0) return false;
         if (requested_md5) |value| if (!validMd5(value)) return false;
@@ -230,10 +231,15 @@ pub const Sync = struct {
         const claim_owned = switch (self.claim(lookup_key) catch return false) {
             .claimed => |value| value,
             .duplicate => {
-                // A lookup or another score request is already downloading the
-                // same archive. Give it a bounded chance to finish instead of
-                // issuing a token which cannot be submitted.
-                for (0..300) |_| {
+                // Browsing may already be downloading a large archive. Do not
+                // make a score-token request wait behind it: the selected .osu
+                // payload is small, independently hash-checked, and safe to
+                // upsert while the full-set cache finishes.
+                if (known) |selection| {
+                    self.downloadSingleMap(store, beatmap_id, selection.set_id, &selection.md5, selection.status) catch {};
+                    if (try scoreFileReady(store, beatmap_id, requested_md5)) return true;
+                }
+                for (0..160) |_| {
                     std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch return false;
                     if (try scoreFileReady(store, beatmap_id, requested_md5)) return true;
                 }
@@ -241,7 +247,8 @@ pub const Sync = struct {
             },
             .at_capacity => return false,
         };
-        defer self.removeFromProgress(claim_owned);
+        var release_claim = true;
+        defer if (release_claim) self.removeFromProgress(claim_owned);
 
         _ = self.attempts.fetchAdd(1, .monotonic);
         const identity: BeatmapIdentity = if (known) |selection|
@@ -258,28 +265,48 @@ pub const Sync = struct {
             _ = self.backoff_skips.fetchAdd(1, .monotonic);
             return false;
         }
-        var archive_error: ?anyerror = null;
-        if (self.fetchAndStoreMetadata(store, &identity.md5, identity.set_id)) |remote| {
-            defer remote.deinit();
-            self.downloadArchive(store, &identity.md5, identity.set_id, remote) catch |err| {
-                archive_error = err;
-            };
+        var remote: ?RemoteSet = null;
+        var metadata_error: ?anyerror = null;
+        if (self.fetchAndStoreMetadata(store, &identity.md5, identity.set_id)) |value| {
+            remote = value;
         } else |err| {
-            archive_error = err;
+            metadata_error = err;
         }
+        defer if (remote) |value| value.deinit();
 
-        if (archive_error) |err| {
-            std.log.warn("[hydrate] full set unavailable set={d} map={d} error={t}; trying verified map payload", .{ identity.set_id, beatmap_id, err });
-            const status = if (known) |selection| selection.status else @as(i8, 2);
-            self.downloadSingleMap(store, beatmap_id, identity.set_id, &identity.md5, status) catch |fallback_err| {
-                std.log.warn("[hydrate] single map fallback failed map={d}: {t}", .{ beatmap_id, fallback_err });
-                self.recordFailure(store, &identity.md5, identity.set_id, fallback_err);
-                return fallback_err;
+        const status = if (remote) |value| localStatus(value.approved) else if (known) |selection| selection.status else @as(i8, 2);
+        var selected_map_ready = true;
+        self.downloadSingleMap(store, beatmap_id, identity.set_id, &identity.md5, status) catch |map_err| {
+            selected_map_ready = false;
+            const set = remote orelse {
+                const err = metadata_error orelse map_err;
+                std.log.warn("[hydrate] selected map unavailable map={d}: {t}", .{ beatmap_id, err });
+                self.recordFailure(store, &identity.md5, identity.set_id, err);
+                return err;
             };
-        }
+            std.log.warn("[hydrate] selected map unavailable map={d}: {t}; trying full set", .{ beatmap_id, map_err });
+            self.downloadArchive(store, &identity.md5, identity.set_id, set) catch |archive_err| {
+                std.log.warn("[hydrate] full set fallback failed set={d} map={d}: {t}", .{ identity.set_id, beatmap_id, archive_err });
+                self.recordFailure(store, &identity.md5, identity.set_id, archive_err);
+                return archive_err;
+            };
+        };
+        if (selected_map_ready) if (remote) |set| {
+            const md5_owned = self.allocator.dupe(u8, &identity.md5) catch null;
+            if (md5_owned) |md5| {
+                const thread = std.Thread.spawn(.{}, backgroundLookupDownload, .{ self, store, claim_owned, md5, identity.set_id, set }) catch null;
+                if (thread) |handle| {
+                    remote = null;
+                    release_claim = false;
+                    handle.detach();
+                } else {
+                    self.allocator.free(md5);
+                }
+            }
+        };
         store.clearHydrationFailure(&identity.md5) catch |err|
             std.log.warn("[hydrate] could not clear failure state md5={s}: {t}", .{ &identity.md5, err });
-        _ = self.successes.fetchAdd(1, .monotonic);
+        if (release_claim) _ = self.successes.fetchAdd(1, .monotonic);
         return try scoreFileReady(store, beatmap_id, requested_md5);
     }
 

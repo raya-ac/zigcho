@@ -81,7 +81,7 @@ def main() -> None:
             if sha256(package.read(package_name)) != value:
                 raise SystemExit(f"manifest checksum mismatch: {name}")
 
-        required_markers = ("https://api.kai.ovh", "zigcho-lazer", "zigcho!lazer", "OSU_EXTERNAL_UPDATE_PROVIDER")
+        required_markers = ("https://api.kai.ovh", "zigcho-lazer", "zigcho!lazer", "OSU_EXTERNAL_UPDATE_PROVIDER", "clampLength(room.RoomID.ToString())")
         markers_found = {marker: False for marker in required_markers}
         for name in names:
             if name.endswith("/"):

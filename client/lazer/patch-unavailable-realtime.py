@@ -38,6 +38,7 @@ api_access = checkout / "osu.Game/Online/API/APIAccess.cs"
 endpoint = checkout / "osu.Game/Online/EndpointConfiguration.cs"
 desktop_program = checkout / "osu.Desktop/Program.cs"
 desktop_project = checkout / "osu.Desktop/osu.Desktop.csproj"
+discord_presence = checkout / "osu.Desktop/DiscordRichPresence.cs"
 osu_game = checkout / "osu.Game/OsuGame.cs"
 osu_game_base = checkout / "osu.Game/OsuGameBase.cs"
 beatmap_metadata_source = checkout / "osu.Game/Beatmaps/APIBeatmapMetadataSource.cs"
@@ -141,6 +142,11 @@ replace_once(
 replace_one_of(desktop_project, ("    <AssemblyTitle>osu!(lazer)</AssemblyTitle>", "    <AssemblyTitle>zigcho lazer</AssemblyTitle>"), "    <AssemblyTitle>zigcho!lazer</AssemblyTitle>")
 replace_one_of(desktop_project, ("    <Product>osu!(lazer)</Product>", "    <Product>zigcho lazer</Product>"), "    <Product>zigcho!lazer</Product>")
 replace_one_of(desktop_project, ("    <Title>osu!</Title>", "    <Title>zigcho lazer</Title>"), "    <Title>zigcho!lazer</Title>")
+replace_once(
+    discord_presence,
+    "                    ID = room.RoomID.ToString(),",
+    "                    ID = clampLength(room.RoomID.ToString()),",
+)
 replace_one_of(
     osu_game_base,
     (

@@ -607,12 +607,17 @@ pub const Store = struct {
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{map_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT md5,mode FROM zigcho.beatmaps WHERE id=$1", &.{id});
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT md5,set_id,status,mode FROM zigcho.beatmaps WHERE id=$1", &.{id});
         defer result.deinit();
         if (result.rows() == 0) return null;
         const md5 = result.value(0, 0);
         if (md5.len != 32) return error.InvalidBeatmap;
-        var selection: BeatmapSelection = .{ .md5 = undefined, .mode = try result.int(u8, 0, 1) };
+        var selection: BeatmapSelection = .{
+            .md5 = undefined,
+            .set_id = try result.int(i32, 0, 1),
+            .status = try result.int(i8, 0, 2),
+            .mode = try result.int(u8, 0, 3),
+        };
         @memcpy(&selection.md5, md5);
         return selection;
     }

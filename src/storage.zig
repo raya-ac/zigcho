@@ -3191,19 +3191,29 @@ pub const Store = struct {
         return try allocator.dupe(u8, ptr[0..len]);
     }
 
-    pub const BeatmapSelection = struct { md5: [32]u8, mode: u8 };
+    pub const BeatmapSelection = struct {
+        md5: [32]u8,
+        set_id: i32,
+        status: i8,
+        mode: u8,
+    };
 
     pub fn beatmapSelectionById(self: *Store, map_id: i32) !?BeatmapSelection {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT md5,mode FROM beatmaps WHERE id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT md5,set_id,status,mode FROM beatmaps WHERE id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, map_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const md5 = std.mem.span(c.sqlite3_column_text(stmt, 0));
         if (md5.len != 32) return error.InvalidBeatmap;
-        var selection: BeatmapSelection = .{ .md5 = undefined, .mode = @intCast(c.sqlite3_column_int(stmt, 1)) };
+        var selection: BeatmapSelection = .{
+            .md5 = undefined,
+            .set_id = c.sqlite3_column_int(stmt, 1),
+            .status = @intCast(c.sqlite3_column_int(stmt, 2)),
+            .mode = @intCast(c.sqlite3_column_int(stmt, 3)),
+        };
         @memcpy(&selection.md5, md5);
         return selection;
     }

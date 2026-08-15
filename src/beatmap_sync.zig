@@ -216,6 +216,15 @@ pub const Sync = struct {
 
         if (try scoreFileReady(store, beatmap_id, requested_md5)) return true;
 
+        // Lazer normally asks for metadata before creating a score token. Use
+        // that owned local identity when it exists: re-querying the catalogue
+        // here made score submission depend on osu.direct being up twice.
+        const known = try store.beatmapSelectionById(beatmap_id);
+        if (known) |selection| {
+            if (selection.set_id <= 0) return false;
+            if (requested_md5) |value| if (!std.ascii.eqlIgnoreCase(value, &selection.md5)) return error.BeatmapHashMismatch;
+        }
+
         var key_buffer: [48]u8 = undefined;
         const lookup_key = try std.fmt.bufPrint(&key_buffer, "id:{d}", .{beatmap_id});
         const claim_owned = switch (self.claim(lookup_key) catch return false) {
@@ -235,10 +244,13 @@ pub const Sync = struct {
         defer self.removeFromProgress(claim_owned);
 
         _ = self.attempts.fetchAdd(1, .monotonic);
-        const identity = self.fetchBeatmapIdentity(beatmap_id) catch |err| {
-            _ = self.failures.fetchAdd(1, .monotonic);
-            return err;
-        };
+        const identity: BeatmapIdentity = if (known) |selection|
+            .{ .set_id = selection.set_id, .md5 = selection.md5 }
+        else
+            self.fetchBeatmapIdentity(beatmap_id) catch |err| {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return err;
+            };
         if (requested_md5) |value| if (!std.ascii.eqlIgnoreCase(value, &identity.md5)) return error.BeatmapHashMismatch;
 
         const now = std.Io.Clock.real.now(self.io).toSeconds();
@@ -246,15 +258,25 @@ pub const Sync = struct {
             _ = self.backoff_skips.fetchAdd(1, .monotonic);
             return false;
         }
-        const remote = self.fetchAndStoreMetadata(store, &identity.md5, identity.set_id) catch |err| {
-            self.recordFailure(store, &identity.md5, identity.set_id, err);
-            return err;
-        };
-        defer remote.deinit();
-        self.downloadArchive(store, &identity.md5, identity.set_id, remote) catch |err| {
-            self.recordFailure(store, &identity.md5, identity.set_id, err);
-            return err;
-        };
+        var archive_error: ?anyerror = null;
+        if (self.fetchAndStoreMetadata(store, &identity.md5, identity.set_id)) |remote| {
+            defer remote.deinit();
+            self.downloadArchive(store, &identity.md5, identity.set_id, remote) catch |err| {
+                archive_error = err;
+            };
+        } else |err| {
+            archive_error = err;
+        }
+
+        if (archive_error) |err| {
+            std.log.warn("[hydrate] full set unavailable set={d} map={d} error={t}; trying verified map payload", .{ identity.set_id, beatmap_id, err });
+            const status = if (known) |selection| selection.status else @as(i8, 2);
+            self.downloadSingleMap(store, beatmap_id, identity.set_id, &identity.md5, status) catch |fallback_err| {
+                std.log.warn("[hydrate] single map fallback failed map={d}: {t}", .{ beatmap_id, fallback_err });
+                self.recordFailure(store, &identity.md5, identity.set_id, fallback_err);
+                return fallback_err;
+            };
+        }
         store.clearHydrationFailure(&identity.md5) catch |err|
             std.log.warn("[hydrate] could not clear failure state md5={s}: {t}", .{ &identity.md5, err });
         _ = self.successes.fetchAdd(1, .monotonic);
@@ -570,6 +592,36 @@ pub const Sync = struct {
             std.log.info("event=beatmap_cache_pruned entries={d} bytes={d}", .{ pruned.entries, pruned.bytes });
         }
     }
+
+    fn downloadSingleMap(self: *Sync, store: *storage.Store, beatmap_id: i32, set_id: i32, wanted_md5: []const u8, status: i8) !void {
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+
+        const url = try std.fmt.allocPrint(self.allocator, "https://osu.ppy.sh/osu/{d}", .{beatmap_id});
+        defer self.allocator.free(url);
+        const contents = try fetchFn(&client, self.allocator, url, map_limit);
+        defer self.allocator.free(contents);
+
+        const digest = beatmap.md5(contents);
+        if (!std.ascii.eqlIgnoreCase(&digest, wanted_md5)) return error.BeatmapHashMismatch;
+        const metadata = try beatmap.parseWithIds(contents, beatmap_id, set_id);
+        if (metadata.id != beatmap_id or metadata.set_id != set_id) return error.IdMismatch;
+        const attributes = try pp.calculate(contents, .{
+            .mode = metadata.mode,
+            .lazer = 0,
+            .mods = 0,
+            .max_combo = metadata.object_count,
+            .n_geki = if (metadata.mode == 3) metadata.object_count else 0,
+            .n_katu = 0,
+            .n300 = metadata.object_count,
+            .n100 = 0,
+            .n50 = 0,
+            .misses = 0,
+            .legacy_total_score = 1_000_000,
+        });
+        try store.upsertBeatmap(metadata, &digest, status, attributes.stars, attributes.max_combo, contents);
+        std.log.info("[hydrate] stored verified map fallback map={d} set={d} md5={s}", .{ beatmap_id, set_id, &digest });
+    }
 };
 
 fn scoreFileReady(store: *storage.Store, beatmap_id: i32, requested_md5: ?[]const u8) !bool {
@@ -663,8 +715,14 @@ fn fetchFn(client: *std.http.Client, allocator: std.mem.Allocator, url: []const 
             .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/raya-ac/zigcho)" },
         },
-    }) catch return error.UpstreamUnavailable;
-    if (result.status != .ok) return error.UpstreamUnavailable;
+    }) catch |err| {
+        std.log.warn("[hydrate] upstream request failed url={s}: {t}", .{ url, err });
+        return error.UpstreamUnavailable;
+    };
+    if (result.status != .ok) {
+        std.log.warn("[hydrate] upstream status url={s} status={d}", .{ url, @intFromEnum(result.status) });
+        return error.UpstreamUnavailable;
+    }
     return try allocator.realloc(buffer, writer.end);
 }
 

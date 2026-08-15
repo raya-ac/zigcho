@@ -3877,6 +3877,29 @@ test "custom lazer mods win over relax regardless of order" {
     }
 }
 
+test "lazer replay input is bounded and tied to the submitted ruleset" {
+    var replay: [32]u8 = @splat(0);
+    replay[0] = 0;
+    std.mem.writeInt(i32, replay[1..5], 20_260_816, .little);
+    var encoded: [std.base64.standard.Encoder.calcSize(replay.len)]u8 = undefined;
+    const replay_base64 = std.base64.standard.Encoder.encode(&encoded, &replay);
+    var raw: [256]u8 = undefined;
+    const body = try std.fmt.bufPrint(&raw, "{{\"replay\":\"{s}\"}}", .{replay_base64});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const decoded = try lazer.decodeReplay(std.testing.allocator, parsed.value.object, 0);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &replay, decoded);
+    try std.testing.expectError(error.InvalidReplay, lazer.decodeReplay(std.testing.allocator, parsed.value.object, 1));
+
+    const short = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"replay\":\"AA==\"}", .{});
+    defer short.deinit();
+    try std.testing.expectError(error.InvalidReplay, lazer.decodeReplay(std.testing.allocator, short.value.object, 0));
+    const malformed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"replay\":\"not base64\"}", .{});
+    defer malformed.deinit();
+    try std.testing.expectError(error.InvalidReplay, lazer.decodeReplay(std.testing.allocator, malformed.value.object, 0));
+}
+
 test "lazer score input is fully typed and bounded before storage" {
     const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"beatmap_id\":1,\"ruleset_id\":3,\"total_score\":1000000000000,\"legacy_total_score\":null,\"accuracy\":1,\"max_combo\":10000000,\"passed\":false,\"mods\":[],\"statistics\":{},\"client_version\":null}", .{});
     defer valid.deinit();
@@ -3919,7 +3942,7 @@ test "lazer storage only accepts the typed score input" {
     defer std.testing.allocator.free(mods_json);
     const statistics_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "statistics", "{}");
     defer std.testing.allocator.free(statistics_json);
-    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), 0, mods_json, statistics_json, "{}", "[]");
+    const id = try store.insertLazerScore(1, try lazer.parseScore(parsed.value), 0, mods_json, statistics_json, "{}", "[]", &.{});
     try std.testing.expect(id > 0);
 
     var stmt: ?*storage.c.sqlite3_stmt = null;
@@ -4138,21 +4161,27 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectError(error.BeatmapHashMismatch, store.createLazerScoreToken(1, 75, "ffffffffffffffffffffffffffffffff", 0, "11111111111111111111111111111111"));
     try std.testing.expectError(error.BeatmapNotFound, store.createLazerScoreToken(1, 76, "0123456789abcdef0123456789abcdef", 0, "11111111111111111111111111111111"));
     const token = try store.createLazerScoreToken(1, 75, "0123456789ABCDEF0123456789ABCDEF", 0, "11111111111111111111111111111111");
-    try std.testing.expectError(error.ForeignLazerScoreToken, store.submitLazerScoreToken(2, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json));
+    try std.testing.expectError(error.ForeignLazerScoreToken, store.submitLazerScoreToken(2, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json, &.{}));
     var wrong_ruleset = score;
     wrong_ruleset.ruleset_id = 1;
-    try std.testing.expectError(error.LazerScoreTokenMismatch, store.submitLazerScoreToken(1, 75, token, wrong_ruleset, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json));
-    const score_id = try store.submitLazerScoreToken(1, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json);
+    try std.testing.expectError(error.LazerScoreTokenMismatch, store.submitLazerScoreToken(1, 75, token, wrong_ruleset, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json, &.{}));
+    var replay: [32]u8 = @splat(0);
+    replay[0] = 0;
+    std.mem.writeInt(i32, replay[1..5], 20_260_816, .little);
+    const score_id = try store.submitLazerScoreToken(1, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json, &replay);
     try std.testing.expect(score_id > 0);
-    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(1, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json));
-    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerScoreToken(1, 75, token + 2, score, 0, mods_json, statistics_json, "{}", "[]"));
+    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerScoreToken(1, 75, token, score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json, &.{}));
+    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerScoreToken(1, 75, token + 2, score, 0, mods_json, statistics_json, "{}", "[]", &.{}));
 
     var row: ?*storage.c.sqlite3_stmt = null;
-    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT mods_json,statistics_json FROM lazer_scores WHERE id=?1", -1, &row, null));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT mods_json,statistics_json,replay FROM lazer_scores WHERE id=?1", -1, &row, null));
     _ = storage.c.sqlite3_bind_int64(row, 1, score_id);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(row));
     try std.testing.expectEqualStrings(mods_json, std.mem.span(storage.c.sqlite3_column_text(row, 0)));
     try std.testing.expectEqualStrings(statistics_json, std.mem.span(storage.c.sqlite3_column_text(row, 1)));
+    const replay_len: usize = @intCast(storage.c.sqlite3_column_bytes(row, 2));
+    const replay_ptr: [*]const u8 = @ptrCast(storage.c.sqlite3_column_blob(row, 2).?);
+    try std.testing.expectEqualSlices(u8, &replay, replay_ptr[0..replay_len]);
     _ = storage.c.sqlite3_finalize(row);
 
     const leaderboard = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, 50);
@@ -4165,6 +4194,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqualStrings("A", listed.get("rank").?.string);
     try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
     try std.testing.expect(!listed.get("ranked").?.bool);
+    try std.testing.expect(listed.get("has_replay").?.bool);
     try std.testing.expectEqual(@as(i64, 1), parsed_leaderboard.value.object.get("user_score").?.object.get("position").?.integer);
 
     const counts = try store.lazerUserScoreCounts(1, 0);
@@ -4179,6 +4209,10 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(score_id, recent_score.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, 75), recent_score.get("beatmap").?.object.get("id").?.integer);
     try std.testing.expectEqualStrings("artist", recent_score.get("beatmap").?.object.get("beatmapset").?.object.get("artist").?.string);
+    try std.testing.expect(recent_score.get("has_replay").?.bool);
+    const stored_replay = (try store.lazerReplay(std.testing.allocator, score_id)).?;
+    defer std.testing.allocator.free(stored_replay);
+    try std.testing.expectEqualSlices(u8, &replay, stored_replay);
     const pinned = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .pinned, 0, 50);
     defer std.testing.allocator.free(pinned);
     try std.testing.expectEqualStrings("[]", pinned);
@@ -4187,7 +4221,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     var expire_buf: [160]u8 = undefined;
     const expire_sql = try std.fmt.bufPrintZ(&expire_buf, "UPDATE lazer_score_tokens SET expires_at=0 WHERE id={d}", .{expired});
     try store.exec(expire_sql);
-    try std.testing.expectError(error.LazerScoreTokenExpired, store.submitLazerScoreToken(1, 75, expired, score, 0, mods_json, statistics_json, "{}", "[]"));
+    try std.testing.expectError(error.LazerScoreTokenExpired, store.submitLazerScoreToken(1, 75, expired, score, 0, mods_json, statistics_json, "{}", "[]", &.{}));
 
     var version_stmt: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
@@ -4215,7 +4249,7 @@ test "lazer submission updates ranked performance without overwriting another ru
     defer parsed.deinit();
     const input = try lazer.parseSoloScore(parsed.value, 75);
     const token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "11111111111111111111111111111111");
-    _ = try store.submitLazerScoreToken(1, 75, token, input, 500, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
+    _ = try store.submitLazerScoreToken(1, 75, token, input, 500, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]", &.{});
 
     const osu = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 992654), osu.ranked_score);
@@ -4236,7 +4270,7 @@ test "lazer submission updates ranked performance without overwriting another ru
     failed.total_score = 100;
     failed.max_combo = 999;
     const failed_token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
-    _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, 100, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]");
+    _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, 100, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]", &.{});
     const after_fail = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 992654), after_fail.ranked_score);
     try std.testing.expectEqual(@as(i64, 997754), after_fail.total_score);
@@ -4300,12 +4334,12 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     var input = try lazer.parseSoloScore(parsed.value, 75);
 
     const first_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    const first_id = try store.submitLazerScoreToken(1, 75, first_token, input, 100, "[]", "{\"great\":100}", "{\"great\":100}", "[]");
+    const first_id = try store.submitLazerScoreToken(1, 75, first_token, input, 100, "[]", "{\"great\":100}", "{\"great\":100}", "[]", &.{});
     input.beatmap_id = 76;
     input.total_score = 2000;
     input.accuracy = 0.9;
     const second_token = try store.createLazerScoreToken(1, 76, "22222222222222222222222222222222", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    _ = try store.submitLazerScoreToken(1, 76, second_token, input, 200, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]");
+    _ = try store.submitLazerScoreToken(1, 76, second_token, input, 200, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]", &.{});
     const weighted = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i32, 295), weighted.pp);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9487179487), weighted.accuracy, 0.000001);
@@ -4314,7 +4348,7 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     input.total_score = 900;
     input.accuracy = 0.5;
     const lower_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "cccccccccccccccccccccccccccccccc");
-    const lower_id = try store.submitLazerScoreToken(1, 75, lower_token, input, 500, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]");
+    const lower_id = try store.submitLazerScoreToken(1, 75, lower_token, input, 500, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]", &.{});
     const after_lower = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(weighted.pp, after_lower.pp);
     try std.testing.expectApproxEqAbs(weighted.accuracy, after_lower.accuracy, 0.000001);
@@ -4323,7 +4357,7 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     input.rank = "F";
     input.total_score = 5000;
     const failed_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "dddddddddddddddddddddddddddddddd");
-    _ = try store.submitLazerScoreToken(1, 75, failed_token, input, 999, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]");
+    _ = try store.submitLazerScoreToken(1, 75, failed_token, input, 999, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]", &.{});
     const after_fail = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(weighted.pp, after_fail.pp);
     try std.testing.expectApproxEqAbs(weighted.accuracy, after_fail.accuracy, 0.000001);
@@ -4334,7 +4368,7 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     input.total_score = 9000;
     input.accuracy = 1;
     const unranked_token = try store.createLazerScoreToken(1, 77, "33333333333333333333333333333333", 0, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
-    _ = try store.submitLazerScoreToken(1, 77, unranked_token, input, 1000, "[]", "{\"great\":100}", "{\"great\":100}", "[]");
+    _ = try store.submitLazerScoreToken(1, 77, unranked_token, input, 1000, "[]", "{\"great\":100}", "{\"great\":100}", "[]", &.{});
     const after_unranked = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(weighted.pp, after_unranked.pp);
     try std.testing.expectApproxEqAbs(weighted.accuracy, after_unranked.accuracy, 0.000001);
@@ -4413,7 +4447,7 @@ test "stable and lazer share one ranked performance result per map" {
     defer parsed.deinit();
     const lazer_input = try lazer.parseSoloScore(parsed.value, 75);
     const token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 100, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]");
+    _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 100, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]", &.{});
     const after_lazer = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 1500), after_lazer.ranked_score);
     try std.testing.expectEqual(@as(i64, 2500), after_lazer.total_score);

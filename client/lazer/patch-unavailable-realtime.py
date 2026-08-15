@@ -39,9 +39,15 @@ endpoint = checkout / "osu.Game/Online/EndpointConfiguration.cs"
 desktop_program = checkout / "osu.Desktop/Program.cs"
 desktop_project = checkout / "osu.Desktop/osu.Desktop.csproj"
 osu_game = checkout / "osu.Game/OsuGame.cs"
+osu_game_base = checkout / "osu.Game/OsuGameBase.cs"
 beatmap_metadata_source = checkout / "osu.Game/Beatmaps/APIBeatmapMetadataSource.cs"
 leaderboard_manager = checkout / "osu.Game/Online/Leaderboards/LeaderboardManager.cs"
 scores_container = checkout / "osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs"
+submit_score_request = checkout / "osu.Game/Online/Rooms/SubmitScoreRequest.cs"
+submit_solo_score_request = checkout / "osu.Game/Online/Solo/SubmitSoloScoreRequest.cs"
+submit_room_score_request = checkout / "osu.Game/Online/Rooms/SubmitRoomScoreRequest.cs"
+solo_player = checkout / "osu.Game/Screens/Play/SoloPlayer.cs"
+room_submitting_player = checkout / "osu.Game/Screens/Play/RoomSubmittingPlayer.cs"
 
 replace_once(
     api_access,
@@ -101,10 +107,10 @@ replace_once(
 # Keep the custom client away from an installed official lazer client. This changes
 # both its storage directory and IPC pipe, and also prevents the official updater
 # from replacing a zigcho build after startup.
-replace_once(
+replace_one_of(
     desktop_program,
-    '        private const string base_game_name = @"osu-development";',
-    '        private const string base_game_name = @"zigcho-lazer-development";',
+    ('        private const string base_game_name = @"osu-development";', '        private const string base_game_name = @"zigcho-lazer-development";'),
+    '        private const string base_game_name = @"zigcho-lazer-debug";',
 )
 replace_once(
     desktop_program,
@@ -132,9 +138,29 @@ replace_once(
     '        public const string IPC_PIPE_NAME = "osu-lazer";',
     '        public const string IPC_PIPE_NAME = "zigcho-lazer";',
 )
-replace_once(desktop_project, "    <AssemblyTitle>osu!(lazer)</AssemblyTitle>", "    <AssemblyTitle>zigcho lazer</AssemblyTitle>")
-replace_once(desktop_project, "    <Product>osu!(lazer)</Product>", "    <Product>zigcho lazer</Product>")
-replace_once(desktop_project, "    <Title>osu!</Title>", "    <Title>zigcho lazer</Title>")
+replace_one_of(desktop_project, ("    <AssemblyTitle>osu!(lazer)</AssemblyTitle>", "    <AssemblyTitle>zigcho lazer</AssemblyTitle>"), "    <AssemblyTitle>zigcho!lazer</AssemblyTitle>")
+replace_one_of(desktop_project, ("    <Product>osu!(lazer)</Product>", "    <Product>zigcho lazer</Product>"), "    <Product>zigcho!lazer</Product>")
+replace_one_of(desktop_project, ("    <Title>osu!</Title>", "    <Title>zigcho lazer</Title>"), "    <Title>zigcho!lazer</Title>")
+replace_one_of(
+    osu_game_base,
+    (
+        """#if DEBUG
+        public const string GAME_NAME = "osu! (development)";
+#else
+        public const string GAME_NAME = "osu!";
+#endif""",
+        """#if DEBUG
+        public const string GAME_NAME = "zigcho!lazer";
+#else
+        public const string GAME_NAME = "osu!";
+#endif""",
+    ),
+    """#if DEBUG
+        public const string GAME_NAME = "zigcho!lazer";
+#else
+        public const string GAME_NAME = "zigcho!lazer";
+#endif""",
+)
 
 # The upstream gameplay metadata path omits an already-known online ID and sends
 # only checksum + filename. A cold zigcho cache cannot resolve a checksum back to
@@ -158,4 +184,158 @@ replace_once(
     scores_container,
     "            if (Beatmap.Value == null || Beatmap.Value.OnlineID <= 0 || (Beatmap.Value.Status <= BeatmapOnlineStatus.Pending))",
     "            if (!osu.Game.Online.Leaderboards.ZigchoLeaderboardAvailability.IsAvailable(Beatmap.Value))",
+)
+replace_once(
+    scores_container,
+    "using osu.Game.Graphics.UserInterface;",
+    """using osu.Game.Graphics.Sprites;
+using osu.Game.Graphics.UserInterface;""",
+)
+replace_once(
+    scores_container,
+    "        private readonly LeaderboardModSelector modSelector;",
+    """        private readonly LeaderboardModSelector modSelector;
+        private readonly OsuSpriteText namespaceLabel;""",
+)
+replace_once(
+    scores_container,
+    """                                modSelector = new LeaderboardModSelector
+                                {
+                                    Anchor = Anchor.TopCentre,
+                                    Origin = Anchor.TopCentre,
+                                    Ruleset = { BindTarget = ruleset }
+                                }""",
+    """                                namespaceLabel = new OsuSpriteText
+                                {
+                                    Anchor = Anchor.TopCentre,
+                                    Origin = Anchor.TopCentre,
+                                    Text = "vanilla leaderboard"
+                                },
+                                modSelector = new LeaderboardModSelector
+                                {
+                                    Anchor = Anchor.TopCentre,
+                                    Origin = Anchor.TopCentre,
+                                    Ruleset = { BindTarget = ruleset }
+                                }""",
+)
+replace_once(
+    scores_container,
+    "            modSelector.SelectedMods.CollectionChanged += (_, _) => getScores();",
+    """            modSelector.SelectedMods.CollectionChanged += (_, _) =>
+            {
+                updateZigchoLeaderboardNamespace();
+                getScores();
+            };""",
+)
+replace_once(
+    scores_container,
+    "        private bool userIsSupporter => api.IsLoggedIn && api.LocalUser.Value.IsSupporter;",
+    """        private void updateZigchoLeaderboardNamespace()
+        {
+            var acronyms = modSelector.SelectedMods.Select(mod => mod.Acronym.ToString()).ToArray();
+            namespaceLabel.Text = acronyms.Contains("AP")
+                ? "autopilot leaderboard"
+                : acronyms.Contains("RX")
+                    ? "relax leaderboard"
+                    : "vanilla leaderboard";
+        }
+
+        private bool userIsSupporter => api.IsLoggedIn && api.LocalUser.Value.IsSupporter;""",
+)
+
+# Zigcho stores the exact replay beside the score. Official infrastructure gets
+# this data from the spectator service; the isolated client submits its encoded
+# .osr in the same authenticated request so score and replay cannot diverge.
+replace_once(
+    submit_score_request,
+    "using System.Net.Http;",
+    """using System;
+using System.IO;
+using System.Net.Http;""",
+)
+replace_once(
+    submit_score_request,
+    "using Newtonsoft.Json;",
+    """using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using osu.Game.Beatmaps;""",
+)
+replace_once(
+    submit_score_request,
+    "using osu.Game.Scoring;",
+    """using osu.Game.Scoring;
+using osu.Game.Scoring.Legacy;""",
+)
+replace_once(
+    submit_score_request,
+    """        protected readonly long ScoreId;
+
+        protected SubmitScoreRequest(ScoreInfo scoreInfo, long scoreId)
+        {
+            Score = SoloScoreInfo.ForSubmission(scoreInfo);
+            ScoreId = scoreId;
+        }""",
+    """        protected readonly long ScoreId;
+
+        private readonly string serializedScore;
+
+        protected SubmitScoreRequest(Score score, IBeatmap beatmap, long scoreId)
+        {
+            Score = SoloScoreInfo.ForSubmission(score.ScoreInfo);
+            ScoreId = scoreId;
+
+            var settings = new JsonSerializerSettings
+            {
+                ReferenceLoopHandling = ReferenceLoopHandling.Ignore
+            };
+            var payload = JObject.FromObject(Score, JsonSerializer.Create(settings));
+            using var replay = new MemoryStream();
+            new LegacyScoreEncoder(score, beatmap).Encode(replay, leaveOpen: true);
+            payload[\"replay\"] = Convert.ToBase64String(replay.ToArray());
+            serializedScore = payload.ToString(Formatting.None);
+        }""",
+)
+replace_once(
+    submit_score_request,
+    """            req.AddRaw(JsonConvert.SerializeObject(Score, new JsonSerializerSettings
+            {
+                ReferenceLoopHandling = ReferenceLoopHandling.Ignore
+            }));""",
+    "            req.AddRaw(serializedScore);",
+)
+replace_once(
+    submit_solo_score_request,
+    "using osu.Game.Online.Rooms;",
+    """using osu.Game.Beatmaps;
+using osu.Game.Online.Rooms;""",
+)
+replace_once(
+    submit_solo_score_request,
+    """        public SubmitSoloScoreRequest(ScoreInfo scoreInfo, long scoreId, int beatmapId)
+            : base(scoreInfo, scoreId)""",
+    """        public SubmitSoloScoreRequest(Score score, IBeatmap beatmap, long scoreId, int beatmapId)
+            : base(score, beatmap, scoreId)""",
+)
+replace_once(
+    submit_room_score_request,
+    "using osu.Game.Scoring;",
+    """using osu.Game.Beatmaps;
+using osu.Game.Scoring;""",
+)
+replace_once(
+    submit_room_score_request,
+    """        public SubmitRoomScoreRequest(ScoreInfo scoreInfo, long scoreId, long roomId, long playlistItemId)
+            : base(scoreInfo, scoreId)""",
+    """        public SubmitRoomScoreRequest(Score score, IBeatmap beatmap, long scoreId, long roomId, long playlistItemId)
+            : base(score, beatmap, scoreId)""",
+)
+replace_once(
+    solo_player,
+    "            return new SubmitSoloScoreRequest(score.ScoreInfo, token, beatmap.OnlineID);",
+    "            return new SubmitSoloScoreRequest(score, GameplayState.Beatmap, token, beatmap.OnlineID);",
+)
+replace_once(
+    room_submitting_player,
+    "            return new SubmitRoomScoreRequest(score.ScoreInfo, token, Room.RoomID.Value, PlaylistItem.ID);",
+    "            return new SubmitRoomScoreRequest(score, GameplayState.Beatmap, token, Room.RoomID.Value, PlaylistItem.ID);",
 )

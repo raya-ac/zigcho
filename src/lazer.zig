@@ -8,6 +8,8 @@ pub const max_hit_count: i64 = 100_000_000;
 pub const max_mods: usize = 32;
 pub const max_pauses: usize = 4096;
 pub const score_token_lifetime_seconds: i64 = 2 * 60 * 60;
+pub const max_replay_bytes: usize = 8 * 1024 * 1024;
+pub const max_score_body_bytes: usize = 12 * 1024 * 1024;
 
 pub fn modNamespace(mods: ?*const std.json.Array) Namespace {
     const list = mods orelse return .vanilla;
@@ -336,6 +338,7 @@ pub const LeaderboardScore = struct {
     pauses_json: []const u8,
     ended_at: []const u8,
     ranked: bool,
+    has_replay: bool = false,
     beatmap: ?BeatmapSummary = null,
 };
 
@@ -383,11 +386,11 @@ pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !v
     try writer.writeAll(score.maximum_statistics_json);
     try writer.writeAll(",\"pauses\":");
     try writer.writeAll(score.pauses_json);
-    try writer.print(",\"has_replay\":false,\"ranked\":{s},\"preserve\":true,\"processed\":true,\"user\":{{\"id\":{d},\"username\":", .{ if (score.ranked) "true" else "false", score.user_id });
+    try writer.print(",\"has_replay\":{s},\"ranked\":{s},\"preserve\":true,\"processed\":true,\"user\":{{\"id\":{d},\"username\":", .{ if (score.has_replay) "true" else "false", if (score.ranked) "true" else "false", score.user_id });
     try std.json.Stringify.value(score.username, .{}, writer);
     try writer.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":", .{score.user_id});
     try std.json.Stringify.value(score.country, .{}, writer);
-    try writer.writeAll(",\"is_active\":true,\"is_online\":false}");
+    try writer.writeAll(",\"is_active\":true,\"is_online\":true}");
     if (score.beatmap) |beatmap| {
         try writer.print(",\"beatmap\":{{\"id\":{d},\"beatmapset_id\":{d},\"status\":", .{ beatmap.id, beatmap.set_id });
         try std.json.Stringify.value(beatmap.status, .{}, writer);
@@ -467,6 +470,16 @@ pub fn parseSoloScorePath(path: []const u8) ?SoloScorePath {
     const token_id = std.fmt.parseInt(i64, tail[1..], 10) catch return null;
     if (token_id <= 0) return null;
     return .{ .beatmap_id = beatmap_id, .token_id = token_id };
+}
+
+pub fn parseScoreDownloadPath(path: []const u8) ?i64 {
+    const prefix = "/api/v2/scores/";
+    const suffix = "/download";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const id_text = path[prefix.len .. path.len - suffix.len];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const score_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    return if (score_id > 0) score_id else null;
 }
 
 pub fn parseLeaderboardPath(path: []const u8) ?LeaderboardPath {
@@ -649,6 +662,52 @@ pub fn jsonField(allocator: std.mem.Allocator, object: std.json.ObjectMap, key: 
     try std.json.Stringify.value(value, .{}, &output.writer);
     var list = output.toArrayList();
     return list.toOwnedSlice(allocator);
+}
+
+pub fn decodeReplay(allocator: std.mem.Allocator, object: std.json.ObjectMap, ruleset_id: i64) ![]u8 {
+    const value = object.get("replay") orelse return allocator.dupe(u8, "");
+    if (value == .null) return allocator.dupe(u8, "");
+    const encoded = switch (value) {
+        .string => |text| text,
+        else => return error.InvalidReplay,
+    };
+    if (encoded.len == 0) return allocator.dupe(u8, "");
+    if (encoded.len > ((max_replay_bytes + 2) / 3) * 4) return error.InvalidReplay;
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidReplay;
+    if (decoded_size < 32 or decoded_size > max_replay_bytes) return error.InvalidReplay;
+    const replay = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(replay);
+    std.base64.standard.Decoder.decode(replay, encoded) catch return error.InvalidReplay;
+    if (replay[0] != @as(u8, @intCast(ruleset_id))) return error.InvalidReplay;
+    const version = std.mem.readInt(i32, replay[1..5], .little);
+    if (version < 20_100_101) return error.InvalidReplay;
+    return replay;
+}
+
+pub fn modsDisplay(allocator: std.mem.Allocator, mods_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, mods_json, .{});
+    defer parsed.deinit();
+    const mods = switch (parsed.value) {
+        .array => |list| list,
+        else => return error.InvalidMod,
+    };
+    if (mods.items.len == 0) return allocator.dupe(u8, "NM");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('+');
+    for (mods.items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => return error.InvalidMod,
+        };
+        const acronym = switch (object.get("acronym") orelse return error.InvalidMod) {
+            .string => |value| value,
+            else => return error.InvalidMod,
+        };
+        if (!validAcronym(acronym)) return error.InvalidMod;
+        try output.writer.writeAll(acronym);
+    }
+    return output.toOwnedSlice();
 }
 
 fn parseMods(object: std.json.ObjectMap, optional: bool) !?std.json.Array {

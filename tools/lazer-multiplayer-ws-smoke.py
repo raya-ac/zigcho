@@ -153,9 +153,12 @@ class WebSocket:
         if expected.lower() not in response.lower():
             raise RuntimeError("invalid websocket accept")
         self.events = []
-        self.send(1, b'{"protocol":"messagepack","version":1}\x1e')
+        # Zigcho negotiates binary transfer for the MessagePack hub. The JSON
+        # SignalR handshake therefore arrives in a binary WebSocket frame in
+        # the real client, even though its body is JSON.
+        self.send(2, b'{"protocol":"messagepack","version":1}\x1e')
         opcode, payload = self.receive()
-        if opcode != 1 or payload != b"{}\x1e":
+        if opcode != 2 or payload != b"{}\x1e":
             raise RuntimeError(f"invalid SignalR handshake {opcode} {payload!r}")
 
     def close(self):

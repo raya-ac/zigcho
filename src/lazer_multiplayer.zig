@@ -542,8 +542,11 @@ pub const Manager = struct {
 
     pub fn serve(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !void {
         const handshake = try socket.readSmallMessage();
-        if (handshake.opcode != .text or !std.mem.endsWith(u8, handshake.data, "\x1e") or std.mem.indexOf(u8, handshake.data, "\"protocol\":\"messagepack\"") == null) return error.InvalidSignalRHandshake;
-        try socket.writeMessage("{}\x1e", .text);
+        if ((handshake.opcode != .text and handshake.opcode != .binary) or !validSignalRHandshake(self.allocator, handshake.data)) return error.InvalidSignalRHandshake;
+        // SignalR's handshake body is JSON even when the selected hub protocol
+        // uses binary transfer. Match the negotiated WebSocket transfer format
+        // instead of assuming the JSON bytes arrived in a text frame.
+        try socket.writeMessage("{}\x1e", handshake.opcode);
         const connection = try self.connect(user, socket);
         defer self.disconnect(connection);
         while (connection.alive) {
@@ -1752,6 +1755,25 @@ pub fn negotiateJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"negotiateVersion\":1,\"connectionId\":\"{s}\",\"connectionToken\":\"{s}\",\"availableTransports\":[{{\"transport\":\"WebSockets\",\"transferFormats\":[\"Binary\"]}}]}}", .{ &token, &token });
 }
 
+fn validSignalRHandshake(allocator: std.mem.Allocator, data: []const u8) bool {
+    if (data.len < 2 or data[data.len - 1] != 0x1e or std.mem.indexOfScalar(u8, data[0 .. data.len - 1], 0x1e) != null) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data[0 .. data.len - 1], .{}) catch return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const protocol = object.get("protocol") orelse return false;
+    const version = object.get("version") orelse return false;
+    return switch (protocol) {
+        .string => |value| std.mem.eql(u8, value, "messagepack"),
+        else => false,
+    } and switch (version) {
+        .integer => |value| value == 1,
+        else => false,
+    };
+}
+
 test "bounded messagepack framing accepts a room snapshot and rejects nested bombs" {
     var body: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer body.deinit();
@@ -1785,4 +1807,11 @@ test "lazer multiplayer score path separates room playlist and token ids" {
     const submit = parseRoomScorePath("/api/v2/rooms/5/playlist/8/scores/13").?;
     try std.testing.expectEqual(@as(?i64, 13), submit.token_id);
     try std.testing.expectEqual(@as(?RoomScorePath, null), parseRoomScorePath("/api/v2/rooms/5/playlist/users/scores"));
+}
+
+test "signalr accepts messagepack handshake bytes independent of websocket opcode" {
+    try std.testing.expect(validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"messagepack\",\"version\":1}\x1e"));
+    try std.testing.expect(validSignalRHandshake(std.testing.allocator, "{\"version\":1,\"protocol\":\"messagepack\"}\x1e"));
+    try std.testing.expect(!validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"json\",\"version\":1}\x1e"));
+    try std.testing.expect(!validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"messagepack\",\"version\":1}"));
 }

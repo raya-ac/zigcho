@@ -82,14 +82,14 @@ def main() -> None:
         "client_lane=production\n"
     ).encode()
     readme_text = (
-        "zigcho lazer for Windows x64\r\n"
+        "zigcho!lazer for Windows x64\r\n"
         "\r\n"
         "Open osu!.exe to start. This build keeps its data in the zigcho-lazer folder,\r\n"
         "uses its own IPC pipe, and cannot replace or update an official osu! install.\r\n"
         "It connects to api.kai.ovh and kai.ovh. Public chat uses the REST\r\n"
         "fallback; multiplayer and spectating are still offline in this alpha.\r\n"
         "\r\n"
-        "This development build is not code-signed yet, so Windows SmartScreen may warn.\r\n"
+        "This alpha is not code-signed yet, so Windows SmartScreen may warn.\r\n"
         "Check the .zip.sha256 file before opening it.\r\n"
     ).encode()
 

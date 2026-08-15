@@ -11,7 +11,7 @@ this is not connected to official osu! accounts. Stable and the custom lazer cli
 - real replays, PP, weighted top plays, pins, map ratings, Direct and on-demand beatmap caching
 - the `kai` bot, player commands, staff tools, BN map ranking and audited moderation
 - PostgreSQL migrations, backups, restore drills, release rollback and bounded runtime caches
-- lazer accounts, profiles, beatmaps, ranked solo scores and normal head-to-head rooms for the pinned custom client
+- `zigcho!lazer` accounts, profiles, beatmaps, vanilla/Relax/Autopilot boards, replay downloads and normal head-to-head rooms
 - a public site with profiles, map leaderboards, replay downloads, player login and proper account settings
 - private custom avatars in Cloudflare R2, served through `a.kai.ovh/{user_id}`
 

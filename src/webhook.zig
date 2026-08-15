@@ -31,6 +31,7 @@ pub const Webhook = struct {
         user_id: i32,
         grade: []const u8,
         mods: i32,
+        mods_text: ?[]const u8 = null,
         mode: u8,
         rank: i32,
         total_score: i64,
@@ -89,7 +90,7 @@ pub const Webhook = struct {
     fn buildJson(buf: *[4096]u8, mod_buf: *[64]u8, data: ScoreData) ![]const u8 {
         const display_grade = gradeDisplay(data.grade);
         const color = gradeColor(data.grade);
-        const mods_str = stable_mods.shortString(mod_buf, data.mods);
+        const mods_str = data.mods_text orelse stable_mods.shortString(mod_buf, data.mods);
         const mode_str = modeName(data.mode);
         var w = std.Io.Writer.fixed(buf);
         try w.writeAll("{\"username\":");

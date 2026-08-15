@@ -2,6 +2,10 @@
 set -eu
 
 server=${1:-./zig-out/bin/zigcho}
+case "$server" in
+  /*) ;;
+  *) server="$(CDPATH='' cd -- "$(dirname "$server")" && pwd)/$(basename "$server")" ;;
+esac
 port=${ZIGCHO_SMOKE_PORT:-18094}
 origin="http://127.0.0.1:$port"
 work=$(mktemp -d "${TMPDIR:-/tmp}/zigcho-lazer-score.XXXXXX")
@@ -30,7 +34,7 @@ expect_status() {
   [ "$1" = "$2" ] || fail "$3 status=$1 expected=$2"
 }
 
-"$server" 127.0.0.1 "$port" "$database" >"$server_log" 2>&1 &
+(cd "$work" && "$server" 127.0.0.1 "$port" "$database") >"$server_log" 2>&1 &
 server_pid=$!
 attempt=0
 until curl --fail --silent "$origin/health" >/dev/null 2>&1; do
@@ -131,7 +135,7 @@ jq -e '
   all(.[]; .message_length_limit == 2000)
 ' "$response" >/dev/null || fail invalid_chat_channel_list_contract
 auth_get /api/v2/chat/channels/4 chat_channel
-jq -e '.channel.channel_id == 4 and .channel.name == "#lazer" and .users == []' "$response" >/dev/null || fail invalid_chat_channel_contract
+jq -e '.channel.channel_id == 4 and .channel.name == "#lazer" and (.users | length) == 2 and .users[0].id == 4 and .users[1].id == 3 and .users[1].is_bot == true and .users[1].is_online == true' "$response" >/dev/null || fail invalid_chat_channel_contract
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/chat/channels/4/users/4" \
   --header "Authorization: Bearer $token_one")
@@ -184,7 +188,7 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
   --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$score_body")
 expect_status "$code" 200 submit_score
 score_id=$(jq -er '.id | select(. > 0)' "$response")
-jq -e '.position == null' "$response" >/dev/null || fail invalid_client_response
+jq -e '.position == 1' "$response" >/dev/null || fail invalid_client_response
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/beatmaps/75/solo/scores/$score_token" \
   --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$score_body")
@@ -207,12 +211,14 @@ jq -e --argjson id "$score_id" '
   .user_score.position == 1
 ' "$response" >/dev/null || fail invalid_custom_leaderboard_contract
 
-vanilla_body='{"rank":"S","total_score":123456,"total_score_without_mods":123456,"accuracy":0.9,"max_combo":8,"ruleset_id":0,"passed":true,"mods":[],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[]}'
+replay_base64='ANAnNQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+vanilla_body='{"rank":"S","total_score":123456,"total_score_without_mods":123456,"accuracy":0.9,"max_combo":8,"ruleset_id":0,"passed":true,"mods":[],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[],"replay":"ANAnNQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
 vanilla_token=$(create_score_token "$token_one")
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/beatmaps/75/solo/scores/$vanilla_token" \
   --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$vanilla_body")
 expect_status "$code" 200 submit_vanilla_score
 vanilla_score_id=$(jq -er '.id | select(. > 0)' "$response")
+jq -e '.position == 1' "$response" >/dev/null || fail vanilla_position_missing
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&limit=50' vanilla_leaderboard
 jq -e --argjson id "$vanilla_score_id" '
@@ -221,8 +227,41 @@ jq -e --argjson id "$vanilla_score_id" '
   .scores[0].ranked == true and
   .scores[0].total_score == 123456 and
   .scores[0].pp > 0 and
+  .scores[0].has_replay == true and
   .user_score.score.id == $id
 ' "$response" >/dev/null || fail invalid_vanilla_leaderboard_contract
+
+auth_get "/api/v2/scores/$vanilla_score_id/download" authenticated_lazer_replay
+[ "$(base64 < "$response" | tr -d '\r\n')" = "$replay_base64" ] || fail authenticated_lazer_replay_mismatch
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/replays/lazer/$vanilla_score_id")
+expect_status "$code" 200 public_lazer_replay
+[ "$(base64 < "$response" | tr -d '\r\n')" = "$replay_base64" ] || fail public_lazer_replay_mismatch
+
+rx_body='{"rank":"A","total_score":223456,"total_score_without_mods":223456,"accuracy":0.92,"max_combo":9,"ruleset_id":0,"passed":true,"mods":[{"acronym":"RX"}],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[]}'
+rx_token=$(create_score_token "$token_one")
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/beatmaps/75/solo/scores/$rx_token" \
+  --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$rx_body")
+expect_status "$code" 200 submit_relax_score
+rx_score_id=$(jq -er '.id | select(. > 0)' "$response")
+auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=RX&limit=50' relax_leaderboard
+jq -e --argjson id "$rx_score_id" '.score_count == 1 and .scores[0].id == $id and .scores[0].mods[0].acronym == "RX" and .scores[0].ranked == false and .user_score.position == 1' "$response" >/dev/null || fail invalid_relax_leaderboard_contract
+
+ap_body='{"rank":"A","total_score":323456,"total_score_without_mods":323456,"accuracy":0.93,"max_combo":9,"ruleset_id":0,"passed":true,"mods":[{"acronym":"AP"}],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[]}'
+ap_token=$(create_score_token "$token_one")
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/beatmaps/75/solo/scores/$ap_token" \
+  --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$ap_body")
+expect_status "$code" 200 submit_autopilot_score
+ap_score_id=$(jq -er '.id | select(. > 0)' "$response")
+auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=AP&limit=50' autopilot_leaderboard
+jq -e --argjson id "$ap_score_id" '.score_count == 1 and .scores[0].id == $id and .scores[0].mods[0].acronym == "AP" and .scores[0].ranked == false and .user_score.position == 1' "$response" >/dev/null || fail invalid_autopilot_leaderboard_contract
+auth_get /api/v2/chat/channels/2/messages score_announcements
+jq -e '
+  length == 4 and
+  all(.[]; .sender_id == 3 and .channel_id == 2 and (.content | contains("set #1 on artist - title [diff]"))) and
+  any(.[]; .content | contains("[vanilla] NM")) and
+  any(.[]; .content | contains("[relax] +RX")) and
+  any(.[]; .content | contains("[autopilot] +AP"))
+' "$response" >/dev/null || fail invalid_score_announcement_contract
 
 auth_get /api/v2/me/ me_after_vanilla_score
 jq -e '
@@ -259,7 +298,7 @@ auth_get '/api/v2/users/4/osu?key=id' profile_after_scores
 jq -e '
   .scores_best_count == 1 and
   .scores_first_count == 1 and
-  .scores_recent_count == 2 and
+  .scores_recent_count == 4 and
   .scores_pinned_count == 0
 ' "$response" >/dev/null || fail invalid_profile_score_counts
 
@@ -274,9 +313,11 @@ jq -e --argjson id "$vanilla_score_id" '
 ' "$response" >/dev/null || fail invalid_profile_best_scores
 
 auth_get '/api/v2/users/4/scores/recent?mode=osu&offset=0&limit=50' profile_recent_scores
-jq -e --argjson custom "$score_id" --argjson vanilla "$vanilla_score_id" '
-  length == 2 and
+jq -e --argjson custom "$score_id" --argjson vanilla "$vanilla_score_id" --argjson relax "$rx_score_id" --argjson autopilot "$ap_score_id" '
+  length == 4 and
   any(.[]; .id == $custom and .ranked == false and .mods[0].acronym == "RX" and .mods[1].acronym == "WIGGLE") and
+  any(.[]; .id == $relax and .ranked == false and .mods[0].acronym == "RX") and
+  any(.[]; .id == $autopilot and .ranked == false and .mods[0].acronym == "AP") and
   any(.[]; .id == $vanilla and .ranked == true and .mods == [])
 ' "$response" >/dev/null || fail invalid_profile_recent_scores
 
@@ -291,5 +332,5 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
   --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$score_body")
 expect_status "$code" 401 reject_expired_token
 
-[ "$(sqlite3 "$database" 'SELECT count(*) FROM lazer_scores')" = 2 ] || fail rejected_submissions_were_stored
-echo "lazer_solo_score_smoke_ok custom_score_id=$score_id vanilla_score_id=$vanilla_score_id"
+[ "$(sqlite3 "$database" 'SELECT count(*) FROM lazer_scores')" = 4 ] || fail rejected_submissions_were_stored
+echo "lazer_solo_score_smoke_ok custom_score_id=$score_id vanilla_score_id=$vanilla_score_id relax_score_id=$rx_score_id autopilot_score_id=$ap_score_id"

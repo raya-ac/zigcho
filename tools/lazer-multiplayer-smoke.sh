@@ -2,6 +2,10 @@
 set -eu
 
 server=${1:-./zig-out/bin/zigcho}
+case "$server" in
+  /*) ;;
+  *) server="$(CDPATH='' cd -- "$(dirname "$server")" && pwd)/$(basename "$server")" ;;
+esac
 port=${ZIGCHO_MULTIPLAYER_SMOKE_PORT:-18096}
 origin="http://127.0.0.1:$port"
 work=$(mktemp -d "${TMPDIR:-/tmp}/zigcho-lazer-multiplayer.XXXXXX")
@@ -26,7 +30,7 @@ fail() {
   exit 1
 }
 
-"$server" 127.0.0.1 "$port" "$database" >"$server_log" 2>&1 &
+(cd "$work" && "$server" 127.0.0.1 "$port" "$database") >"$server_log" 2>&1 &
 server_pid=$!
 attempt=0
 until curl --fail --silent "$origin/health" >/dev/null 2>&1; do

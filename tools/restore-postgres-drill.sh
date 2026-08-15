@@ -49,7 +49,21 @@ pg_restore --exit-on-error --no-owner --no-privileges --dbname="$drill_db" "$bac
 schema_version=$(psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT max(version) FROM zigcho.schema_migrations")
 invalid_indexes=$(psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT count(*) FROM pg_index WHERE NOT indisvalid")
 unvalidated_fks=$(psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT count(*) FROM pg_constraint WHERE contype='f' AND NOT convalidated")
-counts=$(psql --dbname="$drill_db" --tuples-only --no-align --field-separator=, --command="SELECT (SELECT count(*) FROM zigcho.users),(SELECT count(*) FROM zigcho.scores),(SELECT count(*) FROM zigcho.beatmaps),(SELECT count(*) FROM zigcho.audit_log),(SELECT count(*) FROM zigcho.anticheat_observations),(SELECT count(*) FROM zigcho.anticheat_replay_fingerprints)")
+table_count() {
+  table=$1
+  case "$table" in
+    users|scores|beatmaps|audit_log|anticheat_observations|anticheat_replay_fingerprints) ;;
+    *) echo "refusing unexpected restore count table: $table" >&2; return 1 ;;
+  esac
+  exists=$(psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT to_regclass('zigcho.$table') IS NOT NULL")
+  if [ "$exists" != "t" ]; then
+    echo 0
+    return
+  fi
+  psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT count(*) FROM zigcho.$table"
+}
+
+counts="$(table_count users),$(table_count scores),$(table_count beatmaps),$(table_count audit_log),$(table_count anticheat_observations),$(table_count anticheat_replay_fingerprints)"
 
 if [ "$schema_version" != "$expected_schema" ] || [ "$invalid_indexes" != "0" ] || [ "$unvalidated_fks" != "0" ]; then
   echo "restore_drill_failed schema=$schema_version invalid_indexes=$invalid_indexes unvalidated_fks=$unvalidated_fks" >&2

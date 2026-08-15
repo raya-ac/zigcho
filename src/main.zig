@@ -1615,6 +1615,22 @@ const App = struct {
             defer self.allocator.free(response);
             return respond(req, .ok, "application/json", response, &.{});
         }
+        if (req.head.method == .GET) if (lazer.parseRankingPath(path)) |ranking_path| {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const page = std.fmt.parseInt(u16, queryField(target, "page") orelse "1", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid page\"}", &.{});
+            if (page == 0 or page > 200) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid page\"}", &.{});
+            var country_buffer: [2]u8 = undefined;
+            var country_filter: ?[]const u8 = null;
+            if (queryField(target, "country")) |value| {
+                if (ranking_path.kind == .country or value.len != 2 or !std.ascii.isAlphabetic(value[0]) or !std.ascii.isAlphabetic(value[1])) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid country\"}", &.{});
+                country_buffer = .{ std.ascii.toUpper(value[0]), std.ascii.toUpper(value[1]) };
+                country_filter = &country_buffer;
+            }
+            const json = try self.store.lazerRankingsJson(self.allocator, ranking_path.ruleset_id, ranking_path.kind, country_filter, page);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{});
+        };
         if (req.head.method == .GET) if (lazer.parseLeaderboardPath(path)) |leaderboard_path| {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
@@ -1645,6 +1661,12 @@ const App = struct {
                 if (!lazer.validHash(version_hash) or !lazer.validHash(beatmap_hash)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid score token hashes\"}", &.{});
                 const ruleset_id = std.fmt.parseInt(i64, ruleset_text, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid ruleset_id\"}", &.{});
                 if (ruleset_id < 0 or ruleset_id > 3) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid ruleset_id\"}", &.{});
+                const pp_ready = self.map_sync.ensureFileByBeatmapId(&self.store, solo_path.beatmap_id, beatmap_hash) catch |err| {
+                    if (err == error.BeatmapHashMismatch) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"beatmap hash mismatch\"}", &.{});
+                    std.log.warn("event=lazer_score_token_hydration_failed beatmap_id={d} error={t}", .{ solo_path.beatmap_id, err });
+                    return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+                };
+                if (!pp_ready) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
                 const token_id = self.store.createLazerScoreToken(user.id, solo_path.beatmap_id, beatmap_hash, ruleset_id, version_hash) catch |err| return switch (err) {
                     error.BeatmapNotFound => respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found\"}", &.{}),
                     error.BeatmapHashMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"beatmap hash mismatch\"}", &.{}),
@@ -1667,7 +1689,15 @@ const App = struct {
                 defer self.allocator.free(maximum_statistics_json);
                 const pauses_json = try lazer.jsonField(self.allocator, parsed.value.object, "pauses", "[]");
                 defer self.allocator.free(pauses_json);
-                const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+                const pp_ready = self.map_sync.ensureFileByBeatmapId(&self.store, solo_path.beatmap_id, null) catch |err| {
+                    std.log.warn("event=lazer_score_submit_hydration_failed beatmap_id={d} token_id={d} error={t}", .{ solo_path.beatmap_id, token_id, err });
+                    return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+                };
+                if (!pp_ready) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+                const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch |err| {
+                    std.log.warn("event=lazer_score_performance_failed beatmap_id={d} token_id={d} error={t}", .{ solo_path.beatmap_id, token_id, err });
+                    return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+                };
                 const score_id = self.store.submitLazerScoreToken(user.id, solo_path.beatmap_id, token_id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json) catch |err| return switch (err) {
                     error.InvalidLazerScoreToken, error.ForeignLazerScoreToken, error.LazerScoreTokenExpired => respond(req, .unauthorized, "application/json", "{\"error\":\"invalid or expired score token\"}", &.{}),
                     error.LazerScoreTokenUsed => respond(req, .conflict, "application/json", "{\"error\":\"score token already used\"}", &.{}),
@@ -1761,7 +1791,15 @@ const App = struct {
             const pauses_json = try lazer.jsonField(self.allocator, parsed.value.object, "pauses", "[]");
             defer self.allocator.free(pauses_json);
             const ns_name = @tagName(score.namespace);
-            const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+            const pp_ready = self.map_sync.ensureFileByBeatmapId(&self.store, @intCast(score.beatmap_id), null) catch |err| {
+                std.log.warn("event=lazer_legacy_score_hydration_failed beatmap_id={d} error={t}", .{ score.beatmap_id, err });
+                return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+            };
+            if (!pp_ready) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
+            const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch |err| {
+                std.log.warn("event=lazer_legacy_score_performance_failed beatmap_id={d} error={t}", .{ score.beatmap_id, err });
+                return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+            };
             const id = try self.store.insertLazerScore(user.id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json);
             var out: [192]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"user_id\":{d},\"rank_namespace\":\"{s}\",\"ranked\":false}}", .{ id, user.id, ns_name });

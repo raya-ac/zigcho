@@ -10,6 +10,7 @@ const stable_mods = @import("stable_mods.zig");
 const screenshot_contract = @import("screenshot.zig");
 const media_contract = @import("media_contract.zig");
 const site_replay = @import("site_replay.zig");
+const user_json = @import("user_json.zig");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
 pub const HardwareEnforcement = sqlite_storage.HardwareEnforcement;
@@ -2398,6 +2399,54 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    pub fn lazerRankingsJson(self: *Store, allocator: std.mem.Allocator, ruleset_id: u8, kind: lazer.RankingKind, country_filter: ?[]const u8, page: u16) ![]u8 {
+        if (page == 0) return error.InvalidPage;
+        var mode_buf: [4]u8 = undefined;
+        var offset_buf: [16]u8 = undefined;
+        const mode = try std.fmt.bufPrint(&mode_buf, "{d}", .{ruleset_id});
+        const offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{(@as(u32, page) - 1) * 50});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        const country_sql =
+            "WITH visible AS (SELECT CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.plays,s.ranked_score,s.pp FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted) " ++
+            "SELECT country,count(*),sum(plays),sum(ranked_score),sum(pp) FROM visible WHERE country!='XX' GROUP BY country ORDER BY sum(pp) DESC,country ASC LIMIT 50 OFFSET $2";
+        const performance_sql =
+            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo," ++
+            "row_number() OVER(ORDER BY s.pp DESC,u.id ASC) global_rank,row_number() OVER(PARTITION BY CASE WHEN u.show_country THEN u.country ELSE 'XX' END ORDER BY s.pp DESC,u.id ASC) country_rank " ++
+            "FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted) " ++
+            "SELECT * FROM visible WHERE ($2='' OR country=$2) ORDER BY pp DESC,id ASC LIMIT 50 OFFSET $3";
+        const score_sql =
+            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo," ++
+            "row_number() OVER(ORDER BY s.total_score DESC,u.id ASC) global_rank,row_number() OVER(PARTITION BY CASE WHEN u.show_country THEN u.country ELSE 'XX' END ORDER BY s.total_score DESC,u.id ASC) country_rank " ++
+            "FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted) " ++
+            "SELECT * FROM visible WHERE ($2='' OR country=$2) ORDER BY total_score DESC,id ASC LIMIT 50 OFFSET $3";
+        var result = switch (kind) {
+            .country => try postgres.queryParams(allocator, lease.conn, country_sql, &.{ mode, offset }),
+            .performance => try postgres.queryParams(allocator, lease.conn, performance_sql, &.{ mode, country_filter orelse "", offset }),
+            .score => try postgres.queryParams(allocator, lease.conn, score_sql, &.{ mode, country_filter orelse "", offset }),
+        };
+        defer result.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll("{\"ranking\":[");
+        for (0..result.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            if (kind == .country) {
+                try output.writer.writeAll("{\"code\":");
+                try jsonString(&output.writer, result.value(row, 0));
+                try output.writer.print(",\"active_users\":{d},\"play_count\":{d},\"ranked_score\":{d},\"performance\":{d}}}", .{ try result.int(i32, row, 1), try result.int(i64, row, 2), try result.int(i64, row, 3), try result.int(i64, row, 4) });
+                continue;
+            }
+            const country_text = result.value(row, 2);
+            const cc: [2]u8 = if (country_text.len == 2) .{ country_text[0], country_text[1] } else .{ 'X', 'X' };
+            const user: domain.User = .{ .id = try result.int(i32, row, 0), .name = result.value(row, 1), .safe_name = "", .country = cc, .privileges = try result.int(u32, row, 3) };
+            const stats: domain.Stats = .{ .mode = @enumFromInt(ruleset_id), .ranked_score = try result.int(i64, row, 4), .total_score = try result.int(i64, row, 5), .pp = try result.int(i32, row, 6), .plays = try result.int(i32, row, 7), .play_time = try result.int(i32, row, 8), .total_hits = try result.int(i64, row, 9), .accuracy = try result.float(f64, row, 10), .max_combo = try result.int(i32, row, 11) };
+            try user_json.writeRankingStatistics(&output.writer, user, stats, try result.int(i32, row, 12), try result.int(i32, row, 13));
+        }
+        try output.writer.writeAll("],\"cursor\":null}");
+        return output.toOwnedSlice();
+    }
+
     fn writeSiteScores(writer: *std.Io.Writer, scores: *postgres.Result, include_weight: bool) !void {
         try writer.writeByte('[');
         for (0..scores.rows()) |row| {
@@ -3422,6 +3471,17 @@ test "postgres account auth stats and token slice" {
     defer std.testing.allocator.free(site_rankings);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"rank\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"name\":\"ari\"") != null);
+    const lazer_performance_rankings = try store.lazerRankingsJson(std.testing.allocator, 0, .performance, null, 1);
+    defer std.testing.allocator.free(lazer_performance_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_performance_rankings, "\"ranking\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_performance_rankings, "\"username\":\"ari\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_performance_rankings, "\"global_rank\":1") != null);
+    const lazer_country_rankings = try store.lazerRankingsJson(std.testing.allocator, 0, .country, null, 1);
+    defer std.testing.allocator.free(lazer_country_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_country_rankings, "\"code\":\"AU\"") != null);
+    const filtered_lazer_rankings = try store.lazerRankingsJson(std.testing.allocator, 0, .score, "AU", 1);
+    defer std.testing.allocator.free(filtered_lazer_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_lazer_rankings, "\"country_code\":\"AU\"") != null);
     const site_profile = (try store.siteProfile(std.testing.allocator, user_id, .all, 0)).?;
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"AU\"") != null);

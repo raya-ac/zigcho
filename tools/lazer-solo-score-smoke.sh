@@ -9,7 +9,7 @@ database="$work/zigcho.db"
 response="$work/response"
 server_log="$work/server.log"
 server_pid=
-repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 
 cleanup() {
   if [ -n "$server_pid" ]; then
@@ -236,6 +236,24 @@ jq -e '
   .statistics_rulesets.taiko.play_count == 0 and
   .statistics_rulesets.taiko.total_score == 0
 ' "$response" >/dev/null || fail v2_score_overwrote_stats
+
+sqlite3 "$database" "UPDATE users SET country='AU' WHERE id=4"
+auth_get '/api/v2/rankings/osu/performance?page=1' performance_rankings
+jq -e '
+  .cursor == null and
+  (.ranking | length) == 1 and
+  .ranking[0].user.id == 4 and
+  .ranking[0].user.username == "lazer-one" and
+  .ranking[0].global_rank == 1 and
+  .ranking[0].country_rank == 1 and
+  .ranking[0].pp > 0 and
+  .ranking[0].play_count == 1 and
+  .ranking[0].hit_accuracy == 90
+' "$response" >/dev/null || fail invalid_performance_rankings_contract
+auth_get '/api/v2/rankings/osu/score?page=1&country=au' score_rankings
+jq -e '.cursor == null and (.ranking | length) == 1 and .ranking[0].user.country_code == "AU" and .ranking[0].total_score == 123456' "$response" >/dev/null || fail invalid_score_rankings_contract
+auth_get '/api/v2/rankings/osu/country?page=1' country_rankings
+jq -e '.cursor == null and (.ranking | length) == 1 and .ranking[0].code == "AU" and .ranking[0].active_users == 1 and .ranking[0].play_count == 1 and .ranking[0].performance > 0' "$response" >/dev/null || fail invalid_country_rankings_contract
 
 auth_get '/api/v2/users/4/osu?key=id' profile_after_scores
 jq -e '

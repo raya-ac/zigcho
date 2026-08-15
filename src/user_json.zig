@@ -53,6 +53,25 @@ fn writeStatistics(writer: *std.Io.Writer, maybe_stats: ?domain.Stats, restricte
     });
 }
 
+pub fn writeRankingStatistics(writer: *std.Io.Writer, user: domain.User, stats: domain.Stats, global_rank: i32, country_rank: i32) !void {
+    try writer.writeAll("{\"user\":");
+    try writeUserCore(writer, user);
+    try writer.writeAll("},\"level\":{\"current\":0,\"progress\":0},\"is_ranked\":true,\"global_rank\":");
+    if (global_rank > 0) try writer.print("{d}", .{global_rank}) else try writer.writeAll("null");
+    try writer.writeAll(",\"country_rank\":");
+    if (country_rank > 0) try writer.print("{d}", .{country_rank}) else try writer.writeAll("null");
+    try writer.print(",\"pp\":{d},\"ranked_score\":{d},\"hit_accuracy\":{d:.6},\"play_count\":{d},\"play_time\":{d},\"total_score\":{d},\"total_hits\":{d},\"maximum_combo\":{d},\"replays_watched_by_others\":0,\"grade_counts\":{{\"ssh\":0,\"ss\":0,\"sh\":0,\"s\":0,\"a\":0}}}}", .{
+        stats.pp,
+        stats.ranked_score,
+        stats.accuracy * 100.0,
+        stats.plays,
+        stats.play_time,
+        stats.total_score,
+        stats.total_hits,
+        stats.max_combo,
+    });
+}
+
 pub fn writeCompact(writer: *std.Io.Writer, user: domain.User) !void {
     try writeUserCore(writer, user);
     try writer.writeByte('}');

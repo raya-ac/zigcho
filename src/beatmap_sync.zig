@@ -175,6 +175,59 @@ pub const Sync = struct {
         return true;
     }
 
+    /// Score submission needs the actual .osu payload, not just the public
+    /// metadata row. Keep browsing asynchronous, but make score-token creation
+    /// wait for a bounded, verified archive hydration.
+    pub fn ensureFileByBeatmapId(self: *Sync, store: *storage.Store, beatmap_id: i32, requested_md5: ?[]const u8) !bool {
+        if (beatmap_id <= 0) return false;
+        if (requested_md5) |value| if (!validMd5(value)) return false;
+
+        if (try scoreFileReady(store, beatmap_id, requested_md5)) return true;
+
+        var key_buffer: [48]u8 = undefined;
+        const lookup_key = try std.fmt.bufPrint(&key_buffer, "id:{d}", .{beatmap_id});
+        const claim_owned = switch (self.claim(lookup_key) catch return false) {
+            .claimed => |value| value,
+            .duplicate => {
+                // A lookup or another score request is already downloading the
+                // same archive. Give it a bounded chance to finish instead of
+                // issuing a token which cannot be submitted.
+                for (0..300) |_| {
+                    std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch return false;
+                    if (try scoreFileReady(store, beatmap_id, requested_md5)) return true;
+                }
+                return false;
+            },
+            .at_capacity => return false,
+        };
+        defer self.removeFromProgress(claim_owned);
+
+        _ = self.attempts.fetchAdd(1, .monotonic);
+        const identity = self.fetchBeatmapIdentity(beatmap_id) catch |err| {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return err;
+        };
+        if (requested_md5) |value| if (!std.ascii.eqlIgnoreCase(value, &identity.md5)) return error.BeatmapHashMismatch;
+
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (!try store.hydrationRetryAllowed(&identity.md5, now)) {
+            _ = self.backoff_skips.fetchAdd(1, .monotonic);
+            return false;
+        }
+        const remote = self.fetchAndStoreMetadata(store, &identity.md5, identity.set_id) catch |err| {
+            self.recordFailure(store, &identity.md5, identity.set_id, err);
+            return err;
+        };
+        self.downloadArchive(store, &identity.md5, identity.set_id, remote) catch |err| {
+            self.recordFailure(store, &identity.md5, identity.set_id, err);
+            return err;
+        };
+        store.clearHydrationFailure(&identity.md5) catch |err|
+            std.log.warn("[hydrate] could not clear failure state md5={s}: {t}", .{ &identity.md5, err });
+        _ = self.successes.fetchAdd(1, .monotonic);
+        return try scoreFileReady(store, beatmap_id, requested_md5);
+    }
+
     /// Hydrate the metadata for a whole set without downloading its archive.
     /// Set overlays need this before they know which individual difficulty will
     /// be opened, while the later beatmap lookup remains responsible for the
@@ -400,6 +453,12 @@ pub const Sync = struct {
         }
     }
 };
+
+fn scoreFileReady(store: *storage.Store, beatmap_id: i32, requested_md5: ?[]const u8) !bool {
+    const selection = (try store.beatmapSelectionById(beatmap_id)) orelse return false;
+    if (requested_md5) |value| if (!std.ascii.eqlIgnoreCase(value, &selection.md5)) return error.BeatmapHashMismatch;
+    return store.beatmapHasFile(&selection.md5);
+}
 
 fn hydrationClaimAllocationRun(allocator: std.mem.Allocator) !void {
     var sync = Sync.init(allocator, std.testing.io, 1);

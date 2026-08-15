@@ -26,6 +26,6 @@ Windows has its own repeatable production build now. The PowerShell path applies
   -OutputDirectory artifacts/lazer
 ```
 
-The result is `zigcho-lazer-0.1.0-alpha.1-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
+The result is `zigcho-lazer-0.1.0-alpha.2-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
 
 This is a portable alpha, not a signed installer. Open `app/osu!.exe` after extracting the whole folder. Windows SmartScreen may warn until the executable has an Authenticode certificate. Public chat now runs over the REST fallback; multiplayer and spectating are still missing, so the package stays marked as a prerelease even though the REST login, beatmap, profile, leaderboard, chat, and solo score paths are connected.

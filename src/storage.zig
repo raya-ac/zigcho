@@ -7,6 +7,7 @@ const stable_mods = @import("stable_mods.zig");
 const screenshot_contract = @import("screenshot.zig");
 const media_contract = @import("media_contract.zig");
 const site_replay = @import("site_replay.zig");
+const user_json = @import("user_json.zig");
 pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -2220,6 +2221,63 @@ pub const Store = struct {
         try output.writer.writeAll("]}");
         var list = output.toArrayList();
         return list.toOwnedSlice(allocator);
+    }
+
+    pub fn lazerRankingsJson(self: *Store, allocator: std.mem.Allocator, ruleset_id: u8, kind: lazer.RankingKind, country_filter: ?[]const u8, page: u16) ![]u8 {
+        if (page == 0) return error.InvalidPage;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const offset: u32 = (@as(u32, page) - 1) * 50;
+        var stmt: ?*c.sqlite3_stmt = null;
+        const country_sql =
+            "WITH visible AS (SELECT CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.plays,s.ranked_score,s.pp FROM stats s JOIN users u ON u.id=s.user_id WHERE s.mode=?1 AND s.plays>0 AND u.id!=3 AND u.restricted=0) " ++
+            "SELECT country,count(*),sum(plays),sum(ranked_score),sum(pp) FROM visible WHERE country!='XX' GROUP BY country ORDER BY sum(pp) DESC,country ASC LIMIT 50 OFFSET ?2";
+        const performance_sql =
+            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo," ++
+            "row_number() OVER(ORDER BY s.pp DESC,u.id ASC) global_rank,row_number() OVER(PARTITION BY CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END ORDER BY s.pp DESC,u.id ASC) country_rank " ++
+            "FROM stats s JOIN users u ON u.id=s.user_id WHERE s.mode=?1 AND s.plays>0 AND u.id!=3 AND u.restricted=0) " ++
+            "SELECT * FROM visible WHERE (?2='' OR country=?2) ORDER BY pp DESC,id ASC LIMIT 50 OFFSET ?3";
+        const score_sql =
+            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo," ++
+            "row_number() OVER(ORDER BY s.total_score DESC,u.id ASC) global_rank,row_number() OVER(PARTITION BY CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END ORDER BY s.total_score DESC,u.id ASC) country_rank " ++
+            "FROM stats s JOIN users u ON u.id=s.user_id WHERE s.mode=?1 AND s.plays>0 AND u.id!=3 AND u.restricted=0) " ++
+            "SELECT * FROM visible WHERE (?2='' OR country=?2) ORDER BY total_score DESC,id ASC LIMIT 50 OFFSET ?3";
+        const sql: [*:0]const u8 = switch (kind) {
+            .country => country_sql,
+            .performance => performance_sql,
+            .score => score_sql,
+        };
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, ruleset_id);
+        if (kind == .country) {
+            _ = c.sqlite3_bind_int64(stmt, 2, offset);
+        } else {
+            const filter = country_filter orelse "";
+            _ = c.sqlite3_bind_text(stmt, 2, filter.ptr, @intCast(filter.len), null);
+            _ = c.sqlite3_bind_int64(stmt, 3, offset);
+        }
+
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll("{\"ranking\":[");
+        var row: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) : (row += 1) {
+            if (row != 0) try output.writer.writeByte(',');
+            if (kind == .country) {
+                try output.writer.writeAll("{\"code\":");
+                try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+                try output.writer.print(",\"active_users\":{d},\"play_count\":{d},\"ranked_score\":{d},\"performance\":{d}}}", .{ c.sqlite3_column_int(stmt, 1), c.sqlite3_column_int64(stmt, 2), c.sqlite3_column_int64(stmt, 3), c.sqlite3_column_int64(stmt, 4) });
+                continue;
+            }
+            const country_text = std.mem.span(c.sqlite3_column_text(stmt, 2));
+            const cc: [2]u8 = if (country_text.len == 2) .{ country_text[0], country_text[1] } else .{ 'X', 'X' };
+            const user: domain.User = .{ .id = c.sqlite3_column_int(stmt, 0), .name = std.mem.span(c.sqlite3_column_text(stmt, 1)), .safe_name = "", .country = cc, .privileges = @intCast(c.sqlite3_column_int64(stmt, 3)) };
+            const stats: domain.Stats = .{ .mode = @enumFromInt(ruleset_id), .ranked_score = c.sqlite3_column_int64(stmt, 4), .total_score = c.sqlite3_column_int64(stmt, 5), .pp = c.sqlite3_column_int(stmt, 6), .plays = c.sqlite3_column_int(stmt, 7), .play_time = c.sqlite3_column_int(stmt, 8), .total_hits = c.sqlite3_column_int64(stmt, 9), .accuracy = c.sqlite3_column_double(stmt, 10), .max_combo = c.sqlite3_column_int(stmt, 11) };
+            try user_json.writeRankingStatistics(&output.writer, user, stats, c.sqlite3_column_int(stmt, 12), c.sqlite3_column_int(stmt, 13));
+        }
+        try output.writer.writeAll("],\"cursor\":null}");
+        return output.toOwnedSlice();
     }
 
     fn prepareSiteScores(self: *Store, sql: [:0]const u8, user_id: i32, score_mode: u8, namespace: []const u8) !*c.sqlite3_stmt {

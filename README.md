@@ -39,6 +39,7 @@ the full public hostname contract is in `deploy/hosts.txt`. production releases 
 tools/stable-web-smoke.sh https://osu.kai.ovh
 tools/stable-map-upstream-smoke.sh https://osu.kai.ovh
 tools/lazer-solo-score-smoke.sh https://api.kai.ovh
+tools/lazer-upstream-score-smoke.sh ./zig-out/bin/zigcho
 ```
 
 the main test suite covers the wire formats, authentication, sessions, Stable scoring, lazer scoring, PP boundaries, chat, rooms, spectating, moderation, migrations, PostgreSQL parity, site sessions, CSRF and avatar validation. release builds also run inside the pinned Linux container before they are promoted.

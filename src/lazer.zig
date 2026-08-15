@@ -264,6 +264,13 @@ pub const LeaderboardPath = struct {
     beatmap_id: i32,
 };
 
+pub const RankingKind = enum { performance, score, country };
+
+pub const RankingPath = struct {
+    ruleset_id: u8,
+    kind: RankingKind,
+};
+
 pub const ChannelUserPath = struct {
     channel_id: i64,
     user_id: i32,
@@ -471,6 +478,26 @@ pub fn parseLeaderboardPath(path: []const u8) ?LeaderboardPath {
     const beatmap_id = std.fmt.parseInt(i32, id_text, 10) catch return null;
     if (beatmap_id <= 0) return null;
     return .{ .beatmap_id = beatmap_id };
+}
+
+pub fn parseRankingPath(path: []const u8) ?RankingPath {
+    const prefix = "/api/v2/rankings/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    if (separator == 0 or std.mem.indexOfScalar(u8, rest[separator + 1 ..], '/') != null) return null;
+    const ruleset_id: u8 = if (std.mem.eql(u8, rest[0..separator], "osu"))
+        0
+    else if (std.mem.eql(u8, rest[0..separator], "taiko"))
+        1
+    else if (std.mem.eql(u8, rest[0..separator], "fruits"))
+        2
+    else if (std.mem.eql(u8, rest[0..separator], "mania"))
+        3
+    else
+        return null;
+    const kind = std.meta.stringToEnum(RankingKind, rest[separator + 1 ..]) orelse return null;
+    return .{ .ruleset_id = ruleset_id, .kind = kind };
 }
 
 pub fn validChannelId(channel_id: i64) bool {

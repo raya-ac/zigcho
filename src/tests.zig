@@ -3862,6 +3862,73 @@ test "official lazer solo score paths match the pinned client contract" {
     try std.testing.expect(lazer.parseLeaderboardPath("/api/v2/beatmaps/nope/scores") == null);
 }
 
+test "official lazer ranking paths match the pinned client contract" {
+    const performance = lazer.parseRankingPath("/api/v2/rankings/osu/performance").?;
+    try std.testing.expectEqual(@as(u8, 0), performance.ruleset_id);
+    try std.testing.expectEqual(lazer.RankingKind.performance, performance.kind);
+    const country_ranking = lazer.parseRankingPath("/api/v2/rankings/fruits/country").?;
+    try std.testing.expectEqual(@as(u8, 2), country_ranking.ruleset_id);
+    try std.testing.expectEqual(lazer.RankingKind.country, country_ranking.kind);
+    try std.testing.expectEqual(lazer.RankingKind.score, lazer.parseRankingPath("/api/v2/rankings/mania/score").?.kind);
+    try std.testing.expect(lazer.parseRankingPath("/api/v2/rankings/catch/performance") == null);
+    try std.testing.expect(lazer.parseRankingPath("/api/v2/rankings/osu") == null);
+    try std.testing.expect(lazer.parseRankingPath("/api/v2/rankings/osu/performance/extra") == null);
+}
+
+test "lazer ranking payloads order performance score and countries independently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-rankings.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,country,password_hash,password_salt) VALUES" ++
+            "(1,'score first','score_first','AU',x'00',x'00')," ++
+            "(2,'pp first','pp_first','GB',x'00',x'00')," ++
+            "(5,'hidden','hidden','AU',x'00',x'00');" ++
+            "UPDATE users SET restricted=1 WHERE id=5;" ++
+            "INSERT INTO stats(user_id,mode,ranked_score,total_score,pp,plays,play_time,total_hits,accuracy,max_combo) VALUES" ++
+            "(1,0,900,5000,300,5,60,100,0.95,50)," ++
+            "(2,0,800,4000,400,4,50,90,0.90,40)," ++
+            "(5,0,9999,9999,9999,99,99,99,1,99)",
+    );
+
+    const performance_json = try store.lazerRankingsJson(std.testing.allocator, 0, .performance, null, 1);
+    defer std.testing.allocator.free(performance_json);
+    var performance = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, performance_json, .{});
+    defer performance.deinit();
+    const performance_rows = performance.value.object.get("ranking").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), performance_rows.len);
+    try std.testing.expectEqualStrings("pp first", performance_rows[0].object.get("user").?.object.get("username").?.string);
+    try std.testing.expectEqual(@as(i64, 1), performance_rows[0].object.get("global_rank").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 90), performance_rows[0].object.get("hit_accuracy").?.float, 0.000001);
+
+    const score_json = try store.lazerRankingsJson(std.testing.allocator, 0, .score, null, 1);
+    defer std.testing.allocator.free(score_json);
+    var score = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, score_json, .{});
+    defer score.deinit();
+    try std.testing.expectEqualStrings("score first", score.value.object.get("ranking").?.array.items[0].object.get("user").?.object.get("username").?.string);
+
+    const au_json = try store.lazerRankingsJson(std.testing.allocator, 0, .performance, "AU", 1);
+    defer std.testing.allocator.free(au_json);
+    var au = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, au_json, .{});
+    defer au.deinit();
+    try std.testing.expectEqual(@as(usize, 1), au.value.object.get("ranking").?.array.items.len);
+    try std.testing.expectEqualStrings("AU", au.value.object.get("ranking").?.array.items[0].object.get("user").?.object.get("country_code").?.string);
+
+    const countries_json = try store.lazerRankingsJson(std.testing.allocator, 0, .country, null, 1);
+    defer std.testing.allocator.free(countries_json);
+    var countries = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, countries_json, .{});
+    defer countries.deinit();
+    const country_rows = countries.value.object.get("ranking").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), country_rows.len);
+    try std.testing.expectEqualStrings("GB", country_rows[0].object.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 4), country_rows[0].object.get("play_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 400), country_rows[0].object.get("performance").?.integer);
+}
+
 test "lazer ruleset profile paths match the pinned client contract" {
     const osu = lazer.parseUserPath("/api/v2/users/4/osu").?;
     try std.testing.expectEqualStrings("4", osu.lookup);

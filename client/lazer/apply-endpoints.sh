@@ -17,5 +17,7 @@ cp "$script_dir/TrustedDomainOnlineStore.cs" "$checkout/osu.Game/Online/TrustedD
 cp "$script_dir/TrustedDomainOnlineStoreTest.cs" "$checkout/osu.Game.Tests/TrustedDomainOnlineStoreTest.cs"
 cp "$script_dir/PollingChatClient.cs" "$checkout/osu.Game/Online/Chat/PollingChatClient.cs"
 cp "$script_dir/PollingChatClientTest.cs" "$checkout/osu.Game.Tests/PollingChatClientTest.cs"
+cp "$script_dir/ZigchoLeaderboardAvailability.cs" "$checkout/osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs"
+cp "$script_dir/ZigchoLeaderboardAvailabilityTest.cs" "$checkout/osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs"
 python3 "$script_dir/patch-unavailable-realtime.py" "$checkout"
 echo "zigcho endpoints and trusted resource domains applied to $checkout"

@@ -25,6 +25,8 @@ $Copies = @{
     "TrustedDomainOnlineStoreTest.cs" = "osu.Game.Tests/TrustedDomainOnlineStoreTest.cs"
     "PollingChatClient.cs" = "osu.Game/Online/Chat/PollingChatClient.cs"
     "PollingChatClientTest.cs" = "osu.Game.Tests/PollingChatClientTest.cs"
+    "ZigchoLeaderboardAvailability.cs" = "osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs"
+    "ZigchoLeaderboardAvailabilityTest.cs" = "osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs"
 }
 
 foreach ($SourceName in $Copies.Keys) {

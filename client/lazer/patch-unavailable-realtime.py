@@ -26,6 +26,8 @@ desktop_program = checkout / "osu.Desktop/Program.cs"
 desktop_project = checkout / "osu.Desktop/osu.Desktop.csproj"
 osu_game = checkout / "osu.Game/OsuGame.cs"
 beatmap_metadata_source = checkout / "osu.Game/Beatmaps/APIBeatmapMetadataSource.cs"
+leaderboard_manager = checkout / "osu.Game/Online/Leaderboards/LeaderboardManager.cs"
+scores_container = checkout / "osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs"
 
 replace_once(
     api_access,
@@ -112,4 +114,19 @@ replace_once(
     beatmap_metadata_source,
     "            var req = new GetBeatmapRequest(md5Hash: beatmapInfo.MD5Hash, filename: beatmapInfo.Path);",
     "            var req = new GetBeatmapRequest(onlineId: beatmapInfo.OnlineID, md5Hash: beatmapInfo.MD5Hash, filename: beatmapInfo.Path);",
+)
+
+# Official lazer treats cached pending/unknown status as proof that an online
+# leaderboard cannot exist. That is not true for zigcho: local metadata can lag
+# the server, and the server also owns leaderboards for custom statuses. Once a
+# map has an online ID, ask zigcho and let its response decide what is available.
+replace_once(
+    leaderboard_manager,
+    "                    if (newCriteria.Beatmap.OnlineID <= 0 || newCriteria.Beatmap.Status <= BeatmapOnlineStatus.Pending)",
+    "                    if (!ZigchoLeaderboardAvailability.IsAvailable(newCriteria.Beatmap))",
+)
+replace_once(
+    scores_container,
+    "            if (Beatmap.Value == null || Beatmap.Value.OnlineID <= 0 || (Beatmap.Value.Status <= BeatmapOnlineStatus.Pending))",
+    "            if (!osu.Game.Online.Leaderboards.ZigchoLeaderboardAvailability.IsAvailable(Beatmap.Value))",
 )

@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           ./client/lazer/apply-endpoints.ps1 -Checkout work/osu-client
-          dotnet test work/osu-client/osu.Game.Tests/osu.Game.Tests.csproj -c Release --filter "FullyQualifiedName~TrustedDomainOnlineStoreTest|FullyQualifiedName~PollingChatClientTest"
+          dotnet test work/osu-client/osu.Game.Tests/osu.Game.Tests.csproj -c Release --filter "FullyQualifiedName~TrustedDomainOnlineStoreTest|FullyQualifiedName~PollingChatClientTest|FullyQualifiedName~ZigchoLeaderboardAvailabilityTest"
 
       - name: build and verify the portable client
         shell: pwsh

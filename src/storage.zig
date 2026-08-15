@@ -88,15 +88,24 @@ pub const AnticheatObservation = struct {
     center_hits_bps: u32 = 0,
     mean_center_distance_milli: u32 = 0,
     snap_events: u32 = 0,
+    replay_match_count: u32 = 0,
+    key_press_count: u32 = 0,
+    key_hold_count: u32 = 0,
+    mean_hold_duration_milli: u32 = 0,
+    hold_duration_stddev_milli: u32 = 0,
+    alternation_bps: u32 = 0,
+    target_distance_stddev_milli: u32 = 0,
+    velocity_spike_count: u32 = 0,
+    movement_velocity_stddev_milli: u32 = 0,
 };
 
 pub fn validateAnticheatObservation(user_id: i32, observation: AnticheatObservation) !void {
     if (user_id <= 0 or observation.module.len == 0 or observation.module.len > 64 or !std.unicode.utf8ValidateSlice(observation.module)) return error.InvalidAnticheatObservation;
     if (observation.score_id) |score_id| if (score_id <= 0) return error.InvalidAnticheatObservation;
     if ((observation.source == .stable_score) != (observation.score_id != null)) return error.InvalidAnticheatObservation;
-    if (observation.action > 3 or observation.sample_weight == 0 or observation.sample_weight > 100_000 or observation.risk_score > 1000 or observation.confidence_bps > 10_000) return error.InvalidAnticheatObservation;
+    if (observation.action > 3 or observation.sample_weight == 0 or observation.sample_weight > 100_000 or observation.risk_score > 1000 or observation.confidence_bps > 10_000 or observation.replay_match_count > 100_000) return error.InvalidAnticheatObservation;
     if (observation.evidence > std.math.maxInt(i64) or observation.decision_flags > std.math.maxInt(i64)) return error.InvalidAnticheatObservation;
-    if (observation.matched_clicks > observation.objects_checked or observation.snap_events > observation.objects_checked or observation.exact_timing_bps > 10_000 or observation.center_hits_bps > 10_000) return error.InvalidAnticheatObservation;
+    if (observation.matched_clicks > observation.objects_checked or observation.snap_events > observation.objects_checked or observation.exact_timing_bps > 10_000 or observation.center_hits_bps > 10_000 or observation.key_hold_count > observation.key_press_count or observation.alternation_bps > 10_000) return error.InvalidAnticheatObservation;
 }
 
 pub const Store = struct {
@@ -234,6 +243,12 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_025.sql"));
         }
+        if (version < 26) {
+            if (try self.hasAnticheatGameplaySchema())
+                try self.exec("PRAGMA user_version=26")
+            else
+                try self.exec(@embedFile("migration_026.sql"));
+        }
     }
 
     fn hasLazerPerformanceColumns(self: *Store) !bool {
@@ -307,6 +322,30 @@ pub const Store = struct {
                 std.mem.eql(u8, name, "reviewed_at")) found += 1;
         }
         return found == 9;
+    }
+
+    fn hasAnticheatGameplaySchema(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(anticheat_observations)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var found: u8 = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const name = std.mem.span(c.sqlite3_column_text(stmt, 1));
+            if (std.mem.eql(u8, name, "replay_match_count") or
+                std.mem.eql(u8, name, "key_press_count") or
+                std.mem.eql(u8, name, "key_hold_count") or
+                std.mem.eql(u8, name, "mean_hold_duration_milli") or
+                std.mem.eql(u8, name, "hold_duration_stddev_milli") or
+                std.mem.eql(u8, name, "alternation_bps") or
+                std.mem.eql(u8, name, "target_distance_stddev_milli") or
+                std.mem.eql(u8, name, "velocity_spike_count") or
+                std.mem.eql(u8, name, "movement_velocity_stddev_milli")) found += 1;
+        }
+        if (found != 9) return false;
+        var table: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='anticheat_replay_fingerprints'", -1, &table, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(table);
+        return c.sqlite3_step(table) == c.SQLITE_ROW;
     }
 
     fn hasAvatarColumn(self: *Store) !bool {
@@ -557,7 +596,7 @@ pub const Store = struct {
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "INSERT INTO anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)";
+        const sql = "INSERT INTO anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events,replay_match_count,key_press_count,key_hold_count,mean_hold_duration_milli,hold_duration_stddev_milli,alternation_bps,target_distance_stddev_milli,velocity_spike_count,movement_velocity_stddev_milli) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)";
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
@@ -584,10 +623,19 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int64(stmt, 18, observation.center_hits_bps);
         _ = c.sqlite3_bind_int64(stmt, 19, observation.mean_center_distance_milli);
         _ = c.sqlite3_bind_int64(stmt, 20, observation.snap_events);
+        _ = c.sqlite3_bind_int64(stmt, 21, observation.replay_match_count);
+        _ = c.sqlite3_bind_int64(stmt, 22, observation.key_press_count);
+        _ = c.sqlite3_bind_int64(stmt, 23, observation.key_hold_count);
+        _ = c.sqlite3_bind_int64(stmt, 24, observation.mean_hold_duration_milli);
+        _ = c.sqlite3_bind_int64(stmt, 25, observation.hold_duration_stddev_milli);
+        _ = c.sqlite3_bind_int64(stmt, 26, observation.alternation_bps);
+        _ = c.sqlite3_bind_int64(stmt, 27, observation.target_distance_stddev_milli);
+        _ = c.sqlite3_bind_int64(stmt, 28, observation.velocity_spike_count);
+        _ = c.sqlite3_bind_int64(stmt, 29, observation.movement_velocity_stddev_milli);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         const observation_id = c.sqlite3_last_insert_rowid(self.db);
         var detail_buf: [512]u8 = undefined;
-        const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} rule_revision={d}", .{
+        const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} replay_match_count={d} rule_revision={d}", .{
             observation_id,
             observation.module,
             source,
@@ -598,11 +646,39 @@ pub const Store = struct {
             observation.risk_score,
             observation.confidence_bps,
             observation.evidence,
+            observation.replay_match_count,
             observation.rule_revision,
         });
         try self.insertAuditLocked(3, "anticheat.observe", user_id, detail);
         try self.exec("COMMIT");
         return observation_id;
+    }
+
+    pub fn crossAccountReplayMatches(self: *Store, user_id: i32, digest: *const [32]u8) !u32 {
+        if (user_id <= 0) return error.InvalidUser;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(DISTINCT user_id) FROM anticheat_replay_fingerprints WHERE replay_sha256=?1 AND user_id!=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_blob(stmt, 1, digest, digest.len, null);
+        _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return @intCast(@min(@as(i64, 100_000), c.sqlite3_column_int64(stmt, 0)));
+    }
+
+    pub fn recordReplayFingerprint(self: *Store, user_id: i32, score_id: i64, digest: *const [32]u8) !void {
+        if (user_id <= 0 or score_id <= 0) return error.InvalidReplayFingerprint;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "INSERT INTO anticheat_replay_fingerprints(score_id,user_id,replay_sha256) SELECT id,user_id,?1 FROM scores WHERE id=?2 AND user_id=?3 ON CONFLICT(score_id) DO NOTHING";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_blob(stmt, 1, digest, digest.len, null);
+        _ = c.sqlite3_bind_int64(stmt, 2, score_id);
+        _ = c.sqlite3_bind_int(stmt, 3, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
     pub const RegistrationConflicts = struct { username: bool, email: bool };
@@ -1523,7 +1599,7 @@ pub const Store = struct {
         const pending = c.sqlite3_column_int64(pending_stmt, 0);
 
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at FROM anticheat_observations o JOIN users u ON u.id=o.user_id LEFT JOIN users reviewer ON reviewer.id=o.reviewer_id ORDER BY (o.review_label='pending') DESC,o.created_at DESC,o.id DESC LIMIT 250";
+        const sql = "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.replay_match_count,o.key_press_count,o.key_hold_count,o.mean_hold_duration_milli,o.hold_duration_stddev_milli,o.alternation_bps,o.target_distance_stddev_milli,o.velocity_spike_count,o.movement_velocity_stddev_milli,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at FROM anticheat_observations o JOIN users u ON u.id=o.user_id LEFT JOIN users reviewer ON reviewer.id=o.reviewer_id ORDER BY (o.review_label='pending') DESC,o.created_at DESC,o.id DESC LIMIT 250";
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -1539,18 +1615,21 @@ pub const Store = struct {
             try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 4)), .{}, &output.writer);
             try output.writer.writeAll(",\"module\":");
             try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 5)), .{}, &output.writer);
-            try output.writer.print(",\"action\":{d},\"sample_weight\":{d},\"reason\":{d},\"risk\":{d},\"confidence_bps\":{d},\"evidence\":{d},\"decision_flags\":{d},\"rule_revision\":{d},\"objects\":{d},\"clicks\":{d},\"mean_timing_milli\":{d},\"timing_stddev_milli\":{d},\"exact_timing_bps\":{d},\"center_hits_bps\":{d},\"mean_center_distance_milli\":{d},\"snaps\":{d},\"review_label\":", .{
+            try output.writer.print(",\"action\":{d},\"sample_weight\":{d},\"reason\":{d},\"risk\":{d},\"confidence_bps\":{d},\"evidence\":{d},\"decision_flags\":{d},\"rule_revision\":{d},\"objects\":{d},\"clicks\":{d},\"mean_timing_milli\":{d},\"timing_stddev_milli\":{d},\"exact_timing_bps\":{d},\"center_hits_bps\":{d},\"mean_center_distance_milli\":{d},\"snaps\":{d},\"replay_match_count\":{d},\"key_press_count\":{d},\"key_hold_count\":{d},\"mean_hold_duration_milli\":{d},\"hold_duration_stddev_milli\":{d},\"alternation_bps\":{d},\"target_distance_stddev_milli\":{d},\"velocity_spike_count\":{d},\"movement_velocity_stddev_milli\":{d},\"review_label\":", .{
                 c.sqlite3_column_int64(stmt, 6),  c.sqlite3_column_int64(stmt, 7),  c.sqlite3_column_int64(stmt, 8),  c.sqlite3_column_int64(stmt, 9),
                 c.sqlite3_column_int64(stmt, 10), c.sqlite3_column_int64(stmt, 11), c.sqlite3_column_int64(stmt, 12), c.sqlite3_column_int64(stmt, 13),
                 c.sqlite3_column_int64(stmt, 14), c.sqlite3_column_int64(stmt, 15), c.sqlite3_column_int64(stmt, 16), c.sqlite3_column_int64(stmt, 17),
                 c.sqlite3_column_int64(stmt, 18), c.sqlite3_column_int64(stmt, 19), c.sqlite3_column_int64(stmt, 20), c.sqlite3_column_int64(stmt, 21),
+                c.sqlite3_column_int64(stmt, 22), c.sqlite3_column_int64(stmt, 23), c.sqlite3_column_int64(stmt, 24), c.sqlite3_column_int64(stmt, 25),
+                c.sqlite3_column_int64(stmt, 26), c.sqlite3_column_int64(stmt, 27), c.sqlite3_column_int64(stmt, 28), c.sqlite3_column_int64(stmt, 29),
+                c.sqlite3_column_int64(stmt, 30),
             });
-            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 22)), .{}, &output.writer);
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 31)), .{}, &output.writer);
             try output.writer.writeAll(",\"reviewer\":");
-            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 23)), .{}, &output.writer);
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 32)), .{}, &output.writer);
             try output.writer.writeAll(",\"review_note\":");
-            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 24)), .{}, &output.writer);
-            try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}}}", .{ c.sqlite3_column_int64(stmt, 25), c.sqlite3_column_int64(stmt, 26) });
+            try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 33)), .{}, &output.writer);
+            try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}}}", .{ c.sqlite3_column_int64(stmt, 34), c.sqlite3_column_int64(stmt, 35) });
         }
         try output.writer.writeAll("]}");
         return output.toOwnedSlice();

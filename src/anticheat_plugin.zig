@@ -61,7 +61,8 @@ pub const Host = struct {
         if (result.abi_version != abi.version or result.struct_size != @sizeOf(abi.GameplayResultV1)) return error.InvalidDecision;
         try validateDecision(result.decision);
         if (result.objects_checked > event.object_count or result.matched_clicks > result.objects_checked or
-            result.exact_timing_bps > 10_000 or result.center_hits_bps > 10_000 or result.snap_events > result.objects_checked) return error.InvalidDecision;
+            result.exact_timing_bps > 10_000 or result.center_hits_bps > 10_000 or result.snap_events > result.objects_checked or
+            result.key_hold_count > result.key_press_count or result.alternation_bps > 10_000 or result.velocity_spike_count > event.frame_count) return error.InvalidDecision;
         return result;
     }
 };

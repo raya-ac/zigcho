@@ -547,6 +547,8 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     try store.exec(score_sql);
     const clean_sample_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(43,{d},'cccccccccccccccccccccccccccccccc',0,0,654321,125,0.99,600,320,10,0,0,0,0,1,1,x'00','dddddddddddddddddddddddddddddddd','vanilla',1,70000)", .{player_id});
     try store.exec(clean_sample_sql);
+    const copied_score_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(44,{d},'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',0,0,777777,130,0.99,620,325,8,0,0,0,0,1,1,x'00','ffffffffffffffffffffffffffffffff','vanilla',1,71000)", .{reviewer_id});
+    try store.exec(copied_score_sql);
     const observation_id = try store.recordAnticheatObservation(player_id, .{
         .source = .stable_score,
         .module = "private-test",
@@ -565,6 +567,15 @@ test "anticheat observations stay structured reviewable and non enforcing" {
         .center_hits_bps = 8750,
         .mean_center_distance_milli = 1200,
         .snap_events = 12,
+        .replay_match_count = 1,
+        .key_press_count = 80,
+        .key_hold_count = 79,
+        .mean_hold_duration_milli = 30_000,
+        .hold_duration_stddev_milli = 500,
+        .alternation_bps = 9_900,
+        .target_distance_stddev_milli = 400,
+        .velocity_spike_count = 12,
+        .movement_velocity_stddev_milli = 2_500,
     });
     const clean_sample_id = try store.recordAnticheatObservation(player_id, .{
         .source = .stable_score,
@@ -608,6 +619,18 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"score_id\":43") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"sample_weight\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"exact_timing_bps\":9000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"replay_match_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"alternation_bps\":9900") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"velocity_spike_count\":12") != null);
+
+    var replay_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("identical compressed replay", &replay_digest, .{});
+    try store.recordReplayFingerprint(player_id, 42, &replay_digest);
+    try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(player_id, &replay_digest));
+    try std.testing.expectEqual(@as(u32, 1), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
+    try store.recordReplayFingerprint(reviewer_id, 44, &replay_digest);
+    try std.testing.expectEqual(@as(u32, 1), try store.crossAccountReplayMatches(player_id, &replay_digest));
+    try std.testing.expectEqual(@as(u32, 1), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
 
     try std.testing.expectError(error.InvalidAnticheatReview, store.reviewAnticheatObservation(reviewer_id, observation_id, .clean, "x"));
     try std.testing.expectError(error.AnticheatObservationNotFound, store.reviewAnticheatObservation(reviewer_id, 9999, .dismissed, "not this finding"));
@@ -3840,7 +3863,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 25), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 26), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer submission updates ranked performance without overwriting another ruleset" {

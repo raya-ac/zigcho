@@ -107,7 +107,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -256,6 +256,18 @@ pub const Store = struct {
                     "COMMIT",
             );
         }
+        if (version <= 25) {
+            try postgres.exec(
+                lease.conn,
+                "BEGIN;" ++
+                    "ALTER TABLE zigcho.anticheat_observations ADD COLUMN replay_match_count integer NOT NULL DEFAULT 0 CHECK(replay_match_count BETWEEN 0 AND 100000),ADD COLUMN key_press_count integer NOT NULL DEFAULT 0 CHECK(key_press_count>=0),ADD COLUMN key_hold_count integer NOT NULL DEFAULT 0 CHECK(key_hold_count BETWEEN 0 AND key_press_count),ADD COLUMN mean_hold_duration_milli integer NOT NULL DEFAULT 0 CHECK(mean_hold_duration_milli>=0),ADD COLUMN hold_duration_stddev_milli integer NOT NULL DEFAULT 0 CHECK(hold_duration_stddev_milli>=0),ADD COLUMN alternation_bps integer NOT NULL DEFAULT 0 CHECK(alternation_bps BETWEEN 0 AND 10000),ADD COLUMN target_distance_stddev_milli integer NOT NULL DEFAULT 0 CHECK(target_distance_stddev_milli>=0),ADD COLUMN velocity_spike_count integer NOT NULL DEFAULT 0 CHECK(velocity_spike_count>=0),ADD COLUMN movement_velocity_stddev_milli integer NOT NULL DEFAULT 0 CHECK(movement_velocity_stddev_milli>=0);" ++
+                    "CREATE TABLE zigcho.anticheat_replay_fingerprints(score_id bigint PRIMARY KEY REFERENCES zigcho.scores(id) ON DELETE CASCADE,user_id integer NOT NULL REFERENCES zigcho.users(id) ON DELETE CASCADE,replay_sha256 bytea NOT NULL CHECK(octet_length(replay_sha256)=32),created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint));" ++
+                    "CREATE INDEX anticheat_replay_fingerprints_hash ON zigcho.anticheat_replay_fingerprints(replay_sha256,user_id);" ++
+                    "CREATE INDEX anticheat_replay_fingerprints_user ON zigcho.anticheat_replay_fingerprints(user_id,created_at DESC,score_id DESC);" ++
+                    "INSERT INTO zigcho.schema_migrations(version) VALUES(26);" ++
+                    "COMMIT",
+            );
+        }
         try postgres.exec(lease.conn, "INSERT INTO zigcho.chat_channels(name,topic,write_privileges) VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1) ON CONFLICT(name) DO NOTHING");
     }
 
@@ -331,7 +343,7 @@ pub const Store = struct {
         try sqlite_storage.validateAnticheatObservation(user_id, observation);
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
-        var params: [20]?[]const u8 = undefined;
+        var params: [29]?[]const u8 = undefined;
         params[0] = try param(&buffers, &cursor, user_id);
         params[1] = if (observation.score_id) |score_id| try param(&buffers, &cursor, score_id) else null;
         params[2] = observation.source.text();
@@ -352,15 +364,24 @@ pub const Store = struct {
         params[17] = try param(&buffers, &cursor, observation.center_hits_bps);
         params[18] = try param(&buffers, &cursor, observation.mean_center_distance_milli);
         params[19] = try param(&buffers, &cursor, observation.snap_events);
+        params[20] = try param(&buffers, &cursor, observation.replay_match_count);
+        params[21] = try param(&buffers, &cursor, observation.key_press_count);
+        params[22] = try param(&buffers, &cursor, observation.key_hold_count);
+        params[23] = try param(&buffers, &cursor, observation.mean_hold_duration_milli);
+        params[24] = try param(&buffers, &cursor, observation.hold_duration_stddev_milli);
+        params[25] = try param(&buffers, &cursor, observation.alternation_bps);
+        params[26] = try param(&buffers, &cursor, observation.target_distance_stddev_milli);
+        params[27] = try param(&buffers, &cursor, observation.velocity_spike_count);
+        params[28] = try param(&buffers, &cursor, observation.movement_velocity_stddev_milli);
         var lease = self.pool.acquire();
         defer lease.release();
         try postgres.exec(lease.conn, "BEGIN");
         errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
-        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id", &params);
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events,replay_match_count,key_press_count,key_hold_count,mean_hold_duration_milli,hold_duration_stddev_milli,alternation_bps,target_distance_stddev_milli,velocity_spike_count,movement_velocity_stddev_milli) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING id", &params);
         defer result.deinit();
         const observation_id = try result.int(i64, 0, 0);
         var detail_buf: [512]u8 = undefined;
-        const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} rule_revision={d}", .{
+        const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} replay_match_count={d} rule_revision={d}", .{
             observation_id,
             observation.module,
             observation.source.text(),
@@ -371,11 +392,39 @@ pub const Store = struct {
             observation.risk_score,
             observation.confidence_bps,
             observation.evidence,
+            observation.replay_match_count,
             observation.rule_revision,
         });
         try insertAudit(self.allocator, lease.conn, 3, "anticheat.observe", user_id, detail);
         try postgres.exec(lease.conn, "COMMIT");
         return observation_id;
+    }
+
+    pub fn crossAccountReplayMatches(self: *Store, user_id: i32, digest: *const [32]u8) !u32 {
+        if (user_id <= 0) return error.InvalidUser;
+        const encoded = try postgres.encodeBytea(self.allocator, digest);
+        defer self.allocator.free(encoded);
+        var user_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT least(count(DISTINCT user_id),100000) FROM zigcho.anticheat_replay_fingerprints WHERE replay_sha256=$1 AND user_id!=$2", &.{ encoded, user });
+        defer result.deinit();
+        return @intCast(try result.int(i64, 0, 0));
+    }
+
+    pub fn recordReplayFingerprint(self: *Store, user_id: i32, score_id: i64, digest: *const [32]u8) !void {
+        if (user_id <= 0 or score_id <= 0) return error.InvalidReplayFingerprint;
+        const encoded = try postgres.encodeBytea(self.allocator, digest);
+        defer self.allocator.free(encoded);
+        var user_buf: [24]u8 = undefined;
+        var score_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const score = try std.fmt.bufPrint(&score_buf, "{d}", .{score_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.anticheat_replay_fingerprints(score_id,user_id,replay_sha256) SELECT id,user_id,$1 FROM zigcho.scores WHERE id=$2 AND user_id=$3 ON CONFLICT(score_id) DO NOTHING", &.{ encoded, score, user });
+        result.deinit();
     }
 
     pub fn recordClientHardware(self: *Store, user_id: i32, hardware: ClientHardware) !HardwareEnforcement {
@@ -1846,7 +1895,7 @@ pub const Store = struct {
     pub fn staffAnticheatJson(self: *Store, allocator: std.mem.Allocator) ![]u8 {
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.query(lease.conn, "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at FROM zigcho.anticheat_observations o JOIN zigcho.users u ON u.id=o.user_id LEFT JOIN zigcho.users reviewer ON reviewer.id=o.reviewer_id ORDER BY (o.review_label='pending') DESC,o.created_at DESC,o.id DESC LIMIT 250");
+        var result = try postgres.query(lease.conn, "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.replay_match_count,o.key_press_count,o.key_hold_count,o.mean_hold_duration_milli,o.hold_duration_stddev_milli,o.alternation_bps,o.target_distance_stddev_milli,o.velocity_spike_count,o.movement_velocity_stddev_milli,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at FROM zigcho.anticheat_observations o JOIN zigcho.users u ON u.id=o.user_id LEFT JOIN zigcho.users reviewer ON reviewer.id=o.reviewer_id ORDER BY (o.review_label='pending') DESC,o.created_at DESC,o.id DESC LIMIT 250");
         defer result.deinit();
         var pending_result = try postgres.query(lease.conn, "SELECT count(*) FROM zigcho.anticheat_observations WHERE review_label='pending'");
         defer pending_result.deinit();
@@ -1861,18 +1910,21 @@ pub const Store = struct {
             try jsonString(&output.writer, result.value(row, 4));
             try output.writer.writeAll(",\"module\":");
             try jsonString(&output.writer, result.value(row, 5));
-            try output.writer.print(",\"action\":{d},\"sample_weight\":{d},\"reason\":{d},\"risk\":{d},\"confidence_bps\":{d},\"evidence\":{d},\"decision_flags\":{d},\"rule_revision\":{d},\"objects\":{d},\"clicks\":{d},\"mean_timing_milli\":{d},\"timing_stddev_milli\":{d},\"exact_timing_bps\":{d},\"center_hits_bps\":{d},\"mean_center_distance_milli\":{d},\"snaps\":{d},\"review_label\":", .{
+            try output.writer.print(",\"action\":{d},\"sample_weight\":{d},\"reason\":{d},\"risk\":{d},\"confidence_bps\":{d},\"evidence\":{d},\"decision_flags\":{d},\"rule_revision\":{d},\"objects\":{d},\"clicks\":{d},\"mean_timing_milli\":{d},\"timing_stddev_milli\":{d},\"exact_timing_bps\":{d},\"center_hits_bps\":{d},\"mean_center_distance_milli\":{d},\"snaps\":{d},\"replay_match_count\":{d},\"key_press_count\":{d},\"key_hold_count\":{d},\"mean_hold_duration_milli\":{d},\"hold_duration_stddev_milli\":{d},\"alternation_bps\":{d},\"target_distance_stddev_milli\":{d},\"velocity_spike_count\":{d},\"movement_velocity_stddev_milli\":{d},\"review_label\":", .{
                 try result.int(i32, row, 6),  try result.int(i32, row, 7),  try result.int(i32, row, 8),  try result.int(i32, row, 9),
                 try result.int(i64, row, 10), try result.int(i64, row, 11), try result.int(i32, row, 12), try result.int(i32, row, 13),
                 try result.int(i32, row, 14), try result.int(i32, row, 15), try result.int(i32, row, 16), try result.int(i32, row, 17),
                 try result.int(i32, row, 18), try result.int(i32, row, 19), try result.int(i32, row, 20), try result.int(i32, row, 21),
+                try result.int(i32, row, 22), try result.int(i32, row, 23), try result.int(i32, row, 24), try result.int(i32, row, 25),
+                try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 28), try result.int(i32, row, 29),
+                try result.int(i32, row, 30),
             });
-            try jsonString(&output.writer, result.value(row, 22));
+            try jsonString(&output.writer, result.value(row, 31));
             try output.writer.writeAll(",\"reviewer\":");
-            try jsonString(&output.writer, result.value(row, 23));
+            try jsonString(&output.writer, result.value(row, 32));
             try output.writer.writeAll(",\"review_note\":");
-            try jsonString(&output.writer, result.value(row, 24));
-            try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}}}", .{ try result.int(i64, row, 25), try result.int(i64, row, 26) });
+            try jsonString(&output.writer, result.value(row, 33));
+            try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}}}", .{ try result.int(i64, row, 34), try result.int(i64, row, 35) });
         }
         try output.writer.writeAll("]}");
         return output.toOwnedSlice();
@@ -2853,7 +2905,7 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates through anticheat review schema twenty five" {
+test "postgres runtime migrates through anticheat telemetry schema twenty six" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -2861,16 +2913,16 @@ test "postgres runtime migrates through anticheat review schema twenty five" {
         try old_store.migrate();
         var previous = old_store.pool.acquire();
         defer previous.release();
-        try postgres.exec(previous.conn, "DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; UPDATE zigcho.schema_migrations SET version=20 WHERE version=25");
+        try postgres.exec(previous.conn, "DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; UPDATE zigcho.schema_migrations SET version=20 WHERE version=26");
     }
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')) FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 25), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 26), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -2885,9 +2937,10 @@ test "postgres runtime migrates through anticheat review schema twenty five" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 12));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 13));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 14));
-    try std.testing.expectEqual(@as(i32, 3), try result.int(i32, 0, 15));
-    try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 16));
-    try std.testing.expectEqual(@as(i32, 8), try result.int(i32, 0, 17));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 15));
+    try std.testing.expectEqual(@as(i32, 3), try result.int(i32, 0, 16));
+    try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 17));
+    try std.testing.expectEqual(@as(i32, 8), try result.int(i32, 0, 18));
     const kai = (try store.userById(std.testing.allocator, 3)).?;
     defer {
         std.testing.allocator.free(kai.name);

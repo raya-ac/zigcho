@@ -79,7 +79,9 @@ pub const EventV1 = extern struct {
     hardware_match_count: u32 = 0,
     recent_risk_score: u32 = 0,
     account_age_seconds: u64 = 0,
-    reserved: [8]u64 = [_]u64{0} ** 8,
+    replay_match_count: u32 = 0,
+    reserved32: u32 = 0,
+    reserved: [7]u64 = [_]u64{0} ** 7,
 };
 
 pub const DecisionV1 = extern struct {
@@ -143,5 +145,13 @@ pub const GameplayResultV1 = extern struct {
     center_hits_bps: u32 = 0,
     mean_center_distance_milli: u32 = 0,
     snap_events: u32 = 0,
-    reserved: [6]u64 = [_]u64{0} ** 6,
+    key_press_count: u32 = 0,
+    key_hold_count: u32 = 0,
+    mean_hold_duration_milli: u32 = 0,
+    hold_duration_stddev_milli: u32 = 0,
+    alternation_bps: u32 = 0,
+    target_distance_stddev_milli: u32 = 0,
+    velocity_spike_count: u32 = 0,
+    movement_velocity_stddev_milli: u32 = 0,
+    reserved: [2]u64 = [_]u64{0} ** 2,
 };

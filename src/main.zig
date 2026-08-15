@@ -158,6 +158,10 @@ const App = struct {
         return evidence;
     }
 
+    fn stableGameplayEvidence(score: stable_score.Submission, replay_match_count: u32) u64 {
+        return stableScoreEvidence(score) | (if (replay_match_count != 0) anticheat_abi.Evidence.replay_hash_reused else 0);
+    }
+
     fn observeStableEvidence(self: *App, user_id: i32, source: storage.AnticheatSource, event: anticheat_abi.EventV1) void {
         const host = if (self.anticheat) |*loaded| loaded else return;
         const decision = host.evaluate(event) catch |err| {
@@ -206,7 +210,7 @@ const App = struct {
         });
     }
 
-    fn observeStableGameplay(self: *App, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32) ?anticheat_abi.GameplayResultV1 {
+    fn observeStableGameplay(self: *App, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32, replay_match_count: u32) ?anticheat_abi.GameplayResultV1 {
         const host = if (self.anticheat) |*loaded| loaded else return null;
         if (score.mode != 0 or replay.len == 0) return null;
         var prepared = anticheat_replay.prepare(self.allocator, replay, map, @intCast(score.mods)) catch |err| {
@@ -226,7 +230,7 @@ const App = struct {
                 .ruleset = score.mode,
                 .namespace = anticheatNamespace(score.mods),
                 .event_flags = event_flags,
-                .evidence = stableScoreEvidence(score),
+                .evidence = stableGameplayEvidence(score, replay_match_count),
                 .score = @intCast(score.total_score),
                 .pp_milli = pp_milli,
                 .accuracy_ppm = accuracy_ppm,
@@ -241,6 +245,7 @@ const App = struct {
                 .map_objects = prepared.map_object_count,
                 .elapsed_ms = elapsed_ms,
                 .map_duration_ms = prepared.map_duration_ms,
+                .replay_match_count = replay_match_count,
             },
             .mods = @intCast(score.mods),
             .passed_hits = @intCast(@min(passed_hits_i64, @as(i64, std.math.maxInt(u32)))),
@@ -260,7 +265,7 @@ const App = struct {
         return result;
     }
 
-    fn persistAnticheatObservation(self: *App, user_id: i32, score_id: i64, sample_weight: u32, result: anticheat_abi.GameplayResultV1) void {
+    fn persistAnticheatObservation(self: *App, user_id: i32, score_id: i64, sample_weight: u32, evidence: u64, replay_match_count: u32, result: anticheat_abi.GameplayResultV1) void {
         const host = if (self.anticheat) |*loaded| loaded else return;
         _ = self.store.recordAnticheatObservation(user_id, .{
             .source = .stable_score,
@@ -271,6 +276,7 @@ const App = struct {
             .reason = result.decision.reason,
             .risk_score = result.decision.risk_score,
             .confidence_bps = result.decision.confidence_bps,
+            .evidence = evidence,
             .decision_flags = result.decision.flags,
             .rule_revision = result.decision.rule_revision,
             .objects_checked = result.objects_checked,
@@ -281,6 +287,15 @@ const App = struct {
             .center_hits_bps = result.center_hits_bps,
             .mean_center_distance_milli = result.mean_center_distance_milli,
             .snap_events = result.snap_events,
+            .replay_match_count = replay_match_count,
+            .key_press_count = result.key_press_count,
+            .key_hold_count = result.key_hold_count,
+            .mean_hold_duration_milli = result.mean_hold_duration_milli,
+            .hold_duration_stddev_milli = result.hold_duration_stddev_milli,
+            .alternation_bps = result.alternation_bps,
+            .target_distance_stddev_milli = result.target_distance_stddev_milli,
+            .velocity_spike_count = result.velocity_spike_count,
+            .movement_velocity_stddev_milli = result.movement_velocity_stddev_milli,
         }) catch |err| {
             std.log.warn("event=anticheat_observation_write_failed score_id={d} error={t}", .{ score_id, err });
         };
@@ -1881,16 +1896,26 @@ const App = struct {
                 .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             const elapsed_ms = if (score.passed) score_time else fail_time;
-            const anticheat_observation = self.observeStableGameplay(user.id, score, replay.data, map_file, performance, elapsed_ms);
+            var replay_digest: [32]u8 = undefined;
+            const has_replay_fingerprint = replay.data.len != 0;
+            if (has_replay_fingerprint) std.crypto.hash.sha2.Sha256.hash(replay.data, &replay_digest, .{});
             const stats_mode = stable_score.statsMode(score.mode, score.mods) orelse return respond(req, .ok, "text/plain", "error: no", &.{});
             const before_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
             const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, elapsed_ms) catch |err| {
                 std.log.warn("stable score insert failed: {t}", .{err});
                 return respond(req, .ok, "text/plain", "error: no", &.{});
             };
+            if (has_replay_fingerprint) self.store.recordReplayFingerprint(user.id, score_id, &replay_digest) catch |err| {
+                std.log.warn("event=anticheat_replay_fingerprint_write_failed score_id={d} error={t}", .{ score_id, err });
+            };
+            const replay_match_count = if (has_replay_fingerprint) self.store.crossAccountReplayMatches(user.id, &replay_digest) catch |err| blk: {
+                std.log.warn("event=anticheat_replay_match_lookup_failed user_id={d} error={t}", .{ user.id, err });
+                break :blk 0;
+            } else 0;
+            const anticheat_observation = self.observeStableGameplay(user.id, score, replay.data, map_file, performance, elapsed_ms, replay_match_count);
             if (anticheat_observation) |observation| {
                 const allow_sample = observation.decision.action == anticheat_abi.Action.allow and self.anticheat_allow_sample_modulus != 0 and @mod(score_id, @as(i64, self.anticheat_allow_sample_modulus)) == 0;
-                if (observation.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, observation);
+                if (observation.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, stableGameplayEvidence(score, replay_match_count), replay_match_count, observation);
             }
             const after_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
             const placement = try self.store.scoreLeaderboardPlacement(score_id);

@@ -393,6 +393,37 @@ def main():
         two.invoke(90, "LeaveRoom", [])
         one.invoke(91, "LeaveRoom", [])
 
+        _, one_me = api_request(origin, token_one, "GET", "/api/v2/me")
+        _, two_me = api_request(origin, token_two, "GET", "/api/v2/me")
+        one.invoke(92, "MatchmakingJoinLobbyWithParams", [[1]])
+        two.invoke(91, "MatchmakingJoinLobbyWithParams", [[1]])
+        duel_response = one.invoke(93, "MatchmakingIssueDuel", [[two_me["id"], 1]])
+        if duel_response != []:
+            raise RuntimeError(f"duel issue returned an invalid response: {duel_response}")
+        # A harmless lobby refresh drains the target's independently delivered
+        # duel notification before the accept request needs its id.
+        two.invoke(92, "MatchmakingJoinLobbyWithParams", [[1]])
+        duel_events = two.event_arguments("MatchmakingDuelIssued")
+        if not duel_events:
+            raise RuntimeError("duel target did not receive MatchmakingDuelIssued")
+        duel = duel_events[-1][0]
+        if duel[1] != one_me["id"] or duel[2][0] != 1 or len(duel[0]) != 36:
+            raise RuntimeError(f"duel notification was malformed: {duel}")
+        if two.invoke(93, "MatchmakingAcceptDuel", [[duel[0]]]) != []:
+            raise RuntimeError("duel accept returned an invalid response")
+        one.invoke(94, "MatchmakingAcceptInvitation", [])
+        two.invoke(94, "MatchmakingAcceptInvitation", [])
+        duel_ready = two.event_arguments("MatchmakingRoomReady")[-1]
+        duel_room_id, duel_password = duel_ready
+        one.invoke(95, "MatchmakingLeaveLobby", [])
+        two.invoke(95, "MatchmakingLeaveLobby", [])
+        duel_one = one.invoke(96, "JoinRoomWithPassword", [duel_room_id, duel_password])
+        duel_two = two.invoke(96, "JoinRoomWithPassword", [duel_room_id, duel_password])
+        if duel_one[0] != duel_room_id or len(duel_two[3]) != 2:
+            raise RuntimeError("duel users did not enter their private room")
+        two.invoke(97, "LeaveRoom", [])
+        one.invoke(97, "LeaveRoom", [])
+
         ranked_pools = one.invoke(100, "GetMatchmakingPoolsOfType", [1])
         if not ranked_pools or ranked_pools[0][0] != 101 or ranked_pools[0][1] != 0 or ranked_pools[0][4] != 1:
             raise RuntimeError(f"ranked play pool unavailable: {ranked_pools}")
@@ -469,7 +500,7 @@ def main():
             raise RuntimeError(f"ranked match did not end: {two.ranked_stages()}")
         two.invoke(190, "LeaveRoom", [])
         one.invoke(191, "LeaveRoom", [])
-        print(f"lazer_multiplayer_ws_smoke_ok room_id={room_id} matchmaking_room_id={match_room_id} ranked_room_id={ranked_room_id}")
+        print(f"lazer_multiplayer_ws_smoke_ok room_id={room_id} matchmaking_room_id={match_room_id} duel_room_id={duel_room_id} ranked_room_id={ranked_room_id}")
     finally:
         one.close()
         two.close()

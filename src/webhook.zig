@@ -151,3 +151,29 @@ pub const Webhook = struct {
         };
     }
 };
+
+test "score webhook renders the score specific modded star rating" {
+    var buffer: [4096]u8 = undefined;
+    var mod_buffer: [64]u8 = undefined;
+    const json = try Webhook.buildJson(&buffer, &mod_buffer, .{
+        .username = "ari",
+        .user_id = 1,
+        .grade = "S",
+        .mods = 16,
+        .mode = 0,
+        .rank = 2,
+        .total_score = 1_000_000,
+        .max_combo = 500,
+        .beatmap_max_combo = 600,
+        .accuracy = 0.9876,
+        .pp = 424.5,
+        .stars = 6.42,
+        .perfect = false,
+        .artist = "artist",
+        .title = "title",
+        .version = "difficulty",
+        .set_id = 75,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"★ 6.42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"value\":\"HR\"") != null);
+}

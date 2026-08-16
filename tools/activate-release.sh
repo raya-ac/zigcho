@@ -93,7 +93,7 @@ runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zig
 systemctl stop "$service"
 service_stopped=yes
 recalculated=no
-if [ "$candidate_pp" != "$previous_pp" ]; then
+if [ "$candidate_pp" != "$previous_pp" ] || [ "$current_schema" -lt 29 ]; then
   runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" recalc
   recalculated=yes
 fi

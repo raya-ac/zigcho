@@ -94,6 +94,7 @@ CREATE TABLE scores (
     mods integer NOT NULL,
     score bigint NOT NULL,
     pp double precision NOT NULL DEFAULT 0,
+    star_rating double precision NOT NULL DEFAULT 0,
     accuracy double precision NOT NULL,
     max_combo integer NOT NULL,
     n300 integer NOT NULL,
@@ -325,6 +326,7 @@ CREATE TABLE lazer_scores (
     maximum_statistics_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     pauses_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     pp double precision NOT NULL DEFAULT 0,
+    star_rating double precision NOT NULL DEFAULT 0,
     best boolean NOT NULL DEFAULT false,
     rank_namespace text NOT NULL,
     client_version text,
@@ -466,4 +468,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (28);
+INSERT INTO schema_migrations(version) VALUES (29);

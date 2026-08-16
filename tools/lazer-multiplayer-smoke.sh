@@ -67,5 +67,7 @@ jq -e '. == []' "$response" >/dev/null || fail rooms_not_cleaned_up
 grep -q 'event=lazer_multiplayer_room_created' "$server_log" || fail room_create_not_logged
 grep -q 'event=lazer_multiplayer_room_joined' "$server_log" || fail room_join_not_logged
 grep -q 'event=lazer_matchmaking_group_formed' "$server_log" || fail matchmaking_group_not_logged
+grep -q 'event=lazer_matchmaking_duel_issued' "$server_log" || fail matchmaking_duel_issue_not_logged
+grep -q 'event=lazer_matchmaking_duel_accepted' "$server_log" || fail matchmaking_duel_accept_not_logged
 grep -q 'event=lazer_matchmaking_room_ready' "$server_log" || fail matchmaking_room_not_logged
 echo lazer_multiplayer_smoke_ok

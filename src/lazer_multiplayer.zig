@@ -482,7 +482,10 @@ const PendingMatch = struct {
     id: u32,
     pool_id: i32,
     users: [2]i32,
+    joined: [2]bool = .{ true, true },
     accepted: [2]bool = .{ false, false },
+    is_duel: bool = false,
+    duel_id: Text64 = .{},
     created_at: i64,
 
     fn userIndex(self: PendingMatch, user_id: i32) ?usize {
@@ -621,6 +624,13 @@ pub const Manager = struct {
         return null;
     }
 
+    fn pendingDuelByIdLocked(self: *Manager, duel_id: []const u8) ?*PendingMatch {
+        for (&self.pending_matches) |*entry| if (entry.*) |*pending| {
+            if (pending.is_duel and std.mem.eql(u8, pending.duel_id.slice(), duel_id)) return pending;
+        };
+        return null;
+    }
+
     fn clearPendingMatchLocked(self: *Manager, match_id: u32) void {
         for (&self.pending_matches) |*entry| if (entry.*) |pending| if (pending.id == match_id) {
             entry.* = null;
@@ -735,16 +745,23 @@ pub const Manager = struct {
         var ranked_event: ?[]u8 = null;
         defer if (ranked_event) |event| self.allocator.free(event);
         var queue_peer: ?*Connection = null;
+        var queue_peer_left = false;
+        var queue_pool_id: ?i32 = connection.queue_pool_id;
         self.mutex.lockUncancelable(self.io);
         if (connection.pending_match_id) |match_id| {
             if (self.pendingMatchByIdLocked(match_id)) |pending| {
                 const index = pending.userIndex(connection.user_id) orelse 0;
-                const peer_id = pending.users[1 - index];
-                if (self.connectionByUserLocked(peer_id)) |peer| {
-                    peer.pending_match_id = null;
-                    peer.queue_pool_id = pending.pool_id;
-                    peer.retain();
-                    queue_peer = peer;
+                const peer_index = 1 - index;
+                queue_pool_id = pending.pool_id;
+                if (pending.joined[peer_index]) {
+                    const peer_id = pending.users[peer_index];
+                    if (self.connectionByUserLocked(peer_id)) |peer| {
+                        peer.pending_match_id = null;
+                        peer.queue_pool_id = if (pending.is_duel) null else pending.pool_id;
+                        peer.retain();
+                        queue_peer = peer;
+                        queue_peer_left = pending.is_duel;
+                    }
                 }
             }
             self.clearPendingMatchLocked(match_id);
@@ -762,11 +779,16 @@ pub const Manager = struct {
         self.removeConnectionLocked(connection);
         self.mutex.unlock(self.io);
         if (queue_peer) |peer| {
-            if (eventQueueStatusOwned(self.allocator, 0)) |frame| {
+            const frame_result = if (queue_peer_left)
+                eventNoArgsOwned(self.allocator, "MatchmakingQueueLeft")
+            else
+                eventQueueStatusOwned(self.allocator, 0);
+            if (frame_result) |frame| {
                 defer self.allocator.free(frame);
                 peer.send(frame);
             } else |_| {}
         }
+        if (queue_pool_id) |pool| self.publishLobbyStatus(pool) catch {};
         if (left_user) |user| {
             if (eventUserOwned(self.allocator, "UserLeft", user)) |frame| {
                 defer self.allocator.free(frame);
@@ -994,6 +1016,25 @@ pub const Manager = struct {
         if (std.mem.eql(u8, target, "MatchmakingAcceptInvitation")) {
             if (argument_count != 0) return error.InvalidMultiplayerArguments;
             return self.acceptMatchmakingInvitation(connection, invocation_id);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingIssueDuel")) {
+            if (argument_count != 1) return error.InvalidMultiplayerArguments;
+            const request = try reader.raw();
+            var request_reader: MessagePackReader = .{ .data = request };
+            if (try request_reader.arrayLen() != 2) return error.InvalidMultiplayerArguments;
+            return self.issueMatchmakingDuel(
+                connection,
+                invocation_id,
+                @intCast(try request_reader.integer()),
+                @intCast(try request_reader.integer()),
+            );
+        }
+        if (std.mem.eql(u8, target, "MatchmakingAcceptDuel")) {
+            if (argument_count != 1) return error.InvalidMultiplayerArguments;
+            const request = try reader.raw();
+            var request_reader: MessagePackReader = .{ .data = request };
+            if (try request_reader.arrayLen() != 1) return error.InvalidMultiplayerArguments;
+            return self.acceptMatchmakingDuel(connection, invocation_id, try request_reader.string());
         }
         if (std.mem.eql(u8, target, "MatchmakingDeclineInvitation")) {
             if (argument_count != 0) return error.InvalidMultiplayerArguments;
@@ -1943,6 +1984,175 @@ pub const Manager = struct {
         sendRecipients(recipients[0..recipient_count], frame);
     }
 
+    fn issueMatchmakingDuel(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, target_user_id: i32, pool_id: i32) !void {
+        const id = invocation_id orelse return error.MissingInvocationId;
+        const mode = poolMode(pool_id) orelse return error.InvalidMatchmakingPool;
+        const pool_type = poolType(pool_id) orelse return error.InvalidMatchmakingPool;
+        if (target_user_id == connection.user_id) return error.InvalidMatchmakingDuelTarget;
+        if (connection.room_id != null) return error.AlreadyInMultiplayerRoom;
+
+        // osu!'s duel flow replaces any ordinary queue the challenger was in.
+        try self.leaveMatchmakingQueue(connection, null, false);
+
+        var random: [16]u8 = undefined;
+        try self.io.randomSecure(&random);
+        random[6] = (random[6] & 0x0f) | 0x40;
+        random[8] = (random[8] & 0x3f) | 0x80;
+        const hex = std.fmt.bytesToHex(random, .lower);
+        var duel_id: [36]u8 = undefined;
+        @memcpy(duel_id[0..8], hex[0..8]);
+        duel_id[8] = '-';
+        @memcpy(duel_id[9..13], hex[8..12]);
+        duel_id[13] = '-';
+        @memcpy(duel_id[14..18], hex[12..16]);
+        duel_id[18] = '-';
+        @memcpy(duel_id[19..23], hex[16..20]);
+        duel_id[23] = '-';
+        @memcpy(duel_id[24..36], hex[20..32]);
+
+        const joined = try eventNoArgsOwned(self.allocator, "MatchmakingQueueJoined");
+        defer self.allocator.free(joined);
+        const searching = try eventQueueStatusOwned(self.allocator, 0);
+        defer self.allocator.free(searching);
+        const issued = try eventMatchmakingDuelIssuedOwned(self.allocator, &duel_id, connection.user_id, pool_id, mode, pool_type);
+        defer self.allocator.free(issued);
+        const response = try completionEmptyObjectOwned(self.allocator, id);
+        defer self.allocator.free(response);
+
+        var target: ?*Connection = null;
+        self.mutex.lockUncancelable(self.io);
+        if (connection.room_id != null or connection.queue_pool_id != null or connection.pending_match_id != null) {
+            self.mutex.unlock(self.io);
+            return error.AlreadyInMatchmakingQueue;
+        }
+        if (self.matchmaking_map_counts[mode] == 0) {
+            self.mutex.unlock(self.io);
+            return error.MatchmakingPoolUnavailable;
+        }
+        const recipient = self.connectionByUserLocked(target_user_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MatchmakingPlayerUnavailable;
+        };
+        if (recipient.room_id != null) {
+            self.mutex.unlock(self.io);
+            return error.MatchmakingPlayerUnavailable;
+        }
+        const slot = self.pendingMatchSlotLocked() orelse {
+            self.mutex.unlock(self.io);
+            return error.MatchmakingGroupLimit;
+        };
+        const match_id = self.next_pending_match_id;
+        self.next_pending_match_id +%= 1;
+        if (self.next_pending_match_id == 0) self.next_pending_match_id = 1;
+        var pending: PendingMatch = .{
+            .id = match_id,
+            .pool_id = pool_id,
+            .users = .{ connection.user_id, recipient.user_id },
+            .joined = .{ true, false },
+            .is_duel = true,
+            .created_at = std.Io.Clock.real.now(self.io).toSeconds(),
+        };
+        pending.duel_id.set(&duel_id) catch unreachable;
+        self.pending_matches[slot] = pending;
+        connection.queue_pool_id = pool_id;
+        connection.pending_match_id = match_id;
+        recipient.retain();
+        target = recipient;
+        self.mutex.unlock(self.io);
+        defer if (target) |recipient_connection| recipient_connection.release();
+
+        connection.send(joined);
+        connection.send(searching);
+        target.?.send(issued);
+        connection.send(response);
+        std.log.info("event=lazer_matchmaking_duel_issued challenger_id={d} target_id={d} pool_id={d}", .{ connection.user_id, target_user_id, pool_id });
+        try self.publishLobbyStatus(pool_id);
+    }
+
+    fn acceptMatchmakingDuel(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, duel_id: []const u8) !void {
+        const id = invocation_id orelse return error.MissingInvocationId;
+        if (duel_id.len != 36 or connection.room_id != null) return error.InvalidMatchmakingDuel;
+
+        // Validate before removing the target from another queue. The duel may
+        // have expired or been cancelled while its notification was visible.
+        self.mutex.lockUncancelable(self.io);
+        const initial = self.pendingDuelByIdLocked(duel_id) orelse {
+            self.mutex.unlock(self.io);
+            const response = try completionEmptyObjectOwned(self.allocator, id);
+            defer self.allocator.free(response);
+            connection.send(response);
+            return;
+        };
+        if (initial.users[1] != connection.user_id or initial.joined[1]) {
+            self.mutex.unlock(self.io);
+            return error.InvalidMatchmakingDuel;
+        }
+        const pool_id = initial.pool_id;
+        const pool_type = poolType(pool_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.InvalidMatchmakingPool;
+        };
+        self.mutex.unlock(self.io);
+
+        // Accepting a duel follows official behavior and replaces any other
+        // queue membership held by the target.
+        try self.leaveMatchmakingQueue(connection, null, false);
+
+        const joined = try eventNoArgsOwned(self.allocator, "MatchmakingQueueJoined");
+        defer self.allocator.free(joined);
+        const searching = try eventQueueStatusOwned(self.allocator, 0);
+        defer self.allocator.free(searching);
+        const invited_legacy = try eventNoArgsOwned(self.allocator, "MatchmakingRoomInvited");
+        defer self.allocator.free(invited_legacy);
+        const invited = try eventMatchmakingInvitationOwned(self.allocator, pool_type);
+        defer self.allocator.free(invited);
+        const found = try eventQueueStatusOwned(self.allocator, 1);
+        defer self.allocator.free(found);
+        const response = try completionEmptyObjectOwned(self.allocator, id);
+        defer self.allocator.free(response);
+
+        var challenger: ?*Connection = null;
+        self.mutex.lockUncancelable(self.io);
+        const pending = self.pendingDuelByIdLocked(duel_id) orelse {
+            self.mutex.unlock(self.io);
+            connection.send(response);
+            return;
+        };
+        if (pending.users[1] != connection.user_id or pending.joined[1] or connection.room_id != null or connection.queue_pool_id != null or connection.pending_match_id != null) {
+            self.mutex.unlock(self.io);
+            return error.InvalidMatchmakingDuel;
+        }
+        const challenger_connection = self.connectionByUserLocked(pending.users[0]) orelse {
+            self.mutex.unlock(self.io);
+            connection.send(response);
+            return;
+        };
+        if (challenger_connection.pending_match_id != pending.id or challenger_connection.queue_pool_id != pending.pool_id) {
+            self.mutex.unlock(self.io);
+            connection.send(response);
+            return;
+        }
+        pending.joined[1] = true;
+        connection.queue_pool_id = pending.pool_id;
+        connection.pending_match_id = pending.id;
+        challenger_connection.retain();
+        challenger = challenger_connection;
+        self.mutex.unlock(self.io);
+        defer if (challenger) |challenger_connection_retained| challenger_connection_retained.release();
+
+        connection.send(joined);
+        connection.send(searching);
+        challenger.?.send(invited_legacy);
+        connection.send(invited_legacy);
+        challenger.?.send(invited);
+        connection.send(invited);
+        challenger.?.send(found);
+        connection.send(found);
+        connection.send(response);
+        std.log.info("event=lazer_matchmaking_duel_accepted challenger_id={d} target_id={d} pool_id={d}", .{ challenger.?.user_id, connection.user_id, pool_id });
+        try self.publishLobbyStatus(pool_id);
+    }
+
     fn joinMatchmakingQueue(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, pool_id: i32) !void {
         const mode = poolMode(pool_id) orelse return error.InvalidMatchmakingPool;
         const pool_type = poolType(pool_id) orelse return error.InvalidMatchmakingPool;
@@ -2013,6 +2223,7 @@ pub const Manager = struct {
         const searching = try eventQueueStatusOwned(self.allocator, 0);
         defer self.allocator.free(searching);
         var peer: ?*Connection = null;
+        var peer_left = false;
         var pool_id: ?i32 = null;
         var was_queued = false;
         self.mutex.lockUncancelable(self.io);
@@ -2022,12 +2233,16 @@ pub const Manager = struct {
             if (self.pendingMatchByIdLocked(match_id)) |pending| {
                 pool_id = pending.pool_id;
                 const index = pending.userIndex(connection.user_id) orelse 0;
-                const peer_id = pending.users[1 - index];
-                if (self.connectionByUserLocked(peer_id)) |matched| {
-                    matched.pending_match_id = null;
-                    matched.queue_pool_id = pending.pool_id;
-                    matched.retain();
-                    peer = matched;
+                const peer_index = 1 - index;
+                if (pending.joined[peer_index]) {
+                    const peer_id = pending.users[peer_index];
+                    if (self.connectionByUserLocked(peer_id)) |matched| {
+                        matched.pending_match_id = null;
+                        matched.queue_pool_id = if (pending.is_duel) null else pending.pool_id;
+                        matched.retain();
+                        peer = matched;
+                        peer_left = pending.is_duel;
+                    }
                 }
             }
             self.clearPendingMatchLocked(match_id);
@@ -2037,7 +2252,7 @@ pub const Manager = struct {
         self.mutex.unlock(self.io);
         defer if (peer) |matched| matched.release();
         if (notify and was_queued) connection.send(left);
-        if (peer) |matched| matched.send(searching);
+        if (peer) |matched| matched.send(if (peer_left) left else searching);
         try self.finishVoid(connection, invocation_id);
         if (pool_id) |pool| try self.publishLobbyStatus(pool);
     }
@@ -3165,6 +3380,33 @@ fn eventMatchmakingInvitationOwned(allocator: std.mem.Allocator, pool_type: u8) 
     return allocatingFrame(allocator, &output);
 }
 
+fn eventMatchmakingDuelIssuedOwned(
+    allocator: std.mem.Allocator,
+    duel_id: []const u8,
+    challenger_id: i32,
+    pool_id: i32,
+    mode: u8,
+    pool_type: u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchmakingDuelIssued", 1);
+    try pack.array(3);
+    // MessagePack-CSharp's standard Guid formatter uses the canonical
+    // lowercase 36-character string on the wire.
+    try pack.string(duel_id);
+    try pack.integer(challenger_id);
+    try pack.array(5);
+    try pack.integer(pool_id);
+    try pack.integer(mode);
+    try pack.integer(0);
+    try pack.string(if (pool_type == 0) "quick play" else "ranked play");
+    try pack.integer(pool_type);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
 fn eventMatchmakingRoomReadyOwned(allocator: std.mem.Allocator, room_id: i64, password: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -3184,13 +3426,10 @@ fn eventLobbyStatusOwned(allocator: std.mem.Allocator, users: []const i32) ![]u8
     try pack.array(4);
     try pack.array(users.len);
     for (users) |user_id| try pack.integer(user_id);
-    try pack.array(if (users.len == 0) 0 else 1);
-    if (users.len != 0) {
-        try pack.array(2);
-        try pack.integer(1500);
-        try pack.integer(@intCast(users.len));
-    }
-    try pack.integer(1500);
+    // Ratings are not persistent yet. A made-up single bucket gives lazer a
+    // zero-width graph range and causes its queue screen to calculate NaN.
+    try pack.array(0);
+    try pack.nil();
     try pack.array(0);
     try endEvent(pack);
     return allocatingFrame(allocator, &output);
@@ -3426,6 +3665,53 @@ test "signalr accepts messagepack handshake bytes independent of websocket opcod
     try std.testing.expect(validSignalRHandshake(std.testing.allocator, "{\"version\":1,\"protocol\":\"messagepack\"}\x1e"));
     try std.testing.expect(!validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"json\",\"version\":1}\x1e"));
     try std.testing.expect(!validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"messagepack\",\"version\":1}"));
+}
+
+test "matchmaking lobby status leaves unavailable ratings empty" {
+    const frame = try eventLobbyStatusOwned(std.testing.allocator, &.{ 4, 7 });
+    defer std.testing.allocator.free(frame);
+    var prefix_len: usize = 0;
+    while (frame[prefix_len] & 0x80 != 0) prefix_len += 1;
+    prefix_len += 1;
+    var reader: MessagePackReader = .{ .data = frame[prefix_len..] };
+    try std.testing.expectEqual(@as(usize, 6), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try reader.mapLen());
+    try reader.skip(0);
+    try std.testing.expectEqualStrings("MatchmakingLobbyStatusChanged", try reader.string());
+    try std.testing.expectEqual(@as(usize, 1), try reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 4), try reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 2), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 4), try reader.integer());
+    try std.testing.expectEqual(@as(i64, 7), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try reader.arrayLen());
+    try std.testing.expectEqual(@as(?i64, null), try reader.nullableInteger());
+    try std.testing.expectEqual(@as(usize, 0), try reader.arrayLen());
+}
+
+test "matchmaking duel event uses canonical guid and complete pool" {
+    const duel_id = "00112233-4455-6677-8899-aabbccddeeff";
+    const frame = try eventMatchmakingDuelIssuedOwned(std.testing.allocator, duel_id, 4, 102, 1, 1);
+    defer std.testing.allocator.free(frame);
+    var prefix_len: usize = 0;
+    while (frame[prefix_len] & 0x80 != 0) prefix_len += 1;
+    prefix_len += 1;
+    var reader: MessagePackReader = .{ .data = frame[prefix_len..] };
+    try std.testing.expectEqual(@as(usize, 6), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try reader.mapLen());
+    try reader.skip(0);
+    try std.testing.expectEqualStrings("MatchmakingDuelIssued", try reader.string());
+    try std.testing.expectEqual(@as(usize, 1), try reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 3), try reader.arrayLen());
+    try std.testing.expectEqualStrings(duel_id, try reader.string());
+    try std.testing.expectEqual(@as(i64, 4), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 5), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 102), try reader.integer());
+    try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+    try std.testing.expectEqual(@as(i64, 0), try reader.integer());
+    try std.testing.expectEqualStrings("ranked play", try reader.string());
+    try std.testing.expectEqual(@as(i64, 1), try reader.integer());
 }
 
 test "matchmaking placements use lower-equal ties and aggregate round points" {

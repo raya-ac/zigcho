@@ -129,10 +129,30 @@ pub fn writeCompact(writer: *std.Io.Writer, user: domain.User) !void {
     try writer.writeByte('}');
 }
 
-pub fn meOwned(allocator: std.mem.Allocator, user: domain.User, stats: [4]?domain.Stats, achievements_json: []const u8) ![]u8 {
+fn isoTimestamp(unix_seconds: i64) [20]u8 {
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(0, unix_seconds)) };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    var result: [20]u8 = undefined;
+    _ = std.fmt.bufPrint(&result, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch unreachable;
+    return result;
+}
+
+pub fn meOwned(allocator: std.mem.Allocator, user: domain.User, stats: [4]?domain.Stats, achievements_json: []const u8, last_visit_epoch: i64) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try writeUserCore(&output.writer, user);
+    const last_visit = isoTimestamp(last_visit_epoch);
+    try output.writer.writeAll(",\"last_visit\":");
+    try std.json.Stringify.value(&last_visit, .{}, &output.writer);
     try output.writer.writeAll(",\"statistics_rulesets\":{");
     const names = [_][]const u8{ "osu", "taiko", "fruits", "mania" };
     for (names, 0..) |name, index| {
@@ -149,15 +169,35 @@ pub fn meOwned(allocator: std.mem.Allocator, user: domain.User, stats: [4]?domai
     return output.toOwnedSlice();
 }
 
-pub fn profileOwned(allocator: std.mem.Allocator, user: domain.User, stats: ?domain.Stats, score_counts: domain.UserScoreCounts, achievements_json: []const u8) ![]u8 {
+pub const ProfileSources = struct {
+    stable_stats: ?domain.Stats = null,
+    lazer_stats: ?domain.Stats = null,
+    stable_counts: domain.UserScoreCounts = .{},
+    lazer_counts: domain.UserScoreCounts = .{},
+};
+
+fn writeScoreCounts(writer: *std.Io.Writer, counts: domain.UserScoreCounts) !void {
+    try writer.print("{{\"best\":{d},\"firsts\":{d},\"recent\":{d},\"pinned\":{d}}}", .{ counts.best, counts.firsts, counts.recent, counts.pinned });
+}
+
+pub fn profileOwned(allocator: std.mem.Allocator, user: domain.User, stats: ?domain.Stats, score_counts: domain.UserScoreCounts, sources: ProfileSources, achievements_json: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try writeUserCore(&output.writer, user);
     try output.writer.writeAll(",\"statistics\":");
     try writeStatistics(&output.writer, stats, user.restricted);
+    try output.writer.writeAll(",\"zigcho_statistics\":{\"stable\":");
+    try writeStatistics(&output.writer, sources.stable_stats, user.restricted);
+    try output.writer.writeAll(",\"lazer\":");
+    try writeStatistics(&output.writer, sources.lazer_stats, user.restricted);
+    try output.writer.writeAll("},\"zigcho_score_counts\":{\"stable\":");
+    try writeScoreCounts(&output.writer, sources.stable_counts);
+    try output.writer.writeAll(",\"lazer\":");
+    try writeScoreCounts(&output.writer, sources.lazer_counts);
+    try output.writer.writeByte('}');
     try output.writer.print(",\"scores_best_count\":{d},\"scores_first_count\":{d},\"scores_recent_count\":{d},\"scores_pinned_count\":{d},\"groups\":", .{ score_counts.best, score_counts.firsts, score_counts.recent, score_counts.pinned });
     try writeGroups(&output.writer, user.privileges);
-    try output.writer.writeAll(",\"badges\":[],\"user_achievements\":");
+    try output.writer.writeAll(",\"badges\":[],\"profile_order\":[\"recent_activity\",\"top_ranks\",\"medals\"],\"user_achievements\":");
     try output.writer.writeAll(achievements_json);
     try output.writer.writeAll(",\"monthly_playcounts\":[],\"replays_watched_counts\":[]}");
     return output.toOwnedSlice();
@@ -192,7 +232,12 @@ test "lazer profile JSON owns ruleset stats and role flags" {
         .privileges = (@as(u32, 1) << 4) | (@as(u32, 1) << 11) | (@as(u32, 1) << 13),
     };
     const stats: domain.Stats = .{ .pp = 424, .ranked_score = 3_442_127, .total_score = 9_000_000, .plays = 43, .play_time = 100, .total_hits = 1234, .accuracy = 0.9353, .max_combo = 228, .global_rank = 1 };
-    const profile = try profileOwned(std.testing.allocator, user, stats, .{ .best = 2, .firsts = 1, .recent = 4 }, "[{\"achievement_id\":1,\"achieved_at\":42}]");
+    const profile = try profileOwned(std.testing.allocator, user, stats, .{ .best = 2, .firsts = 1, .recent = 4 }, .{
+        .stable_stats = .{ .pp = 300, .plays = 30 },
+        .lazer_stats = .{ .pp = 124, .plays = 13 },
+        .stable_counts = .{ .best = 1, .firsts = 1, .recent = 3, .pinned = 1 },
+        .lazer_counts = .{ .best = 1, .recent = 1 },
+    }, "[{\"achievement_id\":1,\"achieved_at\":42}]");
     defer std.testing.allocator.free(profile);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, profile, .{});
     defer parsed.deinit();
@@ -205,11 +250,21 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expect(object.get("is_admin").?.bool);
     try std.testing.expectEqual(@as(i64, 424), object.get("statistics").?.object.get("pp").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 93.53), object.get("statistics").?.object.get("hit_accuracy").?.float, 0.0001);
+    try std.testing.expectEqual(@as(i64, 300), object.get("zigcho_statistics").?.object.get("stable").?.object.get("pp").?.integer);
+    try std.testing.expectEqual(@as(i64, 124), object.get("zigcho_statistics").?.object.get("lazer").?.object.get("pp").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), object.get("zigcho_score_counts").?.object.get("stable").?.object.get("recent").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), object.get("zigcho_score_counts").?.object.get("lazer").?.object.get("recent").?.integer);
+    const profile_order = object.get("profile_order").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), profile_order.len);
+    try std.testing.expectEqualStrings("recent_activity", profile_order[0].string);
+    try std.testing.expectEqualStrings("top_ranks", profile_order[1].string);
+    try std.testing.expectEqualStrings("medals", profile_order[2].string);
 
-    const me_json = try meOwned(std.testing.allocator, user, .{ stats, null, null, null }, "[]");
+    const me_json = try meOwned(std.testing.allocator, user, .{ stats, null, null, null }, "[]", 0);
     defer std.testing.allocator.free(me_json);
     var parsed_me = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, me_json, .{});
     defer parsed_me.deinit();
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", parsed_me.value.object.get("last_visit").?.string);
     try std.testing.expectEqual(@as(i64, 43), parsed_me.value.object.get("statistics_rulesets").?.object.get("osu").?.object.get("play_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), parsed_me.value.object.get("statistics_rulesets").?.object.get("mania").?.object.get("play_count").?.integer);
 
@@ -219,7 +274,7 @@ test "lazer profile JSON owns ruleset stats and role flags" {
         .safe_name = "regular",
         .privileges = 3,
     };
-    const regular_json = try meOwned(std.testing.allocator, regular_user, .{ null, null, null, null }, "[]");
+    const regular_json = try meOwned(std.testing.allocator, regular_user, .{ null, null, null, null }, "[]", 0);
     defer std.testing.allocator.free(regular_json);
     var parsed_regular = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, regular_json, .{});
     defer parsed_regular.deinit();
@@ -232,7 +287,7 @@ test "lazer profile JSON owns ruleset stats and role flags" {
         .safe_name = "premium",
         .privileges = 3 | (@as(u32, 1) << 5),
     };
-    const premium_json = try meOwned(std.testing.allocator, premium_user, .{ null, null, null, null }, "[]");
+    const premium_json = try meOwned(std.testing.allocator, premium_user, .{ null, null, null, null }, "[]", 0);
     defer std.testing.allocator.free(premium_json);
     var parsed_premium = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, premium_json, .{});
     defer parsed_premium.deinit();

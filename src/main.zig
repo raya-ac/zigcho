@@ -6,6 +6,7 @@ const sqlite_storage = @import("storage.zig");
 const sessions_mod = @import("sessions.zig");
 const bancho = @import("bancho.zig");
 const lazer = @import("lazer.zig");
+const lazer_bot = @import("lazer_bot.zig");
 const lazer_multiplayer = @import("lazer_multiplayer.zig");
 const lazer_spectator = @import("lazer_spectator.zig");
 const multipart = @import("multipart.zig");
@@ -161,6 +162,7 @@ const App = struct {
     allocator: std.mem.Allocator,
     store: storage.Store,
     sessions: sessions_mod.Sessions,
+    lazer_bot: lazer_bot.Manager,
     lazer_multiplayer: lazer_multiplayer.Manager,
     lazer_spectator: lazer_spectator.Manager,
     limiter: rate_limit.Limiter,
@@ -536,7 +538,7 @@ const App = struct {
             .beatmap_max_combo = info.max_combo,
             .accuracy = score.accuracy,
             .pp = pp_value,
-            .stars = info.star_rating,
+            .stars = score.achievement_stars,
             .perfect = info.max_combo > 0 and score.max_combo >= info.max_combo,
             .artist = info.artist,
             .title = info.title,
@@ -603,6 +605,23 @@ const App = struct {
         }
         try output.writer.writeByte(']');
         return output.toOwnedSlice();
+    }
+
+    fn recordLazerBotReply(self: *App, user: domain.User, content: []const u8, is_action: bool) void {
+        const reply_text = self.lazer_bot.replyOwned(&self.store, &self.sessions, user, content, is_action) catch |err| {
+            std.log.warn("event=lazer_bot_command_failed user_id={d} error={t}", .{ user.id, err });
+            return;
+        };
+        defer self.allocator.free(reply_text);
+        const reply_uuid = randomMessageUuid(self.sessions.io) catch |err| {
+            std.log.warn("event=lazer_bot_uuid_failed user_id={d} error={t}", .{ user.id, err });
+            return;
+        };
+        const reply = self.store.recordLazerDirectMessage(self.allocator, 3, user.id, reply_text, false, &reply_uuid) catch |err| {
+            std.log.warn("event=lazer_bot_reply_failed user_id={d} error={t}", .{ user.id, err });
+            return;
+        };
+        self.allocator.free(reply.json);
     }
 
     fn friendRelationsJson(self: *App, user_id: i32) ![]u8 {
@@ -1724,11 +1743,7 @@ const App = struct {
                 else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message unavailable\"}", &.{}),
             };
             defer self.allocator.free(written.json);
-            if (written.inserted and target_id == 3) {
-                const reply_uuid = try randomMessageUuid(self.sessions.io);
-                const reply = try self.store.recordLazerDirectMessage(self.allocator, 3, user.id, "i'm here. send /np if you want pp on the map you're playing.", false, &reply_uuid);
-                self.allocator.free(reply.json);
-            }
+            if (written.inserted and target_id == 3) self.recordLazerBotReply(user, content, is_action);
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
             try output.writer.print("{{\"new_channel_id\":{d},\"message\":", .{lazer.privateChannelId(target_id).?});
@@ -1856,11 +1871,7 @@ const App = struct {
                 self.broadcastLazerChatToStable(user, channel_name, content) catch |err|
                     std.log.warn("event=lazer_chat_stable_broadcast_failed channel={s} error={t}", .{ channel_name, err });
             }
-            if (written.inserted and private_target_id == 3) {
-                const reply_uuid = try randomMessageUuid(self.sessions.io);
-                const reply = try self.store.recordLazerDirectMessage(self.allocator, 3, user.id, "i'm here. send /np if you want pp on the map you're playing.", false, &reply_uuid);
-                self.allocator.free(reply.json);
-            }
+            if (written.inserted and private_target_id == 3) self.recordLazerBotReply(user, content, is_action);
             return respond(req, .created, "application/json", written.json, &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/chat/ack")) {
@@ -1905,7 +1916,9 @@ const App = struct {
             const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
             const limit = std.fmt.parseInt(u8, queryField(target, "limit") orelse "50", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
             if (limit == 0 or limit > 100 or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid pagination\"}", &.{});
-            const json = try self.store.lazerUserScoresJson(self.allocator, profile_user.id, ruleset_id, score_path.kind, offset, limit);
+            const score_source = domain.parseSiteScoreSource(queryField(target, "source") orelse "all") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid score source\"}", &.{});
+            if (score_source == .scorev2) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid score source\"}", &.{});
+            const json = try self.store.lazerUserScoresJson(self.allocator, profile_user.id, ruleset_id, score_path.kind, score_source, offset, limit);
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -1928,10 +1941,19 @@ const App = struct {
             defer freeUser(self.allocator, found);
             if (found.restricted and found.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
             const stats = try self.store.statsForUser(found.id, user_path.ruleset_id);
-            const score_counts = try self.store.lazerUserScoreCounts(found.id, user_path.ruleset_id);
+            const stable_stats = try self.store.sourceStatsForUser(found.id, user_path.ruleset_id, .stable);
+            const lazer_stats = try self.store.sourceStatsForUser(found.id, user_path.ruleset_id, .lazer);
+            const score_counts = try self.store.lazerUserScoreCounts(found.id, user_path.ruleset_id, .all);
+            const stable_counts = try self.store.lazerUserScoreCounts(found.id, user_path.ruleset_id, .stable);
+            const lazer_counts = try self.store.lazerUserScoreCounts(found.id, user_path.ruleset_id, .lazer);
             const achievements_json = try self.store.lazerUserAchievementsJson(self.allocator, found.id);
             defer self.allocator.free(achievements_json);
-            const json = try user_json.profileOwned(self.allocator, found, stats, score_counts, achievements_json);
+            const json = try user_json.profileOwned(self.allocator, found, stats, score_counts, .{
+                .stable_stats = stable_stats,
+                .lazer_stats = lazer_stats,
+                .stable_counts = stable_counts,
+                .lazer_counts = lazer_counts,
+            }, achievements_json);
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -2248,7 +2270,7 @@ const App = struct {
             const stats = try self.lazerStats(user.id);
             const achievements_json = try self.store.lazerUserAchievementsJson(self.allocator, user.id);
             defer self.allocator.free(achievements_json);
-            const json = try user_json.meOwned(self.allocator, user, stats, achievements_json);
+            const json = try user_json.meOwned(self.allocator, user, stats, achievements_json, std.Io.Clock.real.now(self.sessions.io).toSeconds());
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         }
@@ -2718,7 +2740,7 @@ const App = struct {
                         .beatmap_max_combo = info.max_combo,
                         .accuracy = score.accuracy(),
                         .pp = performance.pp,
-                        .stars = info.star_rating,
+                        .stars = performance.stars,
                         .perfect = score.perfect,
                         .artist = info.artist,
                         .title = info.title,
@@ -2798,7 +2820,7 @@ const App = struct {
             if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
-                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh https://assets.ppy.sh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
             return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", status_page, &headers);
@@ -3045,6 +3067,7 @@ pub fn main(init: std.process.Init) !void {
         .allocator = allocator,
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
+        .lazer_bot = lazer_bot.Manager.init(allocator, init.io),
         .lazer_multiplayer = lazer_multiplayer.Manager.init(allocator, init.io),
         .lazer_spectator = lazer_spectator.Manager.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
@@ -3078,6 +3101,7 @@ pub fn main(init: std.process.Init) !void {
     defer app.limiter.deinit();
     defer app.lazer_spectator.deinit();
     defer app.lazer_multiplayer.deinit();
+    defer app.lazer_bot.deinit();
     defer app.sessions.deinit();
     const address = try std.Io.net.IpAddress.parse(bind, port);
     var listener = try address.listen(init.io, .{ .reuse_address = true });

@@ -52,7 +52,7 @@ for name in lazer-one lazer-two; do
   expect_status "$code" 201 "register_$name"
 done
 
-sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,10,0,readfile('$repo/src/testdata/synthetic-standard.osu'));"
+sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,total_length,star_rating,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,10,0,90,1.7931,readfile('$repo/src/testdata/synthetic-standard.osu'));"
 
 oauth() {
   curl --silent --show-error --request POST "$origin/oauth/token" \
@@ -197,7 +197,7 @@ expect_status "$code" 409 reject_token_reuse
 [ "$(sqlite3 "$database" "SELECT mods_json FROM lazer_scores WHERE id=$score_id")" = '[{"acronym":"RX"},{"acronym":"WIGGLE","settings":{"strength":1.25}}]' ] || fail mods_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT statistics_json FROM lazer_scores WHERE id=$score_id")" = '{"great":300,"miss":2}' ] || fail statistics_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT rank_namespace FROM lazer_scores WHERE id=$score_id")" = custom ] || fail custom_namespace_missing
-[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 28 ] || fail schema_not_migrated
+[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 29 ] || fail schema_not_migrated
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=WIGGLE&limit=50' custom_leaderboard
 jq -e --argjson id "$score_id" '
@@ -212,19 +212,21 @@ jq -e --argjson id "$score_id" '
 ' "$response" >/dev/null || fail invalid_custom_leaderboard_contract
 
 replay_base64='ANAnNQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
-vanilla_body='{"rank":"S","total_score":123456,"total_score_without_mods":123456,"accuracy":0.9,"max_combo":8,"ruleset_id":0,"passed":true,"mods":[],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[],"replay":"ANAnNQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
+vanilla_body='{"rank":"S","total_score":123456,"total_score_without_mods":123456,"accuracy":0.9,"max_combo":8,"ruleset_id":0,"passed":true,"mods":[{"acronym":"HR"}],"statistics":{"great":9,"miss":1},"maximum_statistics":{"great":10},"pauses":[],"replay":"ANAnNQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
 vanilla_token=$(create_score_token "$token_one")
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request PUT "$origin/api/v2/beatmaps/75/solo/scores/$vanilla_token" \
   --header "Authorization: Bearer $token_one" --header 'Content-Type: application/json' --data "$vanilla_body")
 expect_status "$code" 200 submit_vanilla_score
 vanilla_score_id=$(jq -er '.id | select(. > 0)' "$response")
 jq -e '.position == 1' "$response" >/dev/null || fail vanilla_position_missing
+[ "$(sqlite3 "$database" "SELECT abs(star_rating-1.7931)>0.0001 FROM lazer_scores WHERE id=$vanilla_score_id")" = 1 ] || fail modded_star_rating_missing
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&limit=50' vanilla_leaderboard
 jq -e --argjson id "$vanilla_score_id" '
   .score_count == 1 and
   .scores[0].id == $id and
   .scores[0].ranked == true and
+  .scores[0].mods[0].acronym == "HR" and
   .scores[0].total_score == 123456 and
   .scores[0].pp > 0 and
   .scores[0].has_replay == true and
@@ -258,7 +260,7 @@ auth_get /api/v2/chat/channels/2/messages score_announcements
 jq -e '
   length == 4 and
   all(.[]; .sender_id == 3 and .channel_id == 2 and (.content | contains("set #1 on artist - title [diff]"))) and
-  any(.[]; .content | contains("[vanilla] NM")) and
+  any(.[]; .content | contains("[vanilla] +HR")) and
   any(.[]; .content | contains("[relax] +RX")) and
   any(.[]; .content | contains("[autopilot] +AP"))
 ' "$response" >/dev/null || fail invalid_score_announcement_contract
@@ -266,6 +268,7 @@ jq -e '
 auth_get /api/v2/me/ me_after_vanilla_score
 jq -e '
   .statistics_rulesets.osu.play_count == 1 and
+  .statistics_rulesets.osu.play_time == 90 and
   .statistics_rulesets.osu.total_score == 123456 and
   .statistics_rulesets.osu.ranked_score == 123456 and
   .statistics_rulesets.osu.total_hits == 9 and
@@ -307,7 +310,7 @@ jq -e --argjson id "$vanilla_score_id" '
   length == 1 and
   .[0].id == $id and
   .[0].ranked == true and
-  .[0].mods == [] and
+  .[0].mods[0].acronym == "HR" and
   .[0].beatmap.id == 75 and
   .[0].beatmap.beatmapset.artist == "artist"
 ' "$response" >/dev/null || fail invalid_profile_best_scores
@@ -318,7 +321,7 @@ jq -e --argjson custom "$score_id" --argjson vanilla "$vanilla_score_id" --argjs
   any(.[]; .id == $custom and .ranked == false and .mods[0].acronym == "RX" and .mods[1].acronym == "WIGGLE") and
   any(.[]; .id == $relax and .ranked == false and .mods[0].acronym == "RX") and
   any(.[]; .id == $autopilot and .ranked == false and .mods[0].acronym == "AP") and
-  any(.[]; .id == $vanilla and .ranked == true and .mods == [])
+  any(.[]; .id == $vanilla and .ranked == true and .mods[0].acronym == "HR")
 ' "$response" >/dev/null || fail invalid_profile_recent_scores
 
 auth_get '/api/v2/users/4/scores/firsts?mode=osu&offset=0&limit=50' profile_first_scores

@@ -5338,7 +5338,10 @@ test "ranked stable PP is stored and updates normal player stats" {
     const hash = beatmap.md5(map);
     try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
     const archive_bytes = "PK\x03\x04synthetic archive fixture";
-    try store.upsertBeatmapArchive(metadata.set_id, "fixture-sha256", archive_bytes);
+    var archive_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(archive_bytes, &archive_digest, .{});
+    const archive_sha256 = std.fmt.bytesToHex(archive_digest, .lower);
+    try store.upsertBeatmapArchive(metadata.set_id, &archive_sha256, archive_bytes);
     const stored_archive = (try store.beatmapArchive(std.testing.allocator, metadata.set_id)).?;
     defer std.testing.allocator.free(stored_archive);
     try std.testing.expectEqualStrings(archive_bytes, stored_archive);

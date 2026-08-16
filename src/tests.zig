@@ -4650,10 +4650,24 @@ test "lazer ranked stats use legacy scores and pp overwrite while ignoring faile
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(best_rows));
     try std.testing.expectEqual(first_id, storage.c.sqlite3_column_int64(best_rows, 0));
     try std.testing.expectApproxEqAbs(@as(f64, 100), storage.c.sqlite3_column_double(best_rows, 1), 0.001);
-    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(best_rows, 2));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(best_rows, 2));
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(best_rows));
     try std.testing.expectEqual(lower_id, storage.c.sqlite3_column_int64(best_rows, 0));
-    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(best_rows, 2));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(best_rows, 2));
+
+    const best_scores = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .best, .lazer, 0, 50);
+    defer std.testing.allocator.free(best_scores);
+    var parsed_best_scores = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, best_scores, .{});
+    defer parsed_best_scores.deinit();
+    try std.testing.expectEqual(lower_id, parsed_best_scores.value.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 500), parsed_best_scores.value.array.items[0].object.get("pp").?.integer);
+
+    const score_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 75, .lazer, 0)).?;
+    defer std.testing.allocator.free(score_board);
+    var parsed_score_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, score_board, .{});
+    defer parsed_score_board.deinit();
+    try std.testing.expectEqual(first_id, parsed_score_board.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 1000), parsed_score_board.value.object.get("scores").?.array.items[0].object.get("score").?.integer);
 
     const lazer_rankings = try store.siteRankings(std.testing.allocator, .lazer, 0, 0);
     defer std.testing.allocator.free(lazer_rankings);
@@ -4674,6 +4688,36 @@ test "lazer ranked stats use legacy scores and pp overwrite while ignoring faile
     const shared_profile = (try store.siteProfile(std.testing.allocator, 1, .all, 0)).?;
     defer std.testing.allocator.free(shared_profile);
     try std.testing.expect(std.mem.indexOf(u8, shared_profile, "\"client\":\"lazer\"") != null);
+}
+
+test "startup repairs lazer best plays by pp without changing score order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-pp-best-migration.db", .{tmp.sub_path});
+    {
+        var old_store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+        defer old_store.close();
+        try old_store.migrate();
+        try old_store.exec(
+            "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
+                "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(75,75,'11111111111111111111111111111111','a','one','one','m',3);" ++
+                "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace,pp,best) VALUES" ++
+                "(1,1,75,0,1000,1,10,1,'[]','{}','vanilla',100,1),(2,1,75,0,900,1,10,1,'[{\"acronym\":\"HR\"}]','{}','vanilla',500,0)",
+        );
+    }
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT id,best FROM lazer_scores ORDER BY id", -1, &stmt, null));
+    defer _ = storage.c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), storage.c.sqlite3_column_int64(stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(stmt, 1));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 2), storage.c.sqlite3_column_int64(stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 1));
 }
 
 test "stable and lazer share one ranked performance result per map" {

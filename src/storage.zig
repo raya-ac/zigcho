@@ -232,7 +232,7 @@ pub const Store = struct {
         }
         if (version < 22) {
             if (try self.hasLazerPerformanceColumns())
-                try self.exec("UPDATE lazer_scores SET best=1 WHERE id IN (SELECT id FROM (SELECT id,row_number() OVER (PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY CASE WHEN rank_namespace IN ('relax','autopilot') AND pp>0 THEN pp ELSE total_score END DESC,id ASC) place FROM lazer_scores WHERE passed=1) ranked WHERE place=1); PRAGMA user_version=22")
+                try self.exec("UPDATE lazer_scores SET best=1 WHERE id IN (SELECT id FROM (SELECT id,row_number() OVER (PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM lazer_scores WHERE passed=1) ranked WHERE place=1); PRAGMA user_version=22")
             else
                 try self.exec(@embedFile("migration_022.sql"));
         }
@@ -278,6 +278,13 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_029.sql"));
         }
+        try self.exec(
+            "BEGIN IMMEDIATE;" ++
+                "UPDATE lazer_scores SET best=0;" ++
+                "WITH ordered AS (SELECT id,row_number() OVER(PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM lazer_scores WHERE passed=1) " ++
+                "UPDATE lazer_scores SET best=1 WHERE id IN(SELECT id FROM ordered WHERE place=1);" ++
+                "COMMIT",
+        );
         if (needs_score_rebuild) try self.rebuildScoreStats(true);
         try self.exec("INSERT OR IGNORE INTO chat_channels(name,topic,write_privileges) VALUES('#lazer','lazer chat',1)");
     }
@@ -487,6 +494,11 @@ pub const Store = struct {
                 "SELECT id,row_number() OVER (PARTITION BY user_id,map_md5,mode,rank_namespace ORDER BY CASE WHEN rank_namespace IN('vanilla','scorev2') THEN CAST(score AS REAL) ELSE pp END DESC,id ASC) AS place " ++
                 "FROM scores WHERE passed=1" ++
                 ") UPDATE scores SET best=1 WHERE id IN (SELECT id FROM ordered WHERE place=1);",
+        );
+        try self.exec(
+            "UPDATE lazer_scores SET best=0;" ++
+                "WITH ordered AS (SELECT id,row_number() OVER(PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM lazer_scores WHERE passed=1) " ++
+                "UPDATE lazer_scores SET best=1 WHERE id IN(SELECT id FROM ordered WHERE place=1);",
         );
         const internal_mode = "CASE WHEN (s.mods & 8192)!=0 THEN s.mode+8 WHEN (s.mods & 128)!=0 THEN s.mode+4 ELSE s.mode END";
         const lazer_internal_mode = "CASE l.rank_namespace WHEN 'vanilla' THEN l.ruleset_id WHEN 'relax' THEN l.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END";
@@ -3324,13 +3336,10 @@ pub const Store = struct {
         const namespace = @tagName(input.namespace);
         const rank = input.rank orelse if (input.passed) "D" else "F";
         var previous_best_id: i64 = 0;
-        var previous_metric: f64 = 0;
+        var previous_pp: f64 = 0;
+        var previous_score: i64 = 0;
         var previous: ?*c.sqlite3_stmt = null;
-        const uses_pp = input.namespace == .relax or input.namespace == .autopilot;
-        const previous_sql = if (uses_pp)
-            "SELECT id,pp FROM lazer_scores WHERE user_id=?1 AND beatmap_id=?2 AND ruleset_id=?3 AND rank_namespace=?4 AND best=1 LIMIT 1"
-        else
-            "SELECT id,total_score FROM lazer_scores WHERE user_id=?1 AND beatmap_id=?2 AND ruleset_id=?3 AND rank_namespace=?4 AND best=1 LIMIT 1";
+        const previous_sql = "SELECT id,pp,total_score FROM lazer_scores WHERE user_id=?1 AND beatmap_id=?2 AND ruleset_id=?3 AND rank_namespace=?4 AND best=1 LIMIT 1";
         if (c.sqlite3_prepare_v2(self.db, previous_sql, -1, &previous, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         _ = c.sqlite3_bind_int(previous, 1, user_id);
         _ = c.sqlite3_bind_int64(previous, 2, input.beatmap_id);
@@ -3338,11 +3347,11 @@ pub const Store = struct {
         _ = c.sqlite3_bind_text(previous, 4, namespace.ptr, @intCast(namespace.len), null);
         if (c.sqlite3_step(previous) == c.SQLITE_ROW) {
             previous_best_id = c.sqlite3_column_int64(previous, 0);
-            previous_metric = c.sqlite3_column_double(previous, 1);
+            previous_pp = c.sqlite3_column_double(previous, 1);
+            previous_score = c.sqlite3_column_int64(previous, 2);
         }
         _ = c.sqlite3_finalize(previous);
-        const current_metric: f64 = if (uses_pp) pp_value else @floatFromInt(input.total_score);
-        const is_best = input.passed and (previous_best_id == 0 or current_metric > previous_metric);
+        const is_best = input.passed and (previous_best_id == 0 or pp_value > previous_pp or (pp_value == previous_pp and input.total_score > previous_score));
         const sql = "INSERT INTO lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,client_version,pp,best,replay,star_rating) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;

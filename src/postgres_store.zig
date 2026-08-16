@@ -226,7 +226,7 @@ pub const Store = struct {
                 "BEGIN;" ++
                     "ALTER TABLE zigcho.lazer_scores ADD COLUMN pp double precision NOT NULL DEFAULT 0;" ++
                     "ALTER TABLE zigcho.lazer_scores ADD COLUMN best boolean NOT NULL DEFAULT false;" ++
-                    "WITH ranked AS (SELECT id,row_number() OVER (PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY CASE WHEN rank_namespace IN ('relax','autopilot') AND pp>0 THEN pp ELSE total_score::double precision END DESC,id ASC) place FROM zigcho.lazer_scores WHERE passed) UPDATE zigcho.lazer_scores scores SET best=true FROM ranked WHERE scores.id=ranked.id AND ranked.place=1;" ++
+                    "WITH ranked AS (SELECT id,row_number() OVER (PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM zigcho.lazer_scores WHERE passed) UPDATE zigcho.lazer_scores scores SET best=true FROM ranked WHERE scores.id=ranked.id AND ranked.place=1;" ++
                     "CREATE INDEX lazer_scores_user_best ON zigcho.lazer_scores(user_id,ruleset_id,rank_namespace,beatmap_id,best);" ++
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(22);" ++
                     "COMMIT",
@@ -323,6 +323,14 @@ pub const Store = struct {
                     "COMMIT",
             );
         }
+        try postgres.exec(
+            lease.conn,
+            "BEGIN;" ++
+                "UPDATE zigcho.lazer_scores SET best=false;" ++
+                "WITH ordered AS (SELECT id,row_number() OVER(PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM zigcho.lazer_scores WHERE passed) " ++
+                "UPDATE zigcho.lazer_scores scores SET best=true FROM ordered WHERE scores.id=ordered.id AND ordered.place=1;" ++
+                "COMMIT",
+        );
         try postgres.exec(lease.conn, "INSERT INTO zigcho.chat_channels(name,topic,write_privileges) VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1) ON CONFLICT(name) DO NOTHING");
     }
 
@@ -2278,6 +2286,13 @@ pub const Store = struct {
     }
 
     fn rebuildRankedStats(self: *Store, conn: *postgres.c.PGconn) !void {
+        var best = try postgres.query(
+            conn,
+            "UPDATE zigcho.lazer_scores SET best=false;" ++
+                "WITH ordered AS (SELECT id,row_number() OVER(PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM zigcho.lazer_scores WHERE passed) " ++
+                "UPDATE zigcho.lazer_scores scores SET best=true FROM ordered WHERE scores.id=ordered.id AND ordered.place=1",
+        );
+        best.deinit();
         const internal_mode = "CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END";
         const lazer_internal_mode = "CASE l.rank_namespace WHEN 'vanilla' THEN l.ruleset_id WHEN 'relax' THEN l.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END";
         const lazer_hits = "coalesce((l.statistics_json->>'meh')::bigint,0)+coalesce((l.statistics_json->>'ok')::bigint,0)+coalesce((l.statistics_json->>'good')::bigint,0)+coalesce((l.statistics_json->>'great')::bigint,0)+coalesce((l.statistics_json->>'perfect')::bigint,0)";
@@ -3540,16 +3555,13 @@ pub const Store = struct {
         const passed = if (input.passed) "true" else "false";
         const rank = input.rank orelse if (input.passed) "D" else "F";
         const namespace = @tagName(input.namespace);
-        const best_sql = if (input.namespace == .relax or input.namespace == .autopilot)
-            "SELECT id,pp FROM zigcho.lazer_scores WHERE user_id=$1 AND beatmap_id=$2 AND ruleset_id=$3 AND rank_namespace=$4 AND best FOR UPDATE"
-        else
-            "SELECT id,total_score::double precision FROM zigcho.lazer_scores WHERE user_id=$1 AND beatmap_id=$2 AND ruleset_id=$3 AND rank_namespace=$4 AND best FOR UPDATE";
+        const best_sql = "SELECT id,pp,total_score FROM zigcho.lazer_scores WHERE user_id=$1 AND beatmap_id=$2 AND ruleset_id=$3 AND rank_namespace=$4 AND best FOR UPDATE";
         var previous = try postgres.queryParams(self.allocator, conn, best_sql, &.{ user, beatmap_id, ruleset_id, namespace });
         defer previous.deinit();
         const previous_best_id: i64 = if (previous.rows() == 0) 0 else try previous.int(i64, 0, 0);
-        const previous_metric: f64 = if (previous.rows() == 0) 0 else try previous.float(f64, 0, 1);
-        const current_metric: f64 = if (input.namespace == .relax or input.namespace == .autopilot) pp_value else @floatFromInt(input.total_score);
-        const is_best = input.passed and (previous_best_id == 0 or current_metric > previous_metric);
+        const previous_pp: f64 = if (previous.rows() == 0) 0 else try previous.float(f64, 0, 1);
+        const previous_score: i64 = if (previous.rows() == 0) 0 else try previous.int(i64, 0, 2);
+        const is_best = input.passed and (previous_best_id == 0 or pp_value > previous_pp or (pp_value == previous_pp and input.total_score > previous_score));
         var result = try postgres.queryParams(self.allocator, conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,client_version,pp,best,replay,star_rating) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19) RETURNING id", &.{ user, beatmap_id, ruleset_id, total_score, legacy_total_score, accuracy, max_combo, passed, rank, mods_json, statistics_json, maximum_statistics_json, pauses_json, namespace, input.client_version, pp_text, if (is_best) "true" else "false", replay_encoded, star_rating });
         defer result.deinit();
         const score_id = try result.int(i64, 0, 0);

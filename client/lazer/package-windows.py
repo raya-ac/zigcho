@@ -88,10 +88,10 @@ def main() -> None:
         "Open osu!.exe to start. This build keeps its data in the zigcho-lazer folder,\r\n"
         "uses its own IPC pipe, and cannot replace or update an official osu! install.\r\n"
         "It connects to api.kai.ovh and kai.ovh. Public chat uses the REST\r\n"
-        "fallback. normal head-to-head multiplayer rooms are live; matchmaking and\r\n"
-        "spectator streaming are still outside this alpha.\r\n"
+        "fallback. normal rooms, Quick Play, two-player ranked matches and live\r\n"
+        "spectating all use their real zigcho server paths.\r\n"
         "\r\n"
-        "This alpha is not code-signed yet, so Windows SmartScreen may warn.\r\n"
+        "This is a portable build with no installer. Windows may warn because it is unsigned.\r\n"
         "Check the .zip.sha256 file before opening it.\r\n"
     ).encode()
 

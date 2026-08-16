@@ -18,14 +18,23 @@ if ($ActualCommit -ne $ExpectedCommit) {
     throw "expected osu! $ExpectedCommit, got $ActualCommit"
 }
 
-& git -C $Checkout apply --check (Join-Path $ScriptDir "zigcho-client.patch")
-if ($LASTEXITCODE -ne 0) {
-    throw "zigcho client patch does not apply to the pinned osu! checkout"
+$Patch = Join-Path $ScriptDir "zigcho-client.patch"
+
+& git -C $Checkout apply --check $Patch 2>$null
+if ($LASTEXITCODE -eq 0) {
+    & git -C $Checkout apply $Patch
+    if ($LASTEXITCODE -ne 0) {
+        throw "zigcho client patching failed"
+    }
+
+    Write-Host "zigcho client patch applied to $Checkout"
+    return
 }
 
-& git -C $Checkout apply (Join-Path $ScriptDir "zigcho-client.patch")
-if ($LASTEXITCODE -ne 0) {
-    throw "zigcho client patching failed"
+& git -C $Checkout apply --reverse --check $Patch 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "zigcho client patch already applied to $Checkout"
+    return
 }
 
-Write-Host "zigcho client patch applied to $Checkout"
+throw "zigcho client patch does not apply cleanly to the pinned osu! checkout"

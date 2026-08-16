@@ -4,6 +4,7 @@ const protocol = @import("protocol.zig");
 const domain = @import("domain.zig");
 const lazer = @import("lazer.zig");
 const lazer_multiplayer = @import("lazer_multiplayer.zig");
+const lazer_spectator = @import("lazer_spectator.zig");
 const rijndael = @import("rijndael.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
@@ -59,6 +60,7 @@ comptime {
     _ = anticheat_plugin;
     _ = anticheat_replay;
     _ = achievements;
+    _ = lazer_spectator;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -4558,14 +4560,14 @@ test "stable and lazer share one ranked performance result per map" {
     };
     _ = try store.insertStableScore(1, stable_input, 300, "stable replay", 10_000);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":1500,\"total_score_without_mods\":1500,\"accuracy\":0.9,\"max_combo\":90,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":90,\"miss\":10},\"maximum_statistics\":{\"great\":100},\"pauses\":[]}", .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":1500,\"total_score_without_mods\":900,\"accuracy\":0.9,\"max_combo\":90,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":90,\"miss\":10},\"maximum_statistics\":{\"great\":100},\"pauses\":[]}", .{});
     defer parsed.deinit();
     const lazer_input = try lazer.parseSoloScore(parsed.value, 75);
     const token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 350, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]", &.{});
     const after_lazer = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 1500), after_lazer.ranked_score);
-    try std.testing.expectEqual(@as(i64, 2500), after_lazer.total_score);
+    try std.testing.expectEqual(@as(i64, 900), after_lazer.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1900), after_lazer.total_score);
     try std.testing.expectEqual(@as(i32, 350), after_lazer.pp);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), after_lazer.accuracy, 0.000001);
 
@@ -4575,7 +4577,7 @@ test "stable and lazer share one ranked performance result per map" {
     _ = try store.insertStableScore(1, later_stable, 400, "later stable replay", 10_000);
     const after_stable = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 1200), after_stable.ranked_score);
-    try std.testing.expectEqual(@as(i64, 3700), after_stable.total_score);
+    try std.testing.expectEqual(@as(i64, 3100), after_stable.total_score);
     try std.testing.expectEqual(@as(i32, 400), after_stable.pp);
     try std.testing.expectApproxEqAbs(@as(f64, 1), after_stable.accuracy, 0.000001);
 
@@ -4589,6 +4591,19 @@ test "stable and lazer share one ranked performance result per map" {
     try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"source\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"client\":\"stable\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"score\":1500") != null);
+    const stable_profile = (try store.siteProfile(std.testing.allocator, 1, .stable, 0)).?;
+    defer std.testing.allocator.free(stable_profile);
+    try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"selected_source\":\"stable\",\"stats_source\":\"combined\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"selected_stats\":{\"ranked_score\":1200,\"total_score\":3100,\"pp\":400,\"plays\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"client\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"client\":\"lazer\"") == null);
+    const lazer_profile = (try store.siteProfile(std.testing.allocator, 1, .lazer, 0)).?;
+    defer std.testing.allocator.free(lazer_profile);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_source\":\"lazer\",\"stats_source\":\"combined\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":1200,\"total_score\":3100,\"pp\":400,\"plays\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"stable\"") == null);
     const stable_rankings = try store.siteRankings(std.testing.allocator, .stable, 0, 0);
     defer std.testing.allocator.free(stable_rankings);
     try std.testing.expect(std.mem.indexOf(u8, stable_rankings, "\"source\":\"stable\"") != null);
@@ -4597,7 +4612,7 @@ test "stable and lazer share one ranked performance result per map" {
     _ = try store.applyBeatmapRankAction(1, stable_input.map_md5, .rank, "rebuild combined client stats");
     const rebuilt = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 1200), rebuilt.ranked_score);
-    try std.testing.expectEqual(@as(i64, 3700), rebuilt.total_score);
+    try std.testing.expectEqual(@as(i64, 3100), rebuilt.total_score);
     try std.testing.expectEqual(@as(i32, 400), rebuilt.pp);
     try std.testing.expectEqual(@as(i32, 3), rebuilt.plays);
     try std.testing.expectApproxEqAbs(@as(f64, 1), rebuilt.accuracy, 0.000001);

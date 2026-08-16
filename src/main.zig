@@ -7,6 +7,7 @@ const sessions_mod = @import("sessions.zig");
 const bancho = @import("bancho.zig");
 const lazer = @import("lazer.zig");
 const lazer_multiplayer = @import("lazer_multiplayer.zig");
+const lazer_spectator = @import("lazer_spectator.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
@@ -161,6 +162,7 @@ const App = struct {
     store: storage.Store,
     sessions: sessions_mod.Sessions,
     lazer_multiplayer: lazer_multiplayer.Manager,
+    lazer_spectator: lazer_spectator.Manager,
     limiter: rate_limit.Limiter,
     map_sync: beatmap_sync.Sync,
     media_sync: beatmap_media.Sync,
@@ -472,6 +474,7 @@ const App = struct {
     }
 
     fn afterLazerScore(self: *App, user: domain.User, score_id: i64, score: lazer.ScoreInput, pp_value: f64, mods_json: []const u8) ?domain.ScorePlacement {
+        self.lazer_spectator.scoreProcessed(user.id, score_id);
         const placement = self.store.lazerScoreLeaderboardPlacement(score_id) catch |err| {
             std.log.warn("event=lazer_score_placement_failed score_id={d} error={t}", .{ score_id, err });
             return null;
@@ -650,7 +653,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if ((req.head.method == .POST or req.head.method == .PUT) and lazer.parseSoloScorePath(path) != null) return rate_limit.score;
         if ((req.head.method == .POST or req.head.method == .PUT) and lazer_multiplayer.parseRoomScorePath(path) != null) return rate_limit.score;
-        if (std.mem.eql(u8, path, "/multiplayer") or std.mem.eql(u8, path, "/multiplayer/negotiate") or std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/multiplayer") or std.mem.eql(u8, path, "/multiplayer/negotiate") or std.mem.eql(u8, path, "/spectator") or std.mem.eql(u8, path, "/spectator/negotiate") or std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null) return rate_limit.authenticated;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-screenshot.php")) return rate_limit.media_upload;
         if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
@@ -745,6 +748,31 @@ const App = struct {
             try socket.flush();
             self.lazer_multiplayer.serve(user, &socket) catch |err| {
                 std.log.info("event=lazer_multiplayer_connection_closed user_id={d} error={t}", .{ user.id, err });
+            };
+            return;
+        }
+        if (std.mem.eql(u8, path, "/spectator/negotiate")) {
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const json = try lazer_multiplayer.negotiateJson(self.allocator, self.store.io);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
+        if (std.mem.eql(u8, path, "/spectator")) {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const key = switch (req.upgradeRequested()) {
+                .websocket => |maybe_key| maybe_key orelse return respond(req, .bad_request, "application/json", "{\"error\":\"websocket key required\"}", &.{}),
+                else => return respond(req, .bad_request, "application/json", "{\"error\":\"websocket upgrade required\"}", &.{}),
+            };
+            var socket = try req.respondWebSocket(.{ .key = key });
+            try socket.flush();
+            self.lazer_spectator.serve(user, &socket) catch |err| {
+                std.log.info("event=lazer_spectator_connection_closed user_id={d} error={t}", .{ user.id, err });
             };
             return;
         }
@@ -1714,7 +1742,11 @@ const App = struct {
                 defer output.deinit();
                 try output.writer.writeAll("{\"channel\":");
                 try lazer.writePrivateChatChannel(&output.writer, channel_id, other.name, null, null);
-                try output.writer.print(",\"users\":[{d},{d}]}}", .{ user.id, other.id });
+                try output.writer.writeAll(",\"users\":[");
+                try user_json.writeCompact(&output.writer, user);
+                try output.writer.writeByte(',');
+                try user_json.writeCompact(&output.writer, other);
+                try output.writer.writeAll("]}");
                 return respond(req, .ok, "application/json", output.written(), &.{});
             }
             const kai = (try self.store.userById(self.allocator, 3)) orelse return respond(req, .service_unavailable, "application/json", "{\"error\":\"channel presence unavailable\"}", &.{});
@@ -1723,7 +1755,11 @@ const App = struct {
             defer output.deinit();
             try output.writer.writeAll("{\"channel\":");
             try lazer.writeChatChannel(&output.writer, channel_id, null, null);
-            try output.writer.print(",\"users\":[{d},{d}]}}", .{ user.id, kai.id });
+            try output.writer.writeAll(",\"users\":[");
+            try user_json.writeCompact(&output.writer, user);
+            try output.writer.writeByte(',');
+            try user_json.writeCompact(&output.writer, kai);
+            try output.writer.writeAll("]}");
             return respond(req, .ok, "application/json", output.written(), &.{});
         };
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/chat/messages")) {
@@ -2213,6 +2249,7 @@ const App = struct {
             score.achievement_mods = performance.mods;
             score.achievement_perfect = performance.max_combo > 0 and score.max_combo >= performance.max_combo;
             const id = try self.store.insertLazerScore(user.id, score, performance.pp, mods_json, statistics_json, maximum_statistics_json, pauses_json, &.{});
+            self.lazer_spectator.scoreProcessed(user.id, id);
             var out: [192]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"user_id\":{d},\"rank_namespace\":\"{s}\",\"ranked\":true}}", .{ id, user.id, ns_name });
             return respond(req, .created, "application/json", json, &.{});
@@ -2975,6 +3012,7 @@ pub fn main(init: std.process.Init) !void {
         .store = store,
         .sessions = sessions_mod.Sessions.init(allocator, init.io),
         .lazer_multiplayer = lazer_multiplayer.Manager.init(allocator, init.io),
+        .lazer_spectator = lazer_spectator.Manager.init(allocator, init.io),
         .limiter = rate_limit.Limiter.init(allocator, init.io),
         .map_sync = beatmap_sync.Sync.init(allocator, init.io, config.beatmap_cache_max_bytes),
         .media_sync = beatmap_media.Sync.init(allocator, init.io, config.beatmap_media_cache_max_bytes),
@@ -2991,6 +3029,7 @@ pub fn main(init: std.process.Init) !void {
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
+    app.lazer_spectator.bindStore(&app.store);
     kai.country = .{ 'I', 'S' };
     const kai_session = try app.sessions.createBot(kai);
     kai_session.longitude = -21.9426; // reykjavik
@@ -3001,6 +3040,7 @@ pub fn main(init: std.process.Init) !void {
     defer app.map_sync.deinit();
     defer app.geo_client.deinit();
     defer app.limiter.deinit();
+    defer app.lazer_spectator.deinit();
     defer app.lazer_multiplayer.deinit();
     defer app.sessions.deinit();
     const address = try std.Io.net.IpAddress.parse(bind, port);

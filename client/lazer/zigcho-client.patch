@@ -283,7 +283,7 @@ index 031c4fb..30c0d44 100644
              lastSilenceMessageId ??= messages.LastOrDefault()?.Id;
          }
 diff --git a/osu.Game/Online/DevelopmentEndpointConfiguration.cs b/osu.Game/Online/DevelopmentEndpointConfiguration.cs
-index e36e36e..db051f6 100644
+index e36e36e..a1ceff7 100644
 --- a/osu.Game/Online/DevelopmentEndpointConfiguration.cs
 +++ b/osu.Game/Online/DevelopmentEndpointConfiguration.cs
 @@ -1,5 +1,5 @@
@@ -294,7 +294,7 @@ index e36e36e..db051f6 100644
  
  namespace osu.Game.Online
  {
-@@ -7,13 +7,16 @@ public class DevelopmentEndpointConfiguration : EndpointConfiguration
+@@ -7,13 +7,17 @@ public class DevelopmentEndpointConfiguration : EndpointConfiguration
      {
          public DevelopmentEndpointConfiguration()
          {
@@ -302,6 +302,7 @@ index e36e36e..db051f6 100644
 -            APIClientSecret = @"3LP2mhUrV89xxzD1YKNndXHEhWWCRLPNKioZ9ymT";
 +            RealtimeServicesAvailable = false;
 +            MultiplayerServicesAvailable = true;
++            SpectatorServicesAvailable = true;
 +            WebsiteUrl = @"https://kai.ovh";
 +            APIUrl = @"http://127.0.0.1:18095";
 +            APIClientSecret = @"zigcho-lazer";
@@ -310,7 +311,7 @@ index e36e36e..db051f6 100644
 -            MultiplayerUrl = $@"{APIUrl}/signalr/multiplayer";
 -            MetadataUrl = $@"{APIUrl}/signalr/metadata";
 -            BeatmapSubmissionServiceUrl = $@"{APIUrl}/beatmap-submission";
-+            SpectatorUrl = @"https://spectator.kai.ovh/spectator";
++            SpectatorUrl = @"http://127.0.0.1:18095/spectator";
 +            MultiplayerUrl = @"http://127.0.0.1:18095/multiplayer";
 +            MetadataUrl = @"https://spectator.kai.ovh/metadata";
 +            BeatmapSubmissionServiceUrl = @"https://bss.kai.ovh";
@@ -318,10 +319,10 @@ index e36e36e..db051f6 100644
      }
  }
 diff --git a/osu.Game/Online/EndpointConfiguration.cs b/osu.Game/Online/EndpointConfiguration.cs
-index 2ce1432..2984b67 100644
+index 2ce1432..df9ce31 100644
 --- a/osu.Game/Online/EndpointConfiguration.cs
 +++ b/osu.Game/Online/EndpointConfiguration.cs
-@@ -8,6 +8,16 @@ namespace osu.Game.Online
+@@ -8,6 +8,21 @@ namespace osu.Game.Online
      /// </summary>
      public class EndpointConfiguration
      {
@@ -334,6 +335,11 @@ index 2ce1432..2984b67 100644
 +        /// Whether the normal multiplayer SignalR hub is available independently.
 +        /// </summary>
 +        public bool MultiplayerServicesAvailable { get; set; }
++
++        /// <summary>
++        /// Whether the spectator SignalR hub is available independently.
++        /// </summary>
++        public bool SpectatorServicesAvailable { get; set; }
 +
          /// <summary>
          /// The OAuth client secret.
@@ -678,7 +684,7 @@ index 6e4f7e4..8f951a5 100644
      }
  }
 diff --git a/osu.Game/Online/ProductionEndpointConfiguration.cs b/osu.Game/Online/ProductionEndpointConfiguration.cs
-index 37ce2b6..6a3d06b 100644
+index 37ce2b6..8f94552 100644
 --- a/osu.Game/Online/ProductionEndpointConfiguration.cs
 +++ b/osu.Game/Online/ProductionEndpointConfiguration.cs
 @@ -1,5 +1,5 @@
@@ -688,7 +694,7 @@ index 37ce2b6..6a3d06b 100644
  
  namespace osu.Game.Online
  {
-@@ -7,13 +7,16 @@ public class ProductionEndpointConfiguration : EndpointConfiguration
+@@ -7,13 +7,17 @@ public class ProductionEndpointConfiguration : EndpointConfiguration
      {
          public ProductionEndpointConfiguration()
          {
@@ -696,6 +702,7 @@ index 37ce2b6..6a3d06b 100644
 -            APIClientSecret = @"FGc9GAtyHzeQDshWP5Ah7dega8hJACAJpQtw6OXk";
 +            RealtimeServicesAvailable = false;
 +            MultiplayerServicesAvailable = true;
++            SpectatorServicesAvailable = true;
 +            WebsiteUrl = @"https://kai.ovh";
 +            APIUrl = @"https://api.kai.ovh";
 +            APIClientSecret = @"zigcho-lazer";
@@ -1463,10 +1470,10 @@ index 0000000..638d463
 +}
 diff --git a/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
 new file mode 100644
-index 0000000..edcde30
+index 0000000..756a04d
 --- /dev/null
 +++ b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,40 @@
 +// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
 +// See the LICENCE file in the official osu! source tree for full licence text.
 +
@@ -1482,18 +1489,20 @@ index 0000000..edcde30
 +        {
 +            RealtimeServicesAvailable = false,
 +            MultiplayerServicesAvailable = true,
++            SpectatorServicesAvailable = true,
 +            MultiplayerUrl = "https://spectator.kai.ovh/multiplayer",
 +            SpectatorUrl = "https://spectator.kai.ovh/spectator",
 +            MetadataUrl = "https://spectator.kai.ovh/metadata",
 +        };
 +
 +        [Test]
-+        public void TestOnlyMultiplayerHubIsEnabled()
++        public void TestOnlyImplementedHubsAreEnabled()
 +        {
 +            var endpoints = createEndpoints();
 +            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.MultiplayerUrl), Is.True);
-+            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.SpectatorUrl), Is.False);
++            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.SpectatorUrl), Is.True);
 +            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.MetadataUrl), Is.False);
++            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.SpectatorUrl + ".invalid"), Is.False);
 +        }
 +
 +        [Test]
@@ -1507,10 +1516,10 @@ index 0000000..edcde30
 +}
 diff --git a/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs b/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs
 new file mode 100644
-index 0000000..4816217
+index 0000000..1f9c438
 --- /dev/null
 +++ b/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,17 @@
 +// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
 +// See the LICENCE file in the official osu! source tree for full licence text.
 +
@@ -1523,7 +1532,9 @@ index 0000000..4816217
 +        public static bool AllowsHub(EndpointConfiguration endpoints, string endpoint) =>
 +            endpoints.RealtimeServicesAvailable
 +            || (endpoints.MultiplayerServicesAvailable
-+                && string.Equals(endpoint, endpoints.MultiplayerUrl, StringComparison.Ordinal));
++                && string.Equals(endpoint, endpoints.MultiplayerUrl, StringComparison.Ordinal))
++            || (endpoints.SpectatorServicesAvailable
++                && string.Equals(endpoint, endpoints.SpectatorUrl, StringComparison.Ordinal));
 +    }
 +}
 diff --git a/osu.Game/Online/Chat/PollingChatClient.cs b/osu.Game/Online/Chat/PollingChatClient.cs

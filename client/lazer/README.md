@@ -4,7 +4,7 @@ This is the custom lazer part that belongs to zigcho. I am keeping one reviewabl
 
 `upstream-commit.txt` pins the official client revision I have built and opened. `zigcho-client.patch` is the complete client delta and both apply scripts refuse to touch any other revision. Production uses the normal `kai.ovh` hosts. Development keeps the same website and resource hosts, but its API is deliberately loopback-only for the isolated SSH-tunnel QA lane instead of quietly falling back to `dev.ppy.sh`. The store accepts HTTPS resources from `kai.ovh`, `ppy.sh`, and their proper subdomains; it still rejects plaintext, unrelated hosts, suffix lookalikes, data URLs, and relative paths.
 
-General realtime stays disabled. Login, profiles, beatmaps, leaderboards, solo score submission, and public chat use the REST API; chat uses a bounded one-second poll. The normal multiplayer hub is enabled on its own, so rooms do not quietly turn spectator, metadata or notification sockets back on with it.
+General realtime stays disabled. Login, profiles, beatmaps, leaderboards, solo score submission, and public chat use the REST API; chat uses a bounded one-second poll. Normal multiplayer and spectator streaming each have their exact hub enabled. Metadata and notification sockets stay off instead of coming along for the ride.
 
 ```sh
 client/lazer/apply-endpoints.sh work/osu-client
@@ -26,6 +26,6 @@ Windows has its own repeatable production build now. The PowerShell path applies
   -OutputDirectory artifacts/lazer
 ```
 
-The result is `zigcho-lazer-0.1.0-alpha.6-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
+The result is `zigcho-lazer-0.1.0-alpha.7-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
 
-This is a portable alpha, not a signed installer. Open `app/osu!.exe` after extracting the whole folder. Windows SmartScreen may warn until the executable has an Authenticode certificate. Public chat runs over the REST fallback. Leaderboard availability comes from zigcho for every map with an online ID instead of trusting stale local rank metadata. Normal head-to-head rooms can create, join, play, submit and show results now. Spectating, matchmaking, ranked play and a signed installer are still separate work, so the package stays marked as a prerelease.
+This is a portable alpha, not a signed installer. Open `app/osu!.exe` after extracting the whole folder. Windows SmartScreen may warn until the executable has an Authenticode certificate. Public chat runs over the REST fallback. Leaderboard availability comes from zigcho for every map with an online ID instead of trusting stale local rank metadata. Normal head-to-head rooms can create, join, play, submit and show results, and spectator frames now follow the exact people watching instead of being broadcast. Matchmaking, ranked multiplayer and a signed installer are still separate work, so the package stays marked as a prerelease.

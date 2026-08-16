@@ -43,7 +43,7 @@ const Raw2048 = FixedRaw(2048);
 const Text64 = FixedRaw(64);
 const Text128 = FixedRaw(128);
 
-const MessagePackReader = struct {
+pub const MessagePackReader = struct {
     data: []const u8,
     pos: usize = 0,
 
@@ -67,7 +67,7 @@ const MessagePackReader = struct {
         return std.mem.readInt(T, bytes, .big);
     }
 
-    fn arrayLen(self: *MessagePackReader) !usize {
+    pub fn arrayLen(self: *MessagePackReader) !usize {
         const tag = try self.byte();
         if (tag >= 0x90 and tag <= 0x9f) return tag & 0x0f;
         return switch (tag) {
@@ -77,7 +77,7 @@ const MessagePackReader = struct {
         };
     }
 
-    fn mapLen(self: *MessagePackReader) !usize {
+    pub fn mapLen(self: *MessagePackReader) !usize {
         const tag = try self.byte();
         if (tag >= 0x80 and tag <= 0x8f) return tag & 0x0f;
         return switch (tag) {
@@ -87,7 +87,7 @@ const MessagePackReader = struct {
         };
     }
 
-    fn string(self: *MessagePackReader) ![]const u8 {
+    pub fn string(self: *MessagePackReader) ![]const u8 {
         const tag = try self.byte();
         const len: usize = if (tag >= 0xa0 and tag <= 0xbf)
             tag & 0x1f
@@ -100,7 +100,7 @@ const MessagePackReader = struct {
         return self.take(len);
     }
 
-    fn integer(self: *MessagePackReader) !i64 {
+    pub fn integer(self: *MessagePackReader) !i64 {
         const tag = try self.byte();
         if (tag <= 0x7f) return tag;
         if (tag >= 0xe0) return @as(i8, @bitCast(tag));
@@ -117,7 +117,7 @@ const MessagePackReader = struct {
         };
     }
 
-    fn boolean(self: *MessagePackReader) !bool {
+    pub fn boolean(self: *MessagePackReader) !bool {
         return switch (try self.byte()) {
             0xc2 => false,
             0xc3 => true,
@@ -125,7 +125,7 @@ const MessagePackReader = struct {
         };
     }
 
-    fn nullableInteger(self: *MessagePackReader) !?i64 {
+    pub fn nullableInteger(self: *MessagePackReader) !?i64 {
         if (self.pos >= self.data.len) return error.TruncatedMessagePack;
         if (self.data[self.pos] == 0xc0) {
             self.pos += 1;
@@ -134,13 +134,13 @@ const MessagePackReader = struct {
         return try self.integer();
     }
 
-    fn raw(self: *MessagePackReader) ![]const u8 {
+    pub fn raw(self: *MessagePackReader) ![]const u8 {
         const start = self.pos;
         try self.skip(0);
         return self.data[start..self.pos];
     }
 
-    fn skip(self: *MessagePackReader, depth: u8) !void {
+    pub fn skip(self: *MessagePackReader, depth: u8) !void {
         if (depth >= 16) return error.MessagePackNestingTooDeep;
         const tag = try self.byte();
         if (tag <= 0x7f or tag >= 0xe0 or tag == 0xc0 or tag == 0xc2 or tag == 0xc3) return;
@@ -201,10 +201,10 @@ const MessagePackReader = struct {
     }
 };
 
-const MessagePackWriter = struct {
+pub const MessagePackWriter = struct {
     writer: *std.Io.Writer,
 
-    fn array(self: MessagePackWriter, len: usize) !void {
+    pub fn array(self: MessagePackWriter, len: usize) !void {
         if (len <= 15) return self.writer.writeByte(0x90 | @as(u8, @intCast(len)));
         if (len <= std.math.maxInt(u16)) {
             try self.writer.writeByte(0xdc);
@@ -214,7 +214,7 @@ const MessagePackWriter = struct {
         try self.writer.writeInt(u32, @intCast(len), .big);
     }
 
-    fn map(self: MessagePackWriter, len: usize) !void {
+    pub fn map(self: MessagePackWriter, len: usize) !void {
         if (len <= 15) return self.writer.writeByte(0x80 | @as(u8, @intCast(len)));
         if (len <= std.math.maxInt(u16)) {
             try self.writer.writeByte(0xde);
@@ -224,7 +224,7 @@ const MessagePackWriter = struct {
         try self.writer.writeInt(u32, @intCast(len), .big);
     }
 
-    fn string(self: MessagePackWriter, value: []const u8) !void {
+    pub fn string(self: MessagePackWriter, value: []const u8) !void {
         if (value.len <= 31) {
             try self.writer.writeByte(0xa0 | @as(u8, @intCast(value.len)));
         } else if (value.len <= std.math.maxInt(u8)) {
@@ -240,7 +240,7 @@ const MessagePackWriter = struct {
         try self.writer.writeAll(value);
     }
 
-    fn integer(self: MessagePackWriter, value: i64) !void {
+    pub fn integer(self: MessagePackWriter, value: i64) !void {
         if (value >= 0 and value <= 0x7f) return self.writer.writeByte(@intCast(value));
         if (value >= -32 and value < 0) return self.writer.writeByte(@bitCast(@as(i8, @intCast(value))));
         if (value >= std.math.minInt(i8) and value <= std.math.maxInt(i8)) {
@@ -259,20 +259,20 @@ const MessagePackWriter = struct {
         try self.writer.writeInt(i64, value, .big);
     }
 
-    fn float64(self: MessagePackWriter, value: f64) !void {
+    pub fn float64(self: MessagePackWriter, value: f64) !void {
         try self.writer.writeByte(0xcb);
         try self.writer.writeInt(u64, @bitCast(value), .big);
     }
 
-    fn nil(self: MessagePackWriter) !void {
+    pub fn nil(self: MessagePackWriter) !void {
         try self.writer.writeByte(0xc0);
     }
 
-    fn boolean(self: MessagePackWriter, value: bool) !void {
+    pub fn boolean(self: MessagePackWriter, value: bool) !void {
         try self.writer.writeByte(if (value) 0xc3 else 0xc2);
     }
 
-    fn raw(self: MessagePackWriter, value: []const u8) !void {
+    pub fn raw(self: MessagePackWriter, value: []const u8) !void {
         if (value.len == 0) return error.EmptyMessagePackValue;
         try self.writer.writeAll(value);
     }
@@ -1542,7 +1542,7 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false}}", .{ room.channel_id, if (room.state == 0) "idle" else "playing" });
 }
 
-fn frameOwned(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+pub fn frameOwned(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0 or body.len > max_hub_message) return error.MultiplayerPayloadTooLarge;
     var prefix: [5]u8 = undefined;
     var remaining = body.len;
@@ -1561,12 +1561,12 @@ fn frameOwned(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     return output;
 }
 
-fn allocatingFrame(allocator: std.mem.Allocator, output: *std.Io.Writer.Allocating) ![]u8 {
+pub fn allocatingFrame(allocator: std.mem.Allocator, output: *std.Io.Writer.Allocating) ![]u8 {
     const body = output.written();
     return frameOwned(allocator, body);
 }
 
-fn completionVoidOwned(allocator: std.mem.Allocator, invocation_id: []const u8) ![]u8 {
+pub fn completionVoidOwned(allocator: std.mem.Allocator, invocation_id: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const pack: MessagePackWriter = .{ .writer = &output.writer };
@@ -1578,7 +1578,7 @@ fn completionVoidOwned(allocator: std.mem.Allocator, invocation_id: []const u8) 
     return allocatingFrame(allocator, &output);
 }
 
-fn completionErrorOwned(allocator: std.mem.Allocator, invocation_id: []const u8, message: []const u8) ![]u8 {
+pub fn completionErrorOwned(allocator: std.mem.Allocator, invocation_id: []const u8, message: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const pack: MessagePackWriter = .{ .writer = &output.writer };
@@ -1604,7 +1604,7 @@ fn completionRoomOwned(allocator: std.mem.Allocator, invocation_id: []const u8, 
     return allocatingFrame(allocator, &output);
 }
 
-fn beginEvent(pack: MessagePackWriter, target: []const u8, argument_count: usize) !void {
+pub fn beginEvent(pack: MessagePackWriter, target: []const u8, argument_count: usize) !void {
     try pack.array(6);
     try pack.integer(1);
     try pack.map(0);
@@ -1613,7 +1613,7 @@ fn beginEvent(pack: MessagePackWriter, target: []const u8, argument_count: usize
     try pack.array(argument_count);
 }
 
-fn endEvent(pack: MessagePackWriter) !void {
+pub fn endEvent(pack: MessagePackWriter) !void {
     try pack.array(0);
 }
 
@@ -1712,7 +1712,7 @@ fn eventInviteOwned(allocator: std.mem.Allocator, invited_by: i32, room_id: i64,
     return allocatingFrame(allocator, &output);
 }
 
-fn pingOwned(allocator: std.mem.Allocator) ![]u8 {
+pub fn pingOwned(allocator: std.mem.Allocator) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const pack: MessagePackWriter = .{ .writer = &output.writer };
@@ -1755,7 +1755,7 @@ pub fn negotiateJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"negotiateVersion\":1,\"connectionId\":\"{s}\",\"connectionToken\":\"{s}\",\"availableTransports\":[{{\"transport\":\"WebSockets\",\"transferFormats\":[\"Binary\"]}}]}}", .{ &token, &token });
 }
 
-fn validSignalRHandshake(allocator: std.mem.Allocator, data: []const u8) bool {
+pub fn validSignalRHandshake(allocator: std.mem.Allocator, data: []const u8) bool {
     if (data.len < 2 or data[data.len - 1] != 0x1e or std.mem.indexOfScalar(u8, data[0 .. data.len - 1], 0x1e) != null) return false;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, data[0 .. data.len - 1], .{}) catch return false;
     defer parsed.deinit();

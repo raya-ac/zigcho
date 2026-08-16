@@ -134,12 +134,12 @@ def signalr_frame(message):
 
 
 class WebSocket:
-    def __init__(self, host, port, token):
+    def __init__(self, host, port, token, path="/multiplayer?id=smoke"):
         self.socket = socket.create_connection((host, port), timeout=5)
         self.socket.settimeout(5)
         key = base64.b64encode(os.urandom(16)).decode()
         request = (
-            f"GET /multiplayer?id=smoke HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
             f"Sec-WebSocket-Key: {key}\r\nAuthorization: Bearer {token}\r\n\r\n"
         )

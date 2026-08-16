@@ -1,0 +1,1704 @@
+diff --git a/osu.Desktop/DiscordRichPresence.cs b/osu.Desktop/DiscordRichPresence.cs
+index c24cc21..a4c15f1 100644
+--- a/osu.Desktop/DiscordRichPresence.cs
++++ b/osu.Desktop/DiscordRichPresence.cs
+@@ -197,7 +197,7 @@ private void updatePresence(bool hideIdentifiableInformation)
+                 presence.Party = new Party
+                 {
+                     Privacy = string.IsNullOrEmpty(room.Settings.Password) ? Party.PrivacySetting.Public : Party.PrivacySetting.Private,
+-                    ID = room.RoomID.ToString(),
++                    ID = clampLength(room.RoomID.ToString()),
+                     // technically lobbies can have infinite users, but Discord needs this to be set to something.
+                     // to make party display sensible, assign a powers of two above participants count (8 at minimum).
+                     Max = (int)Math.Max(8, Math.Pow(2, Math.Ceiling(Math.Log2(room.Users.Count)))),
+diff --git a/osu.Desktop/Program.cs b/osu.Desktop/Program.cs
+index 354f62a..292f333 100644
+--- a/osu.Desktop/Program.cs
++++ b/osu.Desktop/Program.cs
+@@ -21,9 +21,9 @@ namespace osu.Desktop
+     public static class Program
+     {
+ #if DEBUG
+-        private const string base_game_name = @"osu-development";
++        private const string base_game_name = @"zigcho-lazer-debug";
+ #else
+-        private const string base_game_name = @"osu";
++        private const string base_game_name = @"zigcho-lazer";
+ #endif
+ 
+         private static LegacyTcpIpcProvider? legacyIpc;
+@@ -33,6 +33,8 @@ public static class Program
+         [STAThread]
+         public static void Main(string[] args)
+         {
++            Environment.SetEnvironmentVariable("OSU_EXTERNAL_UPDATE_PROVIDER", "zigcho");
++
+             // IMPORTANT DON'T IGNORE: For general sanity, velopack's setup needs to run before anything else.
+             // This has bitten us in the rear before (bricked updater), and although the underlying issue from
+             // last time has been fixed, let's not tempt fate.
+diff --git a/osu.Desktop/osu.Desktop.csproj b/osu.Desktop/osu.Desktop.csproj
+index acc9364..49fbe91 100644
+--- a/osu.Desktop/osu.Desktop.csproj
++++ b/osu.Desktop/osu.Desktop.csproj
+@@ -5,9 +5,9 @@
+     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+     <Description>A free-to-win rhythm game. Rhythm is just a *click* away!</Description>
+     <AssemblyName>osu!</AssemblyName>
+-    <AssemblyTitle>osu!(lazer)</AssemblyTitle>
+-    <Title>osu!</Title>
+-    <Product>osu!(lazer)</Product>
++    <AssemblyTitle>zigcho!lazer</AssemblyTitle>
++    <Title>zigcho!lazer</Title>
++    <Product>zigcho!lazer</Product>
+     <ApplicationIcon>lazer.ico</ApplicationIcon>
+     <Version>0.0.0</Version>
+     <FileVersion>0.0.0</FileVersion>
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaKeyMod.cs b/osu.Game.Rulesets.Mania/Mods/ManiaKeyMod.cs
+index 4e1bcc5..e24d746 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaKeyMod.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaKeyMod.cs
+@@ -14,7 +14,7 @@ public abstract class ManiaKeyMod : Mod, IApplicableToBeatmapConverter
+         public override string Acronym => Name;
+         public abstract int KeyCount { get; }
+         public override ModType Type => ModType.Conversion;
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         public void ApplyToBeatmapConverter(IBeatmapConverter beatmapConverter)
+         {
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaModHardRock.cs b/osu.Game.Rulesets.Mania/Mods/ManiaModHardRock.cs
+index 93875e5..431095a 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaModHardRock.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaModHardRock.cs
+@@ -10,7 +10,7 @@ namespace osu.Game.Rulesets.Mania.Mods
+ {
+     public class ManiaModHardRock : ModHardRock, IApplicableToHitObject
+     {
+-        public override bool Ranked => false;
++        public override bool Ranked => true;
+ 
+         public const double HIT_WINDOW_DIFFICULTY_MULTIPLIER = 1.4;
+ 
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaModKey1.cs b/osu.Game.Rulesets.Mania/Mods/ManiaModKey1.cs
+index 290e40f..4312728 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaModKey1.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaModKey1.cs
+@@ -14,6 +14,6 @@ public class ManiaModKey1 : ManiaKeyMod
+         public override string Acronym => "1K";
+         public override IconUsage? Icon => OsuIcon.ModOneKey;
+         public override LocalisableString Description => @"Play with one key.";
+-        public override bool Ranked => false;
++        public override bool Ranked => true;
+     }
+ }
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaModKey10.cs b/osu.Game.Rulesets.Mania/Mods/ManiaModKey10.cs
+index 1868714..4901f8f 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaModKey10.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaModKey10.cs
+@@ -14,6 +14,6 @@ public class ManiaModKey10 : ManiaKeyMod
+         public override string Acronym => "10K";
+         public override IconUsage? Icon => OsuIcon.ModTenKeys;
+         public override LocalisableString Description => @"Play with ten keys.";
+-        public override bool Ranked => false;
++        public override bool Ranked => true;
+     }
+ }
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaModKey2.cs b/osu.Game.Rulesets.Mania/Mods/ManiaModKey2.cs
+index 041d38b..54ee50d 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaModKey2.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaModKey2.cs
+@@ -14,6 +14,6 @@ public class ManiaModKey2 : ManiaKeyMod
+         public override string Acronym => "2K";
+         public override IconUsage? Icon => OsuIcon.ModTwoKeys;
+         public override LocalisableString Description => @"Play with two keys.";
+-        public override bool Ranked => false;
++        public override bool Ranked => true;
+     }
+ }
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaModKey3.cs b/osu.Game.Rulesets.Mania/Mods/ManiaModKey3.cs
+index fea5366..180e123 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaModKey3.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaModKey3.cs
+@@ -14,6 +14,6 @@ public class ManiaModKey3 : ManiaKeyMod
+         public override string Acronym => "3K";
+         public override IconUsage? Icon => OsuIcon.ModThreeKeys;
+         public override LocalisableString Description => @"Play with three keys.";
+-        public override bool Ranked => false;
++        public override bool Ranked => true;
+     }
+ }
+diff --git a/osu.Game.Rulesets.Mania/Mods/ManiaModMirror.cs b/osu.Game.Rulesets.Mania/Mods/ManiaModMirror.cs
+index cc7e270..cc62b4a 100644
+--- a/osu.Game.Rulesets.Mania/Mods/ManiaModMirror.cs
++++ b/osu.Game.Rulesets.Mania/Mods/ManiaModMirror.cs
+@@ -14,7 +14,7 @@ namespace osu.Game.Rulesets.Mania.Mods
+     public class ManiaModMirror : ModMirror, IApplicableToBeatmap
+     {
+         public override LocalisableString Description => "Notes are flipped horizontally.";
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         public void ApplyToBeatmap(IBeatmap beatmap)
+         {
+diff --git a/osu.Game.Rulesets.Osu/Mods/OsuModSpunOut.cs b/osu.Game.Rulesets.Osu/Mods/OsuModSpunOut.cs
+index 76c862d..6cecbd4 100644
+--- a/osu.Game.Rulesets.Osu/Mods/OsuModSpunOut.cs
++++ b/osu.Game.Rulesets.Osu/Mods/OsuModSpunOut.cs
+@@ -21,7 +21,7 @@ public class OsuModSpunOut : Mod, IApplicableToDrawableHitObject
+         public override ModType Type => ModType.Automation;
+         public override LocalisableString Description => @"Spinners will be automatically completed.";
+         public override Type[] IncompatibleMods => new[] { typeof(ModAutoplay), typeof(OsuModAutopilot), typeof(OsuModTargetPractice) };
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         public void ApplyToDrawableHitObject(DrawableHitObject hitObject)
+         {
+diff --git a/osu.Game.Rulesets.Osu/Mods/OsuModTouchDevice.cs b/osu.Game.Rulesets.Osu/Mods/OsuModTouchDevice.cs
+index a364190..86ebac3 100644
+--- a/osu.Game.Rulesets.Osu/Mods/OsuModTouchDevice.cs
++++ b/osu.Game.Rulesets.Osu/Mods/OsuModTouchDevice.cs
+@@ -10,6 +10,6 @@ namespace osu.Game.Rulesets.Osu.Mods
+     public class OsuModTouchDevice : ModTouchDevice
+     {
+         public override Type[] IncompatibleMods => base.IncompatibleMods.Concat(new[] { typeof(OsuModAutopilot), typeof(OsuModBloom) }).ToArray();
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+     }
+ }
+diff --git a/osu.Game/Beatmaps/APIBeatmapMetadataSource.cs b/osu.Game/Beatmaps/APIBeatmapMetadataSource.cs
+index e15de7e..3badbb6 100644
+--- a/osu.Game/Beatmaps/APIBeatmapMetadataSource.cs
++++ b/osu.Game/Beatmaps/APIBeatmapMetadataSource.cs
+@@ -33,7 +33,7 @@ public bool TryLookup(BeatmapInfo beatmapInfo, out OnlineBeatmapMetadata? online
+ 
+             Debug.Assert(beatmapInfo.BeatmapSet != null);
+ 
+-            var req = new GetBeatmapRequest(md5Hash: beatmapInfo.MD5Hash, filename: beatmapInfo.Path);
++            var req = new GetBeatmapRequest(onlineId: beatmapInfo.OnlineID, md5Hash: beatmapInfo.MD5Hash, filename: beatmapInfo.Path);
+ 
+             try
+             {
+diff --git a/osu.Game/Online/API/APIAccess.cs b/osu.Game/Online/API/APIAccess.cs
+index c099474..3221769 100644
+--- a/osu.Game/Online/API/APIAccess.cs
++++ b/osu.Game/Online/API/APIAccess.cs
+@@ -93,7 +93,9 @@ public APIAccess(OsuGameBase game, OsuConfigManager config, EndpointConfiguratio
+             }
+ 
+             Endpoints = endpoints;
+-            NotificationsClient = setUpNotificationsClient();
++            NotificationsClient = endpoints.RealtimeServicesAvailable
++                ? setUpNotificationsClient()
++                : new DummyNotificationsClient { HandleMessage = _ => true };
+ 
+             authentication = new OAuth(endpoints.APIClientID, endpoints.APIClientSecret, Endpoints.APIUrl);
+ 
+@@ -493,9 +495,10 @@ public void AuthenticateSecondFactor(string code)
+         }
+ 
+         public IHubClientConnector GetHubConnector(string clientName, string endpoint) =>
+-            new HubClientConnector(clientName, endpoint, this, versionHash);
++            ZigchoRealtimeServicePolicy.AllowsHub(Endpoints, endpoint) ? new HubClientConnector(clientName, endpoint, this, versionHash) : null;
+ 
+-        public IChatClient GetChatClient() => new WebSocketChatClient(this);
++        public IChatClient GetChatClient() =>
++            Endpoints.RealtimeServicesAvailable ? new WebSocketChatClient(this) : new PollingChatClient(this);
+ 
+         public RegistrationRequest.RegistrationRequestErrors CreateAccount(string email, string username, string password)
+         {
+diff --git a/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs b/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs
+index 836a5bc..7da04ac 100644
+--- a/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs
++++ b/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs
+@@ -1,7 +1,6 @@
+ ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+ // See the LICENCE file in the repository root for full licence text.
+ 
+-using System;
+ using Newtonsoft.Json;
+ 
+ namespace osu.Game.Online.API.Requests.Responses
+@@ -12,6 +11,15 @@ public class APIUserAchievement
+         public int ID;
+ 
+         [JsonProperty("achieved_at")]
+-        public DateTimeOffset AchievedAt;
++        public long AchievedAt;
++
++        [JsonProperty("file")]
++        public string Slug = string.Empty;
++
++        [JsonProperty("name")]
++        public string Name = string.Empty;
++
++        [JsonProperty("description")]
++        public string Description = string.Empty;
+     }
+ }
+diff --git a/osu.Game/Online/Chat/ChannelManager.cs b/osu.Game/Online/Chat/ChannelManager.cs
+index 031c4fb..30c0d44 100644
+--- a/osu.Game/Online/Chat/ChannelManager.cs
++++ b/osu.Game/Online/Chat/ChannelManager.cs
+@@ -231,7 +231,15 @@ void dequeueAndRun()
+                 {
+                     var createNewPrivateMessageRequest = new CreateNewPrivateMessageRequest(target.Users.First(), message);
+ 
+-                    createNewPrivateMessageRequest.Success += _ => dequeueAndRun();
++                    createNewPrivateMessageRequest.Success += response =>
++                    {
++                        target.Id = response.ChannelID;
++
++                        if (response.Message != null)
++                            target.AddNewMessages(response.Message);
++
++                        dequeueAndRun();
++                    };
+                     createNewPrivateMessageRequest.Failure += exception =>
+                     {
+                         handlePostException(exception);
+@@ -437,7 +445,24 @@ private void addMessages(List<Message> messages)
+             var blockedUserIds = localUserBlocks.Select(b => b.TargetID).ToList();
+ 
+             foreach (var group in messages.Where(m => !blockedUserIds.Contains(m.SenderId)).GroupBy(m => m.ChannelId))
+-                channels.Find(c => c.Id == group.Key)?.AddNewMessages(group.ToArray());
++            {
++                var channel = channels.Find(c => c.Id == group.Key);
++
++                if (channel == null)
++                {
++                    var otherUser = group.Select(message => message.Sender)
++                                         .FirstOrDefault(sender => sender != null && sender.Id != api.LocalUser.Value.Id);
++
++                    if (otherUser != null)
++                    {
++                        channel = getChannel(new Channel(otherUser) { Id = group.Key }, addToAvailable: true, addToJoined: true);
++                        channel.Joined.Value = true;
++                        channels.Add(channel);
++                    }
++                }
++
++                channel?.AddNewMessages(group.ToArray());
++            }
+ 
+             lastSilenceMessageId ??= messages.LastOrDefault()?.Id;
+         }
+diff --git a/osu.Game/Online/DevelopmentEndpointConfiguration.cs b/osu.Game/Online/DevelopmentEndpointConfiguration.cs
+index e36e36e..db051f6 100644
+--- a/osu.Game/Online/DevelopmentEndpointConfiguration.cs
++++ b/osu.Game/Online/DevelopmentEndpointConfiguration.cs
+@@ -1,5 +1,5 @@
+-﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+-// See the LICENCE file in the repository root for full licence text.
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
+ 
+ namespace osu.Game.Online
+ {
+@@ -7,13 +7,16 @@ public class DevelopmentEndpointConfiguration : EndpointConfiguration
+     {
+         public DevelopmentEndpointConfiguration()
+         {
+-            WebsiteUrl = APIUrl = @"https://dev.ppy.sh";
+-            APIClientSecret = @"3LP2mhUrV89xxzD1YKNndXHEhWWCRLPNKioZ9ymT";
++            RealtimeServicesAvailable = false;
++            MultiplayerServicesAvailable = true;
++            WebsiteUrl = @"https://kai.ovh";
++            APIUrl = @"http://127.0.0.1:18095";
++            APIClientSecret = @"zigcho-lazer";
+             APIClientID = "5";
+-            SpectatorUrl = $@"{APIUrl}/signalr/spectator";
+-            MultiplayerUrl = $@"{APIUrl}/signalr/multiplayer";
+-            MetadataUrl = $@"{APIUrl}/signalr/metadata";
+-            BeatmapSubmissionServiceUrl = $@"{APIUrl}/beatmap-submission";
++            SpectatorUrl = @"https://spectator.kai.ovh/spectator";
++            MultiplayerUrl = @"http://127.0.0.1:18095/multiplayer";
++            MetadataUrl = @"https://spectator.kai.ovh/metadata";
++            BeatmapSubmissionServiceUrl = @"https://bss.kai.ovh";
+         }
+     }
+ }
+diff --git a/osu.Game/Online/EndpointConfiguration.cs b/osu.Game/Online/EndpointConfiguration.cs
+index 2ce1432..2984b67 100644
+--- a/osu.Game/Online/EndpointConfiguration.cs
++++ b/osu.Game/Online/EndpointConfiguration.cs
+@@ -8,6 +8,16 @@ namespace osu.Game.Online
+     /// </summary>
+     public class EndpointConfiguration
+     {
++        /// <summary>
++        /// Whether websocket and SignalR services are available for this endpoint set.
++        /// </summary>
++        public bool RealtimeServicesAvailable { get; set; } = true;
++
++        /// <summary>
++        /// Whether the normal multiplayer SignalR hub is available independently.
++        /// </summary>
++        public bool MultiplayerServicesAvailable { get; set; }
++
+         /// <summary>
+         /// The OAuth client secret.
+         /// </summary>
+diff --git a/osu.Game/Online/Leaderboards/LeaderboardManager.cs b/osu.Game/Online/Leaderboards/LeaderboardManager.cs
+index d4a258a..a86f0a9 100644
+--- a/osu.Game/Online/Leaderboards/LeaderboardManager.cs
++++ b/osu.Game/Online/Leaderboards/LeaderboardManager.cs
+@@ -46,6 +46,14 @@ public partial class LeaderboardManager : Component
+         [Resolved]
+         private RulesetStore rulesets { get; set; } = null!;
+ 
++        [Resolved]
++        private IBeatmapUpdater beatmapUpdater { get; set; } = null!;
++
++        private static readonly TimeSpan metadata_refresh_cooldown = TimeSpan.FromSeconds(10);
++
++        private readonly Dictionary<Guid, DateTimeOffset> lastMetadataRefresh = new Dictionary<Guid, DateTimeOffset>();
++        private readonly HashSet<Guid> scheduledMetadataRechecks = new HashSet<Guid>();
++
+         /// <summary>
+         /// Fetch leaderboard content with the new criteria specified in the background.
+         /// On completion, <see cref="Scores"/> will be updated with the results from this call (unless a more recent call with a different criteria has completed).
+@@ -99,11 +107,41 @@ public void FetchWithCriteria(LeaderboardCriteria newCriteria, bool forceRefresh
+                         return;
+                     }
+ 
+-                    if (newCriteria.Beatmap.OnlineID <= 0 || newCriteria.Beatmap.Status <= BeatmapOnlineStatus.Pending)
++                    if (ZigchoLeaderboardAvailability.RequiresMetadataRefresh(newCriteria.Beatmap))
+                     {
+-                        scores.Value = LeaderboardScores.Failure(LeaderboardFailState.BeatmapUnavailable);
+-                        return;
++                        var beatmap = newCriteria.Beatmap;
++                        var now = DateTimeOffset.UtcNow;
++                        bool queuedRefresh = false;
++                        TimeSpan nextRefreshDelay = metadata_refresh_cooldown;
++
++                        if (beatmap.BeatmapSet?.Realm != null)
++                        {
++                            if (!lastMetadataRefresh.TryGetValue(beatmap.ID, out var lastRefresh) || now - lastRefresh >= metadata_refresh_cooldown)
++                            {
++                                lastMetadataRefresh[beatmap.ID] = now;
++                                beatmapUpdater.Queue(beatmap.BeatmapSet.ToLive(realm), MetadataLookupScope.OnlineFirst);
++                                queuedRefresh = true;
++                            }
++                            else
++                                nextRefreshDelay = metadata_refresh_cooldown - (now - lastRefresh);
++
++                            if (!ZigchoLeaderboardAvailability.IsAvailable(beatmap))
++                            {
++                                scores.Value = null;
++                                scheduleMetadataRecheck(beatmap.ID, queuedRefresh ? TimeSpan.FromMilliseconds(1500) : nextRefreshDelay);
++                                return;
++                            }
++                        }
++
++                        if (!ZigchoLeaderboardAvailability.IsAvailable(beatmap))
++                        {
++                            scores.Value = LeaderboardScores.Failure(LeaderboardFailState.BeatmapUnavailable);
++                            return;
++                        }
++
+                     }
++                    else
++                        lastMetadataRefresh.Remove(newCriteria.Beatmap.ID);
+ 
+                     if ((newCriteria.Scope.RequiresSupporter(newCriteria.ExactMods != null)) && !api.LocalUser.Value.IsSupporter)
+                     {
+@@ -164,6 +202,20 @@ public void FetchWithCriteria(LeaderboardCriteria newCriteria, bool forceRefresh
+             }
+         }
+ 
++        private void scheduleMetadataRecheck(Guid beatmapId, TimeSpan delay)
++        {
++            if (!scheduledMetadataRechecks.Add(beatmapId))
++                return;
++
++            Scheduler.AddDelayed(() =>
++            {
++                scheduledMetadataRechecks.Remove(beatmapId);
++
++                if (CurrentCriteria is LeaderboardCriteria current && current.Beatmap?.ID == beatmapId)
++                    FetchWithCriteria(current, forceRefresh: true);
++            }, Math.Max(250, delay.TotalMilliseconds));
++        }
++
+         private void localScoresChanged(IRealmCollection<ScoreInfo> sender, ChangeSet? changes)
+         {
+             Debug.Assert(CurrentCriteria != null);
+diff --git a/osu.Game/Online/Metadata/OnlineMetadataClient.cs b/osu.Game/Online/Metadata/OnlineMetadataClient.cs
+index 6e4f7e4..8f951a5 100644
+--- a/osu.Game/Online/Metadata/OnlineMetadataClient.cs
++++ b/osu.Game/Online/Metadata/OnlineMetadataClient.cs
+@@ -2,10 +2,13 @@
+ // See the LICENCE file in the repository root for full licence text.
+ 
+ using System;
++using System.Collections.Generic;
+ using System.Diagnostics;
++using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.AspNetCore.SignalR.Client;
++using Newtonsoft.Json;
+ using osu.Framework.Allocation;
+ using osu.Framework.Bindables;
+ using osu.Framework.Logging;
+@@ -19,7 +22,8 @@ namespace osu.Game.Online.Metadata
+ {
+     public partial class OnlineMetadataClient : MetadataClient
+     {
+-        public override IBindable<bool> IsConnected { get; } = new Bindable<bool>();
++        public override IBindable<bool> IsConnected => isConnected;
++        private readonly Bindable<bool> isConnected = new Bindable<bool>();
+ 
+         public override UserPresence LocalUserPresence => localUserPresence;
+         private UserPresence localUserPresence;
+@@ -39,6 +43,7 @@ public partial class OnlineMetadataClient : MetadataClient
+         private IAPIProvider api { get; set; } = null!;
+ 
+         private IHubClientConnector? connector;
++        private readonly CancellationTokenSource presencePollingCancellation = new CancellationTokenSource();
+         private Bindable<int> lastQueueId = null!;
+         private IBindable<APIUser> localUser = null!;
+         private IBindable<UserStatus> userStatus = null!;
+@@ -73,7 +78,7 @@ private void load(OsuConfigManager config, SessionStatics session)
+                     connection.On(nameof(IStatefulUserHubClient.ServerShuttingDown), ((IStatefulUserHubClient)this).ServerShuttingDown);
+                 };
+ 
+-                IsConnected.BindTo(connector.IsConnected);
++                connector.IsConnected.BindValueChanged(connected => isConnected.Value = connected.NewValue, true);
+                 IsConnected.BindValueChanged(isConnectedChanged, true);
+             }
+ 
+@@ -81,6 +86,9 @@ private void load(OsuConfigManager config, SessionStatics session)
+             lastQueueId = config.GetBindable<int>(OsuSetting.LastProcessedMetadataId);
+             userStatus = config.GetBindable<UserStatus>(OsuSetting.UserOnlineStatus);
+             userActivity = session.GetBindable<UserActivity?>(Static.UserOnlineActivity);
++
++            if (connector == null)
++                _ = Task.Run(pollPresence, presencePollingCancellation.Token);
+         }
+ 
+         protected override void LoadComplete()
+@@ -102,6 +110,100 @@ protected override void LoadComplete()
+ 
+         private bool catchingUp;
+ 
++        private async Task pollPresence()
++        {
++            while (!presencePollingCancellation.IsCancellationRequested)
++            {
++                if (!api.IsLoggedIn)
++                {
++                    Schedule(clearPollingPresence);
++                    await delayPresencePoll(1000).ConfigureAwait(false);
++                    continue;
++                }
++
++                var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
++                var request = new GetPresenceRequest();
++                bool succeeded = false;
++
++                request.Success += entries =>
++                {
++                    succeeded = true;
++                    Schedule(() => applyPollingPresence(entries));
++                    completion.TrySetResult(true);
++                };
++                request.Failure += exception =>
++                {
++                    Logger.Log($"Presence poll failed: {exception.Message}", LoggingTarget.Network);
++                    completion.TrySetResult(false);
++                };
++                api.Queue(request);
++
++                try
++                {
++                    Task completed = await Task.WhenAny(completion.Task, Task.Delay(10000, presencePollingCancellation.Token)).ConfigureAwait(false);
++                    if (completed != completion.Task)
++                    {
++                        request.Cancel();
++                        Logger.Log("Presence poll timed out.", LoggingTarget.Network);
++                    }
++
++                    await delayPresencePoll(succeeded ? 5000 : 10000).ConfigureAwait(false);
++                }
++                catch (OperationCanceledException)
++                {
++                    return;
++                }
++            }
++        }
++
++        private async Task delayPresencePoll(int milliseconds)
++        {
++            try
++            {
++                await Task.Delay(milliseconds, presencePollingCancellation.Token).ConfigureAwait(false);
++            }
++            catch (OperationCanceledException)
++            {
++            }
++        }
++
++        private void applyPollingPresence(IReadOnlyCollection<PresenceEntry> entries)
++        {
++            var onlineIds = entries.Select(entry => entry.UserId).ToHashSet();
++
++            foreach (int userId in userPresences.Keys.Where(id => !onlineIds.Contains(id)).ToArray())
++                userPresences.Remove(userId);
++
++            foreach (int userId in onlineIds)
++            {
++                bool isLocal = userId == api.LocalUser.Value.OnlineID;
++                var presence = new UserPresence
++                {
++                    Activity = isLocal ? userActivity.Value : null,
++                    Status = isLocal ? userStatus.Value : UserStatus.Online,
++                };
++                userPresences[userId] = presence;
++                if (isLocal)
++                    localUserPresence = presence;
++            }
++
++            if (!onlineIds.Contains(api.LocalUser.Value.OnlineID))
++                localUserPresence = default;
++
++            isConnected.Value = true;
++        }
++
++        private void clearPollingPresence()
++        {
++            if (connector != null)
++                return;
++
++            userPresences.Clear();
++            friendPresences.Clear();
++            localUserPresence = default;
++            isConnected.Value = false;
++        }
++
+         private void isConnectedChanged(ValueChangedEvent<bool> connected)
+         {
+             if (!connected.NewValue)
+@@ -188,6 +290,17 @@ public override Task<BeatmapUpdates> GetChangesSince(int queueId)
+ 
+         public override Task UpdateActivity(UserActivity? activity)
+         {
++            if (connector == null)
++            {
++                Schedule(() =>
++                {
++                    localUserPresence.Activity = activity;
++                    if (api.LocalUser.Value.OnlineID > 0 && userPresences.ContainsKey(api.LocalUser.Value.OnlineID))
++                        userPresences[api.LocalUser.Value.OnlineID] = localUserPresence;
++                });
++                return Task.CompletedTask;
++            }
++
+             if (connector?.IsConnected.Value != true)
+                 return Task.FromCanceled(new CancellationToken(true));
+ 
+@@ -197,6 +310,17 @@ public override Task UpdateActivity(UserActivity? activity)
+ 
+         public override Task UpdateStatus(UserStatus? status)
+         {
++            if (connector == null)
++            {
++                Schedule(() =>
++                {
++                    localUserPresence.Status = status;
++                    if (api.LocalUser.Value.OnlineID > 0 && userPresences.ContainsKey(api.LocalUser.Value.OnlineID))
++                        userPresences[api.LocalUser.Value.OnlineID] = localUserPresence;
++                });
++                return Task.CompletedTask;
++            }
++
+             if (connector?.IsConnected.Value != true)
+                 return Task.FromCanceled(new CancellationToken(true));
+ 
+@@ -271,6 +395,12 @@ public override Task DailyChallengeUpdated(DailyChallengeInfo? info)
+ 
+         public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultiplayerRoom(long id)
+         {
++            if (connector == null)
++            {
++                WatchedRooms.Add(id);
++                return Array.Empty<MultiplayerPlaylistItemStats>();
++            }
++
+             if (connector?.IsConnected.Value != true)
+                 throw new OperationCanceledException();
+ 
+@@ -284,6 +414,12 @@ public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultipla
+ 
+         public override async Task EndWatchingMultiplayerRoom(long id)
+         {
++            if (connector == null)
++            {
++                WatchedRooms.Remove(id);
++                return;
++            }
++
+             if (connector?.IsConnected.Value != true)
+                 throw new OperationCanceledException();
+ 
+@@ -296,6 +432,9 @@ public override async Task EndWatchingMultiplayerRoom(long id)
+ 
+         public override async Task RefreshFriends()
+         {
++            if (connector == null)
++                return;
++
+             if (connector?.IsConnected.Value != true)
+                 throw new OperationCanceledException();
+ 
+@@ -305,6 +444,8 @@ public override async Task RefreshFriends()
+ 
+         protected override void Dispose(bool isDisposing)
+         {
++            presencePollingCancellation.Cancel();
++            presencePollingCancellation.Dispose();
+             base.Dispose(isDisposing);
+             connector?.Dispose();
+         }
+@@ -320,5 +461,16 @@ protected override async Task DisconnectInternal()
+             if (connector != null)
+                 await connector.Disconnect().ConfigureAwait(false);
+         }
++
++        private sealed class GetPresenceRequest : APIRequest<List<PresenceEntry>>
++        {
++            protected override string Target => "presence";
++        }
++
++        private sealed class PresenceEntry
++        {
++            [JsonProperty("user_id")]
++            public int UserId { get; set; }
++        }
+     }
+ }
+diff --git a/osu.Game/Online/ProductionEndpointConfiguration.cs b/osu.Game/Online/ProductionEndpointConfiguration.cs
+index 37ce2b6..6a3d06b 100644
+--- a/osu.Game/Online/ProductionEndpointConfiguration.cs
++++ b/osu.Game/Online/ProductionEndpointConfiguration.cs
+@@ -1,5 +1,5 @@
+ // Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+-// See the LICENCE file in the repository root for full licence text.
++// See the LICENCE file in the official osu! source tree for full licence text.
+ 
+ namespace osu.Game.Online
+ {
+@@ -7,13 +7,16 @@ public class ProductionEndpointConfiguration : EndpointConfiguration
+     {
+         public ProductionEndpointConfiguration()
+         {
+-            WebsiteUrl = APIUrl = @"https://osu.ppy.sh";
+-            APIClientSecret = @"FGc9GAtyHzeQDshWP5Ah7dega8hJACAJpQtw6OXk";
++            RealtimeServicesAvailable = false;
++            MultiplayerServicesAvailable = true;
++            WebsiteUrl = @"https://kai.ovh";
++            APIUrl = @"https://api.kai.ovh";
++            APIClientSecret = @"zigcho-lazer";
+             APIClientID = "5";
+-            SpectatorUrl = "https://spectator.osu.ppy.sh/spectator";
+-            MultiplayerUrl = "https://spectator.osu.ppy.sh/multiplayer";
+-            MetadataUrl = "https://spectator.osu.ppy.sh/metadata";
+-            BeatmapSubmissionServiceUrl = "https://bss.ppy.sh";
++            SpectatorUrl = "https://spectator.kai.ovh/spectator";
++            MultiplayerUrl = "https://spectator.kai.ovh/multiplayer";
++            MetadataUrl = "https://spectator.kai.ovh/metadata";
++            BeatmapSubmissionServiceUrl = "https://bss.kai.ovh";
+         }
+     }
+ }
+diff --git a/osu.Game/Online/Rooms/MultiplayerScore.cs b/osu.Game/Online/Rooms/MultiplayerScore.cs
+index 74eaea8..7202160 100644
+--- a/osu.Game/Online/Rooms/MultiplayerScore.cs
++++ b/osu.Game/Online/Rooms/MultiplayerScore.cs
+@@ -12,6 +12,7 @@
+ using osu.Game.Beatmaps;
+ using osu.Game.Online.API;
+ using osu.Game.Online.API.Requests.Responses;
++using osu.Game.Online.Notifications.WebSocket.Events;
+ using osu.Game.Rulesets;
+ using osu.Game.Rulesets.Mods;
+ using osu.Game.Rulesets.Scoring;
+@@ -61,6 +62,9 @@ public class MultiplayerScore
+         [JsonProperty("position")]
+         public int? Position { get; set; }
+ 
++        [JsonProperty("achievement_unlocks")]
++        public UserAchievementUnlock[] AchievementUnlocks { get; set; }
++
+         [JsonProperty("pp")]
+         public double? PP { get; set; }
+ 
+diff --git a/osu.Game/Online/Rooms/SubmitRoomScoreRequest.cs b/osu.Game/Online/Rooms/SubmitRoomScoreRequest.cs
+index 3f40438..c7d0259 100644
+--- a/osu.Game/Online/Rooms/SubmitRoomScoreRequest.cs
++++ b/osu.Game/Online/Rooms/SubmitRoomScoreRequest.cs
+@@ -1,6 +1,7 @@
+ ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+ // See the LICENCE file in the repository root for full licence text.
+ 
++using osu.Game.Beatmaps;
+ using osu.Game.Scoring;
+ 
+ namespace osu.Game.Online.Rooms
+@@ -10,8 +11,8 @@ public class SubmitRoomScoreRequest : SubmitScoreRequest
+         private readonly long roomId;
+         private readonly long playlistItemId;
+ 
+-        public SubmitRoomScoreRequest(ScoreInfo scoreInfo, long scoreId, long roomId, long playlistItemId)
+-            : base(scoreInfo, scoreId)
++        public SubmitRoomScoreRequest(Score score, IBeatmap beatmap, long scoreId, long roomId, long playlistItemId)
++            : base(score, beatmap, scoreId)
+         {
+             this.roomId = roomId;
+             this.playlistItemId = playlistItemId;
+diff --git a/osu.Game/Online/Rooms/SubmitScoreRequest.cs b/osu.Game/Online/Rooms/SubmitScoreRequest.cs
+index b4a91a5..5b881d2 100644
+--- a/osu.Game/Online/Rooms/SubmitScoreRequest.cs
++++ b/osu.Game/Online/Rooms/SubmitScoreRequest.cs
+@@ -1,12 +1,17 @@
+ ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+ // See the LICENCE file in the repository root for full licence text.
+ 
++using System;
++using System.IO;
+ using System.Net.Http;
+ using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++using osu.Game.Beatmaps;
+ using osu.Framework.IO.Network;
+ using osu.Game.Online.API;
+ using osu.Game.Online.API.Requests.Responses;
+ using osu.Game.Scoring;
++using osu.Game.Scoring.Legacy;
+ 
+ namespace osu.Game.Online.Rooms
+ {
+@@ -16,10 +21,22 @@ public abstract class SubmitScoreRequest : APIRequest<MultiplayerScore>
+ 
+         protected readonly long ScoreId;
+ 
+-        protected SubmitScoreRequest(ScoreInfo scoreInfo, long scoreId)
++        private readonly string serializedScore;
++
++        protected SubmitScoreRequest(Score score, IBeatmap beatmap, long scoreId)
+         {
+-            Score = SoloScoreInfo.ForSubmission(scoreInfo);
++            Score = SoloScoreInfo.ForSubmission(score.ScoreInfo);
+             ScoreId = scoreId;
++
++            var settings = new JsonSerializerSettings
++            {
++                ReferenceLoopHandling = ReferenceLoopHandling.Ignore
++            };
++            var payload = JObject.FromObject(Score, JsonSerializer.Create(settings));
++            using var replay = new MemoryStream();
++            new LegacyScoreEncoder(score, beatmap).Encode(replay, leaveOpen: true);
++            payload["replay"] = Convert.ToBase64String(replay.ToArray());
++            serializedScore = payload.ToString(Formatting.None);
+         }
+ 
+         protected override WebRequest CreateWebRequest()
+@@ -30,10 +47,7 @@ protected override WebRequest CreateWebRequest()
+             req.Method = HttpMethod.Put;
+             req.Timeout = 30000;
+ 
+-            req.AddRaw(JsonConvert.SerializeObject(Score, new JsonSerializerSettings
+-            {
+-                ReferenceLoopHandling = ReferenceLoopHandling.Ignore
+-            }));
++            req.AddRaw(serializedScore);
+ 
+             return req;
+         }
+diff --git a/osu.Game/Online/Solo/SubmitSoloScoreRequest.cs b/osu.Game/Online/Solo/SubmitSoloScoreRequest.cs
+index 3260ba8..2aa76e2 100644
+--- a/osu.Game/Online/Solo/SubmitSoloScoreRequest.cs
++++ b/osu.Game/Online/Solo/SubmitSoloScoreRequest.cs
+@@ -1,6 +1,7 @@
+ ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+ // See the LICENCE file in the repository root for full licence text.
+ 
++using osu.Game.Beatmaps;
+ using osu.Game.Online.Rooms;
+ using osu.Game.Scoring;
+ 
+@@ -10,8 +11,8 @@ public class SubmitSoloScoreRequest : SubmitScoreRequest
+     {
+         private readonly int beatmapId;
+ 
+-        public SubmitSoloScoreRequest(ScoreInfo scoreInfo, long scoreId, int beatmapId)
+-            : base(scoreInfo, scoreId)
++        public SubmitSoloScoreRequest(Score score, IBeatmap beatmap, long scoreId, int beatmapId)
++            : base(score, beatmap, scoreId)
+         {
+             this.beatmapId = beatmapId;
+         }
+diff --git a/osu.Game/Online/TrustedDomainOnlineStore.cs b/osu.Game/Online/TrustedDomainOnlineStore.cs
+index 2b47f15..3e92f11 100644
+--- a/osu.Game/Online/TrustedDomainOnlineStore.cs
++++ b/osu.Game/Online/TrustedDomainOnlineStore.cs
+@@ -1,5 +1,5 @@
+ // Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+-// See the LICENCE file in the repository root for full licence text.
++// See the LICENCE file in the official osu! source tree for full licence text.
+ 
+ using System;
+ using osu.Framework.IO.Stores;
+@@ -11,7 +11,7 @@ public sealed class TrustedDomainOnlineStore : OnlineStore
+     {
+         protected override string GetLookupUrl(string url)
+         {
+-            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) || !uri.Host.EndsWith(@".ppy.sh", StringComparison.OrdinalIgnoreCase))
++            if (!IsTrustedUrl(url))
+             {
+                 Logger.Log($@"Blocking resource lookup from external website: {url}", LoggingTarget.Network, LogLevel.Important);
+                 return string.Empty;
+@@ -19,5 +19,14 @@ protected override string GetLookupUrl(string url)
+ 
+             return url;
+         }
++
++        internal static bool IsTrustedUrl(string url) =>
++            Uri.TryCreate(url, UriKind.Absolute, out Uri? uri)
++            && string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
++            && (isDomainOrSubdomain(uri.Host, "kai.ovh") || isDomainOrSubdomain(uri.Host, "ppy.sh"));
++
++        private static bool isDomainOrSubdomain(string host, string domain) =>
++            host.Equals(domain, StringComparison.OrdinalIgnoreCase)
++            || host.EndsWith($".{domain}", StringComparison.OrdinalIgnoreCase);
+     }
+ }
+diff --git a/osu.Game/OsuGame.cs b/osu.Game/OsuGame.cs
+index 492567d..3504f5d 100644
+--- a/osu.Game/OsuGame.cs
++++ b/osu.Game/OsuGame.cs
+@@ -97,9 +97,9 @@ public partial class OsuGame : OsuGameBase, IKeyBindingHandler<GlobalAction>, IL
+     {
+ #if DEBUG
+         // Different port allows running release and debug builds alongside each other.
+-        public const string IPC_PIPE_NAME = "osu-lazer-debug";
++        public const string IPC_PIPE_NAME = "zigcho-lazer-debug";
+ #else
+-        public const string IPC_PIPE_NAME = "osu-lazer";
++        public const string IPC_PIPE_NAME = "zigcho-lazer";
+ #endif
+ 
+         /// <summary>
+@@ -1247,7 +1247,7 @@ protected override void LoadComplete()
+ 
+             loadComponentSingleFile(new AccountCreationOverlay(), topMostOverlayContent.Add, true);
+             loadComponentSingleFile<IDialogOverlay>(dialogOverlay = new DialogOverlay(), topMostOverlayContent.Add, true);
+-            loadComponentSingleFile(new MedalOverlay(), topMostOverlayContent.Add);
++            loadComponentSingleFile(new MedalOverlay(), topMostOverlayContent.Add, true);
+ 
+             loadComponentSingleFile(new BackgroundDataStoreProcessor(), Add);
+             loadComponentSingleFile<BeatmapStore>(detachedBeatmapStore = new RealmDetachedBeatmapStore(), Add, true);
+diff --git a/osu.Game/OsuGameBase.cs b/osu.Game/OsuGameBase.cs
+index cc4fa5b..3b49c32 100644
+--- a/osu.Game/OsuGameBase.cs
++++ b/osu.Game/OsuGameBase.cs
+@@ -78,9 +78,9 @@ namespace osu.Game
+     public partial class OsuGameBase : Framework.Game, ICanAcceptFiles, IBeatSyncProvider
+     {
+ #if DEBUG
+-        public const string GAME_NAME = "osu! (development)";
++        public const string GAME_NAME = "zigcho!lazer";
+ #else
+-        public const string GAME_NAME = "osu!";
++        public const string GAME_NAME = "zigcho!lazer";
+ #endif
+ 
+         public const string OSU_PROTOCOL = "osu://";
+diff --git a/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs b/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs
+index 6372931..9f6871c 100644
+--- a/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs
++++ b/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs
+@@ -13,6 +13,7 @@
+ using osu.Framework.Graphics.Shapes;
+ using osu.Game.Beatmaps;
+ using osu.Game.Extensions;
++using osu.Game.Graphics.Sprites;
+ using osu.Game.Graphics.UserInterface;
+ using osu.Game.Online.API;
+ using osu.Game.Online.API.Requests;
+@@ -39,6 +40,7 @@ public partial class ScoresContainer : BeatmapSetLayoutSection
+         private readonly FillFlowContainer topScoresContainer;
+         private readonly LoadingLayer loading;
+         private readonly LeaderboardModSelector modSelector;
++        private readonly OsuSpriteText namespaceLabel;
+         private readonly NoScoresPlaceholder noScoresPlaceholder;
+         private readonly NotSupporterPlaceholder notSupporterPlaceholder;
+         private readonly NoTeamPlaceholder noTeamPlaceholder;
+@@ -133,6 +135,12 @@ public ScoresContainer()
+                                     Origin = Anchor.TopCentre,
+                                     Current = { BindTarget = scope }
+                                 },
++                                namespaceLabel = new OsuSpriteText
++                                {
++                                    Anchor = Anchor.TopCentre,
++                                    Origin = Anchor.TopCentre,
++                                    Text = "vanilla leaderboard"
++                                },
+                                 modSelector = new LeaderboardModSelector
+                                 {
+                                     Anchor = Anchor.TopCentre,
+@@ -214,7 +222,11 @@ protected override void LoadComplete()
+             scope.BindValueChanged(_ => getScores());
+             ruleset.BindValueChanged(_ => getScores());
+ 
+-            modSelector.SelectedMods.CollectionChanged += (_, _) => getScores();
++            modSelector.SelectedMods.CollectionChanged += (_, _) =>
++            {
++                updateZigchoLeaderboardNamespace();
++                getScores();
++            };
+ 
+             Beatmap.BindValueChanged(onBeatmapChanged);
+             user.BindValueChanged(onUserChanged, true);
+@@ -252,7 +264,7 @@ private void getScores()
+             noTeamPlaceholder.Hide();
+             notSupporterPlaceholder.Hide();
+ 
+-            if (Beatmap.Value == null || Beatmap.Value.OnlineID <= 0 || (Beatmap.Value.Status <= BeatmapOnlineStatus.Pending))
++            if (!osu.Game.Online.Leaderboards.ZigchoLeaderboardAvailability.IsAvailable(Beatmap.Value))
+             {
+                 Scores = null;
+                 Hide();
+@@ -288,6 +300,16 @@ private void getScores()
+             api.Queue(getScoresRequest);
+         }
+ 
++        private void updateZigchoLeaderboardNamespace()
++        {
++            var acronyms = modSelector.SelectedMods.Select(mod => mod.Acronym.ToString()).ToArray();
++            namespaceLabel.Text = acronyms.Contains("AP")
++                ? "autopilot leaderboard"
++                : acronyms.Contains("RX")
++                    ? "relax leaderboard"
++                    : "vanilla leaderboard";
++        }
++
+         private bool userIsSupporter => api.IsLoggedIn && api.LocalUser.Value.IsSupporter;
+     }
+ }
+diff --git a/osu.Game/Overlays/MedalOverlay.cs b/osu.Game/Overlays/MedalOverlay.cs
+index 25e22ff..72971ab 100644
+--- a/osu.Game/Overlays/MedalOverlay.cs
++++ b/osu.Game/Overlays/MedalOverlay.cs
+@@ -74,6 +74,11 @@ private void handleMedalMessages(SocketMessage obj)
+             if (details == null)
+                 return;
+ 
++            QueueUnlock(details);
++        }
++
++        public void QueueUnlock(UserAchievementUnlock details)
++        {
+             var medal = new Medal
+             {
+                 Name = details.Title,
+diff --git a/osu.Game/Overlays/MedalSplash/DrawableMedal.cs b/osu.Game/Overlays/MedalSplash/DrawableMedal.cs
+index 6b7ffbd..0e45f6e 100644
+--- a/osu.Game/Overlays/MedalSplash/DrawableMedal.cs
++++ b/osu.Game/Overlays/MedalSplash/DrawableMedal.cs
+@@ -119,7 +119,9 @@ public DrawableMedal(Medal medal)
+         [BackgroundDependencyLoader]
+         private void load(OsuColour colours, TextureStore textures, LargeTextureStore largeTextures)
+         {
+-            medalSprite.Texture = largeTextures.Get(medal.ImageUrl);
++            medalSprite.Texture = medal.InternalName.StartsWith("kai-", StringComparison.Ordinal)
++                ? textures.Get(@"MedalSplash/medal-glow")
++                : largeTextures.Get(medal.ImageUrl);
+             medalGlow.Texture = textures.Get(@"MedalSplash/medal-glow");
+             description.Colour = colours.BlueLight;
+         }
+diff --git a/osu.Game/Overlays/Profile/Sections/MedalsSection.cs b/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
+index 42f241d..3a36e8f 100644
+--- a/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
++++ b/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
+@@ -1,8 +1,16 @@
+ ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+ // See the LICENCE file in the repository root for full licence text.
+ 
++using osu.Framework.Bindables;
++using osu.Framework.Graphics;
++using osu.Framework.Graphics.Containers;
++using osu.Framework.Graphics.Shapes;
+ using osu.Framework.Localisation;
++using osu.Game.Graphics;
++using osu.Game.Graphics.Sprites;
++using osu.Game.Online.API.Requests.Responses;
+ using osu.Game.Resources.Localisation.Web;
++using osuTK;
+ 
+ namespace osu.Game.Overlays.Profile.Sections
+ {
+@@ -11,5 +19,76 @@ public partial class MedalsSection : ProfileSection
+         public override LocalisableString Title => UsersStrings.ShowExtraMedalsTitle;
+ 
+         public override string Identifier => @"medals";
++
++        private readonly FillFlowContainer medalList;
++
++        public MedalsSection()
++        {
++            Child = medalList = new FillFlowContainer
++            {
++                RelativeSizeAxes = Axes.X,
++                AutoSizeAxes = Axes.Y,
++                Direction = FillDirection.Vertical,
++                Spacing = new Vector2(0, 8),
++            };
++
++            User.BindValueChanged(userChanged, true);
++        }
++
++        private void userChanged(ValueChangedEvent<UserProfileData?> user)
++        {
++            medalList.Clear();
++
++            foreach (APIUserAchievement achievement in user.NewValue?.User.Achievements ?? [])
++                medalList.Add(new MedalEntry(achievement));
++        }
++
++        private partial class MedalEntry : CompositeDrawable
++        {
++            public MedalEntry(APIUserAchievement achievement)
++            {
++                RelativeSizeAxes = Axes.X;
++                Height = 58;
++                Masking = true;
++                CornerRadius = 6;
++
++                InternalChildren = new Drawable[]
++                {
++                    new Box
++                    {
++                        RelativeSizeAxes = Axes.Both,
++                        Colour = Colour4.Black.Opacity(0.18f),
++                    },
++                    new Box
++                    {
++                        RelativeSizeAxes = Axes.Y,
++                        Width = 3,
++                        Colour = OsuColour.Gray(0.8f),
++                    },
++                    new FillFlowContainer
++                    {
++                        RelativeSizeAxes = Axes.X,
++                        AutoSizeAxes = Axes.Y,
++                        Padding = new MarginPadding { Horizontal = 14, Vertical = 9 },
++                        Direction = FillDirection.Vertical,
++                        Spacing = new Vector2(0, 2),
++                        Children = new Drawable[]
++                        {
++                            new OsuSpriteText
++                            {
++                                Text = string.IsNullOrEmpty(achievement.Name) ? $"achievement #{achievement.ID}" : achievement.Name,
++                                Font = OsuFont.GetFont(size: 15, weight: FontWeight.SemiBold),
++                            },
++                            new OsuSpriteText
++                            {
++                                Text = achievement.Description,
++                                Font = OsuFont.GetFont(size: 12),
++                                Colour = OsuColour.Gray(0.75f),
++                            },
++                        },
++                    },
++                };
++            }
++        }
+     }
+ }
+diff --git a/osu.Game/Overlays/UserProfileOverlay.cs b/osu.Game/Overlays/UserProfileOverlay.cs
+index edaa1bd..f51f144 100644
+--- a/osu.Game/Overlays/UserProfileOverlay.cs
++++ b/osu.Game/Overlays/UserProfileOverlay.cs
+@@ -117,7 +117,7 @@ private void fetchAndSetContent()
+                     //new AboutSection(),
+                     new RecentSection(),
+                     new RanksSection(),
+-                    //new MedalsSection(),
++                    new MedalsSection(),
+                     new HistoricalSection(),
+                     new BeatmapsSection(),
+                     new KudosuSection()
+diff --git a/osu.Game/Rulesets/Mods/Mod.cs b/osu.Game/Rulesets/Mods/Mod.cs
+index 5572adf..df12a77 100644
+--- a/osu.Game/Rulesets/Mods/Mod.cs
++++ b/osu.Game/Rulesets/Mods/Mod.cs
+@@ -114,7 +114,10 @@ protected virtual LocalisableString GetSettingTooltipText(IBindable bindable)
+         public virtual bool RequiresConfiguration => false;
+ 
+         [JsonIgnore]
+-        public virtual bool Ranked => false;
++        // zigcho accepts every playable mod and keeps non-vanilla combinations on
++        // their own leaderboards. Do not present an "unranked" warning for a score
++        // the connected server will actually store and rank in its namespace.
++        public virtual bool Ranked => true;
+ 
+         /// <summary>
+         /// The mods this mod cannot be enabled with.
+diff --git a/osu.Game/Rulesets/Mods/ModClassic.cs b/osu.Game/Rulesets/Mods/ModClassic.cs
+index 8c6474f..8b181f2 100644
+--- a/osu.Game/Rulesets/Mods/ModClassic.cs
++++ b/osu.Game/Rulesets/Mods/ModClassic.cs
+@@ -28,7 +28,7 @@ public abstract class ModClassic : Mod
+         ///  - Hit windows differ (https://github.com/ppy/osu/issues/11311).
+         ///  - Sliders always gives combo for slider end, even on miss (https://github.com/ppy/osu/issues/11769).
+         /// </summary>
+-        public sealed override bool Ranked => false;
++        public sealed override bool Ranked => true;
+ 
+         public sealed override bool ValidForFreestyleAsRequiredMod => false;
+     }
+diff --git a/osu.Game/Rulesets/Mods/ModDaycore.cs b/osu.Game/Rulesets/Mods/ModDaycore.cs
+index 70aeb40..b87c8b7 100644
+--- a/osu.Game/Rulesets/Mods/ModDaycore.cs
++++ b/osu.Game/Rulesets/Mods/ModDaycore.cs
+@@ -18,7 +18,7 @@ public abstract class ModDaycore : ModRateAdjust
+         public override IconUsage? Icon => OsuIcon.ModDaycore;
+         public override ModType Type => ModType.DifficultyReduction;
+         public override LocalisableString Description => "Whoaaaaa...";
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         [SettingSource("Speed decrease", "The actual decrease to apply", SettingControlType = typeof(MultiplierSettingsSlider))]
+         public override BindableNumber<double> SpeedChange { get; } = new BindableDouble(0.75)
+diff --git a/osu.Game/Rulesets/Mods/ModDoubleTime.cs b/osu.Game/Rulesets/Mods/ModDoubleTime.cs
+index 794be5c..7091592 100644
+--- a/osu.Game/Rulesets/Mods/ModDoubleTime.cs
++++ b/osu.Game/Rulesets/Mods/ModDoubleTime.cs
+@@ -19,7 +19,7 @@ public abstract class ModDoubleTime : ModRateAdjust
+         public override IconUsage? Icon => OsuIcon.ModDoubleTime;
+         public override ModType Type => ModType.DifficultyIncrease;
+         public override LocalisableString Description => "Zoooooooooom...";
+-        public override bool Ranked => SpeedChange.IsDefault;
++        public override bool Ranked => true;
+ 
+         [SettingSource("Speed increase", "The actual increase to apply", SettingControlType = typeof(MultiplierSettingsSlider))]
+         public override BindableNumber<double> SpeedChange { get; } = new BindableDouble(1.5)
+diff --git a/osu.Game/Rulesets/Mods/ModEasy.cs b/osu.Game/Rulesets/Mods/ModEasy.cs
+index 122caf5..4cc4917 100644
+--- a/osu.Game/Rulesets/Mods/ModEasy.cs
++++ b/osu.Game/Rulesets/Mods/ModEasy.cs
+@@ -15,7 +15,7 @@ public abstract class ModEasy : Mod, IApplicableToDifficulty
+         public override IconUsage? Icon => OsuIcon.ModEasy;
+         public override ModType Type => ModType.DifficultyReduction;
+         public override Type[] IncompatibleMods => new[] { typeof(ModHardRock), typeof(ModDifficultyAdjust) };
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+         public override bool ValidForFreestyleAsRequiredMod => true;
+ 
+         protected const float ADJUST_RATIO = 0.5f;
+diff --git a/osu.Game/Rulesets/Mods/ModFlashlight.cs b/osu.Game/Rulesets/Mods/ModFlashlight.cs
+index bebeedb..1ed3ddb 100644
+--- a/osu.Game/Rulesets/Mods/ModFlashlight.cs
++++ b/osu.Game/Rulesets/Mods/ModFlashlight.cs
+@@ -35,7 +35,7 @@ public abstract class ModFlashlight : Mod
+         public override IconUsage? Icon => OsuIcon.ModFlashlight;
+         public override ModType Type => ModType.DifficultyIncrease;
+         public override LocalisableString Description => "Restricted view area.";
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         [SettingSource("Flashlight size", "Multiplier applied to the default flashlight size.")]
+         public abstract BindableFloat SizeMultiplier { get; }
+diff --git a/osu.Game/Rulesets/Mods/ModHalfTime.cs b/osu.Game/Rulesets/Mods/ModHalfTime.cs
+index ae15ea5..4a40667 100644
+--- a/osu.Game/Rulesets/Mods/ModHalfTime.cs
++++ b/osu.Game/Rulesets/Mods/ModHalfTime.cs
+@@ -19,7 +19,7 @@ public abstract class ModHalfTime : ModRateAdjust
+         public override IconUsage? Icon => OsuIcon.ModHalfTime;
+         public override ModType Type => ModType.DifficultyReduction;
+         public override LocalisableString Description => "Less zoom...";
+-        public override bool Ranked => SpeedChange.IsDefault;
++        public override bool Ranked => true;
+ 
+         [SettingSource("Speed decrease", "The actual decrease to apply", SettingControlType = typeof(MultiplierSettingsSlider))]
+         public override BindableNumber<double> SpeedChange { get; } = new BindableDouble(0.75)
+diff --git a/osu.Game/Rulesets/Mods/ModHardRock.cs b/osu.Game/Rulesets/Mods/ModHardRock.cs
+index 713bfe0..a97dacd 100644
+--- a/osu.Game/Rulesets/Mods/ModHardRock.cs
++++ b/osu.Game/Rulesets/Mods/ModHardRock.cs
+@@ -17,7 +17,7 @@ public abstract class ModHardRock : Mod, IApplicableToDifficulty
+         public override ModType Type => ModType.DifficultyIncrease;
+         public override LocalisableString Description => "Everything just got a bit harder...";
+         public override Type[] IncompatibleMods => new[] { typeof(ModEasy), typeof(ModDifficultyAdjust) };
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+         public override bool ValidForFreestyleAsRequiredMod => true;
+ 
+         protected const float ADJUST_RATIO = 1.4f;
+diff --git a/osu.Game/Rulesets/Mods/ModHidden.cs b/osu.Game/Rulesets/Mods/ModHidden.cs
+index 2915cb9..8bbd58c 100644
+--- a/osu.Game/Rulesets/Mods/ModHidden.cs
++++ b/osu.Game/Rulesets/Mods/ModHidden.cs
+@@ -14,7 +14,7 @@ public abstract class ModHidden : ModWithVisibilityAdjustment, IApplicableToScor
+         public override string Acronym => "HD";
+         public override IconUsage? Icon => OsuIcon.ModHidden;
+         public override ModType Type => ModType.DifficultyIncrease;
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         public virtual void ApplyToScoreProcessor(ScoreProcessor scoreProcessor)
+         {
+diff --git a/osu.Game/Rulesets/Mods/ModNightcore.cs b/osu.Game/Rulesets/Mods/ModNightcore.cs
+index e142188..06606ad 100644
+--- a/osu.Game/Rulesets/Mods/ModNightcore.cs
++++ b/osu.Game/Rulesets/Mods/ModNightcore.cs
+@@ -28,7 +28,7 @@ public abstract class ModNightcore : ModRateAdjust
+         public override IconUsage? Icon => OsuIcon.ModNightcore;
+         public override ModType Type => ModType.DifficultyIncrease;
+         public override LocalisableString Description => "Uguuuuuuuu...";
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+ 
+         [SettingSource("Speed increase", "The actual increase to apply", SettingControlType = typeof(MultiplierSettingsSlider))]
+         public override BindableNumber<double> SpeedChange { get; } = new BindableDouble(1.5)
+diff --git a/osu.Game/Rulesets/Mods/ModNoFail.cs b/osu.Game/Rulesets/Mods/ModNoFail.cs
+index 2a195ad..59121aa 100644
+--- a/osu.Game/Rulesets/Mods/ModNoFail.cs
++++ b/osu.Game/Rulesets/Mods/ModNoFail.cs
+@@ -19,7 +19,7 @@ public abstract class ModNoFail : Mod, IApplicableFailOverride, IApplicableToHUD
+         public override ModType Type => ModType.DifficultyReduction;
+         public override LocalisableString Description => "You can't fail, no matter what.";
+         public override Type[] IncompatibleMods => new[] { typeof(ModFailCondition), typeof(ModCinema) };
+-        public override bool Ranked => UsesDefaultConfiguration;
++        public override bool Ranked => true;
+         public override bool ValidForFreestyleAsRequiredMod => true;
+ 
+         private readonly Bindable<bool> showHealthBar = new Bindable<bool>();
+diff --git a/osu.Game/Screens/Play/RoomSubmittingPlayer.cs b/osu.Game/Screens/Play/RoomSubmittingPlayer.cs
+index 4e4d35b..df1317b 100644
+--- a/osu.Game/Screens/Play/RoomSubmittingPlayer.cs
++++ b/osu.Game/Screens/Play/RoomSubmittingPlayer.cs
+@@ -48,7 +48,7 @@ protected RoomSubmittingPlayer(Room room, PlaylistItem playlistItem, PlayerConfi
+         protected override APIRequest<MultiplayerScore> CreateSubmissionRequest(Score score, long token)
+         {
+             Debug.Assert(Room.RoomID != null);
+-            return new SubmitRoomScoreRequest(score.ScoreInfo, token, Room.RoomID.Value, PlaylistItem.ID);
++            return new SubmitRoomScoreRequest(score, GameplayState.Beatmap, token, Room.RoomID.Value, PlaylistItem.ID);
+         }
+     }
+ }
+diff --git a/osu.Game/Screens/Play/SoloPlayer.cs b/osu.Game/Screens/Play/SoloPlayer.cs
+index ee891dd..2011cad 100644
+--- a/osu.Game/Screens/Play/SoloPlayer.cs
++++ b/osu.Game/Screens/Play/SoloPlayer.cs
+@@ -59,7 +59,7 @@ protected override APIRequest<MultiplayerScore> CreateSubmissionRequest(Score sc
+ 
+             Debug.Assert(beatmap.OnlineID > 0);
+ 
+-            return new SubmitSoloScoreRequest(score.ScoreInfo, token, beatmap.OnlineID);
++            return new SubmitSoloScoreRequest(score, GameplayState.Beatmap, token, beatmap.OnlineID);
+         }
+     }
+ }
+diff --git a/osu.Game/Screens/Play/SubmittingPlayer.cs b/osu.Game/Screens/Play/SubmittingPlayer.cs
+index c930783..5549095 100644
+--- a/osu.Game/Screens/Play/SubmittingPlayer.cs
++++ b/osu.Game/Screens/Play/SubmittingPlayer.cs
+@@ -17,6 +17,7 @@
+ using osu.Game.Online;
+ using osu.Game.Online.API;
+ using osu.Game.Online.Multiplayer;
++using osu.Game.Online.Notifications.WebSocket.Events;
+ using osu.Game.Online.Rooms;
+ using osu.Game.Online.Spectator;
+ using osu.Game.Overlays;
+@@ -54,6 +55,10 @@ public abstract partial class SubmittingPlayer : Player
+         [CanBeNull]
+         private INotificationOverlay notifications { get; set; }
+ 
++        [Resolved(canBeNull: true)]
++        [CanBeNull]
++        private MedalOverlay medalOverlay { get; set; }
++
+         private readonly object scoreSubmissionLock = new object();
+         private TaskCompletionSource<bool> scoreSubmissionSource;
+ 
+@@ -325,6 +330,9 @@ private Task submitScore(Score score)
+                 score.ScoreInfo.OnlineID = s.ID;
+                 score.ScoreInfo.Position = s.Position;
+ 
++                foreach (var unlock in s.AchievementUnlocks ?? Array.Empty<UserAchievementUnlock>())
++                    medalOverlay?.QueueUnlock(unlock);
++
+                 scoreSubmissionSource.SetResult(true);
+                 Logger.Log($"Score submission completed! (token:{token.Value} id:{s.ID})");
+             };
+diff --git a/osu.Game.Tests/PollingChatClientTest.cs b/osu.Game.Tests/PollingChatClientTest.cs
+new file mode 100644
+index 0000000..99b2466
+--- /dev/null
++++ b/osu.Game.Tests/PollingChatClientTest.cs
+@@ -0,0 +1,35 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using System.Threading.Tasks;
++using Moq;
++using NUnit.Framework;
++using osu.Game.Online.API;
++using osu.Game.Online.Chat;
++
++namespace osu.Game.Online.Tests
++{
++    [TestFixture]
++    public class PollingChatClientTest
++    {
++        [Test]
++        public async Task TestPresenceWaitsForLoginAndStartsPolling()
++        {
++            bool loggedIn = false;
++            var api = new Mock<IAPIProvider>();
++            api.SetupGet(provider => provider.IsLoggedIn).Returns(() => loggedIn);
++
++            using var client = new PollingChatClient(api.Object);
++            var presence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++            client.PresenceReceived += () => presence.TrySetResult();
++
++            client.RequestPresence();
++            await Task.Delay(100);
++            Assert.That(presence.Task.IsCompleted, Is.False);
++
++            loggedIn = true;
++            Assert.That(await Task.WhenAny(presence.Task, Task.Delay(5000)), Is.SameAs(presence.Task));
++            api.Verify(provider => provider.Queue(It.IsAny<APIRequest>()), Times.AtLeastOnce);
++        }
++    }
++}
+diff --git a/osu.Game.Tests/TrustedDomainOnlineStoreTest.cs b/osu.Game.Tests/TrustedDomainOnlineStoreTest.cs
+new file mode 100644
+index 0000000..e633a61
+--- /dev/null
++++ b/osu.Game.Tests/TrustedDomainOnlineStoreTest.cs
+@@ -0,0 +1,25 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using NUnit.Framework;
++
++namespace osu.Game.Online.Tests
++{
++    [TestFixture]
++    public class TrustedDomainOnlineStoreTest
++    {
++        [TestCase("https://kai.ovh", true)]
++        [TestCase("https://a.kai.ovh/3", true)]
++        [TestCase("https://assets.kai.ovh/beatmaps/1/covers/cover.jpg", true)]
++        [TestCase("https://assets.ppy.sh/menu-content.json", true)]
++        [TestCase("http://a.kai.ovh/3", false)]
++        [TestCase("https://kai.ovh.evil.test/3", false)]
++        [TestCase("https://notkai.ovh/3", false)]
++        [TestCase("data:image/png;base64,AAAA", false)]
++        [TestCase("/relative/resource.png", false)]
++        public void TestTrustedUrl(string url, bool expected)
++        {
++            Assert.That(TrustedDomainOnlineStore.IsTrustedUrl(url), Is.EqualTo(expected));
++        }
++    }
++}
+diff --git a/osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs b/osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs
+new file mode 100644
+index 0000000..638d463
+--- /dev/null
++++ b/osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs
+@@ -0,0 +1,50 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using NUnit.Framework;
++using osu.Game.Beatmaps;
++
++namespace osu.Game.Online.Leaderboards.Tests
++{
++    [TestFixture]
++    public class ZigchoLeaderboardAvailabilityTest
++    {
++        [TestCase(75, BeatmapOnlineStatus.None, true)]
++        [TestCase(75, BeatmapOnlineStatus.Pending, true)]
++        [TestCase(75, BeatmapOnlineStatus.Ranked, true)]
++        [TestCase(-1, BeatmapOnlineStatus.Ranked, false)]
++        [TestCase(0, BeatmapOnlineStatus.Loved, false)]
++        public void TestOnlineIdOwnsAvailability(int onlineId, BeatmapOnlineStatus status, bool expected)
++        {
++            var beatmap = new BeatmapInfo
++            {
++                OnlineID = onlineId,
++                Status = status,
++            };
++
++            Assert.That(ZigchoLeaderboardAvailability.IsAvailable(beatmap), Is.EqualTo(expected));
++        }
++
++        [Test]
++        public void TestNullBeatmapIsUnavailable()
++        {
++            Assert.That(ZigchoLeaderboardAvailability.IsAvailable(null), Is.False);
++        }
++
++        [TestCase(75, BeatmapOnlineStatus.None, true)]
++        [TestCase(75, BeatmapOnlineStatus.Pending, false)]
++        [TestCase(75, BeatmapOnlineStatus.Ranked, false)]
++        [TestCase(-1, BeatmapOnlineStatus.Ranked, true)]
++        [TestCase(0, BeatmapOnlineStatus.Loved, true)]
++        public void TestUnknownOrUnmappedBeatmapRequiresMetadataRefresh(int onlineId, BeatmapOnlineStatus status, bool expected)
++        {
++            var beatmap = new BeatmapInfo
++            {
++                OnlineID = onlineId,
++                Status = status,
++            };
++
++            Assert.That(ZigchoLeaderboardAvailability.RequiresMetadataRefresh(beatmap), Is.EqualTo(expected));
++        }
++    }
++}
+diff --git a/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
+new file mode 100644
+index 0000000..edcde30
+--- /dev/null
++++ b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
+@@ -0,0 +1,38 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using NUnit.Framework;
++using osu.Game.Online.API;
++
++namespace osu.Game.Online.Tests
++{
++    [TestFixture]
++    public class ZigchoRealtimeServicePolicyTest
++    {
++        private static EndpointConfiguration createEndpoints() => new EndpointConfiguration
++        {
++            RealtimeServicesAvailable = false,
++            MultiplayerServicesAvailable = true,
++            MultiplayerUrl = "https://spectator.kai.ovh/multiplayer",
++            SpectatorUrl = "https://spectator.kai.ovh/spectator",
++            MetadataUrl = "https://spectator.kai.ovh/metadata",
++        };
++
++        [Test]
++        public void TestOnlyMultiplayerHubIsEnabled()
++        {
++            var endpoints = createEndpoints();
++            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.MultiplayerUrl), Is.True);
++            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.SpectatorUrl), Is.False);
++            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.MetadataUrl), Is.False);
++        }
++
++        [Test]
++        public void TestFullRealtimeStillEnablesEveryHub()
++        {
++            var endpoints = createEndpoints();
++            endpoints.RealtimeServicesAvailable = true;
++            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.SpectatorUrl), Is.True);
++        }
++    }
++}
+diff --git a/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs b/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs
+new file mode 100644
+index 0000000..4816217
+--- /dev/null
++++ b/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs
+@@ -0,0 +1,15 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using System;
++
++namespace osu.Game.Online.API
++{
++    public static class ZigchoRealtimeServicePolicy
++    {
++        public static bool AllowsHub(EndpointConfiguration endpoints, string endpoint) =>
++            endpoints.RealtimeServicesAvailable
++            || (endpoints.MultiplayerServicesAvailable
++                && string.Equals(endpoint, endpoints.MultiplayerUrl, StringComparison.Ordinal));
++    }
++}
+diff --git a/osu.Game/Online/Chat/PollingChatClient.cs b/osu.Game/Online/Chat/PollingChatClient.cs
+new file mode 100644
+index 0000000..9810579
+--- /dev/null
++++ b/osu.Game/Online/Chat/PollingChatClient.cs
+@@ -0,0 +1,150 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using osu.Framework.Logging;
++using osu.Game.Online.API;
++
++namespace osu.Game.Online.Chat
++{
++    /// <summary>
++    /// Receives zigcho chat messages through the authenticated REST API while
++    /// the websocket notification service is unavailable.
++    /// </summary>
++    public sealed class PollingChatClient : IChatClient
++    {
++        public event Action<Channel>? ChannelJoined
++        {
++            add { }
++            remove { }
++        }
++
++        public event Action<Channel>? ChannelParted
++        {
++            add { }
++            remove { }
++        }
++        public event Action<List<Message>>? NewMessages;
++        public event Action? PresenceReceived;
++
++        private readonly IAPIProvider api;
++        private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
++        private long lastMessageId;
++        private int started;
++        private int presenceOnline;
++
++        public PollingChatClient(IAPIProvider api)
++        {
++            this.api = api;
++        }
++
++        public void RequestPresence()
++        {
++            if (api.IsLoggedIn && Interlocked.Exchange(ref presenceOnline, 1) == 0)
++                PresenceReceived?.Invoke();
++
++            if (Interlocked.Exchange(ref started, 1) == 0)
++                _ = Task.Run(poll, cancellation.Token);
++        }
++
++        private async Task poll()
++        {
++            while (!cancellation.IsCancellationRequested)
++            {
++                if (!api.IsLoggedIn)
++                {
++                    Interlocked.Exchange(ref presenceOnline, 0);
++                    Interlocked.Exchange(ref lastMessageId, 0);
++                    await delay(1000).ConfigureAwait(false);
++                    continue;
++                }
++
++                if (Interlocked.Exchange(ref presenceOnline, 1) == 0)
++                    PresenceReceived?.Invoke();
++
++                var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
++                var request = new PollChatMessagesRequest(Interlocked.Read(ref lastMessageId));
++                bool pollSucceeded = false;
++
++                request.Success += messages =>
++                {
++                    if (messages.Count > 0)
++                    {
++                        advanceCursor(messages.Where(message => message.Id.HasValue).Select(message => message.Id ?? 0).DefaultIfEmpty(0).Max());
++                        NewMessages?.Invoke(messages);
++                    }
++
++                    pollSucceeded = true;
++                    completion.TrySetResult(true);
++                };
++                request.Failure += exception =>
++                {
++                    Logger.Log($"Chat poll failed: {exception.Message}", LoggingTarget.Network);
++                    completion.TrySetResult(false);
++                };
++
++                api.Queue(request);
++
++                try
++                {
++                    Task completed = await Task.WhenAny(completion.Task, Task.Delay(10000, cancellation.Token)).ConfigureAwait(false);
++                    if (completed != completion.Task)
++                    {
++                        request.Cancel();
++                        Logger.Log("Chat poll timed out.", LoggingTarget.Network);
++                    }
++
++                    await delay(pollSucceeded ? 1000 : 5000).ConfigureAwait(false);
++                }
++                catch (OperationCanceledException)
++                {
++                    return;
++                }
++            }
++        }
++
++        private void advanceCursor(long value)
++        {
++            long current;
++            do
++            {
++                current = Interlocked.Read(ref lastMessageId);
++                if (value <= current)
++                    return;
++            }
++            while (Interlocked.CompareExchange(ref lastMessageId, value, current) != current);
++        }
++
++        private async Task delay(int milliseconds)
++        {
++            try
++            {
++                await Task.Delay(milliseconds, cancellation.Token).ConfigureAwait(false);
++            }
++            catch (OperationCanceledException)
++            {
++            }
++        }
++
++        public void Dispose()
++        {
++            cancellation.Cancel();
++        }
++
++        private sealed class PollChatMessagesRequest : APIRequest<List<Message>>
++        {
++            private readonly long since;
++
++            public PollChatMessagesRequest(long since)
++            {
++                this.since = since;
++            }
++
++            protected override string Target => $"chat/messages?since={since}";
++        }
++    }
++}
+diff --git a/osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs b/osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs
+new file mode 100644
+index 0000000..1cc0400
+--- /dev/null
++++ b/osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs
+@@ -0,0 +1,14 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using osu.Game.Beatmaps;
++
++namespace osu.Game.Online.Leaderboards
++{
++    public static class ZigchoLeaderboardAvailability
++    {
++        public static bool IsAvailable(IBeatmapInfo? beatmap) => beatmap?.OnlineID > 0;
++
++        public static bool RequiresMetadataRefresh(BeatmapInfo? beatmap) => beatmap == null || beatmap.OnlineID <= 0 || beatmap.Status == BeatmapOnlineStatus.None;
++    }
++}

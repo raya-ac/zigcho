@@ -142,6 +142,9 @@ pub const ScoreInput = struct {
     rank: ?[]const u8 = null,
     client_version: ?[]const u8 = null,
     namespace: Namespace,
+    achievement_stars: f64 = 0,
+    achievement_mods: u32 = 0,
+    achievement_perfect: bool = false,
 };
 
 pub fn parseScore(value: std.json.Value) !ScoreInput {
@@ -312,6 +315,7 @@ pub const ChatMessage = struct {
     sender_id: i32,
     sender_name: []const u8,
     sender_country: []const u8,
+    sender_privileges: u32,
     content: []const u8,
     is_action: bool,
     uuid: []const u8,
@@ -517,6 +521,40 @@ pub fn validChannelId(channel_id: i64) bool {
     return channel_id >= 1 and channel_id <= 4;
 }
 
+pub fn privateChannelId(other_user_id: i32) ?i64 {
+    if (other_user_id <= 0) return null;
+    return 1_000_000 + @as(i64, other_user_id);
+}
+
+pub fn privateChannelUser(channel_id: i64) ?i32 {
+    if (channel_id <= 1_000_000 or channel_id > 1_000_000 + std.math.maxInt(i32)) return null;
+    return @intCast(channel_id - 1_000_000);
+}
+
+pub fn directMessageTarget(buffer: []u8, first_user_id: i32, second_user_id: i32) ![]const u8 {
+    if (first_user_id <= 0 or second_user_id <= 0 or first_user_id == second_user_id) return error.InvalidDirectMessage;
+    const lower = @min(first_user_id, second_user_id);
+    const upper = @max(first_user_id, second_user_id);
+    return std.fmt.bufPrint(buffer, "@dm:{d}:{d}", .{ lower, upper });
+}
+
+pub fn directMessageOther(target: []const u8, viewer_id: i32) ?i32 {
+    if (!std.mem.startsWith(u8, target, "@dm:")) return null;
+    const pair = target["@dm:".len..];
+    const separator = std.mem.indexOfScalar(u8, pair, ':') orelse return null;
+    if (separator == 0 or std.mem.indexOfScalar(u8, pair[separator + 1 ..], ':') != null) return null;
+    const first = std.fmt.parseInt(i32, pair[0..separator], 10) catch return null;
+    const second = std.fmt.parseInt(i32, pair[separator + 1 ..], 10) catch return null;
+    if (first <= 0 or second <= 0 or first >= second) return null;
+    if (first == viewer_id) return second;
+    if (second == viewer_id) return first;
+    return null;
+}
+
+pub fn validAnyChannelId(channel_id: i64) bool {
+    return validChannelId(channel_id) or privateChannelUser(channel_id) != null;
+}
+
 pub fn channelName(channel_id: i64) ?[]const u8 {
     return switch (channel_id) {
         1 => "#osu",
@@ -555,6 +593,17 @@ pub fn writeChatChannel(writer: *std.Io.Writer, channel_id: i64, last_message_id
     try writer.writeAll(",\"message_length_limit\":2000}");
 }
 
+pub fn writePrivateChatChannel(writer: *std.Io.Writer, channel_id: i64, name: []const u8, last_message_id: ?i64, last_read_id: ?i64) !void {
+    if (privateChannelUser(channel_id) == null) return error.UnknownChannel;
+    try writer.print("{{\"channel_id\":{d},\"name\":", .{channel_id});
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeAll(",\"description\":\"private messages\",\"type\":5,\"last_message_id\":");
+    if (last_message_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+    try writer.writeAll(",\"last_read_id\":");
+    if (last_read_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+    try writer.writeAll(",\"message_length_limit\":2000}");
+}
+
 pub fn validMessageUuid(uuid: []const u8) bool {
     if (uuid.len != 36) return false;
     for (uuid, 0..) |char, index| {
@@ -574,7 +623,15 @@ pub fn writeChatMessage(writer: *std.Io.Writer, message: ChatMessage) !void {
     try std.json.Stringify.value(message.sender_name, .{}, writer);
     try writer.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":", .{message.sender_id});
     try std.json.Stringify.value(message.sender_country, .{}, writer);
-    try writer.writeAll(",\"is_active\":true},\"uuid\":");
+    try writer.writeAll(",\"profile_colour\":");
+    try std.json.Stringify.value(@import("user_json.zig").roleColour(message.sender_privileges), .{}, writer);
+    try writer.print(",\"is_active\":true,\"is_online\":true,\"is_supporter\":true,\"support_level\":{d},\"is_admin\":{s},\"is_gmt\":{s},\"is_bng\":{s},\"is_bot\":{s}}},\"uuid\":", .{
+        @as(u8, if (message.sender_privileges & (@as(u32, 1) << 5) != 0) 2 else 1),
+        if (message.sender_privileges & (@as(u32, 1) << 13) != 0) "true" else "false",
+        if (message.sender_privileges & ((@as(u32, 1) << 12) | (@as(u32, 1) << 13) | (@as(u32, 1) << 14)) != 0) "true" else "false",
+        if (message.sender_privileges & (@as(u32, 1) << 11) != 0) "true" else "false",
+        if (message.sender_id == 3) "true" else "false",
+    });
     try std.json.Stringify.value(message.uuid, .{}, writer);
     try writer.writeByte('}');
 }
@@ -590,7 +647,7 @@ pub fn parseChannelUserPath(path: []const u8) ?ChannelUserPath {
     if (user_text.len == 0 or std.mem.indexOfScalar(u8, user_text, '/') != null) return null;
     const channel_id = std.fmt.parseInt(i64, rest[0..marker_at], 10) catch return null;
     const user_id = std.fmt.parseInt(i32, user_text, 10) catch return null;
-    if (!validChannelId(channel_id) or user_id <= 0) return null;
+    if (!validAnyChannelId(channel_id) or user_id <= 0) return null;
     return .{ .channel_id = channel_id, .user_id = user_id };
 }
 
@@ -601,7 +658,7 @@ pub fn parseChannelMessagesPath(path: []const u8) ?ChannelMessagesPath {
     const id_text = path[prefix.len .. path.len - suffix.len];
     if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
     const channel_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
-    if (!validChannelId(channel_id)) return null;
+    if (!validAnyChannelId(channel_id)) return null;
     return .{ .channel_id = channel_id };
 }
 
@@ -611,7 +668,7 @@ pub fn parseChannelPath(path: []const u8) ?i64 {
     const id_text = path[prefix.len..];
     if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
     const channel_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
-    return if (validChannelId(channel_id)) channel_id else null;
+    return if (validAnyChannelId(channel_id)) channel_id else null;
 }
 
 pub fn parseChannelReadPath(path: []const u8) ?ChannelReadPath {
@@ -625,7 +682,7 @@ pub fn parseChannelReadPath(path: []const u8) ?ChannelReadPath {
     if (message_text.len == 0 or std.mem.indexOfScalar(u8, message_text, '/') != null) return null;
     const channel_id = std.fmt.parseInt(i64, rest[0..marker_at], 10) catch return null;
     const message_id = std.fmt.parseInt(i64, message_text, 10) catch return null;
-    if (!validChannelId(channel_id) or message_id <= 0) return null;
+    if (!validAnyChannelId(channel_id) or message_id <= 0) return null;
     return .{ .channel_id = channel_id, .message_id = message_id };
 }
 

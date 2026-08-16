@@ -8,6 +8,7 @@ const screenshot_contract = @import("screenshot.zig");
 const media_contract = @import("media_contract.zig");
 const site_replay = @import("site_replay.zig");
 const user_json = @import("user_json.zig");
+const achievements = @import("achievements.zig");
 pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -182,16 +183,14 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, "PRAGMA user_version", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         if (c.sqlite3_step(stmt) == c.SQLITE_ROW) version = c.sqlite3_column_int(stmt, 0);
         _ = c.sqlite3_finalize(stmt);
+        const needs_score_rebuild = version < 28;
         if (version < 2) try self.exec(@embedFile("migration_002.sql"));
         if (version < 3) try self.exec(@embedFile("migration_003.sql"));
         if (version < 4) try self.exec(@embedFile("migration_004.sql"));
         if (version < 5) try self.exec(@embedFile("migration_005.sql"));
         if (version < 6) try self.exec(@embedFile("migration_006.sql"));
         if (version < 7) try self.exec(@embedFile("migration_007.sql"));
-        if (version < 8) {
-            try self.rebuildScoreStats(true);
-            try self.exec(@embedFile("migration_008.sql"));
-        }
+        if (version < 8) try self.exec(@embedFile("migration_008.sql"));
         if (version < 9) try self.exec(@embedFile("migration_009.sql"));
         if (version < 10) {
             if (try self.hasAvatarColumn())
@@ -261,6 +260,13 @@ pub const Store = struct {
             else
                 try self.exec(@embedFile("migration_027.sql"));
         }
+        if (version < 28) {
+            if (try self.hasLazerDirectMessageColumns())
+                try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS direct_messages_sender_uuid ON direct_messages(from_id,client_uuid) WHERE client_uuid!=''; UPDATE custom_mods SET ranked=1; CREATE TABLE IF NOT EXISTS user_achievements(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,achievement_id INTEGER NOT NULL CHECK(achievement_id>0),score_source TEXT NOT NULL CHECK(score_source IN ('stable','lazer')),score_id INTEGER NOT NULL CHECK(score_id>0),achieved_at INTEGER NOT NULL DEFAULT (unixepoch()),PRIMARY KEY(user_id,achievement_id)); CREATE INDEX IF NOT EXISTS user_achievements_score ON user_achievements(score_source,score_id); PRAGMA user_version=28")
+            else
+                try self.exec(@embedFile("migration_028.sql"));
+        }
+        if (needs_score_rebuild) try self.rebuildScoreStats(true);
         try self.exec("INSERT OR IGNORE INTO chat_channels(name,topic,write_privileges) VALUES('#lazer','lazer chat',1)");
     }
 
@@ -295,6 +301,20 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('lazer_channel_reads','user_blocks')", -1, &table, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(table);
         return c.sqlite3_step(table) == c.SQLITE_ROW and c.sqlite3_column_int(table, 0) == 2;
+    }
+
+    fn hasLazerDirectMessageColumns(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(direct_messages)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var have_action = false;
+        var have_uuid = false;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const name = std.mem.span(c.sqlite3_column_text(stmt, 1));
+            if (std.mem.eql(u8, name, "is_action")) have_action = true;
+            if (std.mem.eql(u8, name, "client_uuid")) have_uuid = true;
+        }
+        return have_action and have_uuid;
     }
 
     fn hasSiteProfileSchema(self: *Store) !bool {
@@ -437,21 +457,24 @@ pub const Store = struct {
                 ") UPDATE scores SET best=1 WHERE id IN (SELECT id FROM ordered WHERE place=1);",
         );
         const internal_mode = "CASE WHEN (s.mods & 8192)!=0 THEN s.mode+8 WHEN (s.mods & 128)!=0 THEN s.mode+4 ELSE s.mode END";
+        const lazer_internal_mode = "CASE l.rank_namespace WHEN 'vanilla' THEN l.ruleset_id WHEN 'relax' THEN l.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END";
+        const lazer_hits = "coalesce(CAST(json_extract(l.statistics_json,'$.meh') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.ok') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.good') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.great') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.perfect') AS INTEGER),0)";
         const rebuild_sql = "UPDATE stats SET " ++
-            "total_score=coalesce((SELECT sum(s.score) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "plays=coalesce((SELECT count(*) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
+            "total_score=coalesce((SELECT sum(s.score) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT sum(coalesce(l.legacy_total_score,l.total_score)) FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
+            "plays=coalesce((SELECT count(*) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT count(*) FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
             "play_time=coalesce((SELECT sum(s.time_elapsed/1000) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN (1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)," ++
-            "max_combo=coalesce((SELECT max(s.max_combo) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND b.status>=3),0)," ++
-            "ranked_score=coalesce((SELECT sum(s.score) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND s.best=1 AND b.status IN (3,4)),0)," ++
-            "pp=0,accuracy=0";
+            "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN (1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT sum(" ++ lazer_hits ++ ") FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
+            "max_combo=max(coalesce((SELECT max(s.max_combo) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode AND s.passed=1 AND b.status>=3),0),coalesce((SELECT max(l.max_combo) FROM lazer_scores l JOIN beatmaps b ON b.id=l.beatmap_id WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode AND l.passed=1 AND b.status>=3),0))," ++
+            "ranked_score=0," ++
+            "pp=0,accuracy=0 WHERE user_id!=3 AND (EXISTS(SELECT 1 FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode) OR EXISTS(SELECT 1 FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode))";
         try self.exec(rebuild_sql);
 
         const StatsKey = struct { user_id: i32, mode: u8 };
         var keys: std.ArrayList(StatsKey) = .empty;
         defer keys.deinit(self.allocator);
         var keys_stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT user_id,mode FROM stats ORDER BY user_id,mode", -1, &keys_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        const keys_sql = "SELECT st.user_id,st.mode FROM stats st WHERE st.user_id!=3 AND (EXISTS(SELECT 1 FROM scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode) OR EXISTS(SELECT 1 FROM lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode)) ORDER BY st.user_id,st.mode";
+        if (c.sqlite3_prepare_v2(self.db, keys_sql, -1, &keys_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         while (c.sqlite3_step(keys_stmt) == c.SQLITE_ROW) {
             try keys.append(self.allocator, .{ .user_id = c.sqlite3_column_int(keys_stmt, 0), .mode = @intCast(c.sqlite3_column_int(keys_stmt, 1)) });
         }
@@ -465,33 +488,7 @@ pub const Store = struct {
                 else => continue,
             };
             const vanilla_mode: u8 = key.mode % 4;
-            var scores_stmt: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "SELECT s.pp,s.accuracy FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.passed=1 AND s.best=1 AND s.rank_namespace=?3 AND b.status IN (3,4) ORDER BY s.pp DESC,s.id ASC", -1, &scores_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-            _ = c.sqlite3_bind_int(scores_stmt, 1, key.user_id);
-            _ = c.sqlite3_bind_int(scores_stmt, 2, vanilla_mode);
-            _ = c.sqlite3_bind_text(scores_stmt, 3, namespace.ptr, @intCast(namespace.len), null);
-            var total_pp: f64 = 0;
-            var weighted_accuracy: f64 = 0;
-            var weight: f64 = 1;
-            var score_count: u32 = 0;
-            while (c.sqlite3_step(scores_stmt) == c.SQLITE_ROW) {
-                total_pp += c.sqlite3_column_double(scores_stmt, 0) * weight;
-                weighted_accuracy += c.sqlite3_column_double(scores_stmt, 1) * weight;
-                weight *= 0.95;
-                score_count += 1;
-            }
-            _ = c.sqlite3_finalize(scores_stmt);
-            if (score_count == 0) continue;
-            const bonus_pp = 416.6667 * (1.0 - std.math.pow(f64, 0.9994, @floatFromInt(score_count)));
-            const bonus_accuracy = 1.0 / (20.0 * (1.0 - std.math.pow(f64, 0.95, @floatFromInt(score_count))));
-            var update_stmt: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "UPDATE stats SET pp=?1,accuracy=?2 WHERE user_id=?3 AND mode=?4", -1, &update_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-            _ = c.sqlite3_bind_int64(update_stmt, 1, @intFromFloat(@round(total_pp + bonus_pp)));
-            _ = c.sqlite3_bind_double(update_stmt, 2, weighted_accuracy * bonus_accuracy);
-            _ = c.sqlite3_bind_int(update_stmt, 3, key.user_id);
-            _ = c.sqlite3_bind_int(update_stmt, 4, key.mode);
-            if (c.sqlite3_step(update_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-            _ = c.sqlite3_finalize(update_stmt);
+            try self.rebuildCombinedPerformanceLocked(key.user_id, vanilla_mode, key.mode, namespace);
         }
         if (own_transaction) try self.exec("COMMIT");
     }
@@ -1247,13 +1244,25 @@ pub const Store = struct {
     pub fn storeDirectMessage(self: *Store, from_id: i32, to_id: i32, message: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        var target_buffer: [64]u8 = undefined;
+        const target = try lazer.directMessageTarget(&target_buffer, from_id, to_id);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, from_id);
         _ = c.sqlite3_bind_int(stmt, 2, to_id);
         _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        _ = c.sqlite3_finalize(stmt);
+        stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO chat_messages(sender_id,target,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, from_id);
+        _ = c.sqlite3_bind_text(stmt, 2, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        try self.exec("COMMIT");
     }
 
     pub fn unreadDirectMessages(self: *Store, allocator: std.mem.Allocator, to_id: i32) ![]DirectMessage {
@@ -1329,7 +1338,7 @@ pub const Store = struct {
         const inserted = c.sqlite3_changes(self.db) != 0;
 
         var row: ?*c.sqlite3_stmt = null;
-        const row_sql = "SELECT m.id,m.target,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.sender_id=?1 AND m.client_uuid=?2";
+        const row_sql = "SELECT m.id,m.target,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.sender_id=?1 AND m.client_uuid=?2";
         if (c.sqlite3_prepare_v2(self.db, row_sql, -1, &row, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(row);
         _ = c.sqlite3_bind_int(row, 1, sender_id);
@@ -1347,12 +1356,164 @@ pub const Store = struct {
             .sender_id = sender_id,
             .sender_name = std.mem.span(c.sqlite3_column_text(row, 6)),
             .sender_country = std.mem.span(c.sqlite3_column_text(row, 7)),
+            .sender_privileges = @intCast(c.sqlite3_column_int64(row, 8)),
             .content = message,
             .is_action = is_action,
             .uuid = uuid,
             .timestamp = std.mem.span(c.sqlite3_column_text(row, 5)),
         });
         return .{ .json = try output.toOwnedSlice(), .inserted = inserted };
+    }
+
+    pub fn recordLazerDirectMessage(self: *Store, allocator: std.mem.Allocator, sender_id: i32, target_id: i32, message: []const u8, is_action: bool, uuid: []const u8) !LazerChatWrite {
+        const channel_id = lazer.privateChannelId(target_id) orelse return error.InvalidDirectMessage;
+        var target_buffer: [64]u8 = undefined;
+        const target = try lazer.directMessageTarget(&target_buffer, sender_id, target_id);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+
+        var insert: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO chat_messages(sender_id,target,message,is_action,client_uuid) VALUES(?1,?2,?3,?4,?5)", -1, &insert, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        _ = c.sqlite3_bind_int(insert, 1, sender_id);
+        _ = c.sqlite3_bind_text(insert, 2, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_text(insert, 3, message.ptr, @intCast(message.len), null);
+        _ = c.sqlite3_bind_int(insert, 4, @intFromBool(is_action));
+        _ = c.sqlite3_bind_text(insert, 5, uuid.ptr, @intCast(uuid.len), null);
+        if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        const inserted = c.sqlite3_changes(self.db) != 0;
+        _ = c.sqlite3_finalize(insert);
+
+        var row: ?*c.sqlite3_stmt = null;
+        const row_sql = "SELECT m.id,m.target,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.sender_id=?1 AND m.client_uuid=?2";
+        if (c.sqlite3_prepare_v2(self.db, row_sql, -1, &row, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(row);
+        _ = c.sqlite3_bind_int(row, 1, sender_id);
+        _ = c.sqlite3_bind_text(row, 2, uuid.ptr, @intCast(uuid.len), null);
+        if (c.sqlite3_step(row) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        if (!std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(row, 1)), target) or
+            !std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(row, 2)), message) or
+            (c.sqlite3_column_int(row, 3) != 0) != is_action) return error.ChatUuidConflict;
+
+        if (inserted) {
+            var direct: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message,is_action,client_uuid) VALUES(?1,?2,?3,?4,?5)", -1, &direct, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(direct);
+            _ = c.sqlite3_bind_int(direct, 1, sender_id);
+            _ = c.sqlite3_bind_int(direct, 2, target_id);
+            _ = c.sqlite3_bind_text(direct, 3, message.ptr, @intCast(message.len), null);
+            _ = c.sqlite3_bind_int(direct, 4, @intFromBool(is_action));
+            _ = c.sqlite3_bind_text(direct, 5, uuid.ptr, @intCast(uuid.len), null);
+            if (c.sqlite3_step(direct) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
+
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try lazer.writeChatMessage(&output.writer, .{
+            .id = c.sqlite3_column_int64(row, 0),
+            .channel_id = channel_id,
+            .sender_id = sender_id,
+            .sender_name = std.mem.span(c.sqlite3_column_text(row, 6)),
+            .sender_country = std.mem.span(c.sqlite3_column_text(row, 7)),
+            .sender_privileges = @intCast(c.sqlite3_column_int64(row, 8)),
+            .content = message,
+            .is_action = is_action,
+            .uuid = uuid,
+            .timestamp = std.mem.span(c.sqlite3_column_text(row, 5)),
+        });
+        try self.exec("COMMIT");
+        return .{ .json = try output.toOwnedSlice(), .inserted = inserted };
+    }
+
+    pub fn lazerDirectMessagesJson(self: *Store, allocator: std.mem.Allocator, viewer_id: i32, other_id: i32, since: i64, limit: u16) ![]u8 {
+        if (since < 0 or limit == 0 or limit > 100) return error.InvalidChatQuery;
+        const channel_id = lazer.privateChannelId(other_id) orelse return error.InvalidDirectMessage;
+        var target_buffer: [64]u8 = undefined;
+        const target = try lazer.directMessageTarget(&target_buffer, viewer_id, other_id);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql = if (since == 0)
+            "SELECT m.id,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM (SELECT * FROM chat_messages WHERE target=?1 ORDER BY id DESC LIMIT ?2) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
+        else
+            "SELECT m.id,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.target=?1 AND m.id>?2 AND u.restricted=0 ORDER BY m.id LIMIT ?3";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 2, if (since == 0) limit else since);
+        if (since != 0) _ = c.sqlite3_bind_int(stmt, 3, limit);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try lazer.writeChatMessage(&output.writer, .{
+                .id = c.sqlite3_column_int64(stmt, 0),
+                .channel_id = channel_id,
+                .sender_id = c.sqlite3_column_int(stmt, 1),
+                .sender_name = std.mem.span(c.sqlite3_column_text(stmt, 2)),
+                .sender_country = std.mem.span(c.sqlite3_column_text(stmt, 3)),
+                .sender_privileges = @intCast(c.sqlite3_column_int64(stmt, 8)),
+                .content = std.mem.span(c.sqlite3_column_text(stmt, 4)),
+                .is_action = c.sqlite3_column_int(stmt, 5) != 0,
+                .uuid = std.mem.span(c.sqlite3_column_text(stmt, 6)),
+                .timestamp = std.mem.span(c.sqlite3_column_text(stmt, 7)),
+            });
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
+    pub fn lazerAllMessagesJson(self: *Store, allocator: std.mem.Allocator, viewer_id: i32, since: i64, limit: u16) ![]u8 {
+        if (viewer_id <= 0 or since < 0 or limit == 0 or limit > 100) return error.InvalidChatQuery;
+        var low_pattern_buffer: [64]u8 = undefined;
+        var high_pattern_buffer: [64]u8 = undefined;
+        const low_pattern = try std.fmt.bufPrint(&low_pattern_buffer, "@dm:{d}:%", .{viewer_id});
+        const high_pattern = try std.fmt.bufPrint(&high_pattern_buffer, "@dm:%:{d}", .{viewer_id});
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const filter = "target IN('#osu','#announce','#lobby','#lazer') OR target LIKE ?1 OR target LIKE ?2";
+        const sql = if (since == 0)
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM (SELECT * FROM chat_messages WHERE " ++ filter ++ " ORDER BY id DESC LIMIT ?3) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
+        else
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE (" ++ filter ++ ") AND m.id>?3 AND u.restricted=0 ORDER BY m.id LIMIT ?4";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, low_pattern.ptr, @intCast(low_pattern.len), null);
+        _ = c.sqlite3_bind_text(stmt, 2, high_pattern.ptr, @intCast(high_pattern.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 3, if (since == 0) limit else since);
+        if (since != 0) _ = c.sqlite3_bind_int(stmt, 4, limit);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const message_target = std.mem.span(c.sqlite3_column_text(stmt, 1));
+            const message_channel_id = lazer.channelId(message_target) orelse private: {
+                const other_id = lazer.directMessageOther(message_target, viewer_id) orelse continue;
+                break :private lazer.privateChannelId(other_id).?;
+            };
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try lazer.writeChatMessage(&output.writer, .{
+                .id = c.sqlite3_column_int64(stmt, 0),
+                .channel_id = message_channel_id,
+                .sender_id = c.sqlite3_column_int(stmt, 2),
+                .sender_name = std.mem.span(c.sqlite3_column_text(stmt, 3)),
+                .sender_country = std.mem.span(c.sqlite3_column_text(stmt, 4)),
+                .sender_privileges = @intCast(c.sqlite3_column_int64(stmt, 9)),
+                .content = std.mem.span(c.sqlite3_column_text(stmt, 5)),
+                .is_action = c.sqlite3_column_int(stmt, 6) != 0,
+                .uuid = std.mem.span(c.sqlite3_column_text(stmt, 7)),
+                .timestamp = std.mem.span(c.sqlite3_column_text(stmt, 8)),
+            });
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
     }
 
     pub fn lazerChatMessagesJson(self: *Store, allocator: std.mem.Allocator, channel_id: ?i64, since: i64, limit: u16) ![]u8 {
@@ -1362,13 +1523,13 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
 
         const sql = if (target != null and since == 0)
-            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch') FROM (SELECT * FROM chat_messages WHERE target=?1 ORDER BY id DESC LIMIT ?2) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM (SELECT * FROM chat_messages WHERE target=?1 ORDER BY id DESC LIMIT ?2) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
         else if (target != null)
-            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch') FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.target=?1 AND m.id>?2 AND u.restricted=0 ORDER BY m.id LIMIT ?3"
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.target=?1 AND m.id>?2 AND u.restricted=0 ORDER BY m.id LIMIT ?3"
         else if (since == 0)
-            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch') FROM (SELECT * FROM chat_messages WHERE target IN('#osu','#announce','#lobby','#lazer') ORDER BY id DESC LIMIT ?1) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM (SELECT * FROM chat_messages WHERE target IN('#osu','#announce','#lobby','#lazer') ORDER BY id DESC LIMIT ?1) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
         else
-            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch') FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.target IN('#osu','#announce','#lobby','#lazer') AND m.id>?1 AND u.restricted=0 ORDER BY m.id LIMIT ?2";
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.target IN('#osu','#announce','#lobby','#lazer') AND m.id>?1 AND u.restricted=0 ORDER BY m.id LIMIT ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -1401,6 +1562,7 @@ pub const Store = struct {
                 .sender_id = c.sqlite3_column_int(stmt, 2),
                 .sender_name = std.mem.span(c.sqlite3_column_text(stmt, 3)),
                 .sender_country = std.mem.span(c.sqlite3_column_text(stmt, 4)),
+                .sender_privileges = @intCast(c.sqlite3_column_int64(stmt, 9)),
                 .content = std.mem.span(c.sqlite3_column_text(stmt, 5)),
                 .is_action = c.sqlite3_column_int(stmt, 6) != 0,
                 .uuid = std.mem.span(c.sqlite3_column_text(stmt, 7)),
@@ -2173,26 +2335,28 @@ pub const Store = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var stmt: ?*c.sqlite3_stmt = null;
-        const stable_scorev2_sql =
+        const stable_sql =
             "WITH source_scores AS (" ++
-            "SELECT s.user_id,s.id score_id,s.score total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.best,b.status,b.id beatmap_id " ++
+            "SELECT s.user_id,s.id score_id,s.score total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,b.id beatmap_id " ++
             "FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.mode=?1 AND s.rank_namespace=?2)," ++
-            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM source_scores WHERE passed=1 AND best=1 AND status IN(3,4))," ++
+            "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
+            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*pow(0.95,performance_index))+416.6667*(1-pow(0.9994,count(*)))) pp,sum(accuracy*pow(0.95,performance_index))/(20*(1-pow(0.95,count(*)))) accuracy FROM ranked GROUP BY user_id)," ++
-            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce(sum(CASE WHEN passed=1 AND best=1 AND status IN(3,4) THEN total_score ELSE 0 END),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id) " ++
+            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce((SELECT sum(r.total_score) FROM ranked r WHERE r.user_id=source_scores.user_id),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id) " ++
             "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0 ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET ?3";
         const lazer_sql =
             "WITH source_scores AS (" ++
-            "SELECT s.user_id,s.id score_id,s.total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.best,b.status,s.beatmap_id " ++
+            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
             "FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?1 AND s.rank_namespace=?2)," ++
-            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM source_scores WHERE passed=1 AND best=1 AND status IN(3,4))," ++
+            "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
+            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*pow(0.95,performance_index))+416.6667*(1-pow(0.9994,count(*)))) pp,sum(accuracy*pow(0.95,performance_index))/(20*(1-pow(0.95,count(*)))) accuracy FROM ranked GROUP BY user_id)," ++
-            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce(sum(CASE WHEN passed=1 AND best=1 AND status IN(3,4) THEN total_score ELSE 0 END),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id) " ++
+            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce((SELECT sum(r.total_score) FROM ranked r WHERE r.user_id=source_scores.user_id),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id) " ++
             "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0 ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET ?3";
         const sql: [*:0]const u8 = switch (source) {
             .all => "SELECT row_number() OVER(ORDER BY s.pp DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.pp,s.accuracy,s.plays,s.ranked_score,s.total_score,s.max_combo FROM stats s JOIN users u ON u.id=s.user_id WHERE s.mode=?1 AND u.id!=3 AND u.restricted=0 AND s.plays>0 ORDER BY s.pp DESC,u.id ASC LIMIT 100 OFFSET ?2",
+            .stable, .scorev2 => stable_sql,
             .lazer => lazer_sql,
-            .scorev2 => stable_scorev2_sql,
         };
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -2337,24 +2501,26 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM stats r JOIN users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND ru.restricted=0 AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM stats s WHERE s.user_id=?1 ORDER BY s.mode", -1, &stats, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stats);
         _ = c.sqlite3_bind_int(stats, 1, user_id);
-        const stable_scorev2_stats_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,s.score total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.best,b.status,b.id beatmap_id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.mode=?2 AND s.rank_namespace=?3)," ++
-            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM source_scores WHERE passed=1 AND best=1 AND status IN(3,4))," ++
+        const stable_stats_sql =
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,s.score total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,b.id beatmap_id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.mode=?2 AND s.rank_namespace=?3)," ++
+            "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
+            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*pow(0.95,performance_index))+416.6667*(1-pow(0.9994,count(*)))) pp,sum(accuracy*pow(0.95,performance_index))/(20*(1-pow(0.95,count(*)))) accuracy FROM ranked GROUP BY user_id)," ++
-            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce(sum(CASE WHEN passed=1 AND best=1 AND status IN(3,4) THEN total_score ELSE 0 END),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id)," ++
+            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce((SELECT sum(r.total_score) FROM ranked r WHERE r.user_id=source_scores.user_id),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id)," ++
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,accuracy,max_combo,global_rank FROM ordered WHERE user_id=?1";
         const lazer_stats_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,s.total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.best,b.status,s.beatmap_id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?2 AND s.rank_namespace=?3)," ++
-            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM source_scores WHERE passed=1 AND best=1 AND status IN(3,4))," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?2 AND s.rank_namespace=?3)," ++
+            "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
+            "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*pow(0.95,performance_index))+416.6667*(1-pow(0.9994,count(*)))) pp,sum(accuracy*pow(0.95,performance_index))/(20*(1-pow(0.95,count(*)))) accuracy FROM ranked GROUP BY user_id)," ++
-            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce(sum(CASE WHEN passed=1 AND best=1 AND status IN(3,4) THEN total_score ELSE 0 END),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id)," ++
+            "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce((SELECT sum(r.total_score) FROM ranked r WHERE r.user_id=source_scores.user_id),0) ranked_score,coalesce(max(CASE WHEN passed=1 AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id)," ++
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,accuracy,max_combo,global_rank FROM ordered WHERE user_id=?1";
         const selected_stats_sql: [*:0]const u8 = switch (source) {
             .all => "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM stats r JOIN users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND ru.restricted=0 AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM stats s WHERE s.user_id=?1 AND s.mode=?2 AND s.plays>0",
+            .stable, .scorev2 => stable_stats_sql,
             .lazer => lazer_stats_sql,
-            .scorev2 => stable_scorev2_stats_sql,
         };
         var selected_stats: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, selected_stats_sql, -1, &selected_stats, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -2362,20 +2528,20 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(selected_stats, 1, user_id);
         _ = c.sqlite3_bind_int(selected_stats, 2, score_mode);
         if (source != .all) _ = c.sqlite3_bind_text(selected_stats, 3, namespace.ptr, @intCast(namespace.len), null);
-        const stable_columns = "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL,length(s.replay)>0 FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 ";
-        const lazer_columns = "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json,length(s.replay)>0 FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id ";
+        const stable_columns = "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id map_id,b.artist,b.title,b.version,b.status,'stable',NULL,length(s.replay)>0 FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 ";
+        const lazer_columns = "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id map_id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json,length(s.replay)>0 FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id ";
         const pinned_sql: [:0]const u8 = switch (source) {
-            .all, .scorev2 => stable_columns ++ "JOIN score_pins p ON p.score_id=s.id AND p.user_id=s.user_id WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 ORDER BY p.pinned_at DESC,p.score_id DESC LIMIT 3",
+            .all, .stable, .scorev2 => stable_columns ++ "JOIN score_pins p ON p.score_id=s.id AND p.user_id=s.user_id WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 ORDER BY p.pinned_at DESC,p.score_id DESC LIMIT 3",
             .lazer => stable_columns ++ "WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND 0",
         };
         const top_sql: [:0]const u8 = switch (source) {
             .all => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,beatmap_key) AS (" ++
-                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL,length(s.replay)>0,b.id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND s.best=1 AND b.status IN(3,4) UNION ALL " ++
-                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json,length(s.replay)>0,b.id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND s.best=1 AND b.status IN(3,4))," ++
+                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL,length(s.replay)>0,b.id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4) UNION ALL " ++
+                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json,length(s.replay)>0,b.id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4))," ++
                 "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY pp DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) map_place FROM candidates) " ++
                 "SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_key ASC,id ASC LIMIT 100",
-            .lazer => lazer_columns ++ "WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND s.best=1 AND b.status IN(3,4) ORDER BY s.pp DESC,s.id ASC LIMIT 100",
-            .scorev2 => stable_columns ++ "WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND s.best=1 AND b.status IN(3,4) ORDER BY s.pp DESC,s.id ASC LIMIT 100",
+            .stable, .scorev2 => "WITH candidates AS (" ++ stable_columns ++ "WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4)), ranked AS (SELECT *,row_number() OVER(PARTITION BY map_id ORDER BY pp DESC,id ASC) map_place FROM candidates) SELECT * FROM ranked WHERE map_place=1 ORDER BY pp DESC,map_id ASC,id ASC LIMIT 100",
+            .lazer => "WITH candidates AS (" ++ lazer_columns ++ "WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4)), ranked AS (SELECT *,row_number() OVER(PARTITION BY map_id ORDER BY pp DESC,id ASC) map_place FROM candidates) SELECT * FROM ranked WHERE map_place=1 ORDER BY pp DESC,map_id ASC,id ASC LIMIT 100",
         };
         const recent_sql: [:0]const u8 = switch (source) {
             .all => "WITH recent_scores(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay) AS (" ++
@@ -2383,7 +2549,7 @@ pub const Store = struct {
                 "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json,length(s.replay)>0 FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3) " ++
                 "SELECT * FROM recent_scores ORDER BY submitted_at DESC,client ASC,id DESC LIMIT 20",
             .lazer => lazer_columns ++ "WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 ORDER BY s.id DESC LIMIT 20",
-            .scorev2 => stable_columns ++ "WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 ORDER BY s.id DESC LIMIT 20",
+            .stable, .scorev2 => stable_columns ++ "WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 ORDER BY s.id DESC LIMIT 20",
         };
         const pinned = try self.prepareSiteScores(pinned_sql, user_id, score_mode, namespace);
         defer _ = c.sqlite3_finalize(pinned);
@@ -2432,6 +2598,8 @@ pub const Store = struct {
         try writeSiteScores(&output.writer, top, true);
         try output.writer.writeAll(",\"recent_scores\":");
         if (show_recent_scores) try writeSiteScores(&output.writer, recent, false) else try output.writer.writeAll("[]");
+        try output.writer.writeAll(",\"achievements\":");
+        try self.writeUserAchievementsLocked(&output.writer, user_id, true);
         try output.writer.writeByte('}');
         var list = output.toArrayList();
         return try list.toOwnedSlice(allocator);
@@ -2449,7 +2617,7 @@ pub const Store = struct {
         if (c.sqlite3_step(map) != c.SQLITE_ROW or c.sqlite3_column_int(map, 0) != score_mode) return null;
         const sql =
             "WITH candidates(id,user_id,name,country,privileges,total_score,pp,accuracy,max_combo,mods,mode,rank_namespace,submitted_at,client,mods_json,has_replay) AS (" ++
-            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.submitted_at,'stable',NULL,length(s.replay)>0 FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN users u ON u.id=s.user_id WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='scorev2') UNION ALL " ++
+            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.submitted_at,'stable',NULL,length(s.replay)>0 FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN users u ON u.id=s.user_id WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='stable' OR ?3='scorev2') UNION ALL " ++
             "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.submitted_at,'lazer',s.mods_json,length(s.replay)>0 FROM lazer_scores s JOIN users u ON u.id=s.user_id WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='lazer'))," ++
             "per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN ?5=1 THEN pp ELSE total_score END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN ?5=1 THEN pp ELSE total_score END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) position FROM per_user WHERE user_place=1) " ++
@@ -2593,24 +2761,55 @@ pub const Store = struct {
             }
         }
         if (!allowed) return null;
+        const user_id = c.sqlite3_column_int(stmt, 0);
         const name = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
         errdefer allocator.free(name);
         const safe = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+        errdefer allocator.free(safe);
         const cc = std.mem.span(c.sqlite3_column_text(stmt, 3));
-        return .{ .id = c.sqlite3_column_int(stmt, 0), .name = name, .safe_name = safe, .country = .{ cc[0], cc[1] }, .privileges = @intCast(c.sqlite3_column_int64(stmt, 4)), .silence_end = c.sqlite3_column_int64(stmt, 5), .restricted = c.sqlite3_column_int(stmt, 6) != 0 };
+        const user: domain.User = .{ .id = user_id, .name = name, .safe_name = safe, .country = .{ cc[0], cc[1] }, .privileges = @intCast(c.sqlite3_column_int64(stmt, 4)), .silence_end = c.sqlite3_column_int64(stmt, 5), .restricted = c.sqlite3_column_int(stmt, 6) != 0 };
+        _ = c.sqlite3_finalize(stmt);
+        stmt = null;
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        var touch: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE oauth_tokens SET last_used_at=?1 WHERE token_hash=?2 AND (last_used_at IS NULL OR last_used_at<?3)", -1, &touch, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(touch);
+        _ = c.sqlite3_bind_int64(touch, 1, now);
+        _ = c.sqlite3_bind_blob(touch, 2, &digest, digest.len, null);
+        _ = c.sqlite3_bind_int64(touch, 3, now - 30);
+        if (c.sqlite3_step(touch) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return user;
+    }
+
+    pub fn recentOauthUserIds(self: *Store, allocator: std.mem.Allocator, cutoff: i64) ![]i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT DISTINCT t.user_id FROM oauth_tokens t JOIN users u ON u.id=t.user_id WHERE t.last_used_at>=?1 AND t.revoked_at IS NULL AND t.expires_at>unixepoch() AND u.restricted=0 ORDER BY t.user_id";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, cutoff);
+        var ids: std.ArrayList(i32) = .empty;
+        errdefer ids.deinit(allocator);
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try ids.append(allocator, c.sqlite3_column_int(stmt, 0)),
+            c.SQLITE_DONE => break,
+            else => return error.DatabaseQueryFailed,
+        };
+        return ids.toOwnedSlice(allocator);
     }
 
     pub fn statsForUser(self: *Store, user_id: i32, mode: u8) !?domain.Stats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(1)+1 FROM stats r JOIN users u ON u.id=r.user_id WHERE r.mode=s.mode AND u.restricted=0 AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM stats s WHERE s.user_id=?1 AND s.mode=?2";
+        const sql = "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(1)+1 FROM stats r JOIN users u ON u.id=r.user_id WHERE r.mode=s.mode AND u.restricted=0 AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))),(SELECT count(1)+1 FROM stats r JOIN users u ON u.id=r.user_id WHERE r.mode=s.mode AND u.restricted=0 AND u.country=me.country AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM stats s JOIN users me ON me.id=s.user_id WHERE s.user_id=?1 AND s.mode=?2";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
         _ = c.sqlite3_bind_int(stmt, 2, mode);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        return .{
+        var stats: domain.Stats = .{
             .mode = @enumFromInt(mode % 4),
             .ranked_score = c.sqlite3_column_int64(stmt, 0),
             .total_score = c.sqlite3_column_int64(stmt, 1),
@@ -2621,7 +2820,23 @@ pub const Store = struct {
             .accuracy = c.sqlite3_column_double(stmt, 6),
             .max_combo = c.sqlite3_column_int(stmt, 7),
             .global_rank = c.sqlite3_column_int(stmt, 8),
+            .country_rank = c.sqlite3_column_int(stmt, 9),
         };
+        var stable: ?*c.sqlite3_stmt = null;
+        const stable_sql = "SELECT s.mods,s.accuracy,s.n300,s.n100,s.n50,s.nmiss FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4)";
+        if (c.sqlite3_prepare_v2(self.db, stable_sql, -1, &stable, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stable);
+        _ = c.sqlite3_bind_int(stable, 1, user_id);
+        _ = c.sqlite3_bind_int(stable, 2, mode);
+        while (c.sqlite3_step(stable) == c.SQLITE_ROW) stats.addGrade(stableGrade(mode, c.sqlite3_column_int(stable, 0), c.sqlite3_column_double(stable, 1), c.sqlite3_column_int(stable, 2), c.sqlite3_column_int(stable, 3), c.sqlite3_column_int(stable, 4), c.sqlite3_column_int(stable, 5)));
+        var modern: ?*c.sqlite3_stmt = null;
+        const modern_sql = "SELECT s.rank FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4)";
+        if (c.sqlite3_prepare_v2(self.db, modern_sql, -1, &modern, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(modern);
+        _ = c.sqlite3_bind_int(modern, 1, user_id);
+        _ = c.sqlite3_bind_int(modern, 2, mode);
+        while (c.sqlite3_step(modern) == c.SQLITE_ROW) stats.addGrade(std.mem.span(c.sqlite3_column_text(modern, 0)));
+        return stats;
     }
 
     pub fn revokeToken(self: *Store, token: []const u8) !bool {
@@ -2644,9 +2859,10 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
         const sql =
             "SELECT " ++
-            "(SELECT count(*) FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4))," ++
-            "(SELECT count(*) FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM lazer_scores o JOIN users ou ON ou.id=o.user_id WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))))," ++
-            "(SELECT count(*) FROM lazer_scores WHERE user_id=?1 AND ruleset_id=?2)";
+            "(SELECT count(*) FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4))+(SELECT count(*) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4))," ++
+            "(SELECT count(*) FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM lazer_scores o JOIN users ou ON ou.id=o.user_id WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))))+(SELECT count(*) FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM scores o JOIN users ou ON ou.id=o.user_id WHERE o.map_md5=s.map_md5 AND o.mode=s.mode AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND (o.score>s.score OR (o.score=s.score AND o.id<s.id))))," ++
+            "(SELECT count(*) FROM lazer_scores WHERE user_id=?1 AND ruleset_id=?2)+(SELECT count(*) FROM scores WHERE user_id=?1 AND mode=?2)," ++
+            "(SELECT count(*) FROM score_pins p JOIN scores s ON s.id=p.score_id WHERE p.user_id=?1 AND s.mode=?2)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -2657,25 +2873,44 @@ pub const Store = struct {
             .best = c.sqlite3_column_int(stmt, 0),
             .firsts = c.sqlite3_column_int(stmt, 1),
             .recent = c.sqlite3_column_int(stmt, 2),
+            .pinned = c.sqlite3_column_int(stmt, 3),
         };
     }
 
     pub fn lazerUserScoresJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, ruleset_id: u8, kind: lazer.UserScoreKind, offset: u16, limit: u8) ![]u8 {
         if (limit == 0 or limit > 100) return error.InvalidScoreLimit;
-        if (kind == .pinned) return allocator.dupe(u8, "[]");
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const columns =
-            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score),s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch'),b.status,b.set_id,b.md5,b.mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,length(s.replay)>0 " ++
-            "FROM lazer_scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 ";
-        const sql = switch (kind) {
-            .best => columns ++ "AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) ORDER BY s.pp DESC,s.id ASC LIMIT ?3 OFFSET ?4",
-            .firsts => columns ++ "AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM lazer_scores o JOIN users ou ON ou.id=o.user_id WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))) ORDER BY s.submitted_at DESC,s.id DESC LIMIT ?3 OFFSET ?4",
-            .recent => columns ++ "ORDER BY s.submitted_at DESC,s.id DESC LIMIT ?3 OFFSET ?4",
-            .pinned => unreachable,
+        const filters = switch (kind) {
+            .best => .{
+                "AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4)",
+                "AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4)",
+                "pp DESC,submitted_epoch DESC,id DESC",
+            },
+            .firsts => .{
+                "AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM lazer_scores o JOIN users ou ON ou.id=o.user_id WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id)))",
+                "AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND b.status IN(3,4) AND NOT EXISTS(SELECT 1 FROM scores o JOIN users ou ON ou.id=o.user_id WHERE o.map_md5=s.map_md5 AND o.mode=s.mode AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND (o.score>s.score OR (o.score=s.score AND o.id<s.id)))",
+                "submitted_epoch DESC,id DESC",
+            },
+            .recent => .{ "", "", "submitted_epoch DESC,id DESC" },
+            .pinned => .{
+                "AND 0",
+                "AND EXISTS(SELECT 1 FROM score_pins p WHERE p.user_id=s.user_id AND p.score_id=s.id)",
+                "submitted_epoch DESC,id DESC",
+            },
         };
+        const sql = try std.fmt.allocPrint(allocator,
+            \\SELECT * FROM (
+            \\SELECT 'lazer' source,s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,length(s.replay)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,0 perfect
+            \\FROM lazer_scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 {s}
+            \\UNION ALL
+            \\SELECT 'stable' source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{{}}' statistics_json,'{{}}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect
+            \\FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 {s}
+            \\) ORDER BY {s} LIMIT ?3 OFFSET ?4
+        , .{ filters[0], filters[1], filters[2] });
+        defer allocator.free(sql);
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
         _ = c.sqlite3_bind_int(stmt, 2, ruleset_id);
@@ -2689,40 +2924,49 @@ pub const Store = struct {
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             if (written != 0) try output.writer.writeByte(',');
             written += 1;
-            const status = c.sqlite3_column_int(stmt, 18);
-            const namespace_name = std.mem.span(c.sqlite3_column_text(stmt, 27));
+            const stable = std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)), "stable");
+            const status = c.sqlite3_column_int(stmt, 20);
+            const namespace_name = std.mem.span(c.sqlite3_column_text(stmt, 29));
+            var mods: std.Io.Writer.Allocating = .init(allocator);
+            defer mods.deinit();
+            var statistics: std.Io.Writer.Allocating = .init(allocator);
+            defer statistics.deinit();
+            if (stable) {
+                try stable_mods.writeLazerJson(&mods.writer, c.sqlite3_column_int(stmt, 31), true);
+                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, c.sqlite3_column_int(stmt, 32), c.sqlite3_column_int(stmt, 33), c.sqlite3_column_int(stmt, 34), c.sqlite3_column_int(stmt, 35), c.sqlite3_column_int(stmt, 36), c.sqlite3_column_int(stmt, 37));
+            }
             try lazer.writeLeaderboardScore(&output.writer, .{
-                .id = c.sqlite3_column_int64(stmt, 0),
-                .user_id = c.sqlite3_column_int(stmt, 1),
-                .username = std.mem.span(c.sqlite3_column_text(stmt, 2)),
-                .country = std.mem.span(c.sqlite3_column_text(stmt, 3)),
-                .beatmap_id = c.sqlite3_column_int(stmt, 4),
-                .ruleset_id = c.sqlite3_column_int(stmt, 5),
-                .total_score = c.sqlite3_column_int64(stmt, 6),
-                .total_score_without_mods = c.sqlite3_column_int64(stmt, 7),
-                .pp = c.sqlite3_column_double(stmt, 8),
-                .accuracy = c.sqlite3_column_double(stmt, 9),
-                .max_combo = c.sqlite3_column_int(stmt, 10),
-                .passed = c.sqlite3_column_int(stmt, 11) != 0,
-                .rank = std.mem.span(c.sqlite3_column_text(stmt, 12)),
-                .mods_json = std.mem.span(c.sqlite3_column_text(stmt, 13)),
-                .statistics_json = std.mem.span(c.sqlite3_column_text(stmt, 14)),
-                .maximum_statistics_json = std.mem.span(c.sqlite3_column_text(stmt, 15)),
-                .pauses_json = std.mem.span(c.sqlite3_column_text(stmt, 16)),
-                .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 17)),
+                .id = c.sqlite3_column_int64(stmt, 1),
+                .user_id = c.sqlite3_column_int(stmt, 2),
+                .username = std.mem.span(c.sqlite3_column_text(stmt, 3)),
+                .country = std.mem.span(c.sqlite3_column_text(stmt, 4)),
+                .beatmap_id = c.sqlite3_column_int(stmt, 5),
+                .ruleset_id = c.sqlite3_column_int(stmt, 6),
+                .total_score = c.sqlite3_column_int64(stmt, 7),
+                .total_score_without_mods = c.sqlite3_column_int64(stmt, 8),
+                .pp = c.sqlite3_column_double(stmt, 9),
+                .accuracy = c.sqlite3_column_double(stmt, 10),
+                .max_combo = c.sqlite3_column_int(stmt, 11),
+                .passed = c.sqlite3_column_int(stmt, 12) != 0,
+                .rank = if (stable) stableGrade(ruleset_id, c.sqlite3_column_int(stmt, 31), c.sqlite3_column_double(stmt, 10), c.sqlite3_column_int(stmt, 32), c.sqlite3_column_int(stmt, 33), c.sqlite3_column_int(stmt, 34), c.sqlite3_column_int(stmt, 37)) else std.mem.span(c.sqlite3_column_text(stmt, 13)),
+                .mods_json = if (stable) mods.written() else std.mem.span(c.sqlite3_column_text(stmt, 14)),
+                .statistics_json = if (stable) statistics.written() else std.mem.span(c.sqlite3_column_text(stmt, 15)),
+                .maximum_statistics_json = std.mem.span(c.sqlite3_column_text(stmt, 16)),
+                .pauses_json = std.mem.span(c.sqlite3_column_text(stmt, 17)),
+                .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 18)),
                 .ranked = (status == 3 or status == 4) and std.mem.eql(u8, namespace_name, "vanilla"),
-                .has_replay = c.sqlite3_column_int(stmt, 28) != 0,
+                .has_replay = c.sqlite3_column_int(stmt, 30) != 0,
                 .beatmap = .{
-                    .id = c.sqlite3_column_int(stmt, 4),
-                    .set_id = c.sqlite3_column_int(stmt, 19),
+                    .id = c.sqlite3_column_int(stmt, 5),
+                    .set_id = c.sqlite3_column_int(stmt, 21),
                     .status = lazerStatus(status),
-                    .checksum = std.mem.span(c.sqlite3_column_text(stmt, 20)),
-                    .ruleset_id = c.sqlite3_column_int(stmt, 21),
-                    .star_rating = c.sqlite3_column_double(stmt, 22),
-                    .version = std.mem.span(c.sqlite3_column_text(stmt, 23)),
-                    .artist = std.mem.span(c.sqlite3_column_text(stmt, 24)),
-                    .title = std.mem.span(c.sqlite3_column_text(stmt, 25)),
-                    .creator = std.mem.span(c.sqlite3_column_text(stmt, 26)),
+                    .checksum = std.mem.span(c.sqlite3_column_text(stmt, 22)),
+                    .ruleset_id = c.sqlite3_column_int(stmt, 23),
+                    .star_rating = c.sqlite3_column_double(stmt, 24),
+                    .version = std.mem.span(c.sqlite3_column_text(stmt, 25)),
+                    .artist = std.mem.span(c.sqlite3_column_text(stmt, 26)),
+                    .title = std.mem.span(c.sqlite3_column_text(stmt, 27)),
+                    .creator = std.mem.span(c.sqlite3_column_text(stmt, 28)),
                 },
             });
         }
@@ -2730,9 +2974,102 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
-    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, limit: u8) ![]u8 {
+    fn stableClassicLeaderboardJsonLocked(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, limit: u8) ![]u8 {
+        const sql =
+            "WITH ordered AS (" ++
+            "SELECT s.*,b.status,b.set_id,b.id beatmap_id,b.star_rating,b.version,b.artist,b.title,b.creator,row_number() OVER(PARTITION BY s.user_id ORDER BY s.score DESC,s.id ASC) AS user_place " ++
+            "FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
+            "WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND u.restricted=0)," ++
+            "board AS (SELECT *,row_number() OVER(ORDER BY score DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
+            "SELECT position,score_count,id,user_id,(SELECT name FROM users WHERE id=board.user_id),(SELECT country FROM users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,strftime('%Y-%m-%dT%H:%M:%SZ',submitted_at,'unixepoch'),status,set_id,map_md5,star_rating,version,artist,title,creator " ++
+            "FROM board WHERE position<=?3 OR user_id=?4 ORDER BY position";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, beatmap_id);
+        _ = c.sqlite3_bind_int(stmt, 2, ruleset_id);
+        _ = c.sqlite3_bind_int(stmt, 3, limit);
+        _ = c.sqlite3_bind_int(stmt, 4, requester_id);
+
+        var scores: std.Io.Writer.Allocating = .init(allocator);
+        defer scores.deinit();
+        var user_score: ?[]u8 = null;
+        defer if (user_score) |json| allocator.free(json);
+        var score_count: i64 = 0;
+        var written: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const position = c.sqlite3_column_int64(stmt, 0);
+            score_count = c.sqlite3_column_int64(stmt, 1);
+            var mods: std.Io.Writer.Allocating = .init(allocator);
+            defer mods.deinit();
+            try stable_mods.writeLazerJson(&mods.writer, c.sqlite3_column_int(stmt, 19), true);
+            var statistics: std.Io.Writer.Allocating = .init(allocator);
+            defer statistics.deinit();
+            try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, c.sqlite3_column_int(stmt, 12), c.sqlite3_column_int(stmt, 13), c.sqlite3_column_int(stmt, 14), c.sqlite3_column_int(stmt, 15), c.sqlite3_column_int(stmt, 16), c.sqlite3_column_int(stmt, 17));
+            const score: lazer.LeaderboardScore = .{
+                .id = c.sqlite3_column_int64(stmt, 2),
+                .user_id = c.sqlite3_column_int(stmt, 3),
+                .username = std.mem.span(c.sqlite3_column_text(stmt, 4)),
+                .country = std.mem.span(c.sqlite3_column_text(stmt, 5)),
+                .beatmap_id = c.sqlite3_column_int(stmt, 6),
+                .ruleset_id = c.sqlite3_column_int(stmt, 7),
+                .total_score = c.sqlite3_column_int64(stmt, 8),
+                .total_score_without_mods = c.sqlite3_column_int64(stmt, 8),
+                .pp = c.sqlite3_column_double(stmt, 9),
+                .accuracy = c.sqlite3_column_double(stmt, 10),
+                .max_combo = c.sqlite3_column_int(stmt, 11),
+                .passed = true,
+                .rank = stableGrade(ruleset_id, c.sqlite3_column_int(stmt, 19), c.sqlite3_column_double(stmt, 10), c.sqlite3_column_int(stmt, 12), c.sqlite3_column_int(stmt, 13), c.sqlite3_column_int(stmt, 14), c.sqlite3_column_int(stmt, 17)),
+                .mods_json = mods.written(),
+                .statistics_json = statistics.written(),
+                .maximum_statistics_json = "{}",
+                .pauses_json = "[]",
+                .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 20)),
+                .ranked = c.sqlite3_column_int(stmt, 21) == 3 or c.sqlite3_column_int(stmt, 21) == 4,
+                .has_replay = false,
+                .beatmap = .{
+                    .id = c.sqlite3_column_int(stmt, 6),
+                    .set_id = c.sqlite3_column_int(stmt, 22),
+                    .status = lazerStatus(c.sqlite3_column_int(stmt, 21)),
+                    .checksum = std.mem.span(c.sqlite3_column_text(stmt, 23)),
+                    .ruleset_id = ruleset_id,
+                    .star_rating = c.sqlite3_column_double(stmt, 24),
+                    .version = std.mem.span(c.sqlite3_column_text(stmt, 25)),
+                    .artist = std.mem.span(c.sqlite3_column_text(stmt, 26)),
+                    .title = std.mem.span(c.sqlite3_column_text(stmt, 27)),
+                    .creator = std.mem.span(c.sqlite3_column_text(stmt, 28)),
+                },
+            };
+            if (position <= limit) {
+                if (written != 0) try scores.writer.writeByte(',');
+                try lazer.writeLeaderboardScore(&scores.writer, score);
+                written += 1;
+            }
+            if (score.user_id == requester_id) {
+                var own: std.Io.Writer.Allocating = .init(allocator);
+                errdefer own.deinit();
+                try own.writer.print("{{\"position\":{d},\"score\":", .{position});
+                try lazer.writeLeaderboardScore(&own.writer, score);
+                try own.writer.writeByte('}');
+                user_score = try own.toOwnedSlice();
+            }
+        }
+        const score_rows_json = try scores.toOwnedSlice();
+        defer allocator.free(score_rows_json);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"score_count\":{d},\"scores\":[", .{score_count});
+        try output.writer.writeAll(score_rows_json);
+        try output.writer.writeAll("],\"user_score\":");
+        if (user_score) |json| try output.writer.writeAll(json) else try output.writer.writeAll("null");
+        try output.writer.writeByte('}');
+        return output.toOwnedSlice();
+    }
+
+    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, classic: bool, limit: u8) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (classic) return self.stableClassicLeaderboardJsonLocked(allocator, requester_id, beatmap_id, ruleset_id, limit);
         const sql =
             "WITH ordered AS (" ++
             "SELECT s.*,b.status,row_number() OVER(PARTITION BY s.user_id ORDER BY CASE WHEN s.rank_namespace IN('relax','autopilot') THEN s.pp ELSE s.total_score END DESC,s.id ASC) AS user_place " ++
@@ -2811,6 +3148,63 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
+    fn awardAchievementsLocked(self: *Store, user_id: i32, source: []const u8, score_id: i64, input: achievements.Input) !void {
+        const candidates = achievements.candidates(input);
+        if (candidates.len == 0) return;
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "INSERT OR IGNORE INTO user_achievements(user_id,achievement_id,score_source,score_id) SELECT ?1,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM users WHERE id=?1 AND restricted=0)";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        for (candidates.slice()) |achievement_id| {
+            _ = c.sqlite3_reset(stmt);
+            _ = c.sqlite3_clear_bindings(stmt);
+            _ = c.sqlite3_bind_int(stmt, 1, user_id);
+            _ = c.sqlite3_bind_int(stmt, 2, achievement_id);
+            _ = c.sqlite3_bind_text(stmt, 3, source.ptr, @intCast(source.len), null);
+            _ = c.sqlite3_bind_int64(stmt, 4, score_id);
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
+    }
+
+    fn writeUserAchievementsLocked(self: *Store, writer: *std.Io.Writer, user_id: i32, include_metadata: bool) !void {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT achievement_id,achieved_at FROM user_achievements WHERE user_id=?1 ORDER BY achieved_at,achievement_id", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        try writer.writeByte('[');
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id: u8 = @intCast(c.sqlite3_column_int(stmt, 0));
+            if (achievements.byId(id) == null) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try achievements.writeJson(writer, id, c.sqlite3_column_int64(stmt, 1), include_metadata);
+        }
+        try writer.writeByte(']');
+    }
+
+    pub fn lazerUserAchievementsJson(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try self.writeUserAchievementsLocked(&output.writer, user_id, true);
+        return output.toOwnedSlice();
+    }
+
+    pub fn newAchievementsForScore(self: *Store, source: []const u8, score_id: i64) !achievements.Unlocks {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT achievement_id FROM user_achievements WHERE score_source=?1 AND score_id=?2 ORDER BY achievement_id", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, source.ptr, @intCast(source.len), null);
+        _ = c.sqlite3_bind_int64(stmt, 2, score_id);
+        var result: achievements.Unlocks = .{};
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) result.append(@intCast(c.sqlite3_column_int(stmt, 0)));
+        return result;
+    }
+
     pub fn insertLazerScore(self: *Store, user_id: i32, input: lazer.ScoreInput, pp_value: f64, mods_json: []const u8, statistics_json: []const u8, maximum_statistics_json: []const u8, pauses_json: []const u8, replay_data: []const u8) !i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2880,45 +3274,43 @@ pub const Store = struct {
             _ = c.sqlite3_bind_int64(unset, 1, previous_best_id);
             if (c.sqlite3_step(unset) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         }
-        try self.updateLazerStatsLocked(user_id, score_id, input, is_best);
+        try self.updateLazerStatsLocked(user_id, input);
+        var map: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT status FROM beatmaps WHERE id=?1", -1, &map, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(map);
+        _ = c.sqlite3_bind_int64(map, 1, input.beatmap_id);
+        const ranked = c.sqlite3_step(map) == c.SQLITE_ROW and (c.sqlite3_column_int(map, 0) == 3 or c.sqlite3_column_int(map, 0) == 4);
+        try self.awardAchievementsLocked(user_id, "lazer", score_id, .{
+            .eligible = input.passed and input.namespace == .vanilla and ranked,
+            .mode = @intCast(input.ruleset_id),
+            .mods = input.achievement_mods,
+            .perfect = input.achievement_perfect,
+            .max_combo = @intCast(input.max_combo),
+            .stars = input.achievement_stars,
+            .accuracy = input.accuracy,
+            .pp = pp_value,
+        });
         return score_id;
     }
 
-    fn updateLazerStatsLocked(self: *Store, user_id: i32, score_id: i64, input: lazer.ScoreInput, is_best: bool) !void {
+    fn updateLazerStatsLocked(self: *Store, user_id: i32, input: lazer.ScoreInput) !void {
         const stats_mode = lazer.statsMode(input) orelse return;
         var map: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "SELECT md5,status FROM beatmaps WHERE id=?1", -1, &map, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(map);
         _ = c.sqlite3_bind_int64(map, 1, input.beatmap_id);
         if (c.sqlite3_step(map) != c.SQLITE_ROW) return;
-        const map_md5 = std.mem.span(c.sqlite3_column_text(map, 0));
         const map_status = c.sqlite3_column_int(map, 1);
         const namespace = @tagName(input.namespace);
-
-        var previous: ?*c.sqlite3_stmt = null;
-        const previous_sql =
-            "SELECT max(value) FROM (" ++
-            "SELECT max(score) AS value FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND rank_namespace=?4 AND passed=1 " ++
-            "UNION ALL SELECT max(total_score) FROM lazer_scores WHERE user_id=?1 AND beatmap_id=?5 AND ruleset_id=?3 AND rank_namespace=?4 AND passed=1 AND id!=?6)";
-        if (c.sqlite3_prepare_v2(self.db, previous_sql, -1, &previous, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(previous);
-        _ = c.sqlite3_bind_int(previous, 1, user_id);
-        _ = c.sqlite3_bind_text(previous, 2, map_md5.ptr, @intCast(map_md5.len), null);
-        _ = c.sqlite3_bind_int64(previous, 3, input.ruleset_id);
-        _ = c.sqlite3_bind_text(previous, 4, namespace.ptr, @intCast(namespace.len), null);
-        _ = c.sqlite3_bind_int64(previous, 5, input.beatmap_id);
-        _ = c.sqlite3_bind_int64(previous, 6, score_id);
-        if (c.sqlite3_step(previous) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
-        const previous_best: i64 = if (c.sqlite3_column_type(previous, 0) == c.SQLITE_NULL) 0 else c.sqlite3_column_int64(previous, 0);
-        const ranked_delta: i64 = if (input.passed and (map_status == 3 or map_status == 4) and input.total_score > previous_best) input.total_score - previous_best else 0;
+        const legacy_score = input.legacy_total_score orelse input.total_score;
         const hits = lazer.totalHits(input);
 
         var update: ?*c.sqlite3_stmt = null;
         const update_sql = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?2,plays=plays+1,total_hits=total_hits+?3,max_combo=CASE WHEN ?4=1 THEN max(max_combo,?5) ELSE max_combo END WHERE user_id=?6 AND mode=?7";
         if (c.sqlite3_prepare_v2(self.db, update_sql, -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(update);
-        _ = c.sqlite3_bind_int64(update, 1, input.total_score);
-        _ = c.sqlite3_bind_int64(update, 2, ranked_delta);
+        _ = c.sqlite3_bind_int64(update, 1, legacy_score);
+        _ = c.sqlite3_bind_int64(update, 2, 0);
         _ = c.sqlite3_bind_int64(update, 3, hits);
         _ = c.sqlite3_bind_int(update, 4, @intFromBool(input.passed and map_status >= 3));
         _ = c.sqlite3_bind_int64(update, 5, input.max_combo);
@@ -2932,16 +3324,16 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(map_update, 1, @intFromBool(input.passed));
         _ = c.sqlite3_bind_int64(map_update, 2, input.beatmap_id);
         if (c.sqlite3_step(map_update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        if (input.passed and is_best and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceLocked(user_id, @intCast(input.ruleset_id), stats_mode, namespace);
+        if (input.passed and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceLocked(user_id, @intCast(input.ruleset_id), stats_mode, namespace);
     }
 
     fn rebuildCombinedPerformanceLocked(self: *Store, user_id: i32, ruleset_id: u8, stats_mode: u8, namespace: []const u8) !void {
         const sql =
             "WITH candidates AS (" ++
-            "SELECT b.id beatmap_id,s.pp,s.accuracy,0 source,s.id score_id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND s.best=1 AND b.status IN(3,4) " ++
-            "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,1,s.id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND s.best=1 AND b.status IN(3,4))," ++
+            "SELECT b.id beatmap_id,s.pp,s.accuracy,s.score legacy_score,0 source,s.id score_id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4) " ++
+            "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score),1,s.id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4))," ++
             "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
-            "SELECT pp,accuracy FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC";
+            "SELECT pp,accuracy,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -2952,21 +3344,24 @@ pub const Store = struct {
         var weighted_accuracy: f64 = 0;
         var weight: f64 = 1;
         var score_count: u32 = 0;
+        var ranked_score: i64 = 0;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             total_pp += c.sqlite3_column_double(stmt, 0) * weight;
             weighted_accuracy += c.sqlite3_column_double(stmt, 1) * weight;
+            ranked_score += c.sqlite3_column_int64(stmt, 2);
             weight *= 0.95;
             score_count += 1;
         }
         const bonus_pp = 416.6667 * (1.0 - std.math.pow(f64, 0.9994, @floatFromInt(score_count)));
         const accuracy = if (score_count == 0) 0 else weighted_accuracy / (20.0 * (1.0 - std.math.pow(f64, 0.95, @floatFromInt(score_count))));
         var update: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "UPDATE stats SET pp=?1,accuracy=?2 WHERE user_id=?3 AND mode=?4", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE stats SET pp=?1,accuracy=?2,ranked_score=?3 WHERE user_id=?4 AND mode=?5", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(update);
         _ = c.sqlite3_bind_int64(update, 1, @intFromFloat(@round(total_pp + bonus_pp)));
         _ = c.sqlite3_bind_double(update, 2, accuracy);
-        _ = c.sqlite3_bind_int(update, 3, user_id);
-        _ = c.sqlite3_bind_int(update, 4, stats_mode);
+        _ = c.sqlite3_bind_int64(update, 3, ranked_score);
+        _ = c.sqlite3_bind_int(update, 4, user_id);
+        _ = c.sqlite3_bind_int(update, 5, stats_mode);
         if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
@@ -3632,15 +4027,6 @@ pub const Store = struct {
             previous_best_pp = c.sqlite3_column_double(best_stmt, 2);
         }
         _ = c.sqlite3_finalize(best_stmt);
-        var previous_ranked_score = previous_best_score;
-        var lazer_best: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT max(l.total_score) FROM lazer_scores l JOIN beatmaps b ON b.id=l.beatmap_id WHERE l.user_id=?1 AND b.md5=?2 AND l.ruleset_id=?3 AND l.rank_namespace=?4 AND l.passed=1", -1, &lazer_best, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        _ = c.sqlite3_bind_int(lazer_best, 1, user_id);
-        _ = c.sqlite3_bind_text(lazer_best, 2, score.map_md5.ptr, @intCast(score.map_md5.len), null);
-        _ = c.sqlite3_bind_int(lazer_best, 3, score.mode);
-        _ = c.sqlite3_bind_text(lazer_best, 4, namespace.ptr, @intCast(namespace.len), null);
-        if (c.sqlite3_step(lazer_best) == c.SQLITE_ROW and c.sqlite3_column_type(lazer_best, 0) != c.SQLITE_NULL) previous_ranked_score = @max(previous_ranked_score, c.sqlite3_column_int64(lazer_best, 0));
-        _ = c.sqlite3_finalize(lazer_best);
         const uses_pp_metric = stable_mods.usesPpMetric(namespace);
         const updates_player_stats = stable_mods.updatesPlayerStats(namespace);
         const is_best = score.passed and if (uses_pp_metric) pp_value > previous_best_pp else score.total_score > previous_best_score;
@@ -3689,15 +4075,24 @@ pub const Store = struct {
         const map_status = c.sqlite3_column_int(status_stmt, 0);
         const has_leaderboard = map_status >= 3;
         const awards_ranked_pp = map_status == 3 or map_status == 4;
+        try self.awardAchievementsLocked(user_id, "stable", id, .{
+            .eligible = score.passed and std.mem.eql(u8, namespace, "vanilla") and awards_ranked_pp,
+            .mode = score.mode,
+            .mods = @intCast(score.mods),
+            .perfect = score.perfect,
+            .max_combo = @intCast(score.max_combo),
+            .stars = score.achievement_stars,
+            .accuracy = score.accuracy(),
+            .pp = pp_value,
+        });
         if (updates_player_stats) {
-            const ranked_delta: i64 = if (is_best and awards_ranked_pp and score.total_score > previous_ranked_score) score.total_score - previous_ranked_score else 0;
             const total_hits: i64 = @as(i64, score.n300) + score.n100 + score.n50 + if (score.mode == 1 or score.mode == 3) @as(i64, score.ngeki) + score.nkatu else 0;
             const update_stats = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?2,plays=plays+1,play_time=play_time+?3,total_hits=total_hits+?4,max_combo=CASE WHEN ?5=1 THEN max(max_combo,?6) ELSE max_combo END WHERE user_id=?7 AND mode=?8";
             var stats_stmt: ?*c.sqlite3_stmt = null;
             if (c.sqlite3_prepare_v2(self.db, update_stats, -1, &stats_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
             defer _ = c.sqlite3_finalize(stats_stmt);
             _ = c.sqlite3_bind_int64(stats_stmt, 1, score.total_score);
-            _ = c.sqlite3_bind_int64(stats_stmt, 2, ranked_delta);
+            _ = c.sqlite3_bind_int64(stats_stmt, 2, 0);
             _ = c.sqlite3_bind_int64(stats_stmt, 3, time_elapsed_ms / 1000);
             _ = c.sqlite3_bind_int64(stats_stmt, 4, total_hits);
             _ = c.sqlite3_bind_int(stats_stmt, 5, @intFromBool(score.passed and has_leaderboard));
@@ -3713,7 +4108,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(map_stmt, 1, @intFromBool(score.passed));
         _ = c.sqlite3_bind_text(map_stmt, 2, score.map_md5.ptr, @intCast(score.map_md5.len), null);
         if (c.sqlite3_step(map_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        if (updates_player_stats and is_best and awards_ranked_pp) {
+        if (updates_player_stats and score.passed and awards_ranked_pp) {
             try self.rebuildCombinedPerformanceLocked(user_id, score.mode, stats_mode, namespace);
         }
         try self.exec("COMMIT");

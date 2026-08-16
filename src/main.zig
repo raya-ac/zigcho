@@ -12,6 +12,7 @@ const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
 const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
+const achievements = @import("achievements.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
 const screenshot = @import("screenshot.zig");
@@ -43,8 +44,27 @@ fn freeUser(allocator: std.mem.Allocator, user: domain.User) void {
     allocator.free(user.safe_name);
 }
 
-fn lazerPerformance(allocator: std.mem.Allocator, store: *storage.Store, input: lazer.ScoreInput, mods_json: []const u8) !f64 {
-    const state = (try lazer.performanceState(input)) orelse return 0;
+fn randomMessageUuid(io: std.Io) ![36]u8 {
+    var raw: [16]u8 = undefined;
+    try std.Io.randomSecure(io, &raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    var uuid: [36]u8 = undefined;
+    @memcpy(uuid[0..8], hex[0..8]);
+    uuid[8] = '-';
+    @memcpy(uuid[9..13], hex[8..12]);
+    uuid[13] = '-';
+    @memcpy(uuid[14..18], hex[12..16]);
+    uuid[18] = '-';
+    @memcpy(uuid[19..23], hex[16..20]);
+    uuid[23] = '-';
+    @memcpy(uuid[24..36], hex[20..32]);
+    return uuid;
+}
+
+const LazerPerformance = struct { pp: f64 = 0, stars: f64 = 0, max_combo: u32 = 0, mods: u32 = 0 };
+
+fn lazerPerformance(allocator: std.mem.Allocator, store: *storage.Store, input: lazer.ScoreInput, mods_json: []const u8) !LazerPerformance {
+    const state = (try lazer.performanceState(input)) orelse return .{};
     const map_file = (try store.beatmapFileById(allocator, @intCast(input.beatmap_id))) orelse return error.BeatmapPayloadMissing;
     defer allocator.free(map_file);
     const performance_input: pp.Input = .{
@@ -67,7 +87,7 @@ fn lazerPerformance(allocator: std.mem.Allocator, store: *storage.Store, input: 
         try pp.calculateLazer(map_file, mods_json, performance_input)
     else
         try pp.calculate(map_file, performance_input);
-    return performance.pp;
+    return .{ .pp = performance.pp, .stars = performance.stars, .max_combo = performance.max_combo, .mods = state.mods };
 }
 
 fn intLines(allocator: std.mem.Allocator, values: []const i32) ![]u8 {
@@ -408,6 +428,18 @@ const App = struct {
         return if (custom) .custom else if (autopilot) .autopilot else if (relax) .relax else .vanilla;
     }
 
+    fn lazerLeaderboardClassic(target: []const u8) bool {
+        const query_start = std.mem.findScalar(u8, target, '?') orelse return false;
+        var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+        while (parameters.next()) |parameter| {
+            const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
+            const key = parameter[0..equals];
+            if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
+            if (std.ascii.eqlIgnoreCase(parameter[equals + 1 ..], "CL")) return true;
+        }
+        return false;
+    }
+
     fn isAvatarHost(value: ?[]const u8) bool {
         const host = value orelse return false;
         const end = std.mem.findScalar(u8, host, ':') orelse host.len;
@@ -485,6 +517,18 @@ const App = struct {
         return placement;
     }
 
+    fn lazerScoreResponse(self: *App, user_id: i32, score_id: i64, placement: ?domain.ScorePlacement) ![]u8 {
+        const unlocks = try self.store.newAchievementsForScore("lazer", score_id);
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"id\":{d},\"position\":", .{score_id});
+        if (placement) |current| try output.writer.print("{d}", .{current.rank + 1}) else try output.writer.writeAll("null");
+        try output.writer.writeAll(",\"achievement_unlocks\":");
+        try achievements.writeLazerUnlocks(&output.writer, unlocks, user_id);
+        try output.writer.writeByte('}');
+        return output.toOwnedSlice();
+    }
+
     fn broadcastLazerChatToStable(self: *App, user: domain.User, target: []const u8, message: []const u8) !void {
         if (lazer.channelId(target) == null) return;
         var packet = protocol.Writer.init(self.allocator);
@@ -505,6 +549,31 @@ const App = struct {
         var stats: [4]?domain.Stats = .{ null, null, null, null };
         for (0..stats.len) |mode| stats[mode] = try self.store.statsForUser(user_id, @intCast(mode));
         return stats;
+    }
+
+    fn lazerPresenceJson(self: *App, requester_id: i32) ![]u8 {
+        const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
+        const oauth_ids = try self.store.recentOauthUserIds(self.allocator, cutoff);
+        defer self.allocator.free(oauth_ids);
+        const stable_ids = try self.sessions.onlineUserIds(self.allocator);
+        defer self.allocator.free(stable_ids);
+
+        var ids: std.ArrayList(i32) = .empty;
+        defer ids.deinit(self.allocator);
+        try ids.ensureTotalCapacity(self.allocator, oauth_ids.len + stable_ids.len + 2);
+        for ([_]i32{ 3, requester_id }) |id| if (std.mem.indexOfScalar(i32, ids.items, id) == null) try ids.append(self.allocator, id);
+        for (oauth_ids) |id| if (std.mem.indexOfScalar(i32, ids.items, id) == null) try ids.append(self.allocator, id);
+        for (stable_ids) |id| if (std.mem.indexOfScalar(i32, ids.items, id) == null) try ids.append(self.allocator, id);
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        for (ids.items, 0..) |id, index| {
+            if (index != 0) try output.writer.writeByte(',');
+            try output.writer.print("{{\"user_id\":{d}}}", .{id});
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
     }
 
     fn friendRelationsJson(self: *App, user_id: i32) ![]u8 {
@@ -1463,7 +1532,7 @@ const App = struct {
             _ = try self.store.revokeToken(token);
             return respond(req, .ok, "application/json", "{}", &.{});
         }
-        if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"Server-side cursor relax\",\"ranked\":false,\"score_multiplier\":0.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":false}}", &.{});
+        if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"server accepted; separate relax leaderboard\",\"ranked\":true,\"score_multiplier\":0.0,\"settings\":{}},{\"acronym\":\"AP\",\"name\":\"Autopilot\",\"description\":\"server accepted; separate autopilot leaderboard\",\"ranked\":true,\"score_multiplier\":0.0,\"settings\":{}},{\"acronym\":\"CL\",\"name\":\"Classic\",\"description\":\"Stable score leaderboard\",\"ranked\":true,\"score_multiplier\":1.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":true}}", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/seasonal-backgrounds")) return respond(req, .ok, "application/json", "{\"backgrounds\":[]}", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/web/osu-getseasonal.php")) return respond(req, .ok, "application/json", "[]", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/menu-content.json")) return respond(req, .ok, "application/json", "{\"images\":[]}", &.{});
@@ -1545,34 +1614,116 @@ const App = struct {
             return respond(req, .no_content, "application/json", "", &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/chat/channels")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (req.head.method == .GET) {
+                const channels = try self.store.lazerChannelListJson(self.allocator, user.id);
+                defer self.allocator.free(channels);
+                return respond(req, .ok, "application/json", channels, &.{});
+            }
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const kind = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"type"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"type required\"}", &.{});
+            defer self.allocator.free(kind);
+            if (!std.ascii.eqlIgnoreCase(kind, "PM") and !std.mem.eql(u8, kind, "5")) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"unsupported channel type\"}", &.{});
+            const target_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"target_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"target required\"}", &.{});
+            defer self.allocator.free(target_text);
+            const target_id = std.fmt.parseInt(i32, target_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid target\"}", &.{});
+            if (target_id == user.id) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"cannot message yourself\"}", &.{});
+            const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            defer freeUser(self.allocator, target_user);
+            if (target_user.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            const messages = try self.store.lazerDirectMessagesJson(self.allocator, user.id, target_id, 0, 50);
+            defer self.allocator.free(messages);
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.print("{{\"channel_id\":{d},\"recent_messages\":", .{lazer.privateChannelId(target_id).?});
+            try output.writer.writeAll(messages);
+            try output.writer.writeByte('}');
+            return respond(req, .ok, "application/json", output.written(), &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v2/chat/new")) {
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"restricted\"}", &.{});
+            const now = std.Io.Clock.real.now(self.sessions.io).toSeconds();
+            if (user.silence_end > now) return respond(req, .forbidden, "application/json", "{\"error\":\"silenced\"}", &.{});
+            const target_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"target_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"target required\"}", &.{});
+            defer self.allocator.free(target_text);
+            const target_id = std.fmt.parseInt(i32, target_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid target\"}", &.{});
+            if (target_id == user.id) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"cannot message yourself\"}", &.{});
+            const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            defer freeUser(self.allocator, target_user);
+            if (target_user.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            const content = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"message"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"message required\"}", &.{});
+            defer self.allocator.free(content);
+            const uuid = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"uuid"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"uuid required\"}", &.{});
+            defer self.allocator.free(uuid);
+            const action_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"is_action"})) orelse try self.allocator.dupe(u8, "false");
+            defer self.allocator.free(action_text);
+            const is_action = if (std.mem.eql(u8, action_text, "true")) true else if (std.mem.eql(u8, action_text, "false")) false else return respond(req, .bad_request, "application/json", "{\"error\":\"invalid action\"}", &.{});
+            if (content.len == 0 or content.len > 2000 or !std.unicode.utf8ValidateSlice(content) or std.mem.indexOfScalar(u8, content, 0) != null) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid message\"}", &.{});
+            if (!lazer.validMessageUuid(uuid)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid uuid\"}", &.{});
+            const written = self.store.recordLazerDirectMessage(self.allocator, user.id, target_id, content, is_action, uuid) catch |err| return switch (err) {
+                error.ChatUuidConflict => respond(req, .conflict, "application/json", "{\"error\":\"message uuid conflict\"}", &.{}),
+                error.InvalidDirectMessage => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid target\"}", &.{}),
+                else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message unavailable\"}", &.{}),
+            };
+            defer self.allocator.free(written.json);
+            if (written.inserted and target_id == 3) {
+                const reply_uuid = try randomMessageUuid(self.sessions.io);
+                const reply = try self.store.recordLazerDirectMessage(self.allocator, 3, user.id, "i'm here. send /np if you want pp on the map you're playing.", false, &reply_uuid);
+                self.allocator.free(reply.json);
+            }
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.print("{{\"new_channel_id\":{d},\"message\":", .{lazer.privateChannelId(target_id).?});
+            try output.writer.writeAll(written.json);
+            try output.writer.writeByte('}');
+            return respond(req, .created, "application/json", output.written(), &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v2/presence")) {
             if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
-            const channels = try self.store.lazerChannelListJson(self.allocator, user.id);
-            defer self.allocator.free(channels);
-            return respond(req, .ok, "application/json", channels, &.{});
+            const presence = try self.lazerPresenceJson(user.id);
+            defer self.allocator.free(presence);
+            return respond(req, .ok, "application/json", presence, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         if (lazer.parseChannelUserPath(path)) |channel_path| {
             if (req.head.method != .PUT and req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
             if (channel_path.user_id != user.id) return respond(req, .forbidden, "application/json", "{\"error\":\"channel user mismatch\"}", &.{});
+            if (lazer.privateChannelUser(channel_path.channel_id)) |other_id| {
+                const other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                defer freeUser(self.allocator, other);
+                if (other.restricted or other.id == user.id) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+            }
             return respond(req, .ok, "application/json", "{}", &.{});
         }
         if (req.head.method == .GET) if (lazer.parseChannelPath(path)) |channel_id| {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
+            if (lazer.privateChannelUser(channel_id)) |other_id| {
+                if (other_id == user.id) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                const other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                defer freeUser(self.allocator, other);
+                if (other.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                var output: std.Io.Writer.Allocating = .init(self.allocator);
+                defer output.deinit();
+                try output.writer.writeAll("{\"channel\":");
+                try lazer.writePrivateChatChannel(&output.writer, channel_id, other.name, null, null);
+                try output.writer.print(",\"users\":[{d},{d}]}}", .{ user.id, other.id });
+                return respond(req, .ok, "application/json", output.written(), &.{});
+            }
             const kai = (try self.store.userById(self.allocator, 3)) orelse return respond(req, .service_unavailable, "application/json", "{\"error\":\"channel presence unavailable\"}", &.{});
             defer freeUser(self.allocator, kai);
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
             try output.writer.writeAll("{\"channel\":");
             try lazer.writeChatChannel(&output.writer, channel_id, null, null);
-            try output.writer.writeAll(",\"users\":[");
-            try user_json.writeCompact(&output.writer, user);
-            try output.writer.writeByte(',');
-            try user_json.writeCompact(&output.writer, kai);
-            try output.writer.writeAll("]}");
+            try output.writer.print(",\"users\":[{d},{d}]}}", .{ user.id, kai.id });
             return respond(req, .ok, "application/json", output.written(), &.{});
         };
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/chat/messages")) {
@@ -1580,7 +1731,7 @@ const App = struct {
             defer freeUser(self.allocator, user);
             const since = std.fmt.parseInt(i64, queryField(target, "since") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid since\"}", &.{});
             if (since < 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid since\"}", &.{});
-            const messages = try self.store.lazerChatMessagesJson(self.allocator, null, since, 100);
+            const messages = try self.store.lazerAllMessagesJson(self.allocator, user.id, since, 100);
             defer self.allocator.free(messages);
             return respond(req, .ok, "application/json", messages, &.{});
         }
@@ -1588,18 +1739,31 @@ const App = struct {
             if (req.head.method != .PUT) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
-            self.store.markLazerChannelRead(user.id, channel_path.channel_id, channel_path.message_id) catch |err| return switch (err) {
-                error.ChatMessageNotFound => respond(req, .not_found, "application/json", "{\"error\":\"chat message not found\"}", &.{}),
-                else => respond(req, .internal_server_error, "application/json", "{\"error\":\"read state unavailable\"}", &.{}),
-            };
+            if (lazer.privateChannelUser(channel_path.channel_id)) |other_id|
+                self.store.markDirectMessagesRead(user.id, other_id) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"read state unavailable\"}", &.{})
+            else
+                self.store.markLazerChannelRead(user.id, channel_path.channel_id, channel_path.message_id) catch |err| return switch (err) {
+                    error.ChatMessageNotFound => respond(req, .not_found, "application/json", "{\"error\":\"chat message not found\"}", &.{}),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"read state unavailable\"}", &.{}),
+                };
             return respond(req, .ok, "application/json", "{}", &.{});
         }
         if (lazer.parseChannelMessagesPath(path)) |channel_path| {
             if (req.head.method != .GET and req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
+            const private_target_id = lazer.privateChannelUser(channel_path.channel_id);
+            if (private_target_id) |target_id| {
+                if (target_id == user.id) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                defer freeUser(self.allocator, target_user);
+                if (target_user.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+            }
             if (req.head.method == .GET) {
-                const messages = try self.store.lazerChatMessagesJson(self.allocator, channel_path.channel_id, 0, 50);
+                const messages = if (private_target_id) |target_id|
+                    try self.store.lazerDirectMessagesJson(self.allocator, user.id, target_id, 0, 50)
+                else
+                    try self.store.lazerChatMessagesJson(self.allocator, channel_path.channel_id, 0, 50);
                 defer self.allocator.free(messages);
                 return respond(req, .ok, "application/json", messages, &.{});
             }
@@ -1615,16 +1779,26 @@ const App = struct {
             const is_action = if (std.mem.eql(u8, action_text, "true")) true else if (std.mem.eql(u8, action_text, "false")) false else return respond(req, .bad_request, "application/json", "{\"error\":\"invalid action\"}", &.{});
             if (content.len == 0 or content.len > 2000 or !std.unicode.utf8ValidateSlice(content) or std.mem.indexOfScalar(u8, content, 0) != null) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid message\"}", &.{});
             if (!lazer.validMessageUuid(uuid)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid uuid\"}", &.{});
-            const channel_name = lazer.channelName(channel_path.channel_id).?;
-            const written = self.store.recordLazerPublicMessage(self.allocator, user.id, channel_name, content, is_action, uuid) catch |err| return switch (err) {
+            const written = (if (private_target_id) |target_id|
+                self.store.recordLazerDirectMessage(self.allocator, user.id, target_id, content, is_action, uuid)
+            else
+                self.store.recordLazerPublicMessage(self.allocator, user.id, lazer.channelName(channel_path.channel_id).?, content, is_action, uuid)) catch |err| return switch (err) {
                 error.ChannelReadOnly => respond(req, .forbidden, "application/json", "{\"error\":\"channel is read-only\"}", &.{}),
                 error.ChatUuidConflict => respond(req, .conflict, "application/json", "{\"error\":\"message uuid conflict\"}", &.{}),
                 error.UnknownChannel => respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{}),
                 else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message unavailable\"}", &.{}),
             };
             defer self.allocator.free(written.json);
-            if (written.inserted) self.broadcastLazerChatToStable(user, channel_name, content) catch |err|
-                std.log.warn("event=lazer_chat_stable_broadcast_failed channel={s} error={t}", .{ channel_name, err });
+            if (written.inserted and private_target_id == null) {
+                const channel_name = lazer.channelName(channel_path.channel_id).?;
+                self.broadcastLazerChatToStable(user, channel_name, content) catch |err|
+                    std.log.warn("event=lazer_chat_stable_broadcast_failed channel={s} error={t}", .{ channel_name, err });
+            }
+            if (written.inserted and private_target_id == 3) {
+                const reply_uuid = try randomMessageUuid(self.sessions.io);
+                const reply = try self.store.recordLazerDirectMessage(self.allocator, 3, user.id, "i'm here. send /np if you want pp on the map you're playing.", false, &reply_uuid);
+                self.allocator.free(reply.json);
+            }
             return respond(req, .created, "application/json", written.json, &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/chat/ack")) {
@@ -1693,7 +1867,9 @@ const App = struct {
             if (found.restricted and found.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
             const stats = try self.store.statsForUser(found.id, user_path.ruleset_id);
             const score_counts = try self.store.lazerUserScoreCounts(found.id, user_path.ruleset_id);
-            const json = try user_json.profileOwned(self.allocator, found, stats, score_counts);
+            const achievements_json = try self.store.lazerUserAchievementsJson(self.allocator, found.id);
+            defer self.allocator.free(achievements_json);
+            const json = try user_json.profileOwned(self.allocator, found, stats, score_counts, achievements_json);
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -1765,7 +1941,7 @@ const App = struct {
             if (raw_limit == 0 or raw_limit > 100) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
             const scope = queryField(target, "type") orelse "global";
             if (!std.mem.eql(u8, scope, "global") and !std.mem.eql(u8, scope, "country") and !std.mem.eql(u8, scope, "friend")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported leaderboard scope\"}", &.{});
-            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), @intCast(raw_limit));
+            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), lazerLeaderboardClassic(target), @intCast(raw_limit));
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -1806,7 +1982,7 @@ const App = struct {
                 if (req.head.method != .PUT) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
                 const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_json\"}", &.{});
                 defer parsed.deinit();
-                const score = lazer.parseSoloScore(parsed.value, solo_path.beatmap_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
+                var score = lazer.parseSoloScore(parsed.value, solo_path.beatmap_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
                 const replay_data = lazer.decodeReplay(self.allocator, parsed.value.object, score.ruleset_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_replay\"}", &.{});
                 defer self.allocator.free(replay_data);
                 const mods_json = try lazer.jsonField(self.allocator, parsed.value.object, "mods", "[]");
@@ -1822,22 +1998,22 @@ const App = struct {
                     return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
                 };
                 if (!pp_ready) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
-                const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch |err| {
+                const performance = lazerPerformance(self.allocator, &self.store, score, mods_json) catch |err| {
                     std.log.warn("event=lazer_score_performance_failed beatmap_id={d} token_id={d} error={t}", .{ solo_path.beatmap_id, token_id, err });
                     return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
                 };
-                const score_id = self.store.submitLazerScoreToken(user.id, solo_path.beatmap_id, token_id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json, replay_data) catch |err| return switch (err) {
+                score.achievement_stars = performance.stars;
+                score.achievement_mods = performance.mods;
+                score.achievement_perfect = performance.max_combo > 0 and score.max_combo >= performance.max_combo;
+                const score_id = self.store.submitLazerScoreToken(user.id, solo_path.beatmap_id, token_id, score, performance.pp, mods_json, statistics_json, maximum_statistics_json, pauses_json, replay_data) catch |err| return switch (err) {
                     error.InvalidLazerScoreToken, error.ForeignLazerScoreToken, error.LazerScoreTokenExpired => respond(req, .unauthorized, "application/json", "{\"error\":\"invalid or expired score token\"}", &.{}),
                     error.LazerScoreTokenUsed => respond(req, .conflict, "application/json", "{\"error\":\"score token already used\"}", &.{}),
                     error.LazerScoreTokenMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match submission\"}", &.{}),
                     else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score submission failed\"}", &.{}),
                 };
-                var out: [128]u8 = undefined;
-                const placement = self.afterLazerScore(user, score_id, score, pp_value, mods_json);
-                const json = if (placement) |current|
-                    try std.fmt.bufPrint(&out, "{{\"id\":{d},\"position\":{d}}}", .{ score_id, current.rank + 1 })
-                else
-                    try std.fmt.bufPrint(&out, "{{\"id\":{d},\"position\":null}}", .{score_id});
+                const placement = self.afterLazerScore(user, score_id, score, performance.pp, mods_json);
+                const json = try self.lazerScoreResponse(user.id, score_id, placement);
+                defer self.allocator.free(json);
                 return respond(req, .ok, "application/json", json, &.{});
             }
             return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
@@ -1852,7 +2028,7 @@ const App = struct {
             const score_context = self.lazer_multiplayer.scoreContext(user.id, room_score_path.room_id, room_score_path.playlist_item_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
 
             if (room_score_path.token_id == null and req.head.method == .GET) {
-                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, 100);
+                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, false, 100);
                 defer self.allocator.free(board_json);
                 const parsed_board = std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{}) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
                 defer parsed_board.deinit();
@@ -1905,7 +2081,7 @@ const App = struct {
                 if (req.head.method != .PUT) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
                 const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_json\"}", &.{});
                 defer parsed.deinit();
-                const score = lazer.parseSoloScore(parsed.value, score_context.beatmap_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
+                var score = lazer.parseSoloScore(parsed.value, score_context.beatmap_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
                 const replay_data = lazer.decodeReplay(self.allocator, parsed.value.object, score.ruleset_id) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_replay\"}", &.{});
                 defer self.allocator.free(replay_data);
                 const mods_json = try lazer.jsonField(self.allocator, parsed.value.object, "mods", "[]");
@@ -1916,19 +2092,19 @@ const App = struct {
                 defer self.allocator.free(maximum_statistics_json);
                 const pauses_json = try lazer.jsonField(self.allocator, parsed.value.object, "pauses", "[]");
                 defer self.allocator.free(pauses_json);
-                const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
-                const score_id = self.store.submitLazerScoreToken(user.id, score_context.beatmap_id, token_id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json, replay_data) catch |err| return switch (err) {
+                const performance = lazerPerformance(self.allocator, &self.store, score, mods_json) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
+                score.achievement_stars = performance.stars;
+                score.achievement_mods = performance.mods;
+                score.achievement_perfect = performance.max_combo > 0 and score.max_combo >= performance.max_combo;
+                const score_id = self.store.submitLazerScoreToken(user.id, score_context.beatmap_id, token_id, score, performance.pp, mods_json, statistics_json, maximum_statistics_json, pauses_json, replay_data) catch |err| return switch (err) {
                     error.InvalidLazerScoreToken, error.ForeignLazerScoreToken, error.LazerScoreTokenExpired => respond(req, .unauthorized, "application/json", "{\"error\":\"invalid or expired score token\"}", &.{}),
                     error.LazerScoreTokenUsed => respond(req, .conflict, "application/json", "{\"error\":\"score token already used\"}", &.{}),
                     error.LazerScoreTokenMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match submission\"}", &.{}),
                     else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score submission failed\"}", &.{}),
                 };
-                var out: [128]u8 = undefined;
-                const placement = self.afterLazerScore(user, score_id, score, pp_value, mods_json);
-                const json = if (placement) |current|
-                    try std.fmt.bufPrint(&out, "{{\"id\":{d},\"position\":{d}}}", .{ score_id, current.rank + 1 })
-                else
-                    try std.fmt.bufPrint(&out, "{{\"id\":{d},\"position\":null}}", .{score_id});
+                const placement = self.afterLazerScore(user, score_id, score, performance.pp, mods_json);
+                const json = try self.lazerScoreResponse(user.id, score_id, placement);
+                defer self.allocator.free(json);
                 return respond(req, .ok, "application/json", json, &.{});
             }
             return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
@@ -2000,7 +2176,9 @@ const App = struct {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
             const stats = try self.lazerStats(user.id);
-            const json = try user_json.meOwned(self.allocator, user, stats);
+            const achievements_json = try self.store.lazerUserAchievementsJson(self.allocator, user.id);
+            defer self.allocator.free(achievements_json);
+            const json = try user_json.meOwned(self.allocator, user, stats, achievements_json);
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         }
@@ -2012,7 +2190,7 @@ const App = struct {
             defer self.allocator.free(user.safe_name);
             const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_json\"}", &.{});
             defer parsed.deinit();
-            const score = lazer.parseScore(parsed.value) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
+            var score = lazer.parseScore(parsed.value) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid_score_or_mod\"}", &.{});
             const mods_json = try lazer.jsonField(self.allocator, parsed.value.object, "mods", "[]");
             defer self.allocator.free(mods_json);
             const statistics_json = try lazer.jsonField(self.allocator, parsed.value.object, "statistics", "{}");
@@ -2027,13 +2205,16 @@ const App = struct {
                 return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
             };
             if (!pp_ready) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap payload unavailable\"}", &.{});
-            const pp_value = lazerPerformance(self.allocator, &self.store, score, mods_json) catch |err| {
+            const performance = lazerPerformance(self.allocator, &self.store, score, mods_json) catch |err| {
                 std.log.warn("event=lazer_legacy_score_performance_failed beatmap_id={d} error={t}", .{ score.beatmap_id, err });
                 return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"performance calculation failed\"}", &.{});
             };
-            const id = try self.store.insertLazerScore(user.id, score, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json, &.{});
+            score.achievement_stars = performance.stars;
+            score.achievement_mods = performance.mods;
+            score.achievement_perfect = performance.max_combo > 0 and score.max_combo >= performance.max_combo;
+            const id = try self.store.insertLazerScore(user.id, score, performance.pp, mods_json, statistics_json, maximum_statistics_json, pauses_json, &.{});
             var out: [192]u8 = undefined;
-            const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"user_id\":{d},\"rank_namespace\":\"{s}\",\"ranked\":false}}", .{ id, user.id, ns_name });
+            const json = try std.fmt.bufPrint(&out, "{{\"id\":{d},\"user_id\":{d},\"rank_namespace\":\"{s}\",\"ranked\":true}}", .{ id, user.id, ns_name });
             return respond(req, .created, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/") and req.head.method == .POST) {
@@ -2369,7 +2550,7 @@ const App = struct {
             const fail_time = std.fmt.parseInt(u32, (form.first("ft") orelse return rejectStableScore(req, "missing_fail_time", body.len)).data, 10) catch return rejectStableScore(req, "invalid_fail_time", body.len);
             var decrypted = score_crypto.decrypt(self.allocator, encrypted.data, client_hash_encrypted, iv, osu_version) catch |err| return rejectStableScoreError(req, "decrypt_failed", err, body.len);
             defer decrypted.deinit();
-            const score = stable_score.parse(decrypted.score_data) catch |err| {
+            var score = stable_score.parse(decrypted.score_data) catch |err| {
                 std.log.warn("stable score rejected: reason=score_parse_failed error={t} fields={d} plaintext_bytes={d} body_bytes={d}", .{ err, std.mem.count(u8, decrypted.score_data, ":") + 1, decrypted.score_data.len, body.len });
                 return respond(req, .bad_request, "text/plain", "error: no", &.{});
             };
@@ -2418,6 +2599,7 @@ const App = struct {
                 .misses = @intCast(score.nmiss),
                 .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
+            score.achievement_stars = performance.stars;
             const elapsed_ms = if (score.passed) score_time else fail_time;
             var replay_digest: [32]u8 = undefined;
             const has_replay_fingerprint = replay.data.len != 0;
@@ -2474,7 +2656,8 @@ const App = struct {
                     });
                 }
             }
-            const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes }, placed, before_stats, after_stats, performance.pp);
+            const unlocked_achievements = try self.store.newAchievementsForScore("stable", score_id);
+            const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes }, placed, before_stats, after_stats, performance.pp, unlocked_achievements);
             defer self.allocator.free(response_body);
             return respond(req, .ok, "text/plain", response_body, &.{});
         }

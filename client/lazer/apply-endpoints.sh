@@ -11,15 +11,6 @@ if [ "$actual_commit" != "$expected_commit" ]; then
     exit 1
 fi
 
-cp "$script_dir/ProductionEndpointConfiguration.cs" "$checkout/osu.Game/Online/ProductionEndpointConfiguration.cs"
-cp "$script_dir/DevelopmentEndpointConfiguration.cs" "$checkout/osu.Game/Online/DevelopmentEndpointConfiguration.cs"
-cp "$script_dir/TrustedDomainOnlineStore.cs" "$checkout/osu.Game/Online/TrustedDomainOnlineStore.cs"
-cp "$script_dir/TrustedDomainOnlineStoreTest.cs" "$checkout/osu.Game.Tests/TrustedDomainOnlineStoreTest.cs"
-cp "$script_dir/PollingChatClient.cs" "$checkout/osu.Game/Online/Chat/PollingChatClient.cs"
-cp "$script_dir/PollingChatClientTest.cs" "$checkout/osu.Game.Tests/PollingChatClientTest.cs"
-cp "$script_dir/ZigchoLeaderboardAvailability.cs" "$checkout/osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs"
-cp "$script_dir/ZigchoLeaderboardAvailabilityTest.cs" "$checkout/osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs"
-cp "$script_dir/ZigchoRealtimeServicePolicy.cs" "$checkout/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs"
-cp "$script_dir/ZigchoRealtimeServicePolicyTest.cs" "$checkout/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs"
-python3 "$script_dir/patch-unavailable-realtime.py" "$checkout"
-echo "zigcho endpoints and trusted resource domains applied to $checkout"
+git -C "$checkout" apply --check "$script_dir/zigcho-client.patch"
+git -C "$checkout" apply "$script_dir/zigcho-client.patch"
+echo "zigcho client patch applied to $checkout"

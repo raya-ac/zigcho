@@ -18,31 +18,14 @@ if ($ActualCommit -ne $ExpectedCommit) {
     throw "expected osu! $ExpectedCommit, got $ActualCommit"
 }
 
-$Copies = @{
-    "ProductionEndpointConfiguration.cs" = "osu.Game/Online/ProductionEndpointConfiguration.cs"
-    "DevelopmentEndpointConfiguration.cs" = "osu.Game/Online/DevelopmentEndpointConfiguration.cs"
-    "TrustedDomainOnlineStore.cs" = "osu.Game/Online/TrustedDomainOnlineStore.cs"
-    "TrustedDomainOnlineStoreTest.cs" = "osu.Game.Tests/TrustedDomainOnlineStoreTest.cs"
-    "PollingChatClient.cs" = "osu.Game/Online/Chat/PollingChatClient.cs"
-    "PollingChatClientTest.cs" = "osu.Game.Tests/PollingChatClientTest.cs"
-    "ZigchoLeaderboardAvailability.cs" = "osu.Game/Online/Leaderboards/ZigchoLeaderboardAvailability.cs"
-    "ZigchoLeaderboardAvailabilityTest.cs" = "osu.Game.Tests/ZigchoLeaderboardAvailabilityTest.cs"
-    "ZigchoRealtimeServicePolicy.cs" = "osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs"
-    "ZigchoRealtimeServicePolicyTest.cs" = "osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs"
-}
-
-foreach ($SourceName in $Copies.Keys) {
-    Copy-Item -LiteralPath (Join-Path $ScriptDir $SourceName) -Destination (Join-Path $Checkout $Copies[$SourceName]) -Force
-}
-
-$Python = if (Get-Command python -ErrorAction SilentlyContinue) { "python" } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } else { $null }
-if (-not $Python) {
-    throw "python 3 is required to patch the pinned client"
-}
-
-& $Python (Join-Path $ScriptDir "patch-unavailable-realtime.py") $Checkout
+& git -C $Checkout apply --check (Join-Path $ScriptDir "zigcho-client.patch")
 if ($LASTEXITCODE -ne 0) {
-    throw "client source patching failed"
+    throw "zigcho client patch does not apply to the pinned osu! checkout"
 }
 
-Write-Host "zigcho endpoints, client isolation, and trusted resource domains applied to $Checkout"
+& git -C $Checkout apply (Join-Path $ScriptDir "zigcho-client.patch")
+if ($LASTEXITCODE -ne 0) {
+    throw "zigcho client patching failed"
+}
+
+Write-Host "zigcho client patch applied to $Checkout"

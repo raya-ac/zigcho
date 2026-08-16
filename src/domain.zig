@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const Mode = enum(u8) { osu, taiko, @"catch", mania };
-pub const SiteScoreSource = enum { all, lazer, scorev2 };
+pub const SiteScoreSource = enum { all, stable, lazer, scorev2 };
 pub const ProfileAccent = enum { pink, violet, blue, mint, gold, red };
 pub const SiteProfileSettings = struct {
     bio: []const u8,
@@ -69,6 +69,25 @@ pub const Stats = struct {
     accuracy: f64 = 0,
     max_combo: i32 = 0,
     global_rank: i32 = 0,
+    country_rank: i32 = 0,
+    grade_ssh: i32 = 0,
+    grade_ss: i32 = 0,
+    grade_sh: i32 = 0,
+    grade_s: i32 = 0,
+    grade_a: i32 = 0,
+
+    pub fn addGrade(self: *Stats, grade: []const u8) void {
+        if (std.mem.eql(u8, grade, "XH") or std.mem.eql(u8, grade, "SSH"))
+            self.grade_ssh += 1
+        else if (std.mem.eql(u8, grade, "X") or std.mem.eql(u8, grade, "SS"))
+            self.grade_ss += 1
+        else if (std.mem.eql(u8, grade, "SH"))
+            self.grade_sh += 1
+        else if (std.mem.eql(u8, grade, "S"))
+            self.grade_s += 1
+        else if (std.mem.eql(u8, grade, "A"))
+            self.grade_a += 1;
+    }
 };
 
 pub const UserScoreCounts = struct {
@@ -99,6 +118,7 @@ pub const Score = struct {
 
 pub fn parseSiteScoreSource(value: []const u8) ?SiteScoreSource {
     if (std.mem.eql(u8, value, "all")) return .all;
+    if (std.mem.eql(u8, value, "stable")) return .stable;
     if (std.mem.eql(u8, value, "lazer")) return .lazer;
     if (std.mem.eql(u8, value, "scorev2")) return .scorev2;
     return null;
@@ -113,7 +133,7 @@ pub fn parseProfileAccent(value: []const u8) ?ProfileAccent {
 
 pub fn validSiteMode(source: SiteScoreSource, mode: u8) bool {
     return switch (source) {
-        .all, .lazer => mode <= 6 or mode == 8,
+        .all, .stable, .lazer => mode <= 6 or mode == 8,
         .scorev2 => mode <= 3,
     };
 }

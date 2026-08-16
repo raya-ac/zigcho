@@ -237,6 +237,15 @@ pub const Sessions = struct {
         };
         return count;
     }
+    pub fn onlineUserIds(self: *Sessions, allocator: std.mem.Allocator) ![]i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var ids: std.ArrayList(i32) = .empty;
+        errdefer ids.deinit(allocator);
+        try ids.ensureTotalCapacity(allocator, self.items.items.len);
+        for (self.items.items) |session| ids.appendAssumeCapacity(session.user.id);
+        return ids.toOwnedSlice(allocator);
+    }
     pub fn channelCount(self: *const Sessions, name: []const u8) usize {
         var count: usize = 0;
         for (self.items.items) |s| if (s.joined(name)) {
@@ -306,4 +315,23 @@ test "session indices follow replacement and removal" {
     try std.testing.expect(sessions.byToken(&replacement_token) == null);
     try std.testing.expect(sessions.byUser(10) == null);
     try std.testing.expect(sessions.byName("raya player") == null);
+}
+
+test "online user snapshot includes bot and human sessions" {
+    const allocator = std.testing.allocator;
+    var sessions = Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.createBot(.{
+        .id = 3,
+        .name = try allocator.dupe(u8, "kai"),
+        .safe_name = try allocator.dupe(u8, "kai"),
+    });
+    _ = try sessions.create(.{
+        .id = 4,
+        .name = try allocator.dupe(u8, "ari"),
+        .safe_name = try allocator.dupe(u8, "ari"),
+    }, 0, 0, 0);
+    const ids = try sessions.onlineUserIds(allocator);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 4 }, ids);
 }

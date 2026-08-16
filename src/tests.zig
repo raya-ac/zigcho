@@ -39,6 +39,7 @@ const site_replay = @import("site_replay.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
+const achievements = @import("achievements.zig");
 const status_page = @embedFile("status.html");
 
 comptime {
@@ -57,6 +58,7 @@ comptime {
     _ = anticheat_abi;
     _ = anticheat_plugin;
     _ = anticheat_replay;
+    _ = achievements;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -801,6 +803,35 @@ test "authentication and database reads make progress concurrently" {
     try std.testing.expect(!failed.load(.acquire));
 }
 
+test "oauth authentication owns a bounded online presence lease" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/oauth-presence.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    const token = try store.issueToken(user_id, "identify", 60);
+    const now = std.Io.Clock.real.now(std.testing.io).toSeconds();
+
+    const before = try store.recentOauthUserIds(std.testing.allocator, now - 10);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    const user = (try store.authenticateToken(std.testing.allocator, &token, "identify")).?;
+    defer std.testing.allocator.free(user.name);
+    defer std.testing.allocator.free(user.safe_name);
+    const online = try store.recentOauthUserIds(std.testing.allocator, now - 10);
+    defer std.testing.allocator.free(online);
+    try std.testing.expectEqualSlices(i32, &.{user_id}, online);
+
+    try std.testing.expect(try store.revokeToken(&token));
+    const revoked = try store.recentOauthUserIds(std.testing.allocator, now - 10);
+    defer std.testing.allocator.free(revoked);
+    try std.testing.expectEqual(@as(usize, 0), revoked.len);
+}
+
 test "login result owns its token after the session is replaced" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1343,7 +1374,7 @@ test "stable score response reports the committed one based leaderboard rank" {
         .client_time = "260811000000",
         .client_flags = "0",
     };
-    const response = try stable_response.scoreSubmission(std.testing.allocator, 4, 99, score, .{ .id = 10, .set_id = 20, .plays = 8, .passes = 6 }, .{ .rank = 3, .submitted_is_best = true }, .{ .global_rank = 8, .pp = 100 }, .{ .global_rank = 7, .pp = 120 }, 42.25);
+    const response = try stable_response.scoreSubmission(std.testing.allocator, 4, 99, score, .{ .id = 10, .set_id = 20, .plays = 8, .passes = 6 }, .{ .rank = 3, .submitted_is_best = true }, .{ .global_rank = 8, .pp = 100 }, .{ .global_rank = 7, .pp = 120 }, 42.25, .{});
     defer std.testing.allocator.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "chartId:beatmap") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "rankAfter:4") != null);
@@ -2640,6 +2671,13 @@ test "lazer channel list and follow-up paths match the client contract" {
     try std.testing.expectEqual(@as(i64, 3), read.channel_id);
     try std.testing.expectEqual(@as(i64, 729), read.message_id);
     try std.testing.expectEqual(@as(i64, 4), lazer.parseChannelPath("/api/v2/chat/channels/4").?);
+    try std.testing.expectEqual(@as(i64, 1_000_037), lazer.privateChannelId(37).?);
+    try std.testing.expectEqual(@as(i32, 37), lazer.privateChannelUser(1_000_037).?);
+    try std.testing.expectEqual(@as(i64, 1_000_037), lazer.parseChannelPath("/api/v2/chat/channels/1000037").?);
+    try std.testing.expectEqual(@as(i64, 1_000_037), lazer.parseChannelMessagesPath("/api/v2/chat/channels/1000037/messages").?.channel_id);
+    try std.testing.expectEqual(@as(i32, 4), lazer.directMessageOther("@dm:4:37", 37).?);
+    try std.testing.expectEqual(@as(i32, 37), lazer.directMessageOther("@dm:4:37", 4).?);
+    try std.testing.expect(lazer.directMessageOther("@dm:4:37", 9) == null);
     try std.testing.expectEqualStrings("#lazer", lazer.channelName(4).?);
     try std.testing.expectEqual(@as(i64, 1), lazer.channelId("#osu").?);
     try std.testing.expect(lazer.validMessageUuid("01234567-89ab-cdef-0123-456789abcdef"));
@@ -2728,6 +2766,58 @@ test "lazer public chat persists actions and deduplicates client uuids" {
     const action_id = action_parsed.value.object.get("message_id").?.integer;
     try std.testing.expectError(error.ChatMessageNotFound, store.markLazerChannelRead(user_id, 1, action_id));
     try std.testing.expectError(error.ChatMessageNotFound, store.markLazerChannelRead(user_id, 1, 999_999));
+}
+
+test "lazer private messages share one cursor with stable offline mail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-private-chat.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const first_id = try store.register("first chat", "first-chat@example.test", "0123456789abcdef0123456789abcdef");
+    const second_id = try store.register("second chat", "second-chat@example.test", "fedcba9876543210fedcba9876543210");
+    const third_id = try store.register("third chat", "third-chat@example.test", "11111111111111111111111111111111");
+
+    const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const first = try store.recordLazerDirectMessage(std.testing.allocator, first_id, second_id, "private hello", false, uuid);
+    defer std.testing.allocator.free(first.json);
+    try std.testing.expect(first.inserted);
+    const duplicate = try store.recordLazerDirectMessage(std.testing.allocator, first_id, second_id, "private hello", false, uuid);
+    defer std.testing.allocator.free(duplicate.json);
+    try std.testing.expect(!duplicate.inserted);
+    try std.testing.expectError(error.ChatUuidConflict, store.recordLazerDirectMessage(std.testing.allocator, first_id, second_id, "changed retry", false, uuid));
+
+    const history = try store.lazerDirectMessagesJson(std.testing.allocator, second_id, first_id, 0, 50);
+    defer std.testing.allocator.free(history);
+    const parsed_history = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, history, .{});
+    defer parsed_history.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_history.value.array.items.len);
+    try std.testing.expectEqual(lazer.privateChannelId(first_id).?, parsed_history.value.array.items[0].object.get("channel_id").?.integer);
+    try std.testing.expectEqualStrings("private hello", parsed_history.value.array.items[0].object.get("content").?.string);
+
+    const updates = try store.lazerAllMessagesJson(std.testing.allocator, second_id, 0, 100);
+    defer std.testing.allocator.free(updates);
+    try std.testing.expect(std.mem.indexOf(u8, updates, "private hello") != null);
+    const unrelated = try store.lazerAllMessagesJson(std.testing.allocator, third_id, 0, 100);
+    defer std.testing.allocator.free(unrelated);
+    try std.testing.expect(std.mem.indexOf(u8, unrelated, "private hello") == null);
+
+    const unread = try store.unreadDirectMessages(std.testing.allocator, second_id);
+    defer {
+        for (unread) |*message| message.deinit(std.testing.allocator);
+        std.testing.allocator.free(unread);
+    }
+    try std.testing.expectEqual(@as(usize, 1), unread.len);
+    try std.testing.expectEqualStrings("private hello", unread[0].message);
+    try store.markDirectMessagesRead(second_id, first_id);
+
+    try store.storeDirectMessage(second_id, first_id, "stable hello");
+    const stable_update = try store.lazerAllMessagesJson(std.testing.allocator, first_id, 0, 100);
+    defer std.testing.allocator.free(stable_update);
+    try std.testing.expect(std.mem.indexOf(u8, stable_update, "stable hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_update, "private hello") != null);
 }
 
 test "lazer registration fields are form decoded" {
@@ -4184,7 +4274,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqualSlices(u8, &replay, replay_ptr[0..replay_len]);
     _ = storage.c.sqlite3_finalize(row);
 
-    const leaderboard = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, 50);
+    const leaderboard = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, false, 50);
     defer std.testing.allocator.free(leaderboard);
     var parsed_leaderboard = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, leaderboard, .{});
     defer parsed_leaderboard.deinit();
@@ -4217,6 +4307,30 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer std.testing.allocator.free(pinned);
     try std.testing.expectEqualStrings("[]", pinned);
 
+    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,'vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid())");
+    const combined_recent = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, 0, 50);
+    defer std.testing.allocator.free(combined_recent);
+    var parsed_combined = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined_recent, .{});
+    defer parsed_combined.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_combined.value.array.items.len);
+    const stable_profile_score = parsed_combined.value.array.items[0].object;
+    try std.testing.expect(stable_profile_score.get("id").?.integer >= 4_000_000_000_000_000_000);
+    try std.testing.expectEqualStrings("A", stable_profile_score.get("rank").?.string);
+    try std.testing.expectEqualStrings("CL", stable_profile_score.get("mods").?.array.items[0].object.get("acronym").?.string);
+    try std.testing.expect(!stable_profile_score.get("has_replay").?.bool);
+    const stable_pinned = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .pinned, 0, 50);
+    defer std.testing.allocator.free(stable_pinned);
+    var parsed_pinned = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stable_pinned, .{});
+    defer parsed_pinned.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_pinned.value.array.items.len);
+
+    const classic_board = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, true, 50);
+    defer std.testing.allocator.free(classic_board);
+    var parsed_classic = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, classic_board, .{});
+    defer parsed_classic.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_classic.value.object.get("score_count").?.integer);
+    try std.testing.expectEqualStrings("CL", parsed_classic.value.object.get("scores").?.array.items[0].object.get("mods").?.array.items[0].object.get("acronym").?.string);
+
     const expired = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
     var expire_buf: [160]u8 = undefined;
     const expire_sql = try std.fmt.bufPrintZ(&expire_buf, "UPDATE lazer_score_tokens SET expires_at=0 WHERE id={d}", .{expired});
@@ -4227,7 +4341,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 27), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 28), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer submission updates ranked performance without overwriting another ruleset" {
@@ -4252,8 +4366,8 @@ test "lazer submission updates ranked performance without overwriting another ru
     _ = try store.submitLazerScoreToken(1, 75, token, input, 500, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]", &.{});
 
     const osu = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 992654), osu.ranked_score);
-    try std.testing.expectEqual(@as(i64, 997654), osu.total_score);
+    try std.testing.expectEqual(@as(i64, 900000), osu.ranked_score);
+    try std.testing.expectEqual(@as(i64, 910000), osu.total_score);
     try std.testing.expectEqual(@as(i32, 500), osu.pp);
     try std.testing.expectEqual(@as(i32, 8), osu.plays);
     try std.testing.expectEqual(@as(i64, 1000), osu.total_hits);
@@ -4272,8 +4386,8 @@ test "lazer submission updates ranked performance without overwriting another ru
     const failed_token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
     _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, 100, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]", &.{});
     const after_fail = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 992654), after_fail.ranked_score);
-    try std.testing.expectEqual(@as(i64, 997754), after_fail.total_score);
+    try std.testing.expectEqual(@as(i64, 900000), after_fail.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1_810_000), after_fail.total_score);
     try std.testing.expectEqual(@as(i32, 9), after_fail.plays);
     try std.testing.expectEqual(@as(i32, 321), after_fail.max_combo);
     try std.testing.expectEqual(@as(i32, 500), after_fail.pp);
@@ -4313,7 +4427,7 @@ test "schema twenty two backfills the historical lazer best score" {
     }
 }
 
-test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
+test "lazer ranked stats use legacy scores and pp overwrite while ignoring failed or unranked pp" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -4350,8 +4464,9 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     const lower_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "cccccccccccccccccccccccccccccccc");
     const lower_id = try store.submitLazerScoreToken(1, 75, lower_token, input, 500, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]", &.{});
     const after_lower = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(weighted.pp, after_lower.pp);
-    try std.testing.expectApproxEqAbs(weighted.accuracy, after_lower.accuracy, 0.000001);
+    try std.testing.expectEqual(@as(i32, 690), after_lower.pp);
+    try std.testing.expectEqual(@as(i64, 2000), after_lower.ranked_score);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6948717949), after_lower.accuracy, 0.000001);
 
     input.passed = false;
     input.rank = "F";
@@ -4359,8 +4474,8 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     const failed_token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "dddddddddddddddddddddddddddddddd");
     _ = try store.submitLazerScoreToken(1, 75, failed_token, input, 999, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]", &.{});
     const after_fail = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(weighted.pp, after_fail.pp);
-    try std.testing.expectApproxEqAbs(weighted.accuracy, after_fail.accuracy, 0.000001);
+    try std.testing.expectEqual(after_lower.pp, after_fail.pp);
+    try std.testing.expectApproxEqAbs(after_lower.accuracy, after_fail.accuracy, 0.000001);
 
     input.passed = true;
     input.rank = "A";
@@ -4370,8 +4485,8 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     const unranked_token = try store.createLazerScoreToken(1, 77, "33333333333333333333333333333333", 0, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
     _ = try store.submitLazerScoreToken(1, 77, unranked_token, input, 1000, "[]", "{\"great\":100}", "{\"great\":100}", "[]", &.{});
     const after_unranked = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(weighted.pp, after_unranked.pp);
-    try std.testing.expectApproxEqAbs(weighted.accuracy, after_unranked.accuracy, 0.000001);
+    try std.testing.expectEqual(after_lower.pp, after_unranked.pp);
+    try std.testing.expectApproxEqAbs(after_lower.accuracy, after_unranked.accuracy, 0.000001);
 
     var best_rows: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT id,pp,best FROM lazer_scores WHERE id IN(?1,?2) ORDER BY id", -1, &best_rows, null));
@@ -4390,13 +4505,13 @@ test "lazer ranked stats weight best plays and ignore failed or unranked pp" {
     defer std.testing.allocator.free(lazer_rankings);
     try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"source\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"name\":\"ari\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"pp\":295") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"pp\":690") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_rankings, "\"plays\":5") != null);
 
     const lazer_profile = (try store.siteProfile(std.testing.allocator, 1, .lazer, 0)).?;
     defer std.testing.allocator.free(lazer_profile);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_source\":\"lazer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":3000,\"total_score\":17900,\"pp\":295,\"plays\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":2000,\"total_score\":5000,\"pp\":690,\"plays\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"mods_json\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"passed\":false") != null);
@@ -4447,22 +4562,46 @@ test "stable and lazer share one ranked performance result per map" {
     defer parsed.deinit();
     const lazer_input = try lazer.parseSoloScore(parsed.value, 75);
     const token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 100, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]", &.{});
+    _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 350, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]", &.{});
     const after_lazer = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 1500), after_lazer.ranked_score);
     try std.testing.expectEqual(@as(i64, 2500), after_lazer.total_score);
-    try std.testing.expectEqual(@as(i32, 300), after_lazer.pp);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), after_lazer.accuracy, 0.000001);
+    try std.testing.expectEqual(@as(i32, 350), after_lazer.pp);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), after_lazer.accuracy, 0.000001);
 
     var later_stable = stable_input;
     later_stable.online_checksum = "cccccccccccccccccccccccccccccccc";
     later_stable.total_score = 1200;
     _ = try store.insertStableScore(1, later_stable, 400, "later stable replay", 10_000);
     const after_stable = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 1500), after_stable.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1200), after_stable.ranked_score);
     try std.testing.expectEqual(@as(i64, 3700), after_stable.total_score);
     try std.testing.expectEqual(@as(i32, 400), after_stable.pp);
     try std.testing.expectApproxEqAbs(@as(f64, 1), after_stable.accuracy, 0.000001);
+
+    const stable_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 75, .stable, 0)).?;
+    defer std.testing.allocator.free(stable_board);
+    try std.testing.expect(std.mem.indexOf(u8, stable_board, "\"source\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_board, "\"client\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_board, "\"client\":\"lazer\"") == null);
+    const lazer_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 75, .lazer, 0)).?;
+    defer std.testing.allocator.free(lazer_board);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"source\":\"lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"client\":\"lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"client\":\"stable\"") == null);
+    const stable_rankings = try store.siteRankings(std.testing.allocator, .stable, 0, 0);
+    defer std.testing.allocator.free(stable_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, stable_rankings, "\"source\":\"stable\"") != null);
+
+    try store.exec("UPDATE stats SET ranked_score=1,total_score=2,pp=3,plays=4,accuracy=0.5,max_combo=5 WHERE user_id=1 AND mode=0");
+    _ = try store.applyBeatmapRankAction(1, stable_input.map_md5, .rank, "rebuild combined client stats");
+    const rebuilt = (try store.statsForUser(1, 0)).?;
+    try std.testing.expectEqual(@as(i64, 1200), rebuilt.ranked_score);
+    try std.testing.expectEqual(@as(i64, 3700), rebuilt.total_score);
+    try std.testing.expectEqual(@as(i32, 400), rebuilt.pp);
+    try std.testing.expectEqual(@as(i32, 3), rebuilt.plays);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), rebuilt.accuracy, 0.000001);
+    try std.testing.expectEqual(@as(i32, 100), rebuilt.max_combo);
 }
 
 test "Rijndael-256 matches the py3rijndael block fixture" {
@@ -5113,7 +5252,7 @@ test "ranked stable PP is stored and updates normal player stats" {
     const scorev2_profile = (try store.siteProfile(std.testing.allocator, 1, .scorev2, 0)).?;
     defer std.testing.allocator.free(scorev2_profile);
     try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"selected_source\":\"scorev2\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"selected_stats\":{\"ranked_score\":2000000,\"total_score\":3500000,\"pp\":1,\"plays\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"selected_stats\":{\"ranked_score\":1500000,\"total_score\":3500000,\"pp\":999,\"plays\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"namespace\":\"scorev2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"client\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, scorev2_profile, "\"mods\":536870912") != null);

@@ -24,6 +24,7 @@ pub const Submission = struct {
     mode: u8,
     client_time: []const u8,
     client_flags: []const u8,
+    achievement_stars: f64 = 0,
 
     pub fn accuracy(self: Submission) f64 {
         const total: i64 = switch (self.mode) {

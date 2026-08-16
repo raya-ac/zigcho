@@ -5,7 +5,7 @@ const sqlite = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const required_sqlite_version = 27;
+const required_sqlite_version = 28;
 
 const Kind = enum { text, integer, real, boolean, blob };
 const Column = struct { name: []const u8, kind: Kind };
@@ -64,8 +64,9 @@ const beatmap_comments = [_]Column{
     .{ .name = "colour", .kind = .text },     .{ .name = "created_at", .kind = .integer },
 };
 const direct_messages = [_]Column{
-    .{ .name = "id", .kind = .integer },   .{ .name = "from_id", .kind = .integer }, .{ .name = "to_id", .kind = .integer },
-    .{ .name = "message", .kind = .text }, .{ .name = "read", .kind = .boolean },    .{ .name = "created_at", .kind = .integer },
+    .{ .name = "id", .kind = .integer },       .{ .name = "from_id", .kind = .integer },    .{ .name = "to_id", .kind = .integer },
+    .{ .name = "message", .kind = .text },     .{ .name = "read", .kind = .boolean },       .{ .name = "is_action", .kind = .boolean },
+    .{ .name = "client_uuid", .kind = .text }, .{ .name = "created_at", .kind = .integer },
 };
 const audit_log = [_]Column{
     .{ .name = "id", .kind = .integer },  .{ .name = "actor_id", .kind = .integer }, .{ .name = "action", .kind = .text },
@@ -180,6 +181,10 @@ const user_avatars = [_]Column{
     .{ .name = "user_id", .kind = .integer }, .{ .name = "object_key", .kind = .text },    .{ .name = "content_type", .kind = .text },
     .{ .name = "etag", .kind = .text },       .{ .name = "updated_at", .kind = .integer },
 };
+const user_achievements = [_]Column{
+    .{ .name = "user_id", .kind = .integer },  .{ .name = "achievement_id", .kind = .integer }, .{ .name = "score_source", .kind = .text },
+    .{ .name = "score_id", .kind = .integer }, .{ .name = "achieved_at", .kind = .integer },
+};
 
 const tables = [_]Table{
     .{ .name = "users", .columns = &users, .identity = true },
@@ -213,6 +218,7 @@ const tables = [_]Table{
     .{ .name = "screenshots", .columns = &screenshots },
     .{ .name = "beatmap_media", .columns = &beatmap_media },
     .{ .name = "user_avatars", .columns = &user_avatars },
+    .{ .name = "user_achievements", .columns = &user_achievements },
 };
 
 fn sqliteError(db: *sqlite.sqlite3) void {
@@ -468,7 +474,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "postgres table inventory stays at the current sqlite schema" {
-    try std.testing.expectEqual(@as(usize, 31), tables.len);
+    try std.testing.expectEqual(@as(usize, 32), tables.len);
     try std.testing.expectEqualStrings("users", tables[0].name);
-    try std.testing.expectEqualStrings("user_avatars", tables[tables.len - 1].name);
+    try std.testing.expectEqualStrings("user_achievements", tables[tables.len - 1].name);
 }

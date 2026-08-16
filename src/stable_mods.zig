@@ -134,6 +134,66 @@ pub fn shortString(buffer: []u8, mods_value: i32) []const u8 {
     return if (position == 0) "NM" else buffer[0..position];
 }
 
+pub fn writeLazerJson(writer: *std.Io.Writer, mods_value: i32, include_classic: bool) !void {
+    const mods = canonical(mods_value);
+    try writer.writeByte('[');
+    var first = true;
+    if (include_classic) {
+        try writer.writeAll("{\"acronym\":\"CL\"}");
+        first = false;
+    }
+    const names = [_]struct { bit: i32, name: []const u8 }{
+        .{ .bit = no_fail, .name = "NF" },
+        .{ .bit = easy, .name = "EZ" },
+        .{ .bit = touch_device, .name = "TD" },
+        .{ .bit = hidden, .name = "HD" },
+        .{ .bit = hard_rock, .name = "HR" },
+        .{ .bit = sudden_death, .name = "SD" },
+        .{ .bit = double_time, .name = "DT" },
+        .{ .bit = relax, .name = "RX" },
+        .{ .bit = half_time, .name = "HT" },
+        .{ .bit = nightcore, .name = "NC" },
+        .{ .bit = flashlight, .name = "FL" },
+        .{ .bit = spun_out, .name = "SO" },
+        .{ .bit = autopilot, .name = "AP" },
+        .{ .bit = perfect, .name = "PF" },
+        .{ .bit = key4, .name = "4K" },
+        .{ .bit = key5, .name = "5K" },
+        .{ .bit = key6, .name = "6K" },
+        .{ .bit = key7, .name = "7K" },
+        .{ .bit = key8, .name = "8K" },
+        .{ .bit = fade_in, .name = "FI" },
+        .{ .bit = random, .name = "RD" },
+        .{ .bit = target, .name = "TP" },
+        .{ .bit = key9, .name = "9K" },
+        .{ .bit = key_coop, .name = "CO" },
+        .{ .bit = key1, .name = "1K" },
+        .{ .bit = key3, .name = "3K" },
+        .{ .bit = key2, .name = "2K" },
+        .{ .bit = score_v2, .name = "V2" },
+        .{ .bit = mirror, .name = "MR" },
+    };
+    for (names) |entry| {
+        if (entry.bit == double_time and mods & nightcore != 0) continue;
+        if (entry.bit == sudden_death and mods & perfect != 0) continue;
+        if (mods & entry.bit == 0) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{{\"acronym\":\"{s}\"}}", .{entry.name});
+    }
+    try writer.writeByte(']');
+}
+
+pub fn writeLazerStatistics(writer: *std.Io.Writer, mode: u8, n300: i32, n100: i32, n50: i32, ngeki: i32, nkatu: i32, nmiss: i32) !void {
+    switch (mode) {
+        0 => try writer.print("{{\"great\":{d},\"ok\":{d},\"meh\":{d},\"miss\":{d}}}", .{ n300, n100, n50, nmiss }),
+        1 => try writer.print("{{\"great\":{d},\"ok\":{d},\"miss\":{d}}}", .{ n300, n100, nmiss }),
+        2 => try writer.print("{{\"great\":{d},\"large_tick_hit\":{d},\"small_tick_hit\":{d},\"small_tick_miss\":{d},\"miss\":{d}}}", .{ n300, n100, n50, nkatu, nmiss }),
+        3 => try writer.print("{{\"perfect\":{d},\"great\":{d},\"good\":{d},\"ok\":{d},\"meh\":{d},\"miss\":{d}}}", .{ ngeki, n300, nkatu, n100, n50, nmiss }),
+        else => return error.InvalidMode,
+    }
+}
+
 fn compactBit(pair: []const u8) ?i32 {
     if (std.ascii.eqlIgnoreCase(pair, "nf")) return no_fail;
     if (std.ascii.eqlIgnoreCase(pair, "ez")) return easy;
@@ -218,6 +278,16 @@ test "stable mod labels suppress implied bits" {
     try std.testing.expectEqualStrings("NC", shortString(&buffer, double_time | nightcore));
     try std.testing.expectEqualStrings("PF", shortString(&buffer, sudden_death | perfect));
     try std.testing.expectEqualStrings("HDRX", shortString(&buffer, hidden | relax));
+}
+
+test "stable mods and judgements serialize for lazer classic" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeLazerJson(&output.writer, hidden | double_time | nightcore, true);
+    try std.testing.expectEqualStrings("[{\"acronym\":\"CL\"},{\"acronym\":\"HD\"},{\"acronym\":\"NC\"}]", output.written());
+    output.clearRetainingCapacity();
+    try writeLazerStatistics(&output.writer, 3, 500, 100, 20, 300, 50, 2);
+    try std.testing.expectEqualStrings("{\"perfect\":300,\"great\":500,\"good\":50,\"ok\":100,\"meh\":20,\"miss\":2}", output.written());
 }
 
 test "stable scorev2 has a score board but no player stats slice" {

@@ -1173,6 +1173,8 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, status_page, "download replay ↓") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_page, "https://assets.ppy.sh/medals/client/") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_page, "class=\"achievement-icon\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "custom-achievement-icon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "kind==='accuracy'?value+'%'") != null);
 }
 
 test "stable screenshots survive storage with exact type isolation" {

@@ -3058,7 +3058,7 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
-    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, classic: bool, limit: u8) ![]u8 {
+    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, classic: bool, limit: u8) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (classic) return self.stableClassicLeaderboardJsonLocked(allocator, requester_id, beatmap_id, ruleset_id, limit);
@@ -3066,12 +3066,14 @@ pub const Store = struct {
             "WITH ordered AS (" ++
             "SELECT s.*,b.status,row_number() OVER(PARTITION BY s.user_id ORDER BY CASE WHEN s.rank_namespace IN('relax','autopilot') THEN s.pp ELSE s.total_score END DESC,s.id ASC) AS user_place " ++
             "FROM lazer_scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id " ++
-            "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0)," ++
+            "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 " ++
+            "AND NOT EXISTS(SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
+            "AND NOT EXISTS(SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP')))," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
             "SELECT position,score_count,id,user_id,(SELECT name FROM users WHERE id=board.user_id),(SELECT country FROM users WHERE id=board.user_id)," ++
             "beatmap_id,ruleset_id,total_score,coalesce(legacy_total_score,total_score),pp,accuracy,max_combo,passed,rank,mods_json,statistics_json," ++
             "maximum_statistics_json,pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',submitted_at,'unixepoch'),status,length(replay)>0 " ++
-            "FROM board WHERE position<=?4 OR user_id=?5 ORDER BY position";
+            "FROM board WHERE position<=?5 OR user_id=?6 ORDER BY position";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -3079,8 +3081,9 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 2, ruleset_id);
         const namespace_name = @tagName(namespace);
         _ = c.sqlite3_bind_text(stmt, 3, namespace_name.ptr, @intCast(namespace_name.len), null);
-        _ = c.sqlite3_bind_int(stmt, 4, limit);
-        _ = c.sqlite3_bind_int(stmt, 5, requester_id);
+        _ = c.sqlite3_bind_text(stmt, 4, exact_mods_json.ptr, @intCast(exact_mods_json.len), null);
+        _ = c.sqlite3_bind_int(stmt, 5, limit);
+        _ = c.sqlite3_bind_int(stmt, 6, requester_id);
 
         var scores: std.Io.Writer.Allocating = .init(allocator);
         defer scores.deinit();
@@ -3984,7 +3987,23 @@ pub const Store = struct {
     pub fn lazerScoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT s.best,(SELECT count(*) FROM lazer_scores o JOIN users ou ON ou.id=o.user_id WHERE o.beatmap_id=pb.beatmap_id AND o.ruleset_id=pb.ruleset_id AND o.rank_namespace=pb.rank_namespace AND o.passed=1 AND o.best=1 AND ou.restricted=0 AND ou.id!=3 AND ((pb.rank_namespace IN('vanilla','custom') AND (o.total_score>pb.total_score OR (o.total_score=pb.total_score AND o.id<pb.id))) OR (pb.rank_namespace IN('relax','autopilot') AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN lazer_scores pb ON pb.user_id=s.user_id AND pb.beatmap_id=s.beatmap_id AND pb.ruleset_id=s.ruleset_id AND pb.rank_namespace=s.rank_namespace AND pb.passed=1 AND pb.best=1 WHERE s.id=?1 AND s.passed=1 AND b.status IN(3,4)";
+        const sql =
+            "WITH submitted AS (" ++
+            "SELECT s.*,b.status FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=?1)," ++
+            "ordered AS (" ++
+            "SELECT o.*,row_number() OVER(PARTITION BY o.user_id ORDER BY CASE WHEN o.rank_namespace IN('relax','autopilot') THEN o.pp ELSE o.total_score END DESC,o.id ASC) user_place " ++
+            "FROM lazer_scores o JOIN users u ON u.id=o.user_id JOIN submitted s " ++
+            "WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND u.restricted=0 AND u.id!=3 " ++
+            "AND NOT EXISTS(SELECT upper(json_extract(candidate.value,'$.acronym')) FROM json_each(o.mods_json) candidate WHERE s.rank_namespace!='custom' OR upper(json_extract(candidate.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(origin.value,'$.acronym')) FROM json_each(s.mods_json) origin WHERE s.rank_namespace!='custom' OR upper(json_extract(origin.value,'$.acronym')) NOT IN('RX','AP')) " ++
+            "AND NOT EXISTS(SELECT upper(json_extract(origin.value,'$.acronym')) FROM json_each(s.mods_json) origin WHERE s.rank_namespace!='custom' OR upper(json_extract(origin.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(candidate.value,'$.acronym')) FROM json_each(o.mods_json) candidate WHERE s.rank_namespace!='custom' OR upper(json_extract(candidate.value,'$.acronym')) NOT IN('RX','AP')))," ++
+            "board AS (SELECT * FROM ordered WHERE user_place=1) " ++
+            "SELECT NOT EXISTS(SELECT 1 FROM ordered own,submitted s WHERE own.user_id=s.user_id AND (" ++
+            "(s.rank_namespace IN('vanilla','custom') AND (own.total_score>s.total_score OR (own.total_score=s.total_score AND own.id<s.id))) OR " ++
+            "(s.rank_namespace IN('relax','autopilot') AND (own.pp>s.pp OR (own.pp=s.pp AND own.id<s.id)))))," ++
+            "(SELECT count(*) FROM board o,submitted s WHERE " ++
+            "(s.rank_namespace IN('vanilla','custom') AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))) OR " ++
+            "(s.rank_namespace IN('relax','autopilot') AND (o.pp>s.pp OR (o.pp=s.pp AND o.id<s.id)))) " ++
+            "FROM submitted s WHERE s.passed=1 AND s.status IN(3,4)";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);

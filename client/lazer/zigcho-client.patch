@@ -683,6 +683,18 @@ index 6e4f7e4..8f951a5 100644
 +        }
      }
  }
+diff --git a/osu.Game/Online/OnlineStatusNotifier.cs b/osu.Game/Online/OnlineStatusNotifier.cs
+index f4c33c6..09c4489 100644
+--- a/osu.Game/Online/OnlineStatusNotifier.cs
++++ b/osu.Game/Online/OnlineStatusNotifier.cs
+@@ -112,7 +112,6 @@ protected override void LoadComplete()
+                 switch (getCurrentScreen())
+                 {
+                     case SpectatorPlayer: // obvious issues
+-                    case SubmittingPlayer: // replay sending issues
+                         notifyApiDisconnection();
+                         break;
+                 }
 diff --git a/osu.Game/Online/ProductionEndpointConfiguration.cs b/osu.Game/Online/ProductionEndpointConfiguration.cs
 index 37ce2b6..8f94552 100644
 --- a/osu.Game/Online/ProductionEndpointConfiguration.cs

@@ -442,6 +442,32 @@ const App = struct {
         return false;
     }
 
+    fn lazerLeaderboardModsJson(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        const query_start = std.mem.findScalar(u8, target, '?') orelse {
+            try output.writer.writeByte(']');
+            return output.toOwnedSlice();
+        };
+        var first = true;
+        var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+        while (parameters.next()) |parameter| {
+            const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
+            const key = parameter[0..equals];
+            if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
+            const acronym = parameter[equals + 1 ..];
+            if (std.ascii.eqlIgnoreCase(acronym, "NM") or std.ascii.eqlIgnoreCase(acronym, "CL") or !lazer.validAcronym(acronym)) continue;
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.writeByte('"');
+            for (acronym) |character| try output.writer.writeByte(std.ascii.toUpper(character));
+            try output.writer.writeByte('"');
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
     fn isAvatarHost(value: ?[]const u8) bool {
         const host = value orelse return false;
         const end = std.mem.findScalar(u8, host, ':') orelse host.len;
@@ -1977,7 +2003,9 @@ const App = struct {
             if (raw_limit == 0 or raw_limit > 100) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
             const scope = queryField(target, "type") orelse "global";
             if (!std.mem.eql(u8, scope, "global") and !std.mem.eql(u8, scope, "country") and !std.mem.eql(u8, scope, "friend")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported leaderboard scope\"}", &.{});
-            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), lazerLeaderboardClassic(target), @intCast(raw_limit));
+            const exact_mods_json = try lazerLeaderboardModsJson(self.allocator, target);
+            defer self.allocator.free(exact_mods_json);
+            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), exact_mods_json, lazerLeaderboardClassic(target), @intCast(raw_limit));
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -2064,7 +2092,7 @@ const App = struct {
             const score_context = self.lazer_multiplayer.scoreContext(user.id, room_score_path.room_id, room_score_path.playlist_item_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
 
             if (room_score_path.token_id == null and req.head.method == .GET) {
-                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, false, 100);
+                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, "[]", false, 100);
                 defer self.allocator.free(board_json);
                 const parsed_board = std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{}) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
                 defer parsed_board.deinit();

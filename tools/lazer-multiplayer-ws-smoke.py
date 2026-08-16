@@ -249,6 +249,13 @@ class WebSocket:
                 stages.append(arguments[0][1][0])
         return stages
 
+    def ranked_stages(self):
+        stages = []
+        for arguments in self.event_arguments("MatchRoomStateChanged"):
+            if arguments and arguments[0] and arguments[0][0] == 2:
+                stages.append(arguments[0][1][0])
+        return stages
+
 
 def api_request(origin, token, method, path, body=None, content_type=None):
     request = urllib.request.Request(origin + path, data=body, method=method)
@@ -385,7 +392,84 @@ def main():
             raise RuntimeError(f"matchmaking results did not retain the submitted score: {results}")
         two.invoke(90, "LeaveRoom", [])
         one.invoke(91, "LeaveRoom", [])
-        print(f"lazer_multiplayer_ws_smoke_ok room_id={room_id} matchmaking_room_id={match_room_id}")
+
+        ranked_pools = one.invoke(100, "GetMatchmakingPoolsOfType", [1])
+        if not ranked_pools or ranked_pools[0][0] != 101 or ranked_pools[0][1] != 0 or ranked_pools[0][4] != 1:
+            raise RuntimeError(f"ranked play pool unavailable: {ranked_pools}")
+        one.invoke(101, "MatchmakingJoinLobbyWithParams", [[101]])
+        two.invoke(100, "MatchmakingJoinLobbyWithParams", [[101]])
+        one.invoke(102, "MatchmakingJoinQueue", [101])
+        two.invoke(101, "MatchmakingJoinQueue", [101])
+        one.invoke(103, "MatchmakingAcceptInvitation", [])
+        two.invoke(102, "MatchmakingAcceptInvitation", [])
+        one.invoke(104, "MatchmakingLeaveLobby", [])
+        two.invoke(103, "MatchmakingLeaveLobby", [])
+        ranked_ready = two.event_arguments("MatchmakingRoomReady")[-1]
+        ranked_room_id, ranked_password = ranked_ready
+        ranked_one = one.invoke(105, "JoinRoomWithPassword", [ranked_room_id, ranked_password])
+        one_user_id = ranked_one[3][0][0]
+        ranked_two = two.invoke(104, "JoinRoomWithPassword", [ranked_room_id, ranked_password])
+        two_user_id = next(user[0] for user in ranked_two[3] if user[0] != one_user_id)
+        if ranked_two[5][0] != 2 or ranked_two[5][1][0] != 2:
+            raise RuntimeError(f"ranked users did not enter card discard: {ranked_two[5]}")
+        one.invoke(106, "DiscardCards", [[]])
+        two.invoke(105, "DiscardCards", [[]])
+        if 4 not in two.ranked_stages():
+            raise RuntimeError(f"ranked match did not enter card play: {two.ranked_stages()}")
+
+        for round_number in (1, 2):
+            state_events = two.event_arguments("MatchRoomStateChanged")
+            ranked_state = next(args[0][1] for args in reversed(state_events) if args[0][0] == 2)
+            active_user_id = ranked_state[4]
+            active_card = ranked_state[3][active_user_id][2][0]
+            active = one if active_user_id == one_user_id else two
+            passive = two if active is one else one
+            active.invoke(110 + round_number * 20, "PlayCard", [active_card])
+            passive.invoke(111 + round_number * 20, "ChangeState", [1])
+            active.invoke(112 + round_number * 20, "ChangeState", [1])
+            ranked_stages = one.ranked_stages() + two.ranked_stages()
+            if 7 not in ranked_stages:
+                raise RuntimeError(f"ranked round {round_number} did not start gameplay: {ranked_stages}")
+
+            reveal = one.event_arguments("RankedPlayCardRevealed")[-1]
+            selected_item = reveal[1]
+            selected_item_id = selected_item[0]
+            selected_beatmap_id = selected_item[2]
+            selected_checksum = selected_item[3]
+            for token, client, total in ((token_one, one, 900000), (token_two, two, 100000)):
+                token_form = urllib.parse.urlencode({
+                    "version_hash": "11111111111111111111111111111111",
+                    "beatmap_id": str(selected_beatmap_id),
+                    "beatmap_hash": selected_checksum,
+                    "ruleset_id": "0",
+                }).encode()
+                status, token_response = api_request(origin, token, "POST", f"/api/v2/rooms/{ranked_room_id}/playlist/{selected_item_id}/scores", token_form, "application/x-www-form-urlencoded")
+                if status != 201:
+                    raise RuntimeError(f"ranked round {round_number} score token failed")
+                score_body = json.dumps({
+                    "rank": "A", "total_score": total, "legacy_total_score": total,
+                    "total_score_without_mods": total, "accuracy": 0.95, "max_combo": 9,
+                    "ruleset_id": 0, "passed": True, "mods": [],
+                    "statistics": {"great": 19, "miss": 1}, "maximum_statistics": {"great": 20}, "pauses": [],
+                }).encode()
+                status, _ = api_request(origin, token, "PUT", f"/api/v2/rooms/{ranked_room_id}/playlist/{selected_item_id}/scores/{token_response['id']}", score_body, "application/json")
+                if status != 200:
+                    raise RuntimeError(f"ranked round {round_number} score submit failed")
+
+            one.invoke(113 + round_number * 20, "ChangeState", [3])
+            two.invoke(113 + round_number * 20, "ChangeState", [3])
+            one.invoke(114 + round_number * 20, "ChangeState", [6])
+            two.invoke(114 + round_number * 20, "ChangeState", [6])
+            if 8 not in two.ranked_stages():
+                raise RuntimeError(f"ranked round {round_number} did not reach results: {two.ranked_stages()}")
+            one.invoke(115 + round_number * 20, "ChangeState", [0])
+            two.invoke(115 + round_number * 20, "ChangeState", [0])
+
+        if 9 not in two.ranked_stages():
+            raise RuntimeError(f"ranked match did not end: {two.ranked_stages()}")
+        two.invoke(190, "LeaveRoom", [])
+        one.invoke(191, "LeaveRoom", [])
+        print(f"lazer_multiplayer_ws_smoke_ok room_id={room_id} matchmaking_room_id={match_room_id} ranked_room_id={ranked_room_id}")
     finally:
         one.close()
         two.close()

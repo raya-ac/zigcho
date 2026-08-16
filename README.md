@@ -17,7 +17,7 @@ this is not connected to official osu! accounts. Stable and the custom lazer cli
 
 the website keeps Stable and lazer scoreboards separate because their score values are not comparable. player stats are shared: lazer contributes its legacy score value, and the higher-PP Stable or lazer play owns each map in the combined calculation.
 
-Stable is the complete public lane. lazer is still an alpha: ranked solo play, normal head-to-head rooms, Quick Play and spectator streaming work, while ranked multiplayer and the final signed client release are not finished.
+Stable is the complete public lane. lazer is still an alpha, but ranked solo play, normal head-to-head rooms, Quick Play, two-player ranked matches and live spectating now work.
 
 ## building it
 

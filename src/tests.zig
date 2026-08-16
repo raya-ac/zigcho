@@ -525,6 +525,11 @@ test "config values stay owned after the source buffer changes" {
             "avatar_r2_bucket=avatars\n" ++
             "avatar_r2_access_key_id=test-access\n" ++
             "avatar_r2_secret_access_key=test-secret\n" ++
+            "object_storage_endpoint=https://sin1.contabostorage.com\n" ++
+            "object_storage_bucket=data\n" ++
+            "object_storage_region=default\n" ++
+            "object_storage_access_key_id=object-access\n" ++
+            "object_storage_secret_access_key=object-secret\n" ++
             "osu_api_key=final-key\n",
     );
     var config = try config_mod.parse(std.testing.allocator, source);
@@ -542,6 +547,11 @@ test "config values stay owned after the source buffer changes" {
     try std.testing.expectEqualStrings("avatars", config.avatar_r2_bucket);
     try std.testing.expectEqualStrings("test-access", config.avatar_r2_access_key_id);
     try std.testing.expectEqualStrings("test-secret", config.avatar_r2_secret_access_key);
+    try std.testing.expectEqualStrings("https://sin1.contabostorage.com", config.object_storage_endpoint);
+    try std.testing.expectEqualStrings("data", config.object_storage_bucket);
+    try std.testing.expectEqualStrings("default", config.object_storage_region);
+    try std.testing.expectEqualStrings("object-access", config.object_storage_access_key_id);
+    try std.testing.expectEqualStrings("object-secret", config.object_storage_secret_access_key);
 }
 
 const stable_replay_fixture =
@@ -1227,6 +1237,34 @@ test "beatmap covers and previews survive the bounded media cache" {
     const pruned = try store.pruneBeatmapMedia(0);
     try std.testing.expectEqual(@as(i64, 2), pruned.entries);
     try std.testing.expectEqual(@as(i64, 0), (try store.beatmapMediaCacheStats()).entries);
+}
+
+test "object storage keeps the database rollback copy out of cache pruning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/object-rollback.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(1,10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','a','a','a','a',3)");
+    try store.upsertBeatmapArchive(10, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "archive");
+    try store.putBeatmapMedia(10, .cover, .jpeg, "\xff\xd8\xffcover\xff\xd9");
+    store.bindObjectStorage(.{
+        .endpoint = "https://sin1.contabostorage.com",
+        .bucket = "data",
+        .region = "default",
+        .access_key_id = "fixture-access",
+        .secret_access_key = "fixture-secret",
+    });
+    const archives = try store.pruneBeatmapArchives(0);
+    const media = try store.pruneBeatmapMedia(0);
+    try std.testing.expectEqual(@as(i64, 0), archives.entries);
+    try std.testing.expectEqual(@as(i64, 0), archives.bytes);
+    try std.testing.expectEqual(@as(i64, 0), media.entries);
+    try std.testing.expectEqual(@as(i64, 0), media.bytes);
+    try std.testing.expectEqual(@as(i64, 1), (try store.beatmapCacheStats()).entries);
+    try std.testing.expectEqual(@as(i64, 1), (try store.beatmapMediaCacheStats()).entries);
 }
 
 test "Akatsuki ranks map into local leaderboard states" {

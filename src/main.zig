@@ -35,6 +35,7 @@ const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
 const r2 = @import("r2.zig");
+const object_keys = @import("object_keys.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
@@ -2995,6 +2996,87 @@ fn recalcStats(store: *sqlite_storage.Store) !void {
     }
 }
 
+fn configuredObjectStore(config: config_mod.Config) r2.Storage {
+    return .{
+        .endpoint = config.object_storage_endpoint,
+        .bucket = config.object_storage_bucket,
+        .access_key_id = config.object_storage_access_key_id,
+        .secret_access_key = config.object_storage_secret_access_key,
+        .region = config.object_storage_region,
+    };
+}
+
+fn configuredLegacyAvatarStore(config: config_mod.Config) r2.Storage {
+    return .{
+        .endpoint = config.avatar_r2_endpoint,
+        .bucket = config.avatar_r2_bucket,
+        .access_key_id = config.avatar_r2_access_key_id,
+        .secret_access_key = config.avatar_r2_secret_access_key,
+    };
+}
+
+const AvatarObjectMigrationStats = struct { migrated: i64 = 0, failed: i64 = 0 };
+
+fn migrateAvatarObjects(allocator: std.mem.Allocator, store: *storage.Store, source: r2.Storage, target: r2.Storage) !AvatarObjectMigrationStats {
+    const user_ids = try store.customAvatarUserIds(allocator);
+    defer allocator.free(user_ids);
+    var stats: AvatarObjectMigrationStats = .{};
+    for (user_ids) |user_id| {
+        var avatar = (try store.customAvatarForUser(allocator, user_id)) orelse continue;
+        defer avatar.deinit();
+        var target_valid = false;
+        if (target.getWithLimit(allocator, store.io, avatar.object_key, avatar.content_type, profile_avatar.max_bytes)) |data| {
+            defer allocator.free(data);
+            if (profile_avatar.validate(avatar.content_type, data)) |_| {
+                target_valid = object_keys.matchesSha256(data, &avatar.etag);
+            } else |_| {}
+        } else |_| {}
+        if (target_valid) {
+            stats.migrated += 1;
+            continue;
+        }
+        if (!source.enabled()) {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error=source_not_configured", .{user_id});
+            continue;
+        }
+        const data = source.getWithLimit(allocator, store.io, avatar.object_key, avatar.content_type, profile_avatar.max_bytes) catch |err| {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error={t}", .{ user_id, err });
+            continue;
+        };
+        defer allocator.free(data);
+        _ = profile_avatar.validate(avatar.content_type, data) catch |err| {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error={t}", .{ user_id, err });
+            continue;
+        };
+        if (!object_keys.matchesSha256(data, &avatar.etag)) {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error=etag_mismatch", .{user_id});
+            continue;
+        }
+        target.put(allocator, store.io, avatar.object_key, avatar.content_type, data) catch |err| {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error={t}", .{ user_id, err });
+            continue;
+        };
+        const verified = target.getWithLimit(allocator, store.io, avatar.object_key, avatar.content_type, profile_avatar.max_bytes) catch |err| {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error={t}", .{ user_id, err });
+            continue;
+        };
+        defer allocator.free(verified);
+        if (!object_keys.matchesSha256(verified, &avatar.etag)) {
+            stats.failed += 1;
+            std.log.warn("event=avatar_object_migration_failed user_id={d} error=verification_failed", .{user_id});
+            continue;
+        }
+        stats.migrated += 1;
+    }
+    return stats;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
@@ -3022,6 +3104,47 @@ pub fn main(init: std.process.Init) !void {
             counts.passed,
             counts.maps,
         });
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "object-migrate")) {
+        if (storage.is_postgres and args.len > 2) return error.PostgresUrlMustUseEnvironment;
+        const database: [:0]const u8 = if (storage.is_postgres)
+            std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl)
+        else if (args.len > 2)
+            try allocator.dupeZ(u8, args[2])
+        else
+            "zigcho.db";
+        defer if (!storage.is_postgres and args.len > 2) allocator.free(database);
+        var store = try storage.Store.open(allocator, init.io, database);
+        defer store.close();
+        try store.migrate();
+        var config = try config_mod.load(allocator, init.io);
+        defer config.deinit();
+        const object_store = configuredObjectStore(config);
+        if (!object_store.enabled()) return error.ObjectStorageNotConfigured;
+        store.bindObjectStorage(object_store);
+        const maps = try store.migrateBeatmapObjects();
+        const avatars = try migrateAvatarObjects(allocator, &store, configuredLegacyAvatarStore(config), object_store);
+        std.log.info("event=object_migration_complete archives={d} media={d} avatars={d} failed={d}", .{ maps.archives, maps.media, avatars.migrated, maps.failed + avatars.failed });
+        if (maps.failed + avatars.failed != 0) return error.ObjectMigrationIncomplete;
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "object-purge")) {
+        if (!storage.is_postgres) return error.ObjectPurgeRequiresPostgres;
+        if (args.len > 2) return error.PostgresUrlMustUseEnvironment;
+        const database = std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl);
+        var store = try storage.Store.open(allocator, init.io, database);
+        defer store.close();
+        try store.migrate();
+        var config = try config_mod.load(allocator, init.io);
+        defer config.deinit();
+        const object_store = configuredObjectStore(config);
+        if (!object_store.enabled()) return error.ObjectStorageNotConfigured;
+        store.bindObjectStorage(object_store);
+        const avatars = try migrateAvatarObjects(allocator, &store, configuredLegacyAvatarStore(config), object_store);
+        if (avatars.failed != 0) return error.ObjectMigrationIncomplete;
+        const purged = try store.purgeBeatmapObjectBackups();
+        std.log.info("event=object_purge_complete archives={d} archive_bytes={d} media={d} media_bytes={d} avatars={d}", .{ purged.archives, purged.archive_bytes, purged.media, purged.media_bytes, avatars.migrated });
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "recalc")) {
@@ -3056,6 +3179,8 @@ pub fn main(init: std.process.Init) !void {
     try store.migrate();
     var config = try config_mod.load(allocator, init.io);
     defer config.deinit();
+    const object_store = configuredObjectStore(config);
+    store.bindObjectStorage(object_store);
     const anticheat: ?anticheat_plugin.Host = if (config.anticheat_module_path.len == 0)
         null
     else
@@ -3076,12 +3201,7 @@ pub fn main(init: std.process.Init) !void {
         .score_webhook = webhook.Webhook.init(allocator, init.io, config.score_webhook),
         .anticheat = anticheat,
         .anticheat_allow_sample_modulus = config.anticheat_allow_sample_modulus,
-        .avatar_store = .{
-            .endpoint = config.avatar_r2_endpoint,
-            .bucket = config.avatar_r2_bucket,
-            .access_key_id = config.avatar_r2_access_key_id,
-            .secret_access_key = config.avatar_r2_secret_access_key,
-        },
+        .avatar_store = if (object_store.enabled()) object_store else configuredLegacyAvatarStore(config),
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };

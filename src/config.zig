@@ -9,6 +9,11 @@ pub const Config = struct {
     avatar_r2_bucket: []u8,
     avatar_r2_access_key_id: []u8,
     avatar_r2_secret_access_key: []u8,
+    object_storage_endpoint: []u8,
+    object_storage_bucket: []u8,
+    object_storage_region: []u8,
+    object_storage_access_key_id: []u8,
+    object_storage_secret_access_key: []u8,
     beatmap_cache_max_bytes: u64,
     beatmap_media_cache_max_bytes: u64,
 
@@ -25,6 +30,16 @@ pub const Config = struct {
         errdefer allocator.free(avatar_r2_access_key_id);
         const avatar_r2_secret_access_key = try allocator.dupe(u8, "");
         errdefer allocator.free(avatar_r2_secret_access_key);
+        const object_storage_endpoint = try allocator.dupe(u8, "");
+        errdefer allocator.free(object_storage_endpoint);
+        const object_storage_bucket = try allocator.dupe(u8, "");
+        errdefer allocator.free(object_storage_bucket);
+        const object_storage_region = try allocator.dupe(u8, "default");
+        errdefer allocator.free(object_storage_region);
+        const object_storage_access_key_id = try allocator.dupe(u8, "");
+        errdefer allocator.free(object_storage_access_key_id);
+        const object_storage_secret_access_key = try allocator.dupe(u8, "");
+        errdefer allocator.free(object_storage_secret_access_key);
         return .{
             .allocator = allocator,
             .score_webhook = score_webhook,
@@ -34,6 +49,11 @@ pub const Config = struct {
             .avatar_r2_bucket = avatar_r2_bucket,
             .avatar_r2_access_key_id = avatar_r2_access_key_id,
             .avatar_r2_secret_access_key = avatar_r2_secret_access_key,
+            .object_storage_endpoint = object_storage_endpoint,
+            .object_storage_bucket = object_storage_bucket,
+            .object_storage_region = object_storage_region,
+            .object_storage_access_key_id = object_storage_access_key_id,
+            .object_storage_secret_access_key = object_storage_secret_access_key,
             .beatmap_cache_max_bytes = 2 * 1024 * 1024 * 1024,
             .beatmap_media_cache_max_bytes = 512 * 1024 * 1024,
         };
@@ -46,6 +66,11 @@ pub const Config = struct {
         self.allocator.free(self.avatar_r2_bucket);
         self.allocator.free(self.avatar_r2_access_key_id);
         self.allocator.free(self.avatar_r2_secret_access_key);
+        self.allocator.free(self.object_storage_endpoint);
+        self.allocator.free(self.object_storage_bucket);
+        self.allocator.free(self.object_storage_region);
+        self.allocator.free(self.object_storage_access_key_id);
+        self.allocator.free(self.object_storage_secret_access_key);
         self.* = undefined;
     }
 
@@ -82,6 +107,16 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
             try result.replace(&result.avatar_r2_access_key_id, value);
         } else if (std.mem.eql(u8, key, "avatar_r2_secret_access_key")) {
             try result.replace(&result.avatar_r2_secret_access_key, value);
+        } else if (std.mem.eql(u8, key, "object_storage_endpoint")) {
+            try result.replace(&result.object_storage_endpoint, value);
+        } else if (std.mem.eql(u8, key, "object_storage_bucket")) {
+            try result.replace(&result.object_storage_bucket, value);
+        } else if (std.mem.eql(u8, key, "object_storage_region")) {
+            try result.replace(&result.object_storage_region, value);
+        } else if (std.mem.eql(u8, key, "object_storage_access_key_id")) {
+            try result.replace(&result.object_storage_access_key_id, value);
+        } else if (std.mem.eql(u8, key, "object_storage_secret_access_key")) {
+            try result.replace(&result.object_storage_secret_access_key, value);
         } else if (std.mem.eql(u8, key, "beatmap_cache_max_bytes")) {
             const parsed = std.fmt.parseInt(u64, value, 10) catch continue;
             if (parsed >= 128 * 1024 * 1024 and parsed <= 128 * 1024 * 1024 * 1024)

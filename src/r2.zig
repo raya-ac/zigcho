@@ -9,9 +9,10 @@ pub const Storage = struct {
     bucket: []const u8,
     access_key_id: []const u8,
     secret_access_key: []const u8,
+    region: []const u8 = "auto",
 
     pub fn enabled(self: Storage) bool {
-        return validEndpoint(self.endpoint) and validBucket(self.bucket) and self.access_key_id.len > 0 and self.secret_access_key.len > 0;
+        return validEndpoint(self.endpoint) and validBucket(self.bucket) and validRegion(self.region) and self.access_key_id.len > 0 and self.secret_access_key.len > 0;
     }
 
     pub fn put(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8, data: []const u8) !void {
@@ -24,8 +25,13 @@ pub const Storage = struct {
     }
 
     pub fn get(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8) ![]u8 {
+        return self.getWithLimit(allocator, io, object_key, content_type, max_object_bytes);
+    }
+
+    pub fn getWithLimit(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8, limit: usize) ![]u8 {
         if (!self.enabled()) return error.R2NotConfigured;
-        const buffer = try allocator.alloc(u8, max_object_bytes);
+        if (limit == 0 or limit == std.math.maxInt(usize)) return error.InvalidR2ObjectLimit;
+        const buffer = try allocator.alloc(u8, limit + 1);
         errdefer allocator.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
         const result = self.request(allocator, io, .GET, object_key, content_type, "", &writer) catch |err| switch (err) {
@@ -37,6 +43,7 @@ pub const Storage = struct {
             std.log.warn("event=r2_download_rejected status={d}", .{@intFromEnum(result)});
             return error.R2DownloadFailed;
         }
+        if (writer.end > limit) return error.R2ObjectTooLarge;
         return allocator.realloc(buffer, writer.end);
     }
 
@@ -71,11 +78,11 @@ pub const Storage = struct {
         var request_digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(canonical_request, &request_digest, .{});
         const request_hash = std.fmt.bytesToHex(request_digest, .lower);
-        const credential_scope = try std.fmt.allocPrint(allocator, "{s}/auto/s3/aws4_request", .{&timestamp.date});
+        const credential_scope = try std.fmt.allocPrint(allocator, "{s}/{s}/s3/aws4_request", .{ &timestamp.date, self.region });
         defer allocator.free(credential_scope);
         const string_to_sign = try std.fmt.allocPrint(allocator, "AWS4-HMAC-SHA256\n{s}\n{s}\n{s}", .{ &timestamp.amz, credential_scope, &request_hash });
         defer allocator.free(string_to_sign);
-        const signing_key = try deriveSigningKey(allocator, self.secret_access_key, &timestamp.date, "auto");
+        const signing_key = try deriveSigningKey(allocator, self.secret_access_key, &timestamp.date, self.region);
         defer allocator.free(signing_key);
         var signature_digest: [32]u8 = undefined;
         HmacSha256.create(&signature_digest, string_to_sign, signing_key);
@@ -150,6 +157,12 @@ fn validBucket(value: []const u8) bool {
     return true;
 }
 
+fn validRegion(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64) return false;
+    for (value) |char| if (!std.ascii.isAlphanumeric(char) and char != '-' and char != '_') return false;
+    return true;
+}
+
 fn validObjectKey(value: []const u8) bool {
     if (value.len == 0 or value.len > 200 or value[0] == '/' or std.mem.indexOf(u8, value, "..") != null) return false;
     for (value) |char| if (!std.ascii.isAlphanumeric(char) and char != '/' and char != '-' and char != '_' and char != '.') return false;
@@ -162,8 +175,11 @@ test "r2 timestamp and configuration stay deterministic" {
     try std.testing.expectEqualStrings("20210810T231500Z", &timestamp.amz);
     const configured: Storage = .{ .endpoint = "https://example.r2.cloudflarestorage.com", .bucket = "avatar", .access_key_id = "key", .secret_access_key = "secret" };
     try std.testing.expect(configured.enabled());
+    const contabo: Storage = .{ .endpoint = "https://sin1.contabostorage.com", .bucket = "data", .access_key_id = "key", .secret_access_key = "secret", .region = "default" };
+    try std.testing.expect(contabo.enabled());
     try std.testing.expect(!validObjectKey("../secret"));
     try std.testing.expect(validObjectKey("avatars/4/abcdef.png"));
+    try std.testing.expect(!validBucket("tenant:data"));
 }
 
 test "r2 signing key matches the official s3 signature fixture" {

@@ -13,7 +13,7 @@ this is not connected to official osu! accounts. Stable and the custom lazer cli
 - PostgreSQL migrations, backups, restore drills, release rollback and bounded runtime caches
 - `zigcho!lazer` accounts, profiles, beatmaps, vanilla/Relax/Autopilot boards, replay downloads, normal head-to-head rooms, Quick Play and live spectating
 - a public site with profiles, map leaderboards, replay downloads, player login and proper account settings
-- private custom avatars in Cloudflare R2, served through `a.kai.ovh/{user_id}`
+- private object storage for custom avatars, beatmap archives and map media
 
 the website keeps Stable and lazer scoreboards separate because their score values are not comparable. player stats are shared: lazer contributes its legacy score value, and the higher-PP Stable or lazer play owns each map in the combined calculation.
 
@@ -31,7 +31,7 @@ ZIGCHO_POSTGRES_URL='host=/var/run/postgresql dbname=zigcho user=zigcho connect_
   ./zig-out/bin/zigcho 127.0.0.1 8080
 ```
 
-copy `config.example.ini` to `config.ini` for private runtime settings. the real file is ignored by git and Docker. custom avatars need an R2 key scoped to object read and write on the one avatar bucket; the bucket itself stays private.
+copy `config.example.ini` to `config.ini` for private runtime settings. the real file is ignored by git and Docker. object storage stays private and only needs read/write access to its one bucket. `zigcho object-migrate` copies and verifies the existing map cache and avatars without deleting anything. once an object-aware build is the rollback, `zigcho object-purge` verifies every object again before removing the duplicate PostgreSQL blobs.
 
 the full public hostname contract is in `deploy/hosts.txt`. production releases are built from an exact commit, placed under `/opt/zigcho/releases/<commit>`, then activated with `tools/activate-release.sh`. activation makes and restore-tests a PostgreSQL backup before changing the live symlink.
 

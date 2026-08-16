@@ -9,6 +9,8 @@ const media_contract = @import("media_contract.zig");
 const site_replay = @import("site_replay.zig");
 const user_json = @import("user_json.zig");
 const achievements = @import("achievements.zig");
+const r2 = @import("r2.zig");
+const object_keys = @import("object_keys.zig");
 pub const is_postgres = false;
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -114,6 +116,7 @@ pub const Store = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
     io: std.Io,
+    object_store: r2.Storage = .{ .endpoint = "", .bucket = "", .access_key_id = "", .secret_access_key = "" },
     mutex: std.Io.Mutex = .init,
 
     pub const CustomAvatar = struct {
@@ -162,6 +165,9 @@ pub const Store = struct {
         var db: ?*c.sqlite3 = null;
         if (c.sqlite3_open(path.ptr, &db) != c.SQLITE_OK) return error.DatabaseOpenFailed;
         return .{ .db = db.?, .allocator = allocator, .io = io };
+    }
+    pub fn bindObjectStorage(self: *Store, object_store: r2.Storage) void {
+        self.object_store = object_store;
     }
     pub fn close(self: *Store) void {
         _ = c.sqlite3_close(self.db);
@@ -2337,6 +2343,19 @@ pub const Store = struct {
         bytes: i64,
     };
 
+    pub const ObjectMigrationStats = struct {
+        archives: i64 = 0,
+        media: i64 = 0,
+        failed: i64 = 0,
+    };
+
+    pub const ObjectPurgeStats = struct {
+        archives: i64 = 0,
+        archive_bytes: i64 = 0,
+        media: i64 = 0,
+        media_bytes: i64 = 0,
+    };
+
     pub fn serverCounts(self: *Store) !ServerCounts {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2355,6 +2374,18 @@ pub const Store = struct {
             .passed = c.sqlite3_column_int64(stmt, 2),
             .maps = c.sqlite3_column_int64(stmt, 3),
         };
+    }
+
+    pub fn customAvatarUserIds(self: *Store, allocator: std.mem.Allocator) ![]i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT user_id FROM user_avatars ORDER BY user_id", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var ids: std.ArrayList(i32) = .empty;
+        errdefer ids.deinit(allocator);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) try ids.append(allocator, c.sqlite3_column_int(stmt, 0));
+        return ids.toOwnedSlice(allocator);
     }
 
     pub fn siteRankings(self: *Store, allocator: std.mem.Allocator, source: domain.SiteScoreSource, mode: u8, offset: u16) ![]u8 {
@@ -3820,6 +3851,13 @@ pub const Store = struct {
     }
 
     pub fn upsertBeatmapArchive(self: *Store, set_id: i32, sha256: []const u8, osz_file: []const u8) !void {
+        if (!try self.beatmapSetExists(set_id)) return error.UnknownBeatmapSet;
+        if (self.object_store.enabled() and object_keys.validSha256(sha256)) {
+            const object_key = try object_keys.archive(self.allocator, set_id, sha256);
+            defer self.allocator.free(object_key);
+            self.object_store.put(self.allocator, self.io, object_key, "application/octet-stream", osz_file) catch |err|
+                std.log.warn("event=beatmap_archive_object_write_failed set_id={d} error={t}", .{ set_id, err });
+        }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var exists_stmt: ?*c.sqlite3_stmt = null;
@@ -3861,10 +3899,18 @@ pub const Store = struct {
 
     pub fn putBeatmapMedia(self: *Store, set_id: i32, kind: media_contract.Kind, content_type: media_contract.ContentType, data: []const u8) !void {
         if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidBeatmapMedia;
+        if (!try self.beatmapSetExists(set_id)) return error.UnknownBeatmapSet;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
         var encoded_digest: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&encoded_digest, "{x}", .{digest}) catch unreachable;
+
+        if (self.object_store.enabled()) {
+            const object_key = try object_keys.media(self.allocator, set_id, kind, content_type, &encoded_digest);
+            defer self.allocator.free(object_key);
+            self.object_store.put(self.allocator, self.io, object_key, content_type.value(), data) catch |err|
+                std.log.warn("event=beatmap_media_object_write_failed set_id={d} kind={s} error={t}", .{ set_id, kind.dbName(), err });
+        }
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3888,29 +3934,49 @@ pub const Store = struct {
     }
 
     pub fn beatmapMedia(self: *Store, allocator: std.mem.Allocator, set_id: i32, kind: media_contract.Kind) !?media_contract.Asset {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT content_type,data FROM beatmap_media WHERE set_id=?1 AND kind=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int(stmt, 1, set_id);
-        _ = c.sqlite3_bind_text(stmt, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        const content_type = media_contract.ContentType.parse(std.mem.span(c.sqlite3_column_text(stmt, 0))) orelse return error.InvalidStoredBeatmapMedia;
-        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
-        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-        const data = try allocator.dupe(u8, ptr[0..len]);
-        errdefer allocator.free(data);
-        if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidStoredBeatmapMedia;
-        _ = c.sqlite3_finalize(stmt);
-        stmt = null;
-        var touch: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_media SET last_accessed_at=unixepoch() WHERE set_id=?1 AND kind=?2", -1, &touch, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(touch);
-        _ = c.sqlite3_bind_int(touch, 1, set_id);
-        _ = c.sqlite3_bind_text(touch, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
-        if (c.sqlite3_step(touch) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        return .{ .data = data, .content_type = content_type };
+        const stored = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT content_type,sha256,data FROM beatmap_media WHERE set_id=?1 AND kind=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_int(stmt, 1, set_id);
+            _ = c.sqlite3_bind_text(stmt, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            const content_type = media_contract.ContentType.parse(std.mem.span(c.sqlite3_column_text(stmt, 0))) orelse return error.InvalidStoredBeatmapMedia;
+            const sha256 = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+            errdefer allocator.free(sha256);
+            const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 2));
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+            const data = try allocator.dupe(u8, ptr[0..len]);
+            errdefer allocator.free(data);
+            if (!media_contract.compatible(kind, content_type) or !object_keys.validSha256(sha256)) return error.InvalidStoredBeatmapMedia;
+            var touch: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_media SET last_accessed_at=unixepoch() WHERE set_id=?1 AND kind=?2", -1, &touch, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(touch);
+            _ = c.sqlite3_bind_int(touch, 1, set_id);
+            _ = c.sqlite3_bind_text(touch, 2, kind.dbName().ptr, @intCast(kind.dbName().len), null);
+            if (c.sqlite3_step(touch) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            break :blk .{ .data = data, .content_type = content_type, .sha256 = sha256 };
+        };
+        defer allocator.free(stored.sha256);
+        if (self.object_store.enabled()) {
+            const object_key = try object_keys.media(allocator, set_id, kind, stored.content_type, stored.sha256);
+            defer allocator.free(object_key);
+            if (self.object_store.getWithLimit(allocator, self.io, object_key, stored.content_type.value(), stored.data.len)) |data| {
+                if (object_keys.matchesSha256(data, stored.sha256) and media_contract.detect(kind, data) == stored.content_type) {
+                    allocator.free(stored.data);
+                    return .{ .data = data, .content_type = stored.content_type };
+                }
+                allocator.free(data);
+                std.log.warn("event=beatmap_media_object_invalid set_id={d} kind={s}", .{ set_id, kind.dbName() });
+            } else |err| std.log.warn("event=beatmap_media_object_read_failed set_id={d} kind={s} error={t}", .{ set_id, kind.dbName(), err });
+        }
+        if (media_contract.detect(kind, stored.data) != stored.content_type or !object_keys.matchesSha256(stored.data, stored.sha256)) {
+            allocator.free(stored.data);
+            return error.InvalidStoredBeatmapMedia;
+        }
+        return .{ .data = stored.data, .content_type = stored.content_type };
     }
 
     pub fn beatmapMediaCacheStats(self: *Store) !BeatmapMediaCacheStats {
@@ -3920,6 +3986,7 @@ pub const Store = struct {
     }
 
     pub fn pruneBeatmapMedia(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        if (self.object_store.enabled()) return .{ .entries = 0, .bytes = 0 };
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const before = try self.mediaCacheSizeLocked();
@@ -3942,30 +4009,41 @@ pub const Store = struct {
     }
 
     pub fn beatmapArchive(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?[]u8 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT osz_file FROM beatmap_archives WHERE set_id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int(stmt, 1, set_id);
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
-        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-        const owned = try allocator.dupe(u8, ptr[0..len]);
-        _ = c.sqlite3_finalize(stmt);
-        stmt = null;
-        var touch: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_archives SET last_accessed_at=unixepoch() WHERE set_id=?1", -1, &touch, null) != c.SQLITE_OK) {
-            allocator.free(owned);
-            return error.DatabaseQueryFailed;
+        const stored = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT sha256,osz_file FROM beatmap_archives WHERE set_id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_int(stmt, 1, set_id);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            const sha256 = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+            errdefer allocator.free(sha256);
+            const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const data = try allocator.dupe(u8, ptr[0..len]);
+            errdefer allocator.free(data);
+            var touch: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_archives SET last_accessed_at=unixepoch() WHERE set_id=?1", -1, &touch, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(touch);
+            _ = c.sqlite3_bind_int(touch, 1, set_id);
+            if (c.sqlite3_step(touch) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            break :blk .{ .data = data, .sha256 = sha256 };
+        };
+        defer allocator.free(stored.sha256);
+        if (self.object_store.enabled() and object_keys.validSha256(stored.sha256)) {
+            const object_key = try object_keys.archive(allocator, set_id, stored.sha256);
+            defer allocator.free(object_key);
+            if (self.object_store.getWithLimit(allocator, self.io, object_key, "application/octet-stream", stored.data.len)) |data| {
+                if (object_keys.matchesSha256(data, stored.sha256)) {
+                    allocator.free(stored.data);
+                    return data;
+                }
+                allocator.free(data);
+                std.log.warn("event=beatmap_archive_object_invalid set_id={d}", .{set_id});
+            } else |err| std.log.warn("event=beatmap_archive_object_read_failed set_id={d} error={t}", .{ set_id, err });
         }
-        defer _ = c.sqlite3_finalize(touch);
-        _ = c.sqlite3_bind_int(touch, 1, set_id);
-        if (c.sqlite3_step(touch) != c.SQLITE_DONE) {
-            allocator.free(owned);
-            return error.DatabaseQueryFailed;
-        }
-        return owned;
+        return stored.data;
     }
 
     pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
@@ -4019,6 +4097,7 @@ pub const Store = struct {
     }
 
     pub fn pruneBeatmapArchives(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        if (self.object_store.enabled()) return .{ .entries = 0, .bytes = 0 };
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const before = try self.cacheSizeLocked();
@@ -4038,6 +4117,91 @@ pub const Store = struct {
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
         return .{ .entries = c.sqlite3_column_int64(stmt, 0), .bytes = c.sqlite3_column_int64(stmt, 1) };
+    }
+
+    fn putVerifiedObject(self: *Store, object_key: []const u8, content_type: []const u8, bytes: []const u8, sha256: []const u8) !void {
+        try self.object_store.put(self.allocator, self.io, object_key, content_type, bytes);
+        const downloaded = try self.object_store.getWithLimit(self.allocator, self.io, object_key, content_type, bytes.len);
+        defer self.allocator.free(downloaded);
+        if (downloaded.len != bytes.len or !object_keys.matchesSha256(downloaded, sha256)) return error.ObjectVerificationFailed;
+    }
+
+    pub fn migrateBeatmapObjects(self: *Store) !ObjectMigrationStats {
+        if (!self.object_store.enabled()) return error.ObjectStorageNotConfigured;
+        var stats: ObjectMigrationStats = .{};
+        var offset: i64 = 0;
+        while (true) : (offset += 1) {
+            const item = blk: {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                var stmt: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, "SELECT set_id,sha256,osz_file FROM beatmap_archives ORDER BY set_id LIMIT 1 OFFSET ?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+                defer _ = c.sqlite3_finalize(stmt);
+                _ = c.sqlite3_bind_int64(stmt, 1, offset);
+                if (c.sqlite3_step(stmt) != c.SQLITE_ROW) break :blk null;
+                const sha256 = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+                errdefer self.allocator.free(sha256);
+                const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 2));
+                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+                const data = try self.allocator.dupe(u8, ptr[0..len]);
+                break :blk .{ .set_id = c.sqlite3_column_int(stmt, 0), .sha256 = sha256, .data = data };
+            } orelse break;
+            defer self.allocator.free(item.sha256);
+            defer self.allocator.free(item.data);
+            const object_key = object_keys.archive(self.allocator, item.set_id, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_archive_object_migration_failed set_id={d} error={t}", .{ item.set_id, err });
+                continue;
+            };
+            defer self.allocator.free(object_key);
+            self.putVerifiedObject(object_key, "application/octet-stream", item.data, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_archive_object_migration_failed set_id={d} error={t}", .{ item.set_id, err });
+                continue;
+            };
+            stats.archives += 1;
+        }
+
+        offset = 0;
+        while (true) : (offset += 1) {
+            const item = blk: {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                var stmt: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, "SELECT set_id,kind,content_type,sha256,data FROM beatmap_media ORDER BY set_id,kind LIMIT 1 OFFSET ?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+                defer _ = c.sqlite3_finalize(stmt);
+                _ = c.sqlite3_bind_int64(stmt, 1, offset);
+                if (c.sqlite3_step(stmt) != c.SQLITE_ROW) break :blk null;
+                const kind = media_contract.Kind.parseDb(std.mem.span(c.sqlite3_column_text(stmt, 1))) orelse return error.InvalidStoredBeatmapMedia;
+                const content_type = media_contract.ContentType.parse(std.mem.span(c.sqlite3_column_text(stmt, 2))) orelse return error.InvalidStoredBeatmapMedia;
+                const sha256 = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+                errdefer self.allocator.free(sha256);
+                const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 4));
+                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+                const data = try self.allocator.dupe(u8, ptr[0..len]);
+                break :blk .{ .set_id = c.sqlite3_column_int(stmt, 0), .kind = kind, .content_type = content_type, .sha256 = sha256, .data = data };
+            } orelse break;
+            defer self.allocator.free(item.sha256);
+            defer self.allocator.free(item.data);
+            const object_key = object_keys.media(self.allocator, item.set_id, item.kind, item.content_type, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_media_object_migration_failed set_id={d} kind={s} error={t}", .{ item.set_id, item.kind.dbName(), err });
+                continue;
+            };
+            defer self.allocator.free(object_key);
+            self.putVerifiedObject(object_key, item.content_type.value(), item.data, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_media_object_migration_failed set_id={d} kind={s} error={t}", .{ item.set_id, item.kind.dbName(), err });
+                continue;
+            };
+            stats.media += 1;
+        }
+        return stats;
+    }
+
+    pub fn purgeBeatmapObjectBackups(self: *Store) !ObjectPurgeStats {
+        _ = self;
+        return error.ObjectPurgeRequiresPostgres;
     }
 
     pub fn beatmapForScore(self: *Store, md5: []const u8) !?BeatmapForScore {

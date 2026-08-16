@@ -12,6 +12,8 @@ const media_contract = @import("media_contract.zig");
 const site_replay = @import("site_replay.zig");
 const user_json = @import("user_json.zig");
 const achievements = @import("achievements.zig");
+const r2 = @import("r2.zig");
+const object_keys = @import("object_keys.zig");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
 pub const HardwareEnforcement = sqlite_storage.HardwareEnforcement;
@@ -19,11 +21,14 @@ pub const AnticheatSource = sqlite_storage.AnticheatSource;
 pub const AnticheatReviewLabel = sqlite_storage.AnticheatReviewLabel;
 pub const AnticheatObservation = sqlite_storage.AnticheatObservation;
 pub const is_postgres = true;
+const archive_object_limit: usize = 128 * 1024 * 1024;
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     pool: postgres.Pool,
+    object_store: r2.Storage = .{ .endpoint = "", .bucket = "", .access_key_id = "", .secret_access_key = "" },
+    external_only: bool = false,
 
     const Credential = struct {
         allocator: std.mem.Allocator,
@@ -53,6 +58,8 @@ pub const Store = struct {
     pub const BeatmapCacheStats = struct { entries: i64, bytes: i64, hydration_failures: i64 };
     pub const BeatmapCachePrune = struct { entries: i64, bytes: i64 };
     pub const BeatmapMediaCacheStats = struct { entries: i64, bytes: i64 };
+    pub const ObjectMigrationStats = sqlite_storage.Store.ObjectMigrationStats;
+    pub const ObjectPurgeStats = sqlite_storage.Store.ObjectPurgeStats;
     pub const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
     pub const BeatmapInfo = sqlite_storage.Store.BeatmapInfo;
     pub const StableBeatmapInfo = sqlite_storage.Store.StableBeatmapInfo;
@@ -76,6 +83,10 @@ pub const Store = struct {
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, conninfo: []const u8) !Store {
         return .{ .allocator = allocator, .io = io, .pool = try postgres.Pool.init(allocator, io, conninfo, postgres.Pool.default_size) };
+    }
+
+    pub fn bindObjectStorage(self: *Store, object_store: r2.Storage) void {
+        self.object_store = object_store;
     }
 
     pub fn close(self: *Store) void {
@@ -111,7 +122,8 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30) return error.UnsupportedSchemaVersion;
+        if (version == 30) self.external_only = true;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -720,15 +732,31 @@ pub const Store = struct {
     pub fn upsertBeatmapArchive(self: *Store, set_id: i32, sha256: []const u8, osz_file: []const u8) !void {
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
-        const encoded = try postgres.encodeBytea(self.allocator, osz_file);
-        defer self.allocator.free(encoded);
+        if (!try self.beatmapSetExists(set_id)) return error.UnknownBeatmapSet;
+        const object_written = upload: {
+            if (!self.object_store.enabled() or !object_keys.validSha256(sha256)) break :upload false;
+            const object_key = try object_keys.archive(self.allocator, set_id, sha256);
+            defer self.allocator.free(object_key);
+            self.object_store.put(self.allocator, self.io, object_key, "application/octet-stream", osz_file) catch |err| {
+                std.log.warn("event=beatmap_archive_object_write_failed set_id={d} error={t}", .{ set_id, err });
+                break :upload false;
+            };
+            break :upload true;
+        };
         var lease = self.pool.acquire();
         defer lease.release();
         var exists = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmaps WHERE set_id=$1 LIMIT 1", &.{set});
         defer exists.deinit();
         if (exists.rows() == 0) return error.UnknownBeatmapSet;
-        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_archives(set_id,sha256,osz_file,last_accessed_at) VALUES($1,$2,$3,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, sha256, encoded });
-        result.deinit();
+        if (self.external_only and object_written) {
+            var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_archives(set_id,sha256,osz_file,last_accessed_at) VALUES($1,$2,NULL,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=NULL,imported_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, sha256 });
+            result.deinit();
+        } else {
+            const encoded = try postgres.encodeBytea(self.allocator, osz_file);
+            defer self.allocator.free(encoded);
+            var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_archives(set_id,sha256,osz_file,last_accessed_at) VALUES($1,$2,$3,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,imported_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, sha256, encoded });
+            result.deinit();
+        }
     }
 
     pub fn beatmapSetExists(self: *Store, set_id: i32) !bool {
@@ -754,12 +782,21 @@ pub const Store = struct {
 
     pub fn putBeatmapMedia(self: *Store, set_id: i32, kind: media_contract.Kind, content_type: media_contract.ContentType, data: []const u8) !void {
         if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidBeatmapMedia;
+        if (!try self.beatmapSetExists(set_id)) return error.UnknownBeatmapSet;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
         var encoded_digest: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&encoded_digest, "{x}", .{digest}) catch unreachable;
-        const encoded_data = try postgres.encodeBytea(self.allocator, data);
-        defer self.allocator.free(encoded_data);
+        const object_written = upload: {
+            if (!self.object_store.enabled()) break :upload false;
+            const object_key = try object_keys.media(self.allocator, set_id, kind, content_type, &encoded_digest);
+            defer self.allocator.free(object_key);
+            self.object_store.put(self.allocator, self.io, object_key, content_type.value(), data) catch |err| {
+                std.log.warn("event=beatmap_media_object_write_failed set_id={d} kind={s} error={t}", .{ set_id, kind.dbName(), err });
+                break :upload false;
+            };
+            break :upload true;
+        };
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
         var lease = self.pool.acquire();
@@ -767,23 +804,54 @@ pub const Store = struct {
         var exists = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmaps WHERE set_id=$1 LIMIT 1", &.{set});
         defer exists.deinit();
         if (exists.rows() == 0) return error.UnknownBeatmapSet;
-        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_media(set_id,kind,content_type,sha256,data,last_accessed_at) VALUES($1,$2,$3,$4,$5,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id,kind) DO UPDATE SET content_type=excluded.content_type,sha256=excluded.sha256,data=excluded.data,fetched_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, kind.dbName(), content_type.value(), &encoded_digest, encoded_data });
-        result.deinit();
+        if (self.external_only and object_written) {
+            var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_media(set_id,kind,content_type,sha256,data,last_accessed_at) VALUES($1,$2,$3,$4,NULL,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id,kind) DO UPDATE SET content_type=excluded.content_type,sha256=excluded.sha256,data=NULL,fetched_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, kind.dbName(), content_type.value(), &encoded_digest });
+            result.deinit();
+        } else {
+            const encoded_data = try postgres.encodeBytea(self.allocator, data);
+            defer self.allocator.free(encoded_data);
+            var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_media(set_id,kind,content_type,sha256,data,last_accessed_at) VALUES($1,$2,$3,$4,$5,extract(epoch FROM clock_timestamp())::bigint) ON CONFLICT(set_id,kind) DO UPDATE SET content_type=excluded.content_type,sha256=excluded.sha256,data=excluded.data,fetched_at=extract(epoch FROM clock_timestamp())::bigint,last_accessed_at=extract(epoch FROM clock_timestamp())::bigint", &.{ set, kind.dbName(), content_type.value(), &encoded_digest, encoded_data });
+            result.deinit();
+        }
     }
 
     pub fn beatmapMedia(self: *Store, allocator: std.mem.Allocator, set_id: i32, kind: media_contract.Kind) !?media_contract.Asset {
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
-        var lease = self.pool.acquire();
-        defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_media SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 AND kind=$2 RETURNING content_type,data", &.{ set, kind.dbName() });
-        defer result.deinit();
-        if (result.rows() == 0) return null;
-        const content_type = media_contract.ContentType.parse(result.value(0, 0)) orelse return error.InvalidStoredBeatmapMedia;
-        const data = try postgres.decodeBytea(allocator, result.value(0, 1));
-        errdefer allocator.free(data);
-        if (!media_contract.compatible(kind, content_type) or media_contract.detect(kind, data) != content_type) return error.InvalidStoredBeatmapMedia;
-        return .{ .data = data, .content_type = content_type };
+        const stored = blk: {
+            var lease = self.pool.acquire();
+            defer lease.release();
+            var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_media SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 AND kind=$2 RETURNING content_type,sha256,data", &.{ set, kind.dbName() });
+            defer result.deinit();
+            if (result.rows() == 0) return null;
+            const content_type = media_contract.ContentType.parse(result.value(0, 0)) orelse return error.InvalidStoredBeatmapMedia;
+            const sha256 = try allocator.dupe(u8, result.value(0, 1));
+            errdefer allocator.free(sha256);
+            const data: ?[]u8 = if (result.isNull(0, 2)) null else try postgres.decodeBytea(allocator, result.value(0, 2));
+            errdefer if (data) |owned| allocator.free(owned);
+            if (!media_contract.compatible(kind, content_type) or !object_keys.validSha256(sha256)) return error.InvalidStoredBeatmapMedia;
+            break :blk .{ .data = data, .content_type = content_type, .sha256 = sha256 };
+        };
+        defer allocator.free(stored.sha256);
+        if (self.object_store.enabled()) {
+            const object_key = try object_keys.media(allocator, set_id, kind, stored.content_type, stored.sha256);
+            defer allocator.free(object_key);
+            const limit = if (stored.data) |fallback| fallback.len else kind.maxBytes();
+            if (self.object_store.getWithLimit(allocator, self.io, object_key, stored.content_type.value(), limit)) |data| {
+                if (object_keys.matchesSha256(data, stored.sha256) and media_contract.detect(kind, data) == stored.content_type) {
+                    if (stored.data) |fallback| allocator.free(fallback);
+                    return .{ .data = data, .content_type = stored.content_type };
+                }
+                allocator.free(data);
+                std.log.warn("event=beatmap_media_object_invalid set_id={d} kind={s}", .{ set_id, kind.dbName() });
+            } else |err| std.log.warn("event=beatmap_media_object_read_failed set_id={d} kind={s} error={t}", .{ set_id, kind.dbName(), err });
+        }
+        const fallback = stored.data orelse return null;
+        if (media_contract.detect(kind, fallback) != stored.content_type or !object_keys.matchesSha256(fallback, stored.sha256)) {
+            allocator.free(fallback);
+            return error.InvalidStoredBeatmapMedia;
+        }
+        return .{ .data = fallback, .content_type = stored.content_type };
     }
 
     pub fn beatmapMediaCacheStats(self: *Store) !BeatmapMediaCacheStats {
@@ -795,6 +863,7 @@ pub const Store = struct {
     }
 
     pub fn pruneBeatmapMedia(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        if (self.object_store.enabled()) return .{ .entries = 0, .bytes = 0 };
         var max_buf: [32]u8 = undefined;
         const max_text = try std.fmt.bufPrint(&max_buf, "{d}", .{@min(max_bytes, @as(u64, std.math.maxInt(i64)))});
         var lease = self.pool.acquire();
@@ -807,12 +876,38 @@ pub const Store = struct {
     pub fn beatmapArchive(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?[]u8 {
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
-        var lease = self.pool.acquire();
-        defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_archives SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 RETURNING osz_file", &.{set});
-        defer result.deinit();
-        if (result.rows() == 0) return null;
-        return try postgres.decodeBytea(allocator, result.value(0, 0));
+        const stored = blk: {
+            var lease = self.pool.acquire();
+            defer lease.release();
+            var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_archives SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 RETURNING sha256,osz_file", &.{set});
+            defer result.deinit();
+            if (result.rows() == 0) return null;
+            const sha256 = try allocator.dupe(u8, result.value(0, 0));
+            errdefer allocator.free(sha256);
+            const data: ?[]u8 = if (result.isNull(0, 1)) null else try postgres.decodeBytea(allocator, result.value(0, 1));
+            errdefer if (data) |owned| allocator.free(owned);
+            break :blk .{ .data = data, .sha256 = sha256 };
+        };
+        defer allocator.free(stored.sha256);
+        if (self.object_store.enabled() and object_keys.validSha256(stored.sha256)) {
+            const object_key = try object_keys.archive(allocator, set_id, stored.sha256);
+            defer allocator.free(object_key);
+            const limit = if (stored.data) |fallback| fallback.len else archive_object_limit;
+            if (self.object_store.getWithLimit(allocator, self.io, object_key, "application/octet-stream", limit)) |data| {
+                if (object_keys.matchesSha256(data, stored.sha256)) {
+                    if (stored.data) |fallback| allocator.free(fallback);
+                    return data;
+                }
+                allocator.free(data);
+                std.log.warn("event=beatmap_archive_object_invalid set_id={d}", .{set_id});
+            } else |err| std.log.warn("event=beatmap_archive_object_read_failed set_id={d} error={t}", .{ set_id, err });
+        }
+        const fallback = stored.data orelse return null;
+        if (!object_keys.matchesSha256(fallback, stored.sha256)) {
+            allocator.free(fallback);
+            return error.InvalidStoredBeatmapArchive;
+        }
+        return fallback;
     }
 
     pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
@@ -855,6 +950,7 @@ pub const Store = struct {
     }
 
     pub fn pruneBeatmapArchives(self: *Store, max_bytes: u64) !BeatmapCachePrune {
+        if (self.object_store.enabled()) return .{ .entries = 0, .bytes = 0 };
         var max_buf: [32]u8 = undefined;
         const max_text = try std.fmt.bufPrint(&max_buf, "{d}", .{@min(max_bytes, @as(u64, std.math.maxInt(i64)))});
         var lease = self.pool.acquire();
@@ -862,6 +958,110 @@ pub const Store = struct {
         var result = try postgres.queryParams(self.allocator, lease.conn, "WITH ranked AS (SELECT set_id,octet_length(osz_file) AS bytes,sum(octet_length(osz_file)) OVER(ORDER BY last_accessed_at DESC,imported_at DESC,set_id DESC) AS running_bytes FROM zigcho.beatmap_archives),deleted AS (DELETE FROM zigcho.beatmap_archives WHERE set_id IN(SELECT set_id FROM ranked WHERE running_bytes>$1::bigint) RETURNING octet_length(osz_file) AS bytes) SELECT count(*),coalesce(sum(bytes),0) FROM deleted", &.{max_text});
         defer result.deinit();
         return .{ .entries = try result.int(i64, 0, 0), .bytes = try result.int(i64, 0, 1) };
+    }
+
+    fn putVerifiedObject(self: *Store, object_key: []const u8, content_type: []const u8, bytes: []const u8, sha256: []const u8) !void {
+        try self.object_store.put(self.allocator, self.io, object_key, content_type, bytes);
+        const downloaded = try self.object_store.getWithLimit(self.allocator, self.io, object_key, content_type, bytes.len);
+        defer self.allocator.free(downloaded);
+        if (downloaded.len != bytes.len or !object_keys.matchesSha256(downloaded, sha256)) return error.ObjectVerificationFailed;
+    }
+
+    pub fn migrateBeatmapObjects(self: *Store) !ObjectMigrationStats {
+        if (!self.object_store.enabled()) return error.ObjectStorageNotConfigured;
+        var stats: ObjectMigrationStats = .{};
+        var offset: i64 = 0;
+        while (true) : (offset += 1) {
+            var offset_buf: [32]u8 = undefined;
+            const offset_text = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+            const item = blk: {
+                var lease = self.pool.acquire();
+                defer lease.release();
+                var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT set_id,sha256,osz_file FROM zigcho.beatmap_archives ORDER BY set_id LIMIT 1 OFFSET $1::bigint", &.{offset_text});
+                defer result.deinit();
+                if (result.rows() == 0) break :blk null;
+                const sha256 = try self.allocator.dupe(u8, result.value(0, 1));
+                errdefer self.allocator.free(sha256);
+                const data = try postgres.decodeBytea(self.allocator, result.value(0, 2));
+                break :blk .{ .set_id = try result.int(i32, 0, 0), .sha256 = sha256, .data = data };
+            } orelse break;
+            defer self.allocator.free(item.sha256);
+            defer self.allocator.free(item.data);
+            const object_key = object_keys.archive(self.allocator, item.set_id, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_archive_object_migration_failed set_id={d} error={t}", .{ item.set_id, err });
+                continue;
+            };
+            defer self.allocator.free(object_key);
+            self.putVerifiedObject(object_key, "application/octet-stream", item.data, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_archive_object_migration_failed set_id={d} error={t}", .{ item.set_id, err });
+                continue;
+            };
+            stats.archives += 1;
+        }
+
+        offset = 0;
+        while (true) : (offset += 1) {
+            var offset_buf: [32]u8 = undefined;
+            const offset_text = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+            const item = blk: {
+                var lease = self.pool.acquire();
+                defer lease.release();
+                var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT set_id,kind,content_type,sha256,data FROM zigcho.beatmap_media ORDER BY set_id,kind LIMIT 1 OFFSET $1::bigint", &.{offset_text});
+                defer result.deinit();
+                if (result.rows() == 0) break :blk null;
+                const kind = media_contract.Kind.parseDb(result.value(0, 1)) orelse return error.InvalidStoredBeatmapMedia;
+                const content_type = media_contract.ContentType.parse(result.value(0, 2)) orelse return error.InvalidStoredBeatmapMedia;
+                const sha256 = try self.allocator.dupe(u8, result.value(0, 3));
+                errdefer self.allocator.free(sha256);
+                const data = try postgres.decodeBytea(self.allocator, result.value(0, 4));
+                break :blk .{ .set_id = try result.int(i32, 0, 0), .kind = kind, .content_type = content_type, .sha256 = sha256, .data = data };
+            } orelse break;
+            defer self.allocator.free(item.sha256);
+            defer self.allocator.free(item.data);
+            const object_key = object_keys.media(self.allocator, item.set_id, item.kind, item.content_type, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_media_object_migration_failed set_id={d} kind={s} error={t}", .{ item.set_id, item.kind.dbName(), err });
+                continue;
+            };
+            defer self.allocator.free(object_key);
+            self.putVerifiedObject(object_key, item.content_type.value(), item.data, item.sha256) catch |err| {
+                stats.failed += 1;
+                std.log.warn("event=beatmap_media_object_migration_failed set_id={d} kind={s} error={t}", .{ item.set_id, item.kind.dbName(), err });
+                continue;
+            };
+            stats.media += 1;
+        }
+        return stats;
+    }
+
+    pub fn purgeBeatmapObjectBackups(self: *Store) !ObjectPurgeStats {
+        if (!self.object_store.enabled()) return error.ObjectStorageNotConfigured;
+        const version = blk: {
+            var lease = self.pool.acquire();
+            defer lease.release();
+            var result = try postgres.query(lease.conn, "SELECT max(version) FROM zigcho.schema_migrations");
+            defer result.deinit();
+            break :blk try result.int(i32, 0, 0);
+        };
+        if (version == 30) return .{};
+        if (version != 29) return error.UnsupportedSchemaVersion;
+        const verification = try self.migrateBeatmapObjects();
+        if (verification.failed != 0) return error.ObjectMigrationIncomplete;
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var before = try postgres.query(lease.conn, "SELECT count(osz_file),coalesce(sum(octet_length(osz_file)),0),(SELECT count(data) FROM zigcho.beatmap_media),(SELECT coalesce(sum(octet_length(data)),0) FROM zigcho.beatmap_media) FROM zigcho.beatmap_archives");
+        defer before.deinit();
+        const stats: ObjectPurgeStats = .{
+            .archives = try before.int(i64, 0, 0),
+            .archive_bytes = try before.int(i64, 0, 1),
+            .media = try before.int(i64, 0, 2),
+            .media_bytes = try before.int(i64, 0, 3),
+        };
+        try postgres.exec(lease.conn, @embedFile("migration_030.sql"));
+        self.external_only = true;
+        return stats;
     }
 
     fn writeDirectText(writer: *std.Io.Writer, value: []const u8) !void {
@@ -1234,6 +1434,18 @@ pub const Store = struct {
         var result = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.user_avatars WHERE user_id=$1 RETURNING user_id", &.{id});
         defer result.deinit();
         return result.rows() != 0;
+    }
+
+    pub fn customAvatarUserIds(self: *Store, allocator: std.mem.Allocator) ![]i32 {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.query(lease.conn, "SELECT user_id FROM zigcho.user_avatars ORDER BY user_id");
+        defer result.deinit();
+        var ids: std.ArrayList(i32) = .empty;
+        errdefer ids.deinit(allocator);
+        try ids.ensureTotalCapacity(allocator, result.rows());
+        for (0..result.rows()) |row| ids.appendAssumeCapacity(try result.int(i32, row, 0));
+        return ids.toOwnedSlice(allocator);
     }
 
     pub fn updateSiteProfile(self: *Store, user_id: i32, settings: domain.SiteProfileSettings) !void {

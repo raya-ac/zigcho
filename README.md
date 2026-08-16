@@ -11,13 +11,13 @@ this is not connected to official osu! accounts. Stable and the custom lazer cli
 - real replays, PP, weighted top plays, pins, map ratings, Direct and on-demand beatmap caching
 - the `kai` bot, player commands, staff tools, BN map ranking and audited moderation
 - PostgreSQL migrations, backups, restore drills, release rollback and bounded runtime caches
-- `zigcho!lazer` accounts, profiles, beatmaps, vanilla/Relax/Autopilot boards, replay downloads, normal head-to-head rooms and live spectating
+- `zigcho!lazer` accounts, profiles, beatmaps, vanilla/Relax/Autopilot boards, replay downloads, normal head-to-head rooms, Quick Play and live spectating
 - a public site with profiles, map leaderboards, replay downloads, player login and proper account settings
 - private custom avatars in Cloudflare R2, served through `a.kai.ovh/{user_id}`
 
 the website keeps Stable and lazer scoreboards separate because their score values are not comparable. player stats are shared: lazer contributes its legacy score value, and the higher-PP Stable or lazer play owns each map in the combined calculation.
 
-Stable is the complete public lane. lazer is still an alpha: ranked solo play, normal head-to-head rooms and spectator streaming work, while matchmaking, ranked multiplayer and the final signed client release are not finished.
+Stable is the complete public lane. lazer is still an alpha: ranked solo play, normal head-to-head rooms, Quick Play and spectator streaming work, while ranked multiplayer and the final signed client release are not finished.
 
 ## building it
 

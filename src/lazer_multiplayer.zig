@@ -1,11 +1,26 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const storage = @import("runtime_storage.zig");
 
 pub const max_rooms = 64;
 pub const max_connections = 128;
 pub const max_users = 16;
 pub const max_playlist = 32;
+pub const max_matchmaking_maps = 16;
+pub const matchmaking_rounds = 3;
 const max_hub_message = 60 * 1024;
+
+const matchmaking_stage = struct {
+    const waiting_for_clients_join: u8 = 0;
+    const round_warmup: u8 = 1;
+    const user_beatmap_select: u8 = 2;
+    const server_beatmap_finalised: u8 = 3;
+    const waiting_for_beatmap_download: u8 = 4;
+    const gameplay_warmup: u8 = 5;
+    const gameplay: u8 = 6;
+    const results: u8 = 7;
+    const ended: u8 = 8;
+};
 
 pub const RoomScorePath = struct {
     room_id: i64,
@@ -16,6 +31,13 @@ pub const RoomScorePath = struct {
 pub const RoomScoreContext = struct {
     beatmap_id: i32,
     ruleset_id: u8,
+};
+
+pub const RoomScoreResult = struct {
+    total_score: i64,
+    accuracy: f64,
+    max_combo: i32,
+    passed: bool,
 };
 
 fn FixedRaw(comptime capacity: usize) type {
@@ -295,6 +317,8 @@ const PlaylistItem = struct {
 
 const RoomUser = struct {
     id: i32,
+    name: Text64 = .{},
+    country: [2]u8 = .{ 'X', 'X' },
     state: u8 = 0,
     availability: Raw128 = .{},
     mods: Raw2048 = .{},
@@ -302,6 +326,39 @@ const RoomUser = struct {
     beatmap_id: ?i32 = null,
     voted_skip: bool = false,
     role: u8 = 0,
+};
+
+const MatchmakingRound = struct {
+    round: u8,
+    placement: u8 = 0,
+    total_score: i64 = 0,
+    accuracy: f64 = 0,
+    max_combo: i32 = 0,
+    passed: bool = false,
+};
+
+const MatchmakingUser = struct {
+    id: i32,
+    placement: ?u8 = null,
+    points: i32 = 0,
+    rounds: [matchmaking_rounds]?MatchmakingRound = [_]?MatchmakingRound{null} ** matchmaking_rounds,
+};
+
+const MatchmakingState = struct {
+    stage: u8 = 0,
+    current_round: u8 = 0,
+    candidate_items: [max_users]i64 = [_]i64{0} ** max_users,
+    candidate_count: usize = 0,
+    candidate_item: i64 = 0,
+    gameplay_item: i64 = 0,
+    users: [max_users]?MatchmakingUser = [_]?MatchmakingUser{null} ** max_users,
+    user_count: usize = 0,
+    picks: [max_users]?i64 = [_]?i64{null} ** max_users,
+
+    fn userIndex(self: *const MatchmakingState, user_id: i32) ?usize {
+        for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
+        return null;
+    }
 };
 
 const Settings = struct {
@@ -327,6 +384,9 @@ const Room = struct {
     playlist: [max_playlist]?PlaylistItem = [_]?PlaylistItem{null} ** max_playlist,
     playlist_count: usize = 0,
     channel_id: i32 = 4,
+    matchmaking: ?MatchmakingState = null,
+    allowed_users: [max_users]i32 = [_]i32{0} ** max_users,
+    allowed_user_count: usize = 0,
 
     fn userIndex(self: *const Room, user_id: i32) ?usize {
         for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
@@ -335,6 +395,25 @@ const Room = struct {
 
     fn itemIndex(self: *const Room, item_id: i64) ?usize {
         for (self.playlist, 0..) |entry, index| if (entry) |item| if (item.id == item_id) return index;
+        return null;
+    }
+
+    fn userAllowed(self: *const Room, user_id: i32) bool {
+        if (self.allowed_user_count == 0) return true;
+        return std.mem.indexOfScalar(i32, self.allowed_users[0..self.allowed_user_count], user_id) != null;
+    }
+};
+
+const PendingMatch = struct {
+    id: u32,
+    pool_id: i32,
+    users: [2]i32,
+    accepted: [2]bool = .{ false, false },
+    created_at: i64,
+
+    fn userIndex(self: PendingMatch, user_id: i32) ?usize {
+        if (self.users[0] == user_id) return 0;
+        if (self.users[1] == user_id) return 1;
         return null;
     }
 };
@@ -346,6 +425,9 @@ pub const Connection = struct {
     user_name: Text64 = .{},
     user_country: [2]u8,
     room_id: ?i64 = null,
+    lobby_pool_id: ?i32 = null,
+    queue_pool_id: ?i32 = null,
+    pending_match_id: ?u32 = null,
     io: std.Io,
     write_mutex: std.Io.Mutex = .init,
     socket: ?*std.http.Server.WebSocket = null,
@@ -383,13 +465,52 @@ pub const Connection = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    store: ?*storage.Store = null,
     mutex: std.Io.Mutex = .init,
     rooms: [max_rooms]?*Room = [_]?*Room{null} ** max_rooms,
     connections: std.ArrayList(*Connection) = .empty,
+    matchmaking_maps: [4][max_matchmaking_maps]?storage.Store.MatchmakingBeatmap = [_][max_matchmaking_maps]?storage.Store.MatchmakingBeatmap{[_]?storage.Store.MatchmakingBeatmap{null} ** max_matchmaking_maps} ** 4,
+    matchmaking_map_counts: [4]usize = [_]usize{0} ** 4,
+    pending_matches: [max_rooms]?PendingMatch = [_]?PendingMatch{null} ** max_rooms,
     next_room_id: i64 = 1,
+    next_pending_match_id: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
         return .{ .allocator = allocator, .io = io };
+    }
+
+    pub fn bindStore(self: *Manager, store: *storage.Store) void {
+        self.store = store;
+    }
+
+    pub fn refreshMatchmakingMaps(self: *Manager) !void {
+        const store = self.store orelse return error.MatchmakingStoreUnavailable;
+        var loaded: [4][]storage.Store.MatchmakingBeatmap = undefined;
+        var loaded_count: usize = 0;
+        defer for (loaded[0..loaded_count]) |maps| self.allocator.free(maps);
+        for (0..4) |mode| {
+            loaded[mode] = try store.matchmakingBeatmaps(self.allocator, @intCast(mode), max_matchmaking_maps);
+            loaded_count += 1;
+        }
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (0..4) |mode| {
+            self.matchmaking_maps[mode] = [_]?storage.Store.MatchmakingBeatmap{null} ** max_matchmaking_maps;
+            self.matchmaking_map_counts[mode] = loaded[mode].len;
+            for (loaded[mode], 0..) |map, index| self.matchmaking_maps[mode][index] = map;
+        }
+    }
+
+    pub fn setMatchmakingMaps(self: *Manager, mode: u8, maps: []const storage.Store.MatchmakingBeatmap) !void {
+        if (mode > 3 or maps.len == 0 or maps.len > max_matchmaking_maps) return error.InvalidMatchmakingPool;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.matchmaking_maps[mode] = [_]?storage.Store.MatchmakingBeatmap{null} ** max_matchmaking_maps;
+        self.matchmaking_map_counts[mode] = maps.len;
+        for (maps, 0..) |map, index| {
+            if (map.mode != mode or map.id <= 0) return error.InvalidMatchmakingBeatmap;
+            self.matchmaking_maps[mode][index] = map;
+        }
     }
 
     pub fn deinit(self: *Manager) void {
@@ -406,6 +527,36 @@ pub const Manager = struct {
     fn roomSlotLocked(self: *Manager) ?usize {
         for (self.rooms, 0..) |entry, index| if (entry == null) return index;
         return null;
+    }
+
+    fn connectionByUserLocked(self: *Manager, user_id: i32) ?*Connection {
+        var found: ?*Connection = null;
+        for (self.connections.items) |connection| {
+            if (connection.alive and connection.user_id == user_id) found = connection;
+        }
+        return found;
+    }
+
+    fn pendingMatchByIdLocked(self: *Manager, match_id: u32) ?*PendingMatch {
+        for (&self.pending_matches) |*entry| if (entry.*) |*pending| if (pending.id == match_id) return pending;
+        return null;
+    }
+
+    fn pendingMatchSlotLocked(self: *Manager) ?usize {
+        for (self.pending_matches, 0..) |entry, index| if (entry == null) return index;
+        return null;
+    }
+
+    fn clearPendingMatchLocked(self: *Manager, match_id: u32) void {
+        for (&self.pending_matches) |*entry| if (entry.*) |pending| if (pending.id == match_id) {
+            entry.* = null;
+            return;
+        };
+    }
+
+    fn poolMode(pool_id: i32) ?u8 {
+        if (pool_id < 1 or pool_id > 4) return null;
+        return @intCast(pool_id - 1);
     }
 
     fn recipientsLocked(self: *Manager, room_id: i64, exclude: ?*Connection, output: *[max_connections]*Connection) usize {
@@ -489,11 +640,35 @@ pub const Manager = struct {
         var recipients: [max_connections]*Connection = undefined;
         var left_user: ?RoomUser = null;
         var new_host: ?i32 = null;
+        var queue_peer: ?*Connection = null;
         self.mutex.lockUncancelable(self.io);
+        if (connection.pending_match_id) |match_id| {
+            if (self.pendingMatchByIdLocked(match_id)) |pending| {
+                const index = pending.userIndex(connection.user_id) orelse 0;
+                const peer_id = pending.users[1 - index];
+                if (self.connectionByUserLocked(peer_id)) |peer| {
+                    peer.pending_match_id = null;
+                    peer.queue_pool_id = pending.pool_id;
+                    peer.retain();
+                    queue_peer = peer;
+                }
+            }
+            self.clearPendingMatchLocked(match_id);
+        }
+        connection.pending_match_id = null;
+        connection.queue_pool_id = null;
+        connection.lobby_pool_id = null;
         const count = self.leaveLocked(connection, &recipients, &left_user, &new_host);
         defer releaseRecipients(recipients[0..count]);
+        defer if (queue_peer) |peer| peer.release();
         self.removeConnectionLocked(connection);
         self.mutex.unlock(self.io);
+        if (queue_peer) |peer| {
+            if (eventQueueStatusOwned(self.allocator, 0)) |frame| {
+                defer self.allocator.free(frame);
+                peer.send(frame);
+            } else |_| {}
+        }
         if (left_user) |user| {
             if (eventUserOwned(self.allocator, "UserLeft", user)) |frame| {
                 defer self.allocator.free(frame);
@@ -689,6 +864,46 @@ pub const Manager = struct {
             for (0..argument_count) |_| try reader.skip(0);
             return self.finishVoid(connection, invocation_id);
         }
+        if (std.mem.eql(u8, target, "GetMatchmakingPools") or std.mem.eql(u8, target, "GetMatchmakingPoolsOfType")) {
+            if (argument_count > 1) return error.InvalidMultiplayerArguments;
+            const pool_type: u8 = if (argument_count == 1) @intCast(try reader.integer()) else 0;
+            return self.getMatchmakingPools(connection, invocation_id, pool_type);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingJoinLobby")) {
+            if (argument_count != 0) return error.InvalidMultiplayerArguments;
+            return self.joinMatchmakingLobby(connection, invocation_id, 1);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingJoinLobbyWithParams")) {
+            if (argument_count != 1) return error.InvalidMultiplayerArguments;
+            const request = try reader.raw();
+            var request_reader: MessagePackReader = .{ .data = request };
+            if (try request_reader.arrayLen() < 1) return error.InvalidMultiplayerArguments;
+            return self.joinMatchmakingLobby(connection, invocation_id, @intCast(try request_reader.integer()));
+        }
+        if (std.mem.eql(u8, target, "MatchmakingLeaveLobby")) {
+            if (argument_count != 0) return error.InvalidMultiplayerArguments;
+            return self.leaveMatchmakingLobby(connection, invocation_id);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingJoinQueue")) {
+            if (argument_count != 1) return error.InvalidMultiplayerArguments;
+            return self.joinMatchmakingQueue(connection, invocation_id, @intCast(try reader.integer()));
+        }
+        if (std.mem.eql(u8, target, "MatchmakingLeaveQueue")) {
+            if (argument_count != 0) return error.InvalidMultiplayerArguments;
+            return self.leaveMatchmakingQueue(connection, invocation_id, true);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingAcceptInvitation")) {
+            if (argument_count != 0) return error.InvalidMultiplayerArguments;
+            return self.acceptMatchmakingInvitation(connection, invocation_id);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingDeclineInvitation")) {
+            if (argument_count != 0) return error.InvalidMultiplayerArguments;
+            return self.declineMatchmakingInvitation(connection, invocation_id);
+        }
+        if (std.mem.eql(u8, target, "MatchmakingToggleSelection")) {
+            if (argument_count != 1) return error.InvalidMultiplayerArguments;
+            return self.toggleMatchmakingSelection(connection, invocation_id, try reader.integer());
+        }
         for (0..argument_count) |_| try reader.skip(0);
         return error.UnsupportedMultiplayerMethod;
     }
@@ -726,6 +941,9 @@ pub const Manager = struct {
         var recipients: [max_connections]*Connection = undefined;
         var joined: RoomUser = undefined;
         var response: []u8 = undefined;
+        var match_state_event: ?[]u8 = null;
+        var advanced_match = false;
+        defer if (match_state_event) |event| self.allocator.free(event);
         self.mutex.lockUncancelable(self.io);
         if (connection.room_id != null) {
             self.mutex.unlock(self.io);
@@ -739,6 +957,10 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return error.InvalidMultiplayerPassword;
         }
+        if (!room.userAllowed(connection.user_id)) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
         const limit: usize = room.settings.max_participants orelse max_users;
         if (room.user_count >= limit) {
             self.mutex.unlock(self.io);
@@ -750,13 +972,33 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return error.MultiplayerRoomFull;
         };
-        joined = defaultRoomUser(connection.user_id);
+        joined = try defaultRoomUser(connection.user_id, connection.user_name.slice(), connection.user_country);
         room.users[user_slot] = joined;
         room.user_count += 1;
         connection.room_id = room_id;
+        if (room.matchmaking) |*matchmaking| {
+            if (matchmaking.stage == matchmaking_stage.waiting_for_clients_join and room.user_count == room.allowed_user_count) {
+                matchmaking.current_round = 1;
+                matchmaking.stage = matchmaking_stage.user_beatmap_select;
+                advanced_match = true;
+                match_state_event = eventMatchStateOwned(self.allocator, room) catch |err| {
+                    matchmaking.current_round = 0;
+                    matchmaking.stage = matchmaking_stage.waiting_for_clients_join;
+                    room.users[user_slot] = null;
+                    room.user_count -= 1;
+                    connection.room_id = null;
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+            }
+        }
         const count = self.recipientsLocked(room_id, connection, &recipients);
         defer releaseRecipients(recipients[0..count]);
         response = completionRoomOwned(self.allocator, id, room) catch |err| {
+            if (advanced_match) {
+                room.matchmaking.?.current_round = 0;
+                room.matchmaking.?.stage = matchmaking_stage.waiting_for_clients_join;
+            }
             room.users[user_slot] = null;
             room.user_count -= 1;
             connection.room_id = null;
@@ -769,6 +1011,7 @@ pub const Manager = struct {
         const event = try eventUserOwned(self.allocator, "UserJoined", joined);
         defer self.allocator.free(event);
         sendRecipients(recipients[0..count], event);
+        if (match_state_event) |state_event| sendRecipients(recipients[0..count], state_event);
         std.log.info("event=lazer_multiplayer_room_joined room_id={d} user_id={d}", .{ room_id, connection.user_id });
     }
 
@@ -893,8 +1136,16 @@ pub const Manager = struct {
         var recipients: [max_connections]*Connection = undefined;
         var start_players: [max_connections]*Connection = undefined;
         var start_count: usize = 0;
-        var started_user_ids: [max_users]i32 = undefined;
-        var started_user_count: usize = 0;
+        var load_players: [max_connections]*Connection = undefined;
+        var load_count: usize = 0;
+        var server_user_updates: [max_users]struct { id: i32, state: u8 } = undefined;
+        var server_user_update_count: usize = 0;
+        var match_snapshots: [3]Room = undefined;
+        var match_snapshot_count: usize = 0;
+        var match_events: [3]?[]u8 = [_]?[]u8{null} ** 3;
+        defer for (match_events) |event| if (event) |frame| self.allocator.free(frame);
+        var playlist_event: ?[]u8 = null;
+        defer if (playlist_event) |event| self.allocator.free(event);
         var results_ready = false;
         var changed_room_state: ?i32 = null;
         var emitted_user_state: u8 = new_state;
@@ -904,13 +1155,42 @@ pub const Manager = struct {
             return error.NotInMultiplayerRoom;
         };
         const room = self.roomByIdLocked(room_id).?;
+        const room_before = room.*;
         const user_index = room.userIndex(connection.user_id).?;
-        room.users[user_index].?.state = new_state;
+        const previous_user_state = room.users[user_index].?.state;
+        room.users[user_index].?.state = if (room.state == 2 and previous_user_state == 5 and (new_state == 3 or new_state == 4)) 5 else new_state;
         if (new_state == 6) room.users[user_index].?.state = 7;
         emitted_user_state = room.users[user_index].?.state;
-        const count = self.recipientsLocked(room_id, null, &recipients);
-        defer releaseRecipients(recipients[0..count]);
-        if (new_state == 3 or new_state == 4) {
+        if (room.matchmaking != null and room.matchmaking.?.stage == matchmaking_stage.waiting_for_beatmap_download and new_state == 1) {
+            var all_ready = room.user_count != 0;
+            for (room.users) |entry| if (entry) |user| if (user.state != 1) {
+                all_ready = false;
+            };
+            if (all_ready) {
+                room.matchmaking.?.stage = matchmaking_stage.gameplay_warmup;
+                match_snapshots[match_snapshot_count] = room.*;
+                match_snapshot_count += 1;
+                room.matchmaking.?.stage = matchmaking_stage.gameplay;
+                match_snapshots[match_snapshot_count] = room.*;
+                match_snapshot_count += 1;
+                room.state = 1;
+                changed_room_state = 1;
+                for (&room.users) |*entry| if (entry.*) |*user| {
+                    if (user.state != 1) continue;
+                    user.state = 2;
+                    server_user_updates[server_user_update_count] = .{ .id = user.id, .state = 2 };
+                    server_user_update_count += 1;
+                };
+                for (self.connections.items) |candidate| if (candidate.room_id == room_id) {
+                    const candidate_index = room.userIndex(candidate.user_id) orelse continue;
+                    if (room.users[candidate_index].?.state == 2 and load_count < load_players.len) {
+                        candidate.retain();
+                        load_players[load_count] = candidate;
+                        load_count += 1;
+                    }
+                };
+            }
+        } else if (room.state == 1 and (new_state == 3 or new_state == 4)) {
             var waiting = false;
             var gameplay_users: usize = 0;
             for (room.users) |entry| if (entry) |user| {
@@ -923,8 +1203,8 @@ pub const Manager = struct {
                     if (entry.*) |*user| {
                         if (user.state == 3 or user.state == 4) {
                             user.state = 5;
-                            started_user_ids[started_user_count] = user.id;
-                            started_user_count += 1;
+                            server_user_updates[server_user_update_count] = .{ .id = user.id, .state = 5 };
+                            server_user_update_count += 1;
                         }
                     }
                 }
@@ -949,15 +1229,64 @@ pub const Manager = struct {
                 room.state = 0;
                 results_ready = true;
                 changed_room_state = 0;
+                if (room.matchmaking) |*matchmaking| {
+                    if (matchmaking.gameplay_item != 0) if (room.itemIndex(matchmaking.gameplay_item)) |item_index| {
+                        room.playlist[item_index].?.expired = true;
+                        playlist_event = eventPlaylistOwned(self.allocator, "PlaylistItemChanged", room.playlist[item_index].?) catch |err| {
+                            room.* = room_before;
+                            self.mutex.unlock(self.io);
+                            return err;
+                        };
+                    };
+                    matchmaking.stage = matchmaking_stage.results;
+                    match_snapshots[match_snapshot_count] = room.*;
+                    match_snapshot_count += 1;
+                }
+            }
+        } else if (new_state == 0 and room.matchmaking != null and room.matchmaking.?.stage == matchmaking_stage.results) {
+            var all_idle = room.user_count != 0;
+            for (room.users) |entry| if (entry) |user| if (user.state != 0) {
+                all_idle = false;
+            };
+            if (all_idle) {
+                if (room.matchmaking.?.current_round >= matchmaking_rounds) {
+                    room.matchmaking.?.stage = matchmaking_stage.ended;
+                    match_snapshots[match_snapshot_count] = room.*;
+                    match_snapshot_count += 1;
+                } else {
+                    room.matchmaking.?.current_round += 1;
+                    room.matchmaking.?.candidate_items = [_]i64{0} ** max_users;
+                    room.matchmaking.?.candidate_count = 0;
+                    room.matchmaking.?.candidate_item = 0;
+                    room.matchmaking.?.gameplay_item = 0;
+                    room.matchmaking.?.picks = [_]?i64{null} ** max_users;
+                    room.matchmaking.?.stage = matchmaking_stage.round_warmup;
+                    match_snapshots[match_snapshot_count] = room.*;
+                    match_snapshot_count += 1;
+                    room.matchmaking.?.stage = matchmaking_stage.user_beatmap_select;
+                    match_snapshots[match_snapshot_count] = room.*;
+                    match_snapshot_count += 1;
+                }
             }
         }
-        self.mutex.unlock(self.io);
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
         defer releaseRecipients(start_players[0..start_count]);
+        defer releaseRecipients(load_players[0..load_count]);
+        for (match_snapshots[0..match_snapshot_count], 0..) |*snapshot, index| {
+            match_events[index] = eventMatchStateOwned(self.allocator, snapshot) catch |err| {
+                room.* = room_before;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+        }
+        self.mutex.unlock(self.io);
         const user_state_event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ connection.user_id, emitted_user_state });
         defer self.allocator.free(user_state_event);
         sendRecipients(recipients[0..count], user_state_event);
-        for (started_user_ids[0..started_user_count]) |user_id| {
-            const event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ user_id, 5 });
+        for (match_events[0..match_snapshot_count]) |state_event| sendRecipients(recipients[0..count], state_event.?);
+        for (server_user_updates[0..server_user_update_count]) |update| {
+            const event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ update.id, update.state });
             defer self.allocator.free(event);
             sendRecipients(recipients[0..count], event);
         }
@@ -966,11 +1295,17 @@ pub const Manager = struct {
             defer self.allocator.free(event);
             sendRecipients(recipients[0..count], event);
         }
+        if (load_count != 0) {
+            const event = try eventNoArgsOwned(self.allocator, "LoadRequested");
+            defer self.allocator.free(event);
+            sendRecipients(load_players[0..load_count], event);
+        }
         if (start_count != 0) {
             const event = try eventNoArgsOwned(self.allocator, "GameplayStarted");
             defer self.allocator.free(event);
             sendRecipients(start_players[0..start_count], event);
         }
+        if (playlist_event) |event| sendRecipients(recipients[0..count], event);
         if (results_ready) {
             const event = try eventNoArgsOwned(self.allocator, "ResultsReady");
             defer self.allocator.free(event);
@@ -1289,10 +1624,455 @@ pub const Manager = struct {
         }
         try self.finishVoid(connection, invocation_id);
     }
+
+    fn getMatchmakingPools(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, pool_type: u8) !void {
+        const id = invocation_id orelse return error.MissingInvocationId;
+        if (pool_type > 1) return error.InvalidMatchmakingPool;
+        if (self.store != null) self.refreshMatchmakingMaps() catch |err| {
+            std.log.warn("event=lazer_matchmaking_pool_refresh_failed error={t}", .{err});
+        };
+        var available: [4]bool = [_]bool{false} ** 4;
+        self.mutex.lockUncancelable(self.io);
+        for (0..4) |mode| available[mode] = self.matchmaking_map_counts[mode] != 0;
+        self.mutex.unlock(self.io);
+        const frame = try completionMatchmakingPoolsOwned(self.allocator, id, pool_type, available);
+        defer self.allocator.free(frame);
+        connection.send(frame);
+    }
+
+    fn joinMatchmakingLobby(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, pool_id: i32) !void {
+        const id = invocation_id orelse return error.MissingInvocationId;
+        const mode = poolMode(pool_id) orelse return error.InvalidMatchmakingPool;
+        self.mutex.lockUncancelable(self.io);
+        if (self.matchmaking_map_counts[mode] == 0) {
+            self.mutex.unlock(self.io);
+            return error.MatchmakingPoolUnavailable;
+        }
+        connection.lobby_pool_id = pool_id;
+        self.mutex.unlock(self.io);
+        const response = try completionEmptyObjectOwned(self.allocator, id);
+        defer self.allocator.free(response);
+        connection.send(response);
+        try self.publishLobbyStatus(pool_id);
+    }
+
+    fn leaveMatchmakingLobby(self: *Manager, connection: *Connection, invocation_id: ?[]const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        connection.lobby_pool_id = null;
+        self.mutex.unlock(self.io);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn publishLobbyStatus(self: *Manager, pool_id: i32) !void {
+        var recipients: [max_connections]*Connection = undefined;
+        var recipient_count: usize = 0;
+        var users: [max_connections]i32 = undefined;
+        var user_count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (self.connections.items) |candidate| {
+            if (!candidate.alive) continue;
+            if (candidate.lobby_pool_id == pool_id and recipient_count < recipients.len) {
+                candidate.retain();
+                recipients[recipient_count] = candidate;
+                recipient_count += 1;
+            }
+            if (candidate.queue_pool_id == pool_id and user_count < users.len and std.mem.indexOfScalar(i32, users[0..user_count], candidate.user_id) == null) {
+                users[user_count] = candidate.user_id;
+                user_count += 1;
+            }
+        }
+        self.mutex.unlock(self.io);
+        defer releaseRecipients(recipients[0..recipient_count]);
+        const frame = try eventLobbyStatusOwned(self.allocator, users[0..user_count]);
+        defer self.allocator.free(frame);
+        sendRecipients(recipients[0..recipient_count], frame);
+    }
+
+    fn joinMatchmakingQueue(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, pool_id: i32) !void {
+        const mode = poolMode(pool_id) orelse return error.InvalidMatchmakingPool;
+        const joined = try eventNoArgsOwned(self.allocator, "MatchmakingQueueJoined");
+        defer self.allocator.free(joined);
+        const searching = try eventQueueStatusOwned(self.allocator, 0);
+        defer self.allocator.free(searching);
+        const invited_legacy = try eventNoArgsOwned(self.allocator, "MatchmakingRoomInvited");
+        defer self.allocator.free(invited_legacy);
+        const invited = try eventMatchmakingInvitationOwned(self.allocator, 0);
+        defer self.allocator.free(invited);
+        const found = try eventQueueStatusOwned(self.allocator, 1);
+        defer self.allocator.free(found);
+        var peer: ?*Connection = null;
+        self.mutex.lockUncancelable(self.io);
+        if (connection.room_id != null or connection.queue_pool_id != null or connection.pending_match_id != null) {
+            self.mutex.unlock(self.io);
+            return error.AlreadyInMatchmakingQueue;
+        }
+        if (self.matchmaking_map_counts[mode] == 0) {
+            self.mutex.unlock(self.io);
+            return error.MatchmakingPoolUnavailable;
+        }
+        connection.queue_pool_id = pool_id;
+        for (self.connections.items) |candidate| {
+            if (candidate == connection or candidate.user_id == connection.user_id or !candidate.alive or candidate.room_id != null or candidate.queue_pool_id != pool_id or candidate.pending_match_id != null) continue;
+            peer = candidate;
+            break;
+        }
+        if (peer) |matched| {
+            const slot = self.pendingMatchSlotLocked() orelse {
+                self.mutex.unlock(self.io);
+                return error.MatchmakingGroupLimit;
+            };
+            const match_id = self.next_pending_match_id;
+            self.next_pending_match_id +%= 1;
+            if (self.next_pending_match_id == 0) self.next_pending_match_id = 1;
+            self.pending_matches[slot] = .{
+                .id = match_id,
+                .pool_id = pool_id,
+                .users = .{ matched.user_id, connection.user_id },
+                .created_at = std.Io.Clock.real.now(self.io).toSeconds(),
+            };
+            matched.pending_match_id = match_id;
+            connection.pending_match_id = match_id;
+            matched.retain();
+        }
+        self.mutex.unlock(self.io);
+        defer if (peer) |matched| matched.release();
+        connection.send(joined);
+        connection.send(searching);
+        if (peer) |matched| {
+            matched.send(invited_legacy);
+            connection.send(invited_legacy);
+            matched.send(invited);
+            connection.send(invited);
+            matched.send(found);
+            connection.send(found);
+            std.log.info("event=lazer_matchmaking_group_formed pool_id={d} users={d},{d}", .{ pool_id, matched.user_id, connection.user_id });
+        }
+        try self.finishVoid(connection, invocation_id);
+        try self.publishLobbyStatus(pool_id);
+    }
+
+    fn leaveMatchmakingQueue(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, notify: bool) !void {
+        const left = try eventNoArgsOwned(self.allocator, "MatchmakingQueueLeft");
+        defer self.allocator.free(left);
+        const searching = try eventQueueStatusOwned(self.allocator, 0);
+        defer self.allocator.free(searching);
+        var peer: ?*Connection = null;
+        var pool_id: ?i32 = null;
+        var was_queued = false;
+        self.mutex.lockUncancelable(self.io);
+        pool_id = connection.queue_pool_id;
+        was_queued = pool_id != null or connection.pending_match_id != null;
+        if (connection.pending_match_id) |match_id| {
+            if (self.pendingMatchByIdLocked(match_id)) |pending| {
+                pool_id = pending.pool_id;
+                const index = pending.userIndex(connection.user_id) orelse 0;
+                const peer_id = pending.users[1 - index];
+                if (self.connectionByUserLocked(peer_id)) |matched| {
+                    matched.pending_match_id = null;
+                    matched.queue_pool_id = pending.pool_id;
+                    matched.retain();
+                    peer = matched;
+                }
+            }
+            self.clearPendingMatchLocked(match_id);
+        }
+        connection.pending_match_id = null;
+        connection.queue_pool_id = null;
+        self.mutex.unlock(self.io);
+        defer if (peer) |matched| matched.release();
+        if (notify and was_queued) connection.send(left);
+        if (peer) |matched| matched.send(searching);
+        try self.finishVoid(connection, invocation_id);
+        if (pool_id) |pool| try self.publishLobbyStatus(pool);
+    }
+
+    fn declineMatchmakingInvitation(self: *Manager, connection: *Connection, invocation_id: ?[]const u8) !void {
+        if (connection.pending_match_id == null) return error.NoPendingMatchmakingInvitation;
+        return self.leaveMatchmakingQueue(connection, invocation_id, true);
+    }
+
+    fn createMatchmakingRoomLocked(self: *Manager, pending: PendingMatch, password: []const u8) !*Room {
+        const mode = poolMode(pending.pool_id) orelse return error.InvalidMatchmakingPool;
+        const map_count = self.matchmaking_map_counts[mode];
+        if (map_count == 0) return error.MatchmakingPoolUnavailable;
+        const room = try self.allocator.create(Room);
+        errdefer self.allocator.destroy(room);
+        room.* = .{
+            .id = self.next_room_id,
+            .settings = .{},
+            .host_id = 3,
+            .host_country = .{ 'I', 'S' },
+            .allowed_user_count = pending.users.len,
+            .matchmaking = .{},
+        };
+        self.next_room_id += 1;
+        try room.host_name.set("kai");
+        const mode_names = [_][]const u8{ "osu!", "osu!taiko", "osu!catch", "osu!mania" };
+        var name_buf: [96]u8 = undefined;
+        const room_name = try std.fmt.bufPrint(&name_buf, "zigcho quick play - {s}", .{mode_names[mode]});
+        try room.settings.name.set(room_name);
+        try room.settings.password.set(password);
+        room.settings.match_type = 3;
+        room.settings.queue_mode = 0;
+        room.settings.max_participants = pending.users.len;
+        room.settings.auto_start.bytes[0] = 0;
+        room.settings.auto_start.len = 1;
+        room.allowed_users[0] = pending.users[0];
+        room.allowed_users[1] = pending.users[1];
+        for (pending.users, 0..) |user_id, index| {
+            room.matchmaking.?.users[index] = .{ .id = user_id };
+            room.matchmaking.?.user_count += 1;
+        }
+        for (0..map_count) |index| {
+            const map = self.matchmaking_maps[mode][index].?;
+            var item: PlaylistItem = .{
+                .id = @intCast(index + 1),
+                .owner_id = 3,
+                .beatmap_id = map.id,
+                .ruleset_id = map.mode,
+                .order = @intCast(index),
+                .star_rating = map.stars,
+            };
+            try item.checksum.set(&map.md5);
+            item.required_mods.bytes[0] = 0x90;
+            item.required_mods.len = 1;
+            item.allowed_mods.bytes[0] = 0x90;
+            item.allowed_mods.len = 1;
+            item.played_at.bytes[0] = 0xc0;
+            item.played_at.len = 1;
+            room.playlist[index] = item;
+            room.playlist_count += 1;
+        }
+        room.settings.playlist_item_id = room.playlist[0].?.id;
+        return room;
+    }
+
+    fn acceptMatchmakingInvitation(self: *Manager, connection: *Connection, invocation_id: ?[]const u8) !void {
+        var random: [16]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const password = std.fmt.bytesToHex(random, .lower);
+        const joining = try eventQueueStatusOwned(self.allocator, 2);
+        defer self.allocator.free(joining);
+        var ready: [2]*Connection = undefined;
+        var ready_count: usize = 0;
+        var room_id: ?i64 = null;
+        var pool_id: ?i32 = null;
+        self.mutex.lockUncancelable(self.io);
+        const match_id = connection.pending_match_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NoPendingMatchmakingInvitation;
+        };
+        const pending = self.pendingMatchByIdLocked(match_id) orelse {
+            connection.pending_match_id = null;
+            self.mutex.unlock(self.io);
+            return error.NoPendingMatchmakingInvitation;
+        };
+        const user_index = pending.userIndex(connection.user_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.NoPendingMatchmakingInvitation;
+        };
+        pending.accepted[user_index] = true;
+        pool_id = pending.pool_id;
+        if (pending.accepted[0] and pending.accepted[1]) {
+            var matched_connections: [2]*Connection = undefined;
+            for (pending.users, 0..) |user_id, index| {
+                matched_connections[index] = self.connectionByUserLocked(user_id) orelse {
+                    pending.accepted[user_index] = false;
+                    self.mutex.unlock(self.io);
+                    return error.MatchmakingPlayerUnavailable;
+                };
+            }
+            const room_slot = self.roomSlotLocked() orelse {
+                pending.accepted[user_index] = false;
+                self.mutex.unlock(self.io);
+                return error.MultiplayerRoomLimit;
+            };
+            const room = self.createMatchmakingRoomLocked(pending.*, &password) catch |err| {
+                pending.accepted[user_index] = false;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.rooms[room_slot] = room;
+            room_id = room.id;
+            for (matched_connections) |matched| {
+                matched.pending_match_id = null;
+                matched.queue_pool_id = null;
+                matched.retain();
+                ready[ready_count] = matched;
+                ready_count += 1;
+            }
+            self.clearPendingMatchLocked(match_id);
+        }
+        self.mutex.unlock(self.io);
+        defer releaseRecipients(ready[0..ready_count]);
+        connection.send(joining);
+        if (room_id) |created_room_id| {
+            const event = try eventMatchmakingRoomReadyOwned(self.allocator, created_room_id, &password);
+            defer self.allocator.free(event);
+            sendRecipients(ready[0..ready_count], event);
+            std.log.info("event=lazer_matchmaking_room_ready room_id={d} players={d}", .{ created_room_id, ready_count });
+        }
+        try self.finishVoid(connection, invocation_id);
+        if (pool_id) |pool| try self.publishLobbyStatus(pool);
+    }
+
+    fn toggleMatchmakingSelection(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, playlist_item_id: i64) !void {
+        var random_bytes: [8]u8 = undefined;
+        try self.io.randomSecure(&random_bytes);
+        const random_value = std.mem.readInt(u64, &random_bytes, .little);
+        var recipients: [max_connections]*Connection = undefined;
+        var previous: ?i64 = null;
+        var advanced = false;
+        var finalised_event: ?[]u8 = null;
+        var settings_event: ?[]u8 = null;
+        var download_event: ?[]u8 = null;
+        defer if (finalised_event) |event| self.allocator.free(event);
+        defer if (settings_event) |event| self.allocator.free(event);
+        defer if (download_event) |event| self.allocator.free(event);
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        if (room.matchmaking == null or room.matchmaking.?.stage != matchmaking_stage.user_beatmap_select) {
+            self.mutex.unlock(self.io);
+            return error.InvalidMatchmakingStage;
+        }
+        if (playlist_item_id != -1) {
+            const item_index = room.itemIndex(playlist_item_id) orelse {
+                self.mutex.unlock(self.io);
+                return error.MultiplayerPlaylistItemNotFound;
+            };
+            if (room.playlist[item_index].?.expired) {
+                self.mutex.unlock(self.io);
+                return error.MultiplayerPlaylistItemExpired;
+            }
+        }
+        const match_user_index = room.matchmaking.?.userIndex(connection.user_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        };
+        previous = room.matchmaking.?.picks[match_user_index];
+        if (previous == playlist_item_id) {
+            self.mutex.unlock(self.io);
+            return self.finishVoid(connection, invocation_id);
+        }
+        room.matchmaking.?.picks[match_user_index] = playlist_item_id;
+        var all_picked = room.user_count != 0;
+        for (room.users) |entry| if (entry) |user| {
+            const index = room.matchmaking.?.userIndex(user.id) orelse continue;
+            if (room.matchmaking.?.picks[index] == null) all_picked = false;
+        };
+        if (all_picked) {
+            const previous_matchmaking = room.matchmaking.?;
+            const previous_settings = room.settings;
+            room.matchmaking.?.candidate_count = 0;
+            for (room.matchmaking.?.picks) |pick_entry| if (pick_entry) |pick| {
+                if (std.mem.indexOfScalar(i64, room.matchmaking.?.candidate_items[0..room.matchmaking.?.candidate_count], pick) == null) {
+                    room.matchmaking.?.candidate_items[room.matchmaking.?.candidate_count] = pick;
+                    room.matchmaking.?.candidate_count += 1;
+                }
+            };
+            const candidate_index: usize = @intCast(random_value % room.matchmaking.?.candidate_count);
+            room.matchmaking.?.candidate_item = room.matchmaking.?.candidate_items[candidate_index];
+            room.matchmaking.?.gameplay_item = if (room.matchmaking.?.candidate_item == -1) random: {
+                var active_items: [max_playlist]i64 = undefined;
+                var active_count: usize = 0;
+                for (room.playlist) |entry| if (entry) |item| if (!item.expired) {
+                    active_items[active_count] = item.id;
+                    active_count += 1;
+                };
+                if (active_count == 0) {
+                    room.matchmaking = previous_matchmaking;
+                    self.mutex.unlock(self.io);
+                    return error.MatchmakingPoolUnavailable;
+                }
+                const active_index: usize = @intCast((random_value / room.matchmaking.?.candidate_count) % active_count);
+                break :random active_items[active_index];
+            } else room.matchmaking.?.candidate_item;
+            room.matchmaking.?.stage = matchmaking_stage.server_beatmap_finalised;
+            finalised_event = eventMatchStateOwned(self.allocator, room) catch |err| {
+                room.matchmaking = previous_matchmaking;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            room.settings.playlist_item_id = room.matchmaking.?.gameplay_item;
+            settings_event = eventSettingsOwned(self.allocator, "SettingsChanged", room.settings) catch |err| {
+                room.matchmaking = previous_matchmaking;
+                room.settings = previous_settings;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            room.matchmaking.?.stage = matchmaking_stage.waiting_for_beatmap_download;
+            download_event = eventMatchStateOwned(self.allocator, room) catch |err| {
+                room.matchmaking = previous_matchmaking;
+                room.settings = previous_settings;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            advanced = true;
+        }
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        if (previous) |old| {
+            const event = try eventIntegersOwned(self.allocator, "MatchmakingItemDeselected", &.{ connection.user_id, old });
+            defer self.allocator.free(event);
+            sendRecipients(recipients[0..count], event);
+        }
+        const selected_event = try eventIntegersOwned(self.allocator, "MatchmakingItemSelected", &.{ connection.user_id, playlist_item_id });
+        defer self.allocator.free(selected_event);
+        sendRecipients(recipients[0..count], selected_event);
+        if (advanced) {
+            sendRecipients(recipients[0..count], finalised_event.?);
+            sendRecipients(recipients[0..count], settings_event.?);
+            sendRecipients(recipients[0..count], download_event.?);
+        }
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    pub fn recordRoomScore(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, score: RoomScoreResult) !void {
+        var recipients: [max_connections]*Connection = undefined;
+        var state_event: ?[]u8 = null;
+        defer if (state_event) |event| self.allocator.free(event);
+        self.mutex.lockUncancelable(self.io);
+        const room = self.roomByIdLocked(room_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerRoomNotFound;
+        };
+        if (room.matchmaking == null or room.matchmaking.?.gameplay_item != playlist_item_id or room.matchmaking.?.current_round == 0) {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        const user_index = room.matchmaking.?.userIndex(user_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        };
+        const round_index = room.matchmaking.?.current_round - 1;
+        room.matchmaking.?.users[user_index].?.rounds[round_index] = .{
+            .round = room.matchmaking.?.current_round,
+            .total_score = score.total_score,
+            .accuracy = score.accuracy,
+            .max_combo = score.max_combo,
+            .passed = score.passed,
+        };
+        recomputeMatchmakingPlacements(&room.matchmaking.?);
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        state_event = eventMatchStateOwned(self.allocator, room) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+        sendRecipients(recipients[0..count], state_event.?);
+    }
 };
 
-fn defaultRoomUser(user_id: i32) RoomUser {
+fn defaultRoomUser(user_id: i32, name: []const u8, country: [2]u8) !RoomUser {
     var user: RoomUser = .{ .id = user_id };
+    try user.name.set(name);
+    user.country = country;
     user.availability.bytes[0] = 0x92;
     user.availability.bytes[1] = 0x00;
     user.availability.bytes[2] = 0xc0;
@@ -1300,6 +2080,60 @@ fn defaultRoomUser(user_id: i32) RoomUser {
     user.mods.bytes[0] = 0x90;
     user.mods.len = 1;
     return user;
+}
+
+fn recomputeMatchmakingPlacements(state: *MatchmakingState) void {
+    const points = [_]i32{ 15, 12, 10, 8, 6, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (&state.users) |*entry| if (entry.*) |*user| {
+        user.points = 0;
+        user.placement = null;
+    };
+    for (0..matchmaking_rounds) |round_index| {
+        var order: [max_users]usize = undefined;
+        var count: usize = 0;
+        for (state.users, 0..) |entry, user_index| if (entry) |user| if (user.rounds[round_index] != null) {
+            order[count] = user_index;
+            count += 1;
+        };
+        for (0..count) |left| for (left + 1..count) |right| {
+            const left_round = state.users[order[left]].?.rounds[round_index].?;
+            const right_round = state.users[order[right]].?.rounds[round_index].?;
+            if (right_round.total_score > left_round.total_score or (right_round.total_score == left_round.total_score and state.users[order[right]].?.id < state.users[order[left]].?.id)) {
+                const swap = order[left];
+                order[left] = order[right];
+                order[right] = swap;
+            }
+        };
+        var position: usize = 0;
+        while (position < count) {
+            var end = position + 1;
+            const score = state.users[order[position]].?.rounds[round_index].?.total_score;
+            while (end < count and state.users[order[end]].?.rounds[round_index].?.total_score == score) : (end += 1) {}
+            const placement: u8 = @intCast(end);
+            for (position..end) |cursor| {
+                const user_index = order[cursor];
+                state.users[user_index].?.rounds[round_index].?.placement = placement;
+                state.users[user_index].?.points += points[end - 1];
+            }
+            position = end;
+        }
+    }
+    var order: [max_users]usize = undefined;
+    var count: usize = 0;
+    for (state.users, 0..) |entry, index| if (entry != null) {
+        order[count] = index;
+        count += 1;
+    };
+    for (0..count) |left| for (left + 1..count) |right| {
+        const a = state.users[order[left]].?;
+        const b = state.users[order[right]].?;
+        if (b.points > a.points or (b.points == a.points and b.id < a.id)) {
+            const swap = order[left];
+            order[left] = order[right];
+            order[right] = swap;
+        }
+    };
+    for (order[0..count], 0..) |user_index, placement| state.users[user_index].?.placement = @intCast(placement + 1);
 }
 
 fn parseSettings(encoded: []const u8) !Settings {
@@ -1380,7 +2214,7 @@ fn parseRoom(allocator: std.mem.Allocator, encoded: []const u8, connection: *Con
         .host_country = connection.user_country,
     };
     try room.host_name.set(connection.user_name.slice());
-    room.users[0] = defaultRoomUser(connection.user_id);
+    room.users[0] = try defaultRoomUser(connection.user_id, connection.user_name.slice(), connection.user_country);
     room.user_count = 1;
     for (0..playlist_len) |index| {
         const raw_item = try reader.raw();
@@ -1439,6 +2273,44 @@ fn writePlaylistItem(pack: MessagePackWriter, item: PlaylistItem) !void {
 }
 
 fn writeMatchState(pack: MessagePackWriter, room: *const Room) !void {
+    if (room.matchmaking) |matchmaking| {
+        try pack.array(2);
+        try pack.integer(1);
+        try pack.array(6);
+        try pack.integer(matchmaking.stage);
+        try pack.integer(matchmaking.current_round);
+        try pack.array(matchmaking.candidate_count);
+        for (matchmaking.candidate_items[0..matchmaking.candidate_count]) |item_id| try pack.integer(item_id);
+        try pack.integer(matchmaking.candidate_item);
+        try pack.array(1);
+        try pack.map(matchmaking.user_count);
+        for (matchmaking.users) |entry| if (entry) |user| {
+            try pack.integer(user.id);
+            try pack.array(5);
+            try pack.integer(user.id);
+            if (user.placement) |placement| try pack.integer(placement) else try pack.nil();
+            try pack.integer(user.points);
+            try pack.array(1);
+            var round_count: usize = 0;
+            for (user.rounds) |round| if (round != null) {
+                round_count += 1;
+            };
+            try pack.map(round_count);
+            for (user.rounds) |round_entry| if (round_entry) |round| {
+                try pack.integer(round.round);
+                try pack.array(6);
+                try pack.integer(round.round);
+                try pack.integer(round.placement);
+                try pack.integer(round.total_score);
+                try pack.float64(round.accuracy);
+                try pack.integer(round.max_combo);
+                try pack.map(0);
+            };
+            try pack.nil();
+        };
+        try pack.integer(matchmaking.gameplay_item);
+        return;
+    }
     try pack.array(2);
     try pack.integer(if (room.settings.match_type == 2) 0 else 3);
     try pack.array(3);
@@ -1471,8 +2343,12 @@ fn writeRoom(pack: MessagePackWriter, room: *const Room) !void {
     try writeSettings(pack, room.settings);
     try pack.array(room.user_count);
     for (room.users) |entry| if (entry) |user| try writeUser(pack, user);
-    const host_index = room.userIndex(room.host_id) orelse return error.MultiplayerHostMissing;
-    try writeUser(pack, room.users[host_index].?);
+    if (room.userIndex(room.host_id)) |host_index| {
+        try writeUser(pack, room.users[host_index].?);
+    } else {
+        const host = try defaultRoomUser(room.host_id, room.host_name.slice(), room.host_country);
+        try writeUser(pack, host);
+    }
     try writeMatchState(pack, room);
     try pack.array(room.playlist_count);
     for (room.playlist) |entry| if (entry) |item| try writePlaylistItem(pack, item);
@@ -1514,12 +2390,15 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     var users_written: usize = 0;
     for (room.users) |entry| if (entry) |user| {
         if (users_written != 0) try writer.writeByte(',');
-        const name = if (user.id == room.host_id) room.host_name.slice() else "player";
-        const country = if (user.id == room.host_id) room.host_country else [2]u8{ 'X', 'X' };
-        try writeApiUserJson(writer, user.id, name, country);
+        try writeApiUserJson(writer, user.id, user.name.slice(), user.country);
         users_written += 1;
     };
-    const match_type: []const u8 = if (room.settings.match_type == 2) "team_versus" else "head_to_head";
+    const match_type: []const u8 = switch (room.settings.match_type) {
+        2 => "team_versus",
+        3 => "matchmaking",
+        4 => "ranked_play",
+        else => "head_to_head",
+    };
     const queue_mode: []const u8 = switch (room.settings.queue_mode) {
         1 => "all_players",
         2 => "all_players_round_robin",
@@ -1527,12 +2406,14 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     };
     try writer.writeAll("],\"max_attempts\":null,\"playlist\":[");
     var playlist_written: usize = 0;
+    var active_playlist_items: usize = 0;
     for (room.playlist) |entry| if (entry) |item| {
         if (playlist_written != 0) try writer.writeByte(',');
         try writePlaylistItemJson(writer, item);
         playlist_written += 1;
+        if (!item.expired) active_playlist_items += 1;
     };
-    try writer.print("],\"playlist_item_stats\":{{\"count_active\":{d},\"count_total\":{d},\"ruleset_ids\":[]}},\"difficulty_range\":null,\"type\":", .{ room.playlist_count, room.playlist_count });
+    try writer.print("],\"playlist_item_stats\":{{\"count_active\":{d},\"count_total\":{d},\"ruleset_ids\":[]}},\"difficulty_range\":null,\"type\":", .{ active_playlist_items, room.playlist_count });
     try std.json.Stringify.value(match_type, .{}, writer);
     try writer.writeAll(",\"queue_mode\":");
     try std.json.Stringify.value(queue_mode, .{}, writer);
@@ -1604,6 +2485,46 @@ fn completionRoomOwned(allocator: std.mem.Allocator, invocation_id: []const u8, 
     return allocatingFrame(allocator, &output);
 }
 
+fn completionEmptyObjectOwned(allocator: std.mem.Allocator, invocation_id: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try pack.array(5);
+    try pack.integer(3);
+    try pack.map(0);
+    try pack.string(invocation_id);
+    try pack.integer(3);
+    try pack.array(0);
+    return allocatingFrame(allocator, &output);
+}
+
+fn completionMatchmakingPoolsOwned(allocator: std.mem.Allocator, invocation_id: []const u8, pool_type: u8, available: [4]bool) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try pack.array(5);
+    try pack.integer(3);
+    try pack.map(0);
+    try pack.string(invocation_id);
+    try pack.integer(3);
+    var count: usize = 0;
+    if (pool_type == 0) for (available) |enabled| if (enabled) {
+        count += 1;
+    };
+    try pack.array(count);
+    const names = [_][]const u8{ "quick play", "quick play", "quick play", "quick play" };
+    for (available, 0..) |enabled, mode| {
+        if (!enabled or pool_type != 0) continue;
+        try pack.array(5);
+        try pack.integer(@as(i64, @intCast(mode + 1)));
+        try pack.integer(@intCast(mode));
+        try pack.integer(0);
+        try pack.string(names[mode]);
+        try pack.integer(0);
+    }
+    return allocatingFrame(allocator, &output);
+}
+
 pub fn beginEvent(pack: MessagePackWriter, target: []const u8, argument_count: usize) !void {
     try pack.array(6);
     try pack.integer(1);
@@ -1622,6 +2543,71 @@ fn eventNoArgsOwned(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
     defer output.deinit();
     const pack: MessagePackWriter = .{ .writer = &output.writer };
     try beginEvent(pack, target, 0);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventQueueStatusOwned(allocator: std.mem.Allocator, status: u8) ![]u8 {
+    if (status > 2) return error.InvalidMatchmakingQueueStatus;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchmakingQueueStatusChanged", 1);
+    try pack.array(2);
+    try pack.integer(status);
+    try pack.array(0);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventMatchmakingInvitationOwned(allocator: std.mem.Allocator, pool_type: u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchmakingRoomInvitedWithParams", 1);
+    try pack.array(1);
+    try pack.integer(pool_type);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventMatchmakingRoomReadyOwned(allocator: std.mem.Allocator, room_id: i64, password: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchmakingRoomReady", 2);
+    try pack.integer(room_id);
+    try pack.string(password);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventLobbyStatusOwned(allocator: std.mem.Allocator, users: []const i32) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchmakingLobbyStatusChanged", 1);
+    try pack.array(4);
+    try pack.array(users.len);
+    for (users) |user_id| try pack.integer(user_id);
+    try pack.array(if (users.len == 0) 0 else 1);
+    if (users.len != 0) {
+        try pack.array(2);
+        try pack.integer(1500);
+        try pack.integer(@intCast(users.len));
+    }
+    try pack.integer(1500);
+    try pack.array(0);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventMatchStateOwned(allocator: std.mem.Allocator, room: *const Room) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchRoomStateChanged", 1);
+    try writeMatchState(pack, room);
     try endEvent(pack);
     return allocatingFrame(allocator, &output);
 }
@@ -1814,4 +2800,25 @@ test "signalr accepts messagepack handshake bytes independent of websocket opcod
     try std.testing.expect(validSignalRHandshake(std.testing.allocator, "{\"version\":1,\"protocol\":\"messagepack\"}\x1e"));
     try std.testing.expect(!validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"json\",\"version\":1}\x1e"));
     try std.testing.expect(!validSignalRHandshake(std.testing.allocator, "{\"protocol\":\"messagepack\",\"version\":1}"));
+}
+
+test "matchmaking placements use lower-equal ties and aggregate round points" {
+    var state: MatchmakingState = .{};
+    state.current_round = 2;
+    state.user_count = 2;
+    state.users[0] = .{ .id = 10 };
+    state.users[1] = .{ .id = 20 };
+    state.users[0].?.rounds[0] = .{ .round = 1, .total_score = 500, .passed = true };
+    state.users[1].?.rounds[0] = .{ .round = 1, .total_score = 500, .passed = false };
+    state.users[0].?.rounds[1] = .{ .round = 2, .total_score = 100, .passed = true };
+    state.users[1].?.rounds[1] = .{ .round = 2, .total_score = 900, .passed = true };
+
+    recomputeMatchmakingPlacements(&state);
+
+    try std.testing.expectEqual(@as(u8, 2), state.users[0].?.rounds[0].?.placement);
+    try std.testing.expectEqual(@as(u8, 2), state.users[1].?.rounds[0].?.placement);
+    try std.testing.expectEqual(@as(i32, 27), state.users[1].?.points);
+    try std.testing.expectEqual(@as(i32, 24), state.users[0].?.points);
+    try std.testing.expectEqual(@as(?u8, 1), state.users[1].?.placement);
+    try std.testing.expectEqual(@as(?u8, 2), state.users[0].?.placement);
 }

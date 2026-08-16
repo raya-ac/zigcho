@@ -58,6 +58,7 @@ pub const Store = struct {
     pub const StableBeatmapInfo = sqlite_storage.Store.StableBeatmapInfo;
     pub const DirectMessage = sqlite_storage.Store.DirectMessage;
     pub const BeatmapSelection = sqlite_storage.Store.BeatmapSelection;
+    pub const MatchmakingBeatmap = sqlite_storage.Store.MatchmakingBeatmap;
     pub const BeatmapRating = sqlite_storage.Store.BeatmapRating;
     pub const PpSnapshot = sqlite_storage.Store.PpSnapshot;
     pub const CustomAvatar = sqlite_storage.Store.CustomAvatar;
@@ -635,6 +636,32 @@ pub const Store = struct {
         };
         @memcpy(&selection.md5, md5);
         return selection;
+    }
+
+    pub fn matchmakingBeatmaps(self: *Store, allocator: std.mem.Allocator, mode: u8, limit: u8) ![]MatchmakingBeatmap {
+        if (mode > 3 or limit == 0 or limit > 32) return error.InvalidMatchmakingPool;
+        var mode_buf: [4]u8 = undefined;
+        var limit_buf: [4]u8 = undefined;
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        const limit_text = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,md5,mode,star_rating FROM zigcho.beatmaps WHERE status IN(3,4) AND mode=$1 AND osu_file IS NOT NULL ORDER BY star_rating,id LIMIT $2", &.{ mode_text, limit_text });
+        defer result.deinit();
+        const maps = try allocator.alloc(MatchmakingBeatmap, result.rows());
+        errdefer allocator.free(maps);
+        for (maps, 0..) |*map, row| {
+            const md5 = result.value(row, 1);
+            if (md5.len != 32) return error.InvalidBeatmap;
+            map.* = .{
+                .id = try result.int(i32, row, 0),
+                .md5 = undefined,
+                .mode = try result.int(u8, row, 2),
+                .stars = try result.float(f64, row, 3),
+            };
+            @memcpy(&map.md5, md5);
+        }
+        return maps;
     }
 
     pub fn setScorePinned(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, mods_value: i32, namespace: []const u8, pinned: bool) !i64 {

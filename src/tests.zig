@@ -4619,6 +4619,40 @@ test "stable and lazer share one ranked performance result per map" {
     try std.testing.expectEqual(@as(i32, 100), rebuilt.max_combo);
 }
 
+test "matchmaking pools only use playable ranked maps in ruleset order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/matchmaking-pool.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,mode,star_rating,osu_file) VALUES" ++
+            "(75,75,'11111111111111111111111111111111','a','one','one','m',3,0,5.5,x'01')," ++
+            "(76,76,'22222222222222222222222222222222','a','two','two','m',4,0,2.5,x'02')," ++
+            "(77,77,'33333333333333333333333333333333','a','three','three','m',2,0,1.5,x'03')," ++
+            "(78,78,'44444444444444444444444444444444','a','four','four','m',3,0,3.5,NULL)," ++
+            "(79,79,'55555555555555555555555555555555','a','five','five','m',3,1,1.5,x'05')",
+    );
+
+    const standard = try store.matchmakingBeatmaps(std.testing.allocator, 0, 16);
+    defer std.testing.allocator.free(standard);
+    try std.testing.expectEqual(@as(usize, 2), standard.len);
+    try std.testing.expectEqual(@as(i32, 76), standard[0].id);
+    try std.testing.expectEqualStrings("22222222222222222222222222222222", &standard[0].md5);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), standard[0].stars, 0.000001);
+    try std.testing.expectEqual(@as(i32, 75), standard[1].id);
+
+    const limited = try store.matchmakingBeatmaps(std.testing.allocator, 0, 1);
+    defer std.testing.allocator.free(limited);
+    try std.testing.expectEqual(@as(usize, 1), limited.len);
+    try std.testing.expectEqual(@as(i32, 76), limited[0].id);
+
+    try std.testing.expectError(error.InvalidMatchmakingPool, store.matchmakingBeatmaps(std.testing.allocator, 4, 1));
+    try std.testing.expectError(error.InvalidMatchmakingPool, store.matchmakingBeatmaps(std.testing.allocator, 0, 0));
+}
+
 test "Rijndael-256 matches the py3rijndael block fixture" {
     var key: [32]u8 = undefined;
     try std.base64.standard.Decoder.decode(&key, "qBS8uRhEIBsr8jr8vuY9uUpGFefYRL2HSTtrKhaI1tk=");

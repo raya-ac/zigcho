@@ -153,6 +153,7 @@ class WebSocket:
         if expected.lower() not in response.lower():
             raise RuntimeError("invalid websocket accept")
         self.events = []
+        self.event_messages = []
         # Zigcho negotiates binary transfer for the MessagePack hub. The JSON
         # SignalR handshake therefore arrives in a binary WebSocket frame in
         # the real client, even though its body is JSON.
@@ -232,10 +233,21 @@ class WebSocket:
                 position += length
                 if message[0] == 1:
                     self.events.append(message[3])
+                    self.event_messages.append(message)
                 elif message[0] == 3 and message[2] == str(invocation_id):
                     if message[3] == 1:
                         raise RuntimeError(f"{target} failed: {message[4]}")
                     return message[4] if message[3] == 3 else None
+
+    def event_arguments(self, target):
+        return [message[4] for message in self.event_messages if message[3] == target]
+
+    def matchmaking_stages(self):
+        stages = []
+        for arguments in self.event_arguments("MatchRoomStateChanged"):
+            if arguments and arguments[0] and arguments[0][0] == 1:
+                stages.append(arguments[0][1][0])
+        return stages
 
 
 def api_request(origin, token, method, path, body=None, content_type=None):
@@ -293,7 +305,87 @@ def main():
             raise RuntimeError(f"room results did not contain submitted score: {results}")
         two.invoke(5, "LeaveRoom", [])
         one.invoke(6, "LeaveRoom", [])
-        print(f"lazer_multiplayer_ws_smoke_ok room_id={room_id}")
+
+        pools = one.invoke(10, "GetMatchmakingPoolsOfType", [0])
+        if not pools or pools[0][0] != 1 or pools[0][1] != 0 or pools[0][4] != 0:
+            raise RuntimeError(f"quick play pool unavailable: {pools}")
+        one.invoke(11, "MatchmakingJoinLobbyWithParams", [[1]])
+        two.invoke(10, "MatchmakingJoinLobbyWithParams", [[1]])
+        one.invoke(12, "MatchmakingJoinQueue", [1])
+        two.invoke(11, "MatchmakingJoinQueue", [1])
+        one.invoke(13, "MatchmakingAcceptInvitation", [])
+        two.invoke(12, "MatchmakingAcceptInvitation", [])
+        one.invoke(14, "MatchmakingLeaveLobby", [])
+        two.invoke(13, "MatchmakingLeaveLobby", [])
+        ready_events = two.event_arguments("MatchmakingRoomReady") or one.event_arguments("MatchmakingRoomReady")
+        if not ready_events or len(ready_events[-1]) != 2:
+            raise RuntimeError(f"matchmaking room was not created: one={one.events} two={two.events}")
+        match_room_id, match_password = ready_events[-1]
+        match_one = one.invoke(15, "JoinRoomWithPassword", [match_room_id, match_password])
+        match_two = two.invoke(14, "JoinRoomWithPassword", [match_room_id, match_password])
+        if match_one[0] != match_room_id or match_two[0] != match_room_id or match_two[5][1][0] != 2:
+            raise RuntimeError("matched users did not enter beatmap selection")
+
+        score_id = None
+        for round_number, playlist_item_id in enumerate((1, 2, 3), start=1):
+            stage_offset = len(two.matchmaking_stages())
+            event_offset = len(two.events)
+            one.invoke(20 + round_number * 10, "MatchmakingToggleSelection", [playlist_item_id])
+            if round_number == 1:
+                one.invoke(95, "MatchmakingToggleSelection", [playlist_item_id])
+            two.invoke(21 + round_number * 10, "MatchmakingToggleSelection", [playlist_item_id])
+            stages = two.matchmaking_stages()[stage_offset:]
+            if 3 not in stages or 4 not in stages:
+                raise RuntimeError(f"round {round_number} did not finalise its beatmap: {stages}")
+            one.invoke(22 + round_number * 10, "ChangeState", [1])
+            two.invoke(23 + round_number * 10, "ChangeState", [1])
+            stages = two.matchmaking_stages()[stage_offset:]
+            events = two.events[event_offset:]
+            if "LoadRequested" not in events or 5 not in stages or 6 not in stages:
+                raise RuntimeError(f"round {round_number} did not request gameplay: {events} {stages}")
+            one.invoke(24 + round_number * 10, "ChangeState", [3])
+            one.invoke(25 + round_number * 10, "ChangeState", [4])
+            two.invoke(24 + round_number * 10, "ChangeState", [3])
+
+            if round_number == 1:
+                token_form = urllib.parse.urlencode({
+                    "version_hash": "11111111111111111111111111111111",
+                    "beatmap_id": "75",
+                    "beatmap_hash": "0123456789abcdef0123456789abcdef",
+                    "ruleset_id": "0",
+                }).encode()
+                status, token_response = api_request(origin, token_one, "POST", f"/api/v2/rooms/{match_room_id}/playlist/1/scores", token_form, "application/x-www-form-urlencoded")
+                if status != 201 or token_response["id"] <= 0:
+                    raise RuntimeError("matchmaking score token was not created")
+                score_body = json.dumps({
+                    "rank": "A", "total_score": 900000, "total_score_without_mods": 765432,
+                    "accuracy": 0.95, "max_combo": 9, "ruleset_id": 0, "passed": True,
+                    "mods": [], "statistics": {"great": 19, "miss": 1},
+                    "maximum_statistics": {"great": 20}, "pauses": [],
+                }).encode()
+                status, score_response = api_request(origin, token_one, "PUT", f"/api/v2/rooms/{match_room_id}/playlist/1/scores/{token_response['id']}", score_body, "application/json")
+                if status != 200 or score_response["id"] <= 0:
+                    raise RuntimeError("matchmaking score was not submitted")
+                score_id = score_response["id"]
+
+            one.invoke(26 + round_number * 10, "ChangeState", [6])
+            two.invoke(25 + round_number * 10, "ChangeState", [6])
+            stages = two.matchmaking_stages()[stage_offset:]
+            events = two.events[event_offset:]
+            if "ResultsReady" not in events or 7 not in stages:
+                raise RuntimeError(f"round {round_number} did not reach results")
+            one.invoke(27 + round_number * 10, "ChangeState", [0])
+            two.invoke(26 + round_number * 10, "ChangeState", [0])
+            expected_stage = 8 if round_number == 3 else 2
+            if expected_stage not in two.matchmaking_stages()[stage_offset:]:
+                raise RuntimeError(f"round {round_number} did not advance to stage {expected_stage}")
+
+        status, results = api_request(origin, token_one, "GET", f"/api/v2/rooms/{match_room_id}/playlist/1/scores")
+        if status != 200 or results["total"] < 1 or results["user_score"]["id"] != score_id:
+            raise RuntimeError(f"matchmaking results did not retain the submitted score: {results}")
+        two.invoke(90, "LeaveRoom", [])
+        one.invoke(91, "LeaveRoom", [])
+        print(f"lazer_multiplayer_ws_smoke_ok room_id={room_id} matchmaking_room_id={match_room_id}")
     finally:
         one.close()
         two.close()

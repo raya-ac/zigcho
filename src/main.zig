@@ -2139,6 +2139,12 @@ const App = struct {
                     else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score submission failed\"}", &.{}),
                 };
                 const placement = self.afterLazerScore(user, score_id, score, performance.pp, mods_json);
+                self.lazer_multiplayer.recordRoomScore(user.id, room_score_path.room_id, room_score_path.playlist_item_id, .{
+                    .total_score = score.legacy_total_score orelse score.total_score,
+                    .accuracy = score.accuracy,
+                    .max_combo = @intCast(score.max_combo),
+                    .passed = score.passed,
+                }) catch |err| std.log.warn("event=lazer_matchmaking_score_state_failed room_id={d} playlist_item_id={d} user_id={d} score_id={d} error={t}", .{ room_score_path.room_id, room_score_path.playlist_item_id, user.id, score_id, err });
                 const json = try self.lazerScoreResponse(user.id, score_id, placement);
                 defer self.allocator.free(json);
                 return respond(req, .ok, "application/json", json, &.{});
@@ -3029,6 +3035,8 @@ pub fn main(init: std.process.Init) !void {
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
+    app.lazer_multiplayer.bindStore(&app.store);
+    app.lazer_multiplayer.refreshMatchmakingMaps() catch |err| std.log.warn("event=lazer_matchmaking_pool_startup_failed error={t}", .{err});
     app.lazer_spectator.bindStore(&app.store);
     kai.country = .{ 'I', 'S' };
     const kai_session = try app.sessions.createBot(kai);

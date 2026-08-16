@@ -45,7 +45,7 @@ for name in multiplayer-one multiplayer-two; do
   [ "$code" = 201 ] || fail "register_$name status=$code"
 done
 
-sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,10,0,readfile('$repo/src/testdata/synthetic-standard.osu'));"
+sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff one','mapper',3,10,0,readfile('$repo/src/testdata/synthetic-standard.osu')),(76,75,'1123456789abcdef0123456789abcdef','artist','title','diff two','mapper',3,10,0,readfile('$repo/src/testdata/synthetic-standard.osu')),(77,75,'2123456789abcdef0123456789abcdef','artist','title','diff three','mapper',3,10,0,readfile('$repo/src/testdata/synthetic-standard.osu'));"
 
 oauth() {
   curl --silent --show-error --request POST "$origin/oauth/token" \
@@ -66,4 +66,6 @@ jq -e '. == []' "$response" >/dev/null || fail rooms_not_cleaned_up
 
 grep -q 'event=lazer_multiplayer_room_created' "$server_log" || fail room_create_not_logged
 grep -q 'event=lazer_multiplayer_room_joined' "$server_log" || fail room_join_not_logged
+grep -q 'event=lazer_matchmaking_group_formed' "$server_log" || fail matchmaking_group_not_logged
+grep -q 'event=lazer_matchmaking_room_ready' "$server_log" || fail matchmaking_room_not_logged
 echo lazer_multiplayer_smoke_ok

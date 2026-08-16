@@ -13,6 +13,6 @@ osu! does not use one neat origin. stable and lazer both expect a collection of 
 - `spectator` is kept for lazer spectator and multiplayer streams
 - `bss` is kept for beatmap submission traffic
 
-The names existing does not mean every protocol behind them is finished. Lazer realtime streams and beatmap submission are still reserved surfaces. The page says that plainly.
+The names existing does not mean every protocol behind them is finished. BSS is still reserved for future beatmap submission traffic. The page says that plainly.
 
 Stable IRC is a separate TCP service. A wildcard HTTPS route cannot provide it, so `irc.kai.ovh` is deliberately not in this list until there is an IRC listener and a separately verified TCP route.

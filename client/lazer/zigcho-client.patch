@@ -1569,12 +1569,6 @@ index 42f241d66275993f7d15ccff7c9a54a909cd6123..3a36e8fc1db24b594f00c36cbd2dad77
 +        }
      }
  }
-diff --git a/osu.Game/Overlays/Profile/Sections/ZigchoPlaysSection.cs b/osu.Game/Overlays/Profile/Sections/ZigchoPlaysSection.cs
-deleted file mode 100644
-index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..0000000000000000000000000000000000000000
-diff --git a/osu.Game/Overlays/Profile/Sections/ZigchoStatsSubsection.cs b/osu.Game/Overlays/Profile/Sections/ZigchoStatsSubsection.cs
-deleted file mode 100644
-index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..0000000000000000000000000000000000000000
 diff --git a/osu.Game/Overlays/UserProfileOverlay.cs b/osu.Game/Overlays/UserProfileOverlay.cs
 index edaa1bdc89cb2ffabd5db12a12ae17745c48e852..f51f14413ae25e502ee976eeec63fa56eb12b91f 100644
 --- a/osu.Game/Overlays/UserProfileOverlay.cs

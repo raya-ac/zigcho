@@ -3416,7 +3416,7 @@ pub const Store = struct {
             "SELECT 'stable'::text source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{}'::text statistics_json,'{}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order " ++
             "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND $3!='custom' AND $7::boolean AND (NOT $5::boolean OR s.mods=$8))," ++
-            "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) user_place FROM candidates)," ++
+            "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id,source_order ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_id) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
             "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace " ++
             "FROM board WHERE position<=$9 OR user_id=$10 ORDER BY position";
@@ -3480,7 +3480,8 @@ pub const Store = struct {
                 try lazer.writeLeaderboardScore(&scores.writer, score);
                 written += 1;
             }
-            if (score.user_id == requester_id) {
+            if (score.user_id == requester_id and (!stable or user_score == null)) {
+                if (user_score) |json| allocator.free(json);
                 var own: std.Io.Writer.Allocating = .init(allocator);
                 errdefer own.deinit();
                 try own.writer.print("{{\"position\":{d},\"score\":", .{position});
@@ -4536,6 +4537,31 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, lazer_website_board, "\"source\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_website_board, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_website_board, "\"client\":\"stable\"") == null);
+    {
+        var user_buf: [24]u8 = undefined;
+        const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var inserted = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES($1,$2,0,0,1100,120,0.97,30,97,3,0,0,0,0,false,true,'replay'::bytea,'vanilla',true)", &.{ user_text, second_md5 });
+        inserted.deinit();
+    }
+    const mixed_client_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, 50);
+    defer std.testing.allocator.free(mixed_client_board);
+    var parsed_mixed_client_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, mixed_client_board, .{});
+    defer parsed_mixed_client_board.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_mixed_client_board.value.object.get("score_count").?.integer);
+    const mixed_scores = parsed_mixed_client_board.value.object.get("scores").?.array.items;
+    try std.testing.expectEqual(lazer_score_id, mixed_scores[0].object.get("id").?.integer);
+    try std.testing.expect(mixed_scores[1].object.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(lazer_score_id, parsed_mixed_client_board.value.object.get("user_score").?.object.get("score").?.object.get("id").?.integer);
+    {
+        var user_buf: [24]u8 = undefined;
+        const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var removed = try postgres.queryParams(std.testing.allocator, lease.conn, "DELETE FROM zigcho.scores WHERE user_id=$1 AND map_md5=$2 AND score=1100", &.{ user_text, second_md5 });
+        removed.deinit();
+    }
     var hard_rock_id: i64 = 0;
     {
         var user_buf: [24]u8 = undefined;

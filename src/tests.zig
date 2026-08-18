@@ -4444,7 +4444,8 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
             "(9,1,76,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1)," ++
             "(10,1,77,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1);" ++
             "INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES" ++
-            "(4,'0123456789abcdef0123456789abcdef',0,0,650,65,0.96,65,96,4,0,0,0,0,0,1,x'7265706c6179','vanilla',1)",
+            "(4,'0123456789abcdef0123456789abcdef',0,0,650,65,0.96,65,96,4,0,0,0,0,0,1,x'7265706c6179','vanilla',1)," ++
+            "(1,'0123456789abcdef0123456789abcdef',0,0,550,55,0.95,55,95,5,0,0,0,0,0,1,x'7265706c6179','vanilla',1)",
     );
 
     const hard_rock = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[\"HR\"]", true, false, stable_mods.hard_rock, 50);
@@ -4460,22 +4461,25 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
     defer std.testing.allocator.free(combined);
     var parsed_combined = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined, .{});
     defer parsed_combined.deinit();
-    try std.testing.expectEqual(@as(i64, 3), parsed_combined.value.object.get("score_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), parsed_combined.value.object.get("score_count").?.integer);
     try std.testing.expectEqual(@as(i64, 1), parsed_combined.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, 3), parsed_combined.value.object.get("scores").?.array.items[1].object.get("id").?.integer);
     const stable_board_score = parsed_combined.value.object.get("scores").?.array.items[2].object;
     try std.testing.expect(stable_board_score.get("id").?.integer >= lazer.stable_score_id_offset);
     try std.testing.expect(stable_board_score.get("has_replay").?.bool);
     try std.testing.expectEqualStrings("CL", stable_board_score.get("mods").?.array.items[0].object.get("acronym").?.string);
+    try std.testing.expect(parsed_combined.value.object.get("scores").?.array.items[3].object.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(@as(i64, 1), parsed_combined.value.object.get("user_score").?.object.get("score").?.object.get("id").?.integer);
 
     const exact_nm = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[]", true, false, 0, 50);
     defer std.testing.allocator.free(exact_nm);
     var parsed_exact_nm = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, exact_nm, .{});
     defer parsed_exact_nm.deinit();
-    try std.testing.expectEqual(@as(i64, 3), parsed_exact_nm.value.object.get("score_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), parsed_exact_nm.value.object.get("score_count").?.integer);
     try std.testing.expectEqual(@as(i64, 1), parsed_exact_nm.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
     try std.testing.expect(parsed_exact_nm.value.object.get("scores").?.array.items[1].object.get("id").?.integer >= lazer.stable_score_id_offset);
-    try std.testing.expectEqual(@as(i64, 4), parsed_exact_nm.value.object.get("scores").?.array.items[2].object.get("id").?.integer);
+    try std.testing.expect(parsed_exact_nm.value.object.get("scores").?.array.items[2].object.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(@as(i64, 4), parsed_exact_nm.value.object.get("scores").?.array.items[3].object.get("id").?.integer);
 
     const hard_rock_best = (try store.lazerScoreLeaderboardPlacement(2)).?;
     try std.testing.expect(hard_rock_best.submitted_is_best);

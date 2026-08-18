@@ -36,6 +36,7 @@ const beatmap_media = @import("beatmap_media.zig");
 const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
+const avatar_cache = @import("avatar_cache.zig");
 const r2 = @import("r2.zig");
 const site_replay = @import("site_replay.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
@@ -56,6 +57,7 @@ comptime {
     _ = user_json;
     _ = lazer_bot;
     _ = profile_avatar;
+    _ = avatar_cache;
     _ = r2;
     _ = site_replay;
     _ = anticheat_abi;
@@ -4320,7 +4322,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqualSlices(u8, &replay, replay_ptr[0..replay_len]);
     _ = storage.c.sqlite3_finalize(row);
 
-    const leaderboard = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, "[\"RX\",\"WIGGLE\"]", false, 50);
+    const leaderboard = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, "[\"RX\",\"WIGGLE\"]", true, false, null, 50);
     defer std.testing.allocator.free(leaderboard);
     var parsed_leaderboard = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, leaderboard, .{});
     defer parsed_leaderboard.deinit();
@@ -4353,7 +4355,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer std.testing.allocator.free(pinned);
     try std.testing.expectEqualStrings("[]", pinned);
 
-    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,'vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid())");
+    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,x'7265706c6179','vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid())");
     const combined_recent = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, .all, 0, 50);
     defer std.testing.allocator.free(combined_recent);
     var parsed_combined = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined_recent, .{});
@@ -4363,7 +4365,12 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expect(stable_profile_score.get("id").?.integer >= 4_000_000_000_000_000_000);
     try std.testing.expectEqualStrings("A", stable_profile_score.get("rank").?.string);
     try std.testing.expectEqualStrings("CL", stable_profile_score.get("mods").?.array.items[0].object.get("acronym").?.string);
-    try std.testing.expect(!stable_profile_score.get("has_replay").?.bool);
+    try std.testing.expect(stable_profile_score.get("has_replay").?.bool);
+    const stable_public_id = stable_profile_score.get("id").?.integer;
+    const stable_raw_id = lazer.decodeStableScoreId(stable_public_id).?;
+    const stable_replay = (try store.siteReplay(std.testing.allocator, stable_raw_id)).?;
+    defer std.testing.allocator.free(stable_replay);
+    try std.testing.expect(std.mem.indexOf(u8, stable_replay, "replay") != null);
     const stable_recent = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, .stable, 0, 50);
     defer std.testing.allocator.free(stable_recent);
     var parsed_stable_recent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stable_recent, .{});
@@ -4390,7 +4397,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(i32, 1), lazer_counts.recent);
     try std.testing.expectEqual(@as(i32, 0), lazer_counts.pinned);
 
-    const classic_board = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[]", true, 50);
+    const classic_board = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[\"HD\"]", true, true, stable_mods.hidden, 50);
     defer std.testing.allocator.free(classic_board);
     var parsed_classic = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, classic_board, .{});
     defer parsed_classic.deinit();
@@ -4420,7 +4427,7 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
     try store.migrate();
     try store.exec(
         "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
-            "(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00');" ++
+            "(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00'),(4,'mimi','mimi',x'00',x'00');" ++
             "INSERT INTO beatmaps(id,set_id,md5,status,artist,title,version,creator) VALUES" ++
             "(75,75,'0123456789abcdef0123456789abcdef',3,'artist','title','diff','mapper')," ++
             "(76,76,'1123456789abcdef0123456789abcdef',5,'artist','qualified','diff','mapper')," ++
@@ -4435,34 +4442,49 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
             "(7,2,75,0,800,800,0.98,80,1,'A','[{\"acronym\":\"WIGGLE\"},{\"acronym\":\"HR\"}]','{}','{}','[]','custom',80,1)," ++
             "(8,2,75,0,700,700,0.97,70,1,'A','[{\"acronym\":\"AP\"},{\"acronym\":\"WIGGLE\"}]','{}','{}','[]','custom',70,0)," ++
             "(9,1,76,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1)," ++
-            "(10,1,77,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1)",
+            "(10,1,77,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1);" ++
+            "INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES" ++
+            "(4,'0123456789abcdef0123456789abcdef',0,0,650,65,0.96,65,96,4,0,0,0,0,0,1,x'7265706c6179','vanilla',1)",
     );
 
-    const hard_rock = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[\"HR\"]", false, 50);
+    const hard_rock = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[\"HR\"]", true, false, stable_mods.hard_rock, 50);
     defer std.testing.allocator.free(hard_rock);
     var parsed_hr = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, hard_rock, .{});
     defer parsed_hr.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_hr.value.object.get("score_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), parsed_hr.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
-    try std.testing.expectEqual(@as(i64, 3), parsed_hr.value.object.get("scores").?.array.items[1].object.get("id").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), parsed_hr.value.object.get("user_score").?.object.get("position").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), parsed_hr.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed_hr.value.object.get("scores").?.array.items[1].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed_hr.value.object.get("user_score").?.object.get("position").?.integer);
 
-    const no_mod = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[]", false, 50);
-    defer std.testing.allocator.free(no_mod);
-    var parsed_nm = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, no_mod, .{});
-    defer parsed_nm.deinit();
-    try std.testing.expectEqual(@as(i64, 2), parsed_nm.value.object.get("score_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), parsed_nm.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
-    try std.testing.expectEqual(@as(i64, 3), parsed_nm.value.object.get("scores").?.array.items[1].object.get("id").?.integer);
+    const combined = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[]", false, false, 0, 50);
+    defer std.testing.allocator.free(combined);
+    var parsed_combined = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined, .{});
+    defer parsed_combined.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed_combined.value.object.get("score_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_combined.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), parsed_combined.value.object.get("scores").?.array.items[1].object.get("id").?.integer);
+    const stable_board_score = parsed_combined.value.object.get("scores").?.array.items[2].object;
+    try std.testing.expect(stable_board_score.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expect(stable_board_score.get("has_replay").?.bool);
+    try std.testing.expectEqualStrings("CL", stable_board_score.get("mods").?.array.items[0].object.get("acronym").?.string);
+
+    const exact_nm = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[]", true, false, 0, 50);
+    defer std.testing.allocator.free(exact_nm);
+    var parsed_exact_nm = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, exact_nm, .{});
+    defer parsed_exact_nm.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed_exact_nm.value.object.get("score_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_exact_nm.value.object.get("scores").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expect(parsed_exact_nm.value.object.get("scores").?.array.items[1].object.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(@as(i64, 4), parsed_exact_nm.value.object.get("scores").?.array.items[2].object.get("id").?.integer);
 
     const hard_rock_best = (try store.lazerScoreLeaderboardPlacement(2)).?;
-    try std.testing.expect(!hard_rock_best.submitted_is_best);
-    try std.testing.expectEqual(@as(i32, 2), hard_rock_best.rank);
+    try std.testing.expect(hard_rock_best.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 1), hard_rock_best.rank);
     const hard_rock_lower = (try store.lazerScoreLeaderboardPlacement(5)).?;
     try std.testing.expect(!hard_rock_lower.submitted_is_best);
-    try std.testing.expectEqual(@as(i32, 2), hard_rock_lower.rank);
+    try std.testing.expectEqual(@as(i32, 1), hard_rock_lower.rank);
 
-    const custom = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, "[\"WIGGLE\"]", false, 50);
+    const custom = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .custom, "[\"WIGGLE\"]", true, false, null, 50);
     defer std.testing.allocator.free(custom);
     var parsed_custom = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, custom, .{});
     defer parsed_custom.deinit();

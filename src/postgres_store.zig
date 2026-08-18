@@ -3223,7 +3223,7 @@ pub const Store = struct {
             \\SELECT 'lazer'::text source,s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,coalesce(octet_length(s.replay),0)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect
             \\FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 {s} {s}
             \\UNION ALL
-            \\SELECT 'stable'::text source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{{}}'::text statistics_json,'{{}}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,false has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect
+            \\SELECT 'stable'::text source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{{}}'::text statistics_json,'{{}}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect
             \\FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 {s} {s}
             \\) combined ORDER BY {s} LIMIT $3 OFFSET $4
         , .{ filters[0], if (source == .stable) "AND false" else "", filters[1], if (source == .lazer) "AND false" else "", filters[2] }, 0);
@@ -3390,31 +3390,37 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
-    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, classic: bool, limit: u8) ![]u8 {
-        if (classic) return self.stableClassicLeaderboardJson(allocator, requester_id, beatmap_id, ruleset_id, limit);
+    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, filter_mods: bool, classic: bool, requested_stable_mods: ?i32, limit: u8) ![]u8 {
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
         const requester = try param(&buffers, &cursor, requester_id);
         const beatmap_text = try param(&buffers, &cursor, beatmap_id);
         const ruleset = try param(&buffers, &cursor, ruleset_id);
         const limit_text = try param(&buffers, &cursor, limit);
+        const filter = if (filter_mods) "true" else "false";
+        const classic_only = if (classic) "true" else "false";
+        const stable_supported = if (requested_stable_mods != null) "true" else "false";
+        const stable_bits = try param(&buffers, &cursor, requested_stable_mods orelse 0);
         const namespace_name = @tagName(namespace);
         var lease = self.pool.acquire();
         defer lease.release();
         const sql =
-            "WITH ordered AS (" ++
-            "SELECT s.*,b.status,row_number() OVER(PARTITION BY s.user_id ORDER BY CASE WHEN s.rank_namespace IN('relax','autopilot') THEN s.pp ELSE s.total_score END DESC,s.id ASC) AS user_place " ++
+            "WITH candidates AS (" ++
+            "SELECT 'lazer'::text source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,coalesce(octet_length(s.replay),0)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order " ++
             "FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id " ++
-            "WHERE s.beatmap_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted " ++
-            "AND ($3!='custom' OR (" ++
-            "NOT EXISTS(SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE upper(stored.value->>'acronym') NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE upper(value) NOT IN('RX','AP')) " ++
-            "AND NOT EXISTS(SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE upper(stored.value->>'acronym') NOT IN('RX','AP')))))," ++
-            "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,id,user_id,(SELECT name FROM zigcho.users WHERE id=board.user_id),(SELECT country FROM zigcho.users WHERE id=board.user_id)," ++
-            "beatmap_id,ruleset_id,total_score,coalesce(legacy_total_score,total_score),pp,accuracy,max_combo,passed,rank,mods_json::text,statistics_json::text," ++
-            "maximum_statistics_json::text,pauses_json::text,to_char(to_timestamp(submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),status,coalesce(octet_length(replay),0)>0 " ++
-            "FROM board WHERE position<=$5 OR user_id=$6 ORDER BY position";
-        var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, namespace_name, exact_mods_json, limit_text, requester });
+            "WHERE s.beatmap_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND NOT $6::boolean " ++
+            "AND (NOT $5::boolean OR (" ++
+            "NOT EXISTS(SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE $3!='custom' OR upper(stored.value->>'acronym') NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE $3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
+            "AND NOT EXISTS(SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE $3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE $3!='custom' OR upper(stored.value->>'acronym') NOT IN('RX','AP')))) " ++
+            "UNION ALL " ++
+            "SELECT 'stable'::text source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{}'::text statistics_json,'{}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order " ++
+            "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
+            "WHERE b.id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND $3!='custom' AND $7::boolean AND (NOT $5::boolean OR s.mods=$8))," ++
+            "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) user_place FROM candidates)," ++
+            "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
+            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace " ++
+            "FROM board WHERE position<=$9 OR user_id=$10 ORDER BY position";
+        var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, namespace_name, exact_mods_json, filter, classic_only, stable_supported, stable_bits, limit_text, requester });
         defer result.deinit();
 
         var scores: std.Io.Writer.Allocating = .init(allocator);
@@ -3426,27 +3432,48 @@ pub const Store = struct {
         for (0..result.rows()) |row| {
             const position = try result.int(i64, row, 0);
             score_count = try result.int(i64, row, 1);
+            const stable = std.mem.eql(u8, result.value(row, 2), "stable");
+            var mods: std.Io.Writer.Allocating = .init(allocator);
+            defer mods.deinit();
+            var statistics: std.Io.Writer.Allocating = .init(allocator);
+            defer statistics.deinit();
+            if (stable) {
+                try stable_mods.writeLazerJson(&mods.writer, try result.int(i32, row, 23), true);
+                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, try result.int(i32, row, 24), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 28), try result.int(i32, row, 29));
+            }
             const score: lazer.LeaderboardScore = .{
-                .id = try result.int(i64, row, 2),
-                .user_id = try result.int(i32, row, 3),
-                .username = result.value(row, 4),
-                .country = result.value(row, 5),
-                .beatmap_id = try result.int(i32, row, 6),
-                .ruleset_id = try result.int(i32, row, 7),
-                .total_score = try result.int(i64, row, 8),
-                .total_score_without_mods = try result.int(i64, row, 9),
-                .pp = try result.float(f64, row, 10),
-                .accuracy = try result.float(f64, row, 11),
-                .max_combo = try result.int(i32, row, 12),
-                .passed = try result.boolean(row, 13),
-                .rank = result.value(row, 14),
-                .mods_json = result.value(row, 15),
-                .statistics_json = result.value(row, 16),
-                .maximum_statistics_json = result.value(row, 17),
-                .pauses_json = result.value(row, 18),
-                .ended_at = result.value(row, 19),
-                .ranked = ((try result.int(i32, row, 20)) == 3 or (try result.int(i32, row, 20)) == 4) and namespace == .vanilla,
-                .has_replay = try result.boolean(row, 21),
+                .id = try result.int(i64, row, 3),
+                .user_id = try result.int(i32, row, 4),
+                .username = result.value(row, 5),
+                .country = result.value(row, 6),
+                .beatmap_id = try result.int(i32, row, 7),
+                .ruleset_id = try result.int(i32, row, 8),
+                .total_score = try result.int(i64, row, 9),
+                .total_score_without_mods = try result.int(i64, row, 10),
+                .pp = try result.float(f64, row, 11),
+                .accuracy = try result.float(f64, row, 12),
+                .max_combo = try result.int(i32, row, 13),
+                .passed = try result.boolean(row, 14),
+                .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 23), try result.float(f64, row, 12), try result.int(i32, row, 24), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 29)) else result.value(row, 15),
+                .mods_json = if (stable) mods.written() else result.value(row, 16),
+                .statistics_json = if (stable) statistics.written() else result.value(row, 17),
+                .maximum_statistics_json = result.value(row, 18),
+                .pauses_json = result.value(row, 19),
+                .ended_at = result.value(row, 20),
+                .ranked = ((try result.int(i32, row, 21)) == 3 or (try result.int(i32, row, 21)) == 4) and namespace == .vanilla,
+                .has_replay = try result.boolean(row, 22),
+                .beatmap = .{
+                    .id = try result.int(i32, row, 7),
+                    .set_id = try result.int(i32, row, 31),
+                    .status = lazerStatus(try result.int(i32, row, 21)),
+                    .checksum = result.value(row, 32),
+                    .ruleset_id = try result.int(i32, row, 33),
+                    .star_rating = try result.float(f64, row, 34),
+                    .version = result.value(row, 35),
+                    .artist = result.value(row, 36),
+                    .title = result.value(row, 37),
+                    .creator = result.value(row, 38),
+                },
             };
             if (position <= limit) {
                 if (written != 0) try scores.writer.writeByte(',');
@@ -3786,30 +3813,51 @@ pub const Store = struct {
     pub fn lazerScoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
         var id_buf: [24]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{score_id});
-        var lease = self.pool.acquire();
-        defer lease.release();
-        const sql =
-            "WITH submitted AS (" ++
-            "SELECT s.*,b.status FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1)," ++
-            "ordered AS (" ++
-            "SELECT o.*,row_number() OVER(PARTITION BY o.user_id ORDER BY CASE WHEN o.rank_namespace IN('relax','autopilot') THEN o.pp ELSE o.total_score END DESC,o.id ASC) user_place " ++
-            "FROM zigcho.lazer_scores o JOIN zigcho.users u ON u.id=o.user_id JOIN submitted s ON true " ++
-            "WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed AND NOT u.restricted AND u.id!=3 " ++
-            "AND (s.rank_namespace!='custom' OR (" ++
-            "NOT EXISTS(SELECT upper(candidate.value->>'acronym') FROM jsonb_array_elements(o.mods_json) candidate WHERE upper(candidate.value->>'acronym') NOT IN('RX','AP') EXCEPT SELECT upper(origin.value->>'acronym') FROM jsonb_array_elements(s.mods_json) origin WHERE upper(origin.value->>'acronym') NOT IN('RX','AP')) " ++
-            "AND NOT EXISTS(SELECT upper(origin.value->>'acronym') FROM jsonb_array_elements(s.mods_json) origin WHERE upper(origin.value->>'acronym') NOT IN('RX','AP') EXCEPT SELECT upper(candidate.value->>'acronym') FROM jsonb_array_elements(o.mods_json) candidate WHERE upper(candidate.value->>'acronym') NOT IN('RX','AP')))))," ++
-            "board AS (SELECT * FROM ordered WHERE user_place=1) " ++
-            "SELECT NOT EXISTS(SELECT 1 FROM ordered own,submitted s WHERE own.user_id=s.user_id AND (" ++
-            "(s.rank_namespace IN('vanilla','custom') AND (own.total_score>s.total_score OR (own.total_score=s.total_score AND own.id<s.id))) OR " ++
-            "(s.rank_namespace IN('relax','autopilot') AND (own.pp>s.pp OR (own.pp=s.pp AND own.id<s.id)))))," ++
-            "(SELECT count(*) FROM board o,submitted s WHERE " ++
-            "(s.rank_namespace IN('vanilla','custom') AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))) OR " ++
-            "(s.rank_namespace IN('relax','autopilot') AND (o.pp>s.pp OR (o.pp=s.pp AND o.id<s.id)))) " ++
-            "FROM submitted s WHERE s.passed AND s.status>=3";
-        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{id});
-        defer result.deinit();
-        if (result.rows() == 0) return null;
-        return .{ .submitted_is_best = try result.boolean(0, 0), .rank = try result.int(i32, 0, 1) };
+        const Context = struct { user_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, mods_json: []u8 };
+        const context: Context = blk: {
+            var lease = self.pool.acquire();
+            defer lease.release();
+            var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.user_id,s.beatmap_id,s.ruleset_id,s.rank_namespace,s.mods_json::text,s.passed,b.status FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1", &.{id});
+            defer result.deinit();
+            if (result.rows() == 0 or !try result.boolean(0, 5) or try result.int(i32, 0, 6) < 3) return null;
+            const score_namespace = std.meta.stringToEnum(lazer.Namespace, result.value(0, 3)) orelse return error.DatabaseQueryFailed;
+            break :blk .{
+                .user_id = try result.int(i32, 0, 0),
+                .beatmap_id = try result.int(i32, 0, 1),
+                .ruleset_id = try result.int(u8, 0, 2),
+                .namespace = score_namespace,
+                .mods_json = try self.allocator.dupe(u8, result.value(0, 4)),
+            };
+        };
+        defer self.allocator.free(context.mods_json);
+        const filter = try lazer.scoreModFilter(self.allocator, context.mods_json);
+        defer filter.deinit(self.allocator);
+        const board_json = try self.lazerLeaderboardJson(self.allocator, context.user_id, context.beatmap_id, context.ruleset_id, context.namespace, filter.exact_json, true, false, filter.stable_bits, 100);
+        defer self.allocator.free(board_json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{});
+        defer parsed.deinit();
+        const own = parsed.value.object.get("user_score") orelse return null;
+        const own_object = switch (own) {
+            .object => |value| value,
+            else => return null,
+        };
+        const position_value = switch (own_object.get("position") orelse return null) {
+            .integer => |value| value,
+            else => return null,
+        };
+        const score = own_object.get("score") orelse return null;
+        const score_object = switch (score) {
+            .object => |value| value,
+            else => return null,
+        };
+        const listed_id = switch (score_object.get("id") orelse return null) {
+            .integer => |value| value,
+            else => return null,
+        };
+        return .{
+            .submitted_is_best = listed_id == score_id,
+            .rank = std.math.cast(i32, @max(position_value - 1, 0)) orelse return error.DatabaseQueryFailed,
+        };
     }
 
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {
@@ -4264,7 +4312,7 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, stable_website_board, "\"source\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable_website_board, "\"client\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable_website_board, "\"client\":\"lazer\"") == null);
-    const classic_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 1, 0, .vanilla, "[]", true, 50);
+    const classic_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 1, 0, .vanilla, "[]", true, true, 0, 50);
     defer std.testing.allocator.free(classic_lazer_board);
     try std.testing.expect(std.mem.indexOf(u8, classic_lazer_board, "\"score_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, classic_lazer_board, "\"username\":\"ari\"") != null);
@@ -4450,7 +4498,7 @@ test "postgres account auth stats and token slice" {
     const stored_lazer_replay = (try store.lazerReplay(std.testing.allocator, lazer_score_id)).?;
     defer std.testing.allocator.free(stored_lazer_replay);
     try std.testing.expectEqualSlices(u8, &lazer_replay, stored_lazer_replay);
-    const lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, 50);
+    const lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, 50);
     defer std.testing.allocator.free(lazer_board);
     try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"has_replay\":true") != null);
     {
@@ -4461,7 +4509,7 @@ test "postgres account auth stats and token slice" {
         var clear_replay = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.lazer_scores SET replay=NULL WHERE id=$1", &.{score_id_text});
         clear_replay.deinit();
     }
-    const old_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, 50);
+    const old_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, 50);
     defer std.testing.allocator.free(old_lazer_board);
     try std.testing.expect(std.mem.indexOf(u8, old_lazer_board, "\"has_replay\":false") != null);
     const lazer_placement = (try store.lazerScoreLeaderboardPlacement(lazer_score_id)).?;
@@ -4498,13 +4546,13 @@ test "postgres account auth stats and token slice" {
         defer inserted.deinit();
         hard_rock_id = try inserted.int(i64, 0, 0);
     }
-    const hard_rock_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[\"HR\"]", false, 50);
+    const hard_rock_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[\"HR\"]", true, false, stable_mods.hard_rock, 50);
     defer std.testing.allocator.free(hard_rock_board);
-    try std.testing.expect(std.mem.indexOf(u8, hard_rock_board, "\"total_score\":1234") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hard_rock_board, "\"total_score\":500") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hard_rock_board, "\"total_score\":1234") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hard_rock_board, "\"total_score\":500") != null);
     const hard_rock_placement = (try store.lazerScoreLeaderboardPlacement(hard_rock_id)).?;
-    try std.testing.expect(!hard_rock_placement.submitted_is_best);
-    try std.testing.expectEqual(@as(i32, 1), hard_rock_placement.rank);
+    try std.testing.expect(hard_rock_placement.submitted_is_best);
+    try std.testing.expectEqual(@as(i32, 0), hard_rock_placement.rank);
     var custom_id: i64 = 0;
     {
         var user_buf: [24]u8 = undefined;
@@ -4515,7 +4563,7 @@ test "postgres account auth stats and token slice" {
         defer inserted.deinit();
         custom_id = try inserted.int(i64, 0, 0);
     }
-    const custom_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .custom, "[\"WIGGLE\"]", false, 50);
+    const custom_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .custom, "[\"WIGGLE\"]", true, false, null, 50);
     defer std.testing.allocator.free(custom_board);
     try std.testing.expect(std.mem.indexOf(u8, custom_board, "\"total_score\":600") != null);
     try std.testing.expect(std.mem.indexOf(u8, custom_board, "\"total_score\":800") == null);

@@ -34,6 +34,7 @@ const web_auth = @import("web_auth.zig");
 const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
+const avatar_cache = @import("avatar_cache.zig");
 const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
@@ -173,6 +174,7 @@ const App = struct {
     anticheat: ?anticheat_plugin.Host,
     anticheat_allow_sample_modulus: u32,
     avatar_store: r2.Storage,
+    avatar_cache: avatar_cache.Cache,
     geo_client: std.http.Client,
     started_at: i64,
 
@@ -431,44 +433,6 @@ const App = struct {
             }
         }
         return if (custom) .custom else if (autopilot) .autopilot else if (relax) .relax else .vanilla;
-    }
-
-    fn lazerLeaderboardClassic(target: []const u8) bool {
-        const query_start = std.mem.findScalar(u8, target, '?') orelse return false;
-        var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
-        while (parameters.next()) |parameter| {
-            const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
-            const key = parameter[0..equals];
-            if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
-            if (std.ascii.eqlIgnoreCase(parameter[equals + 1 ..], "CL")) return true;
-        }
-        return false;
-    }
-
-    fn lazerLeaderboardModsJson(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        errdefer output.deinit();
-        try output.writer.writeByte('[');
-        const query_start = std.mem.findScalar(u8, target, '?') orelse {
-            try output.writer.writeByte(']');
-            return output.toOwnedSlice();
-        };
-        var first = true;
-        var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
-        while (parameters.next()) |parameter| {
-            const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
-            const key = parameter[0..equals];
-            if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
-            const acronym = parameter[equals + 1 ..];
-            if (std.ascii.eqlIgnoreCase(acronym, "NM") or std.ascii.eqlIgnoreCase(acronym, "CL") or !lazer.validAcronym(acronym)) continue;
-            if (!first) try output.writer.writeByte(',');
-            first = false;
-            try output.writer.writeByte('"');
-            for (acronym) |character| try output.writer.writeByte(std.ascii.toUpper(character));
-            try output.writer.writeByte('"');
-        }
-        try output.writer.writeByte(']');
-        return output.toOwnedSlice();
     }
 
     fn isAvatarHost(value: ?[]const u8) bool {
@@ -1062,7 +1026,11 @@ const App = struct {
                     if (!replaces_existing_object) self.avatar_store.delete(self.allocator, self.store.io, object_key) catch {};
                     return err;
                 };
-                if (previous) |avatar| if (!std.mem.eql(u8, avatar.object_key, object_key)) self.avatar_store.delete(self.allocator, self.store.io, avatar.object_key) catch |err| std.log.warn("event=website_avatar_old_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+                self.avatar_cache.put(object_key, body) catch |err| std.log.warn("event=website_avatar_cache_write_failed user_id={d} error={t}", .{ user.id, err });
+                if (previous) |avatar| if (!std.mem.eql(u8, avatar.object_key, object_key)) {
+                    self.avatar_cache.remove(avatar.object_key);
+                    self.avatar_store.delete(self.allocator, self.store.io, avatar.object_key) catch |err| std.log.warn("event=website_avatar_old_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+                };
                 std.log.info("event=website_avatar_updated user_id={d} bytes={d} type={s}", .{ user.id, body.len, image.content_type });
                 return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
             }
@@ -1072,7 +1040,10 @@ const App = struct {
                 avatar.deinit();
             };
             _ = try self.store.deleteCustomAvatar(user.id);
-            if (previous) |avatar| self.avatar_store.delete(self.allocator, self.store.io, avatar.object_key) catch |err| std.log.warn("event=website_avatar_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+            if (previous) |avatar| {
+                self.avatar_cache.remove(avatar.object_key);
+                self.avatar_store.delete(self.allocator, self.store.io, avatar.object_key) catch |err| std.log.warn("event=website_avatar_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+            }
             std.log.info("event=website_avatar_reset user_id={d}", .{user.id});
             return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
         }
@@ -1418,11 +1389,16 @@ const App = struct {
         if (req.head.method == .GET) if (lazer.parseScoreDownloadPath(path)) |score_id| {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
-            const replay = (try self.store.lazerReplay(self.allocator, score_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
-            defer self.allocator.free(replay);
+            const stable_score_id = lazer.decodeStableScoreId(score_id);
+            const replay = if (stable_score_id) |stable_id|
+                try self.store.siteReplay(self.allocator, stable_id)
+            else
+                try self.store.lazerReplay(self.allocator, score_id);
+            const data = replay orelse return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
+            defer self.allocator.free(data);
             var disposition_buf: [96]u8 = undefined;
-            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"kai-lazer-score-{d}.osr\"", .{score_id});
-            return respond(req, .ok, "application/x-osu-replay", replay, &.{
+            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"kai-{s}-score-{d}.osr\"", .{ if (stable_score_id != null) "stable" else "lazer", stable_score_id orelse score_id });
+            return respond(req, .ok, "application/x-osu-replay", data, &.{
                 .{ .name = "content-disposition", .value = disposition },
                 .{ .name = "cache-control", .value = "no-store" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
@@ -1483,11 +1459,20 @@ const App = struct {
                 if (try self.store.customAvatarForUser(self.allocator, user_id)) |avatar_value| {
                     var avatar = avatar_value;
                     defer avatar.deinit();
-                    const data = self.avatar_store.get(self.allocator, self.store.io, avatar.object_key, avatar.content_type) catch |err| {
-                        std.log.warn("event=website_avatar_download_failed user_id={d} error={t}", .{ user_id, err });
-                        return respond(req, .bad_gateway, "application/json", "{\"error\":\"avatar storage is not available\"}", &.{.{ .name = "cache-control", .value = "no-store" }});
+                    var data = self.avatar_cache.get(avatar.object_key) catch |err| cache_error: {
+                        std.log.warn("event=website_avatar_cache_read_failed user_id={d} error={t}", .{ user_id, err });
+                        break :cache_error null;
                     };
-                    defer self.allocator.free(data);
+                    if (data == null) {
+                        const fetched = self.avatar_store.get(self.allocator, self.store.io, avatar.object_key, avatar.content_type) catch |err| {
+                            std.log.warn("event=website_avatar_download_failed user_id={d} error={t}", .{ user_id, err });
+                            return respond(req, .bad_gateway, "application/json", "{\"error\":\"avatar storage is not available\"}", &.{.{ .name = "cache-control", .value = "no-store" }});
+                        };
+                        self.avatar_cache.put(avatar.object_key, fetched) catch |err| std.log.warn("event=website_avatar_cache_write_failed user_id={d} error={t}", .{ user_id, err });
+                        data = fetched;
+                    }
+                    const avatar_data = data.?;
+                    defer self.allocator.free(avatar_data);
                     var etag_buf: [66]u8 = undefined;
                     const etag = try std.fmt.bufPrint(&etag_buf, "\"{s}\"", .{&avatar.etag});
                     const custom_headers = [_]std.http.Header{
@@ -1496,7 +1481,7 @@ const App = struct {
                         .{ .name = "x-content-type-options", .value = "nosniff" },
                     };
                     if (header(req, "if-none-match")) |current| if (std.mem.eql(u8, current, etag)) return respond(req, .not_modified, avatar.content_type, "", &custom_headers);
-                    return respond(req, .ok, avatar.content_type, data, &custom_headers);
+                    return respond(req, .ok, avatar.content_type, avatar_data, &custom_headers);
                 }
                 const key = (try self.store.avatarForUser(user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"avatar not found\"}", &.{});
                 const cache_headers = [_]std.http.Header{
@@ -2026,9 +2011,9 @@ const App = struct {
             if (raw_limit == 0 or raw_limit > 100) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
             const scope = queryField(target, "type") orelse "global";
             if (!std.mem.eql(u8, scope, "global") and !std.mem.eql(u8, scope, "country") and !std.mem.eql(u8, scope, "friend")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported leaderboard scope\"}", &.{});
-            const exact_mods_json = try lazerLeaderboardModsJson(self.allocator, target);
-            defer self.allocator.free(exact_mods_json);
-            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), exact_mods_json, lazerLeaderboardClassic(target), @intCast(raw_limit));
+            const mod_filter = lazer.leaderboardModFilter(self.allocator, target) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid leaderboard mods\"}", &.{});
+            defer mod_filter.deinit(self.allocator);
+            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), mod_filter.exact_json, mod_filter.selected, mod_filter.classic, mod_filter.stable_bits, @intCast(raw_limit));
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -2115,7 +2100,7 @@ const App = struct {
             const score_context = self.lazer_multiplayer.scoreContext(user.id, room_score_path.room_id, room_score_path.playlist_item_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
 
             if (room_score_path.token_id == null and req.head.method == .GET) {
-                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, "[]", false, 100);
+                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, "[]", false, false, 0, 100);
                 defer self.allocator.free(board_json);
                 const parsed_board = std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{}) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
                 defer parsed_board.deinit();
@@ -3202,6 +3187,7 @@ pub fn main(init: std.process.Init) !void {
         .anticheat = anticheat,
         .anticheat_allow_sample_modulus = config.anticheat_allow_sample_modulus,
         .avatar_store = if (object_store.enabled()) object_store else configuredLegacyAvatarStore(config),
+        .avatar_cache = avatar_cache.Cache.init(allocator, init.io),
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };
@@ -3216,6 +3202,7 @@ pub fn main(init: std.process.Init) !void {
     if (app.anticheat) |*loaded| std.log.info("event=anticheat_module_loaded module={s} abi={d} mode=observe", .{ loaded.name(), anticheat_abi.version });
     defer if (app.anticheat) |*loaded| loaded.close();
     defer app.score_webhook.deinit();
+    defer app.avatar_cache.deinit();
     defer app.map_sync.deinit();
     defer app.geo_client.deinit();
     defer app.limiter.deinit();

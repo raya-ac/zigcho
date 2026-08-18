@@ -1,4 +1,116 @@
 const std = @import("std");
+const stable_mods = @import("stable_mods.zig");
+
+pub const stable_score_id_offset: i64 = 4_000_000_000_000_000_000;
+
+pub fn encodeStableScoreId(score_id: i64) ?i64 {
+    if (score_id <= 0 or score_id > std.math.maxInt(i64) - stable_score_id_offset) return null;
+    return stable_score_id_offset + score_id;
+}
+
+pub fn decodeStableScoreId(score_id: i64) ?i64 {
+    if (score_id <= stable_score_id_offset) return null;
+    return score_id - stable_score_id_offset;
+}
+
+pub const LeaderboardModFilter = struct {
+    exact_json: []u8,
+    selected: bool,
+    classic: bool,
+    stable_bits: ?i32,
+
+    pub fn deinit(self: LeaderboardModFilter, allocator: std.mem.Allocator) void {
+        allocator.free(self.exact_json);
+    }
+};
+
+pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !LeaderboardModFilter {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('[');
+    var selected = false;
+    var classic = false;
+    var stable_supported = true;
+    var stable_bits: i32 = 0;
+    var first = true;
+    if (std.mem.findScalar(u8, target, '?')) |query_start| {
+        var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+        while (parameters.next()) |parameter| {
+            const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
+            const key = parameter[0..equals];
+            if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
+            selected = true;
+            const acronym = parameter[equals + 1 ..];
+            if (std.ascii.eqlIgnoreCase(acronym, "NM")) continue;
+            if (std.ascii.eqlIgnoreCase(acronym, "CL")) {
+                classic = true;
+                continue;
+            }
+            if (!validAcronym(acronym)) return error.InvalidLeaderboardMod;
+            if (stable_mods.parseCompact(acronym)) |bits| {
+                stable_bits |= bits;
+            } else {
+                stable_supported = false;
+            }
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.writeByte('"');
+            for (acronym) |character| try output.writer.writeByte(std.ascii.toUpper(character));
+            try output.writer.writeByte('"');
+        }
+    }
+    try output.writer.writeByte(']');
+    return .{
+        .exact_json = try output.toOwnedSlice(),
+        .selected = selected,
+        .classic = classic,
+        .stable_bits = if (stable_supported) stable_mods.canonical(stable_bits) else null,
+    };
+}
+
+pub fn scoreModFilter(allocator: std.mem.Allocator, mods_json: []const u8) !LeaderboardModFilter {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, mods_json, .{});
+    defer parsed.deinit();
+    const mods = switch (parsed.value) {
+        .array => |value| value,
+        else => return error.InvalidLeaderboardMod,
+    };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('[');
+    var stable_supported = true;
+    var stable_bits: i32 = 0;
+    var first = true;
+    for (mods.items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => return error.InvalidLeaderboardMod,
+        };
+        const acronym = switch (object.get("acronym") orelse return error.InvalidLeaderboardMod) {
+            .string => |value| value,
+            else => return error.InvalidLeaderboardMod,
+        };
+        if (std.ascii.eqlIgnoreCase(acronym, "NM") or std.ascii.eqlIgnoreCase(acronym, "CL")) continue;
+        if (!validAcronym(acronym)) return error.InvalidLeaderboardMod;
+        if (stable_mods.parseCompact(acronym)) |bits| {
+            stable_bits |= bits;
+        } else {
+            stable_supported = false;
+        }
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try output.writer.writeByte('"');
+        for (acronym) |character| try output.writer.writeByte(std.ascii.toUpper(character));
+        try output.writer.writeByte('"');
+    }
+    try output.writer.writeByte(']');
+    return .{
+        .exact_json = try output.toOwnedSlice(),
+        .selected = true,
+        .classic = false,
+        .stable_bits = if (stable_supported) stable_mods.canonical(stable_bits) else null,
+    };
+}
 
 pub const Namespace = enum { vanilla, relax, autopilot, custom };
 
@@ -125,6 +237,48 @@ pub fn isOfficial(a: []const u8) bool {
     const names = [_][]const u8{ "NF", "EZ", "TD", "HD", "HR", "SD", "DT", "RX", "HT", "NC", "FL", "AT", "SO", "AP", "PF", "4K", "5K", "6K", "7K", "8K", "FI", "RD", "CN", "TP", "9K", "CO", "1K", "3K", "2K", "V2", "MR", "CL", "DA", "WU", "WD", "TC", "BR", "AD", "MU", "NS", "MG", "RP", "AS", "FR", "BU", "SY", "TR", "WG", "SI", "GR", "DF", "WU" };
     for (names) |name| if (std.mem.eql(u8, a, name)) return true;
     return false;
+}
+
+test "leaderboard mod filters distinguish combined exact and classic boards" {
+    const combined = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?type=global");
+    defer combined.deinit(std.testing.allocator);
+    try std.testing.expect(!combined.selected);
+    try std.testing.expect(!combined.classic);
+    try std.testing.expectEqualStrings("[]", combined.exact_json);
+    try std.testing.expectEqual(@as(?i32, 0), combined.stable_bits);
+
+    const no_mod = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods%5B%5D=NM");
+    defer no_mod.deinit(std.testing.allocator);
+    try std.testing.expect(no_mod.selected);
+    try std.testing.expect(!no_mod.classic);
+    try std.testing.expectEqualStrings("[]", no_mod.exact_json);
+    try std.testing.expectEqual(@as(?i32, 0), no_mod.stable_bits);
+
+    const classic_hr = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=CL&mods[]=HR");
+    defer classic_hr.deinit(std.testing.allocator);
+    try std.testing.expect(classic_hr.selected);
+    try std.testing.expect(classic_hr.classic);
+    try std.testing.expectEqualStrings("[\"HR\"]", classic_hr.exact_json);
+    try std.testing.expectEqual(@as(?i32, stable_mods.hard_rock), classic_hr.stable_bits);
+
+    const lazer_only = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=WG");
+    defer lazer_only.deinit(std.testing.allocator);
+    try std.testing.expect(lazer_only.selected);
+    try std.testing.expectEqualStrings("[\"WG\"]", lazer_only.exact_json);
+    try std.testing.expect(lazer_only.stable_bits == null);
+
+    const submitted = try scoreModFilter(std.testing.allocator, "[{\"acronym\":\"HD\"},{\"acronym\":\"HR\"}]");
+    defer submitted.deinit(std.testing.allocator);
+    try std.testing.expect(submitted.selected);
+    try std.testing.expectEqualStrings("[\"HD\",\"HR\"]", submitted.exact_json);
+    try std.testing.expectEqual(@as(?i32, stable_mods.hidden | stable_mods.hard_rock), submitted.stable_bits);
+}
+
+test "stable score ids keep source identity for lazer replay downloads" {
+    const encoded = encodeStableScoreId(223).?;
+    try std.testing.expectEqual(stable_score_id_offset + 223, encoded);
+    try std.testing.expectEqual(@as(?i64, 223), decodeStableScoreId(encoded));
+    try std.testing.expect(decodeStableScoreId(223) == null);
 }
 
 pub const ScoreInput = struct {

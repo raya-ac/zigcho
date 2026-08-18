@@ -3017,7 +3017,7 @@ pub const Store = struct {
             \\SELECT 'lazer' source,s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,length(s.replay)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,0 perfect
             \\FROM lazer_scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 {s} {s}
             \\UNION ALL
-            \\SELECT 'stable' source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{{}}' statistics_json,'{{}}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect
+            \\SELECT 'stable' source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{{}}' statistics_json,'{{}}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,length(s.replay)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect
             \\FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 {s} {s}
             \\) ORDER BY {s} LIMIT ?3 OFFSET ?4
         , .{ filters[0], if (source == .stable) "AND 0" else "", filters[1], if (source == .lazer) "AND 0" else "", filters[2] });
@@ -3179,23 +3179,25 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
-    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, classic: bool, limit: u8) ![]u8 {
+    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, filter_mods: bool, classic: bool, requested_stable_mods: ?i32, limit: u8) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (classic) return self.stableClassicLeaderboardJsonLocked(allocator, requester_id, beatmap_id, ruleset_id, limit);
         const sql =
-            "WITH ordered AS (" ++
-            "SELECT s.*,b.status,row_number() OVER(PARTITION BY s.user_id ORDER BY CASE WHEN s.rank_namespace IN('relax','autopilot') THEN s.pp ELSE s.total_score END DESC,s.id ASC) AS user_place " ++
+            "WITH candidates AS (" ++
+            "SELECT 'lazer' source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,length(s.replay)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,0 perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order " ++
             "FROM lazer_scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id " ++
-            "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 " ++
-            "AND (?3!='custom' OR (" ++
-            "NOT EXISTS(SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM json_each(?4) WHERE upper(value) NOT IN('RX','AP')) " ++
-            "AND NOT EXISTS(SELECT upper(value) FROM json_each(?4) WHERE upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP')))))," ++
-            "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,id,user_id,(SELECT name FROM users WHERE id=board.user_id),(SELECT country FROM users WHERE id=board.user_id)," ++
-            "beatmap_id,ruleset_id,total_score,coalesce(legacy_total_score,total_score),pp,accuracy,max_combo,passed,rank,mods_json,statistics_json," ++
-            "maximum_statistics_json,pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',submitted_at,'unixepoch'),status,length(replay)>0 " ++
-            "FROM board WHERE position<=?5 OR user_id=?6 ORDER BY position";
+            "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?6=0 " ++
+            "AND (?5=0 OR (" ++
+            "NOT EXISTS(SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
+            "AND NOT EXISTS(SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP')))) " ++
+            "UNION ALL " ++
+            "SELECT 'stable' source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{}' statistics_json,'{}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,length(s.replay)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order " ++
+            "FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
+            "WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?3!='custom' AND ?7=1 AND (?5=0 OR s.mods=?8))," ++
+            "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,source_order,source_id) user_place FROM candidates)," ++
+            "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
+            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace " ++
+            "FROM board WHERE position<=?9 OR user_id=?10 ORDER BY position";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -3204,8 +3206,12 @@ pub const Store = struct {
         const namespace_name = @tagName(namespace);
         _ = c.sqlite3_bind_text(stmt, 3, namespace_name.ptr, @intCast(namespace_name.len), null);
         _ = c.sqlite3_bind_text(stmt, 4, exact_mods_json.ptr, @intCast(exact_mods_json.len), null);
-        _ = c.sqlite3_bind_int(stmt, 5, limit);
-        _ = c.sqlite3_bind_int(stmt, 6, requester_id);
+        _ = c.sqlite3_bind_int(stmt, 5, @intFromBool(filter_mods));
+        _ = c.sqlite3_bind_int(stmt, 6, @intFromBool(classic));
+        _ = c.sqlite3_bind_int(stmt, 7, @intFromBool(requested_stable_mods != null));
+        _ = c.sqlite3_bind_int(stmt, 8, requested_stable_mods orelse 0);
+        _ = c.sqlite3_bind_int(stmt, 9, limit);
+        _ = c.sqlite3_bind_int(stmt, 10, requester_id);
 
         var scores: std.Io.Writer.Allocating = .init(allocator);
         defer scores.deinit();
@@ -3216,27 +3222,48 @@ pub const Store = struct {
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const position = c.sqlite3_column_int64(stmt, 0);
             score_count = c.sqlite3_column_int64(stmt, 1);
+            const stable = std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)), "stable");
+            var mods: std.Io.Writer.Allocating = .init(allocator);
+            defer mods.deinit();
+            var statistics: std.Io.Writer.Allocating = .init(allocator);
+            defer statistics.deinit();
+            if (stable) {
+                try stable_mods.writeLazerJson(&mods.writer, c.sqlite3_column_int(stmt, 23), true);
+                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, c.sqlite3_column_int(stmt, 24), c.sqlite3_column_int(stmt, 25), c.sqlite3_column_int(stmt, 26), c.sqlite3_column_int(stmt, 27), c.sqlite3_column_int(stmt, 28), c.sqlite3_column_int(stmt, 29));
+            }
             const score: lazer.LeaderboardScore = .{
-                .id = c.sqlite3_column_int64(stmt, 2),
-                .user_id = c.sqlite3_column_int(stmt, 3),
-                .username = std.mem.span(c.sqlite3_column_text(stmt, 4)),
-                .country = std.mem.span(c.sqlite3_column_text(stmt, 5)),
-                .beatmap_id = c.sqlite3_column_int(stmt, 6),
-                .ruleset_id = c.sqlite3_column_int(stmt, 7),
-                .total_score = c.sqlite3_column_int64(stmt, 8),
-                .total_score_without_mods = c.sqlite3_column_int64(stmt, 9),
-                .pp = c.sqlite3_column_double(stmt, 10),
-                .accuracy = c.sqlite3_column_double(stmt, 11),
-                .max_combo = c.sqlite3_column_int(stmt, 12),
-                .passed = c.sqlite3_column_int(stmt, 13) != 0,
-                .rank = std.mem.span(c.sqlite3_column_text(stmt, 14)),
-                .mods_json = std.mem.span(c.sqlite3_column_text(stmt, 15)),
-                .statistics_json = std.mem.span(c.sqlite3_column_text(stmt, 16)),
-                .maximum_statistics_json = std.mem.span(c.sqlite3_column_text(stmt, 17)),
-                .pauses_json = std.mem.span(c.sqlite3_column_text(stmt, 18)),
-                .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 19)),
-                .ranked = (c.sqlite3_column_int(stmt, 20) == 3 or c.sqlite3_column_int(stmt, 20) == 4) and namespace == .vanilla,
-                .has_replay = c.sqlite3_column_int(stmt, 21) != 0,
+                .id = c.sqlite3_column_int64(stmt, 3),
+                .user_id = c.sqlite3_column_int(stmt, 4),
+                .username = std.mem.span(c.sqlite3_column_text(stmt, 5)),
+                .country = std.mem.span(c.sqlite3_column_text(stmt, 6)),
+                .beatmap_id = c.sqlite3_column_int(stmt, 7),
+                .ruleset_id = c.sqlite3_column_int(stmt, 8),
+                .total_score = c.sqlite3_column_int64(stmt, 9),
+                .total_score_without_mods = c.sqlite3_column_int64(stmt, 10),
+                .pp = c.sqlite3_column_double(stmt, 11),
+                .accuracy = c.sqlite3_column_double(stmt, 12),
+                .max_combo = c.sqlite3_column_int(stmt, 13),
+                .passed = c.sqlite3_column_int(stmt, 14) != 0,
+                .rank = if (stable) stableGrade(ruleset_id, c.sqlite3_column_int(stmt, 23), c.sqlite3_column_double(stmt, 12), c.sqlite3_column_int(stmt, 24), c.sqlite3_column_int(stmt, 25), c.sqlite3_column_int(stmt, 26), c.sqlite3_column_int(stmt, 29)) else std.mem.span(c.sqlite3_column_text(stmt, 15)),
+                .mods_json = if (stable) mods.written() else std.mem.span(c.sqlite3_column_text(stmt, 16)),
+                .statistics_json = if (stable) statistics.written() else std.mem.span(c.sqlite3_column_text(stmt, 17)),
+                .maximum_statistics_json = std.mem.span(c.sqlite3_column_text(stmt, 18)),
+                .pauses_json = std.mem.span(c.sqlite3_column_text(stmt, 19)),
+                .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 20)),
+                .ranked = (c.sqlite3_column_int(stmt, 21) == 3 or c.sqlite3_column_int(stmt, 21) == 4) and namespace == .vanilla,
+                .has_replay = c.sqlite3_column_int(stmt, 22) != 0,
+                .beatmap = .{
+                    .id = c.sqlite3_column_int(stmt, 7),
+                    .set_id = c.sqlite3_column_int(stmt, 31),
+                    .status = lazerStatus(c.sqlite3_column_int(stmt, 21)),
+                    .checksum = std.mem.span(c.sqlite3_column_text(stmt, 32)),
+                    .ruleset_id = c.sqlite3_column_int(stmt, 33),
+                    .star_rating = c.sqlite3_column_double(stmt, 34),
+                    .version = std.mem.span(c.sqlite3_column_text(stmt, 35)),
+                    .artist = std.mem.span(c.sqlite3_column_text(stmt, 36)),
+                    .title = std.mem.span(c.sqlite3_column_text(stmt, 37)),
+                    .creator = std.mem.span(c.sqlite3_column_text(stmt, 38)),
+                },
             };
             if (position <= limit) {
                 if (written != 0) try scores.writer.writeByte(',');
@@ -4240,32 +4267,55 @@ pub const Store = struct {
     }
 
     pub fn lazerScoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const sql =
-            "WITH submitted AS (" ++
-            "SELECT s.*,b.status FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=?1)," ++
-            "ordered AS (" ++
-            "SELECT o.*,row_number() OVER(PARTITION BY o.user_id ORDER BY CASE WHEN o.rank_namespace IN('relax','autopilot') THEN o.pp ELSE o.total_score END DESC,o.id ASC) user_place " ++
-            "FROM lazer_scores o JOIN users u ON u.id=o.user_id JOIN submitted s " ++
-            "WHERE o.beatmap_id=s.beatmap_id AND o.ruleset_id=s.ruleset_id AND o.rank_namespace=s.rank_namespace AND o.passed=1 AND u.restricted=0 AND u.id!=3 " ++
-            "AND (s.rank_namespace!='custom' OR (" ++
-            "NOT EXISTS(SELECT upper(json_extract(candidate.value,'$.acronym')) FROM json_each(o.mods_json) candidate WHERE upper(json_extract(candidate.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(origin.value,'$.acronym')) FROM json_each(s.mods_json) origin WHERE upper(json_extract(origin.value,'$.acronym')) NOT IN('RX','AP')) " ++
-            "AND NOT EXISTS(SELECT upper(json_extract(origin.value,'$.acronym')) FROM json_each(s.mods_json) origin WHERE upper(json_extract(origin.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(candidate.value,'$.acronym')) FROM json_each(o.mods_json) candidate WHERE upper(json_extract(candidate.value,'$.acronym')) NOT IN('RX','AP')))))," ++
-            "board AS (SELECT * FROM ordered WHERE user_place=1) " ++
-            "SELECT NOT EXISTS(SELECT 1 FROM ordered own,submitted s WHERE own.user_id=s.user_id AND (" ++
-            "(s.rank_namespace IN('vanilla','custom') AND (own.total_score>s.total_score OR (own.total_score=s.total_score AND own.id<s.id))) OR " ++
-            "(s.rank_namespace IN('relax','autopilot') AND (own.pp>s.pp OR (own.pp=s.pp AND own.id<s.id)))))," ++
-            "(SELECT count(*) FROM board o,submitted s WHERE " ++
-            "(s.rank_namespace IN('vanilla','custom') AND (o.total_score>s.total_score OR (o.total_score=s.total_score AND o.id<s.id))) OR " ++
-            "(s.rank_namespace IN('relax','autopilot') AND (o.pp>s.pp OR (o.pp=s.pp AND o.id<s.id)))) " ++
-            "FROM submitted s WHERE s.passed=1 AND s.status>=3";
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, score_id);
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        return .{ .submitted_is_best = c.sqlite3_column_int(stmt, 0) != 0, .rank = c.sqlite3_column_int(stmt, 1) };
+        const Context = struct { user_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, mods_json: []u8 };
+        const context: Context = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT s.user_id,s.beatmap_id,s.ruleset_id,s.rank_namespace,s.mods_json,s.passed,b.status FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_int64(stmt, 1, score_id);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW or c.sqlite3_column_int(stmt, 5) == 0 or c.sqlite3_column_int(stmt, 6) < 3) return null;
+            const namespace_name = std.mem.span(c.sqlite3_column_text(stmt, 3));
+            const score_namespace = std.meta.stringToEnum(lazer.Namespace, namespace_name) orelse return error.DatabaseQueryFailed;
+            break :blk .{
+                .user_id = c.sqlite3_column_int(stmt, 0),
+                .beatmap_id = c.sqlite3_column_int(stmt, 1),
+                .ruleset_id = @intCast(c.sqlite3_column_int(stmt, 2)),
+                .namespace = score_namespace,
+                .mods_json = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4))),
+            };
+        };
+        defer self.allocator.free(context.mods_json);
+        const filter = try lazer.scoreModFilter(self.allocator, context.mods_json);
+        defer filter.deinit(self.allocator);
+        const board_json = try self.lazerLeaderboardJson(self.allocator, context.user_id, context.beatmap_id, context.ruleset_id, context.namespace, filter.exact_json, true, false, filter.stable_bits, 100);
+        defer self.allocator.free(board_json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{});
+        defer parsed.deinit();
+        const own = parsed.value.object.get("user_score") orelse return null;
+        const own_object = switch (own) {
+            .object => |value| value,
+            else => return null,
+        };
+        const position = own_object.get("position") orelse return null;
+        const position_value = switch (position) {
+            .integer => |value| value,
+            else => return null,
+        };
+        const score = own_object.get("score") orelse return null;
+        const score_object = switch (score) {
+            .object => |value| value,
+            else => return null,
+        };
+        const listed_id = switch (score_object.get("id") orelse return null) {
+            .integer => |value| value,
+            else => return null,
+        };
+        return .{
+            .submitted_is_best = listed_id == score_id,
+            .rank = std.math.cast(i32, @max(position_value - 1, 0)) orelse return error.DatabaseQueryFailed,
+        };
     }
 
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {

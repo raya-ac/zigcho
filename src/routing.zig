@@ -17,6 +17,8 @@ pub fn lazerBeatmapMetadata(path: []const u8) bool {
 pub fn websitePage(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/") or
         std.mem.eql(u8, path, "/rankings") or
+        std.mem.eql(u8, path, "/teams") or
+        std.mem.eql(u8, path, "/changelog") or
         std.mem.eql(u8, path, "/login") or
         std.mem.eql(u8, path, "/settings") or
         std.mem.eql(u8, path, "/appeal") or
@@ -24,7 +26,8 @@ pub fn websitePage(path: []const u8) bool {
         std.mem.eql(u8, path, "/users")) return true;
     return playerPage(path, "/u/") or
         playerPage(path, "/users/") or
-        numericPage(path, "/beatmapsets/");
+        numericPage(path, "/beatmapsets/") or
+        numericPage(path, "/teams/");
 }
 
 pub fn websiteFallback(path: []const u8) bool {

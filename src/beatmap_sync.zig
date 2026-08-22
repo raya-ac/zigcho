@@ -405,14 +405,22 @@ pub const Sync = struct {
     /// Pull the public CheeseGull catalogue page and persist every difficulty
     /// from each returned set. The returned ids preserve upstream relevance
     /// order so Lazer does not depend on the order of the local cache.
-    pub fn searchSets(self: *Sync, store: *storage.Store, query: []const u8, mode: i8, offset: u16) ![]i32 {
+    pub fn searchSets(self: *Sync, store: *storage.Store, query: []const u8, mode: i8, offset: u16, status: ?[]const u8, sort: ?[]const u8) ![]i32 {
         if (query.len > 256 or mode < -1 or mode > 3) return error.InvalidSearch;
 
         var url: std.Io.Writer.Allocating = .init(self.allocator);
         defer url.deinit();
         try url.writer.print("https://osu.direct/api/search?amount=50&offset={d}", .{offset});
         if (mode >= 0) try url.writer.print("&mode={d}", .{mode});
-        try url.writer.print("&query={f}", .{std.fmt.alt(
+        if (status) |value| try url.writer.print("&status={f}", .{std.fmt.alt(
+            @as(std.Uri.Component, .{ .raw = value }),
+            .formatEscaped,
+        )});
+        if (sort) |value| try url.writer.print("&sort={f}", .{std.fmt.alt(
+            @as(std.Uri.Component, .{ .raw = value }),
+            .formatEscaped,
+        )});
+        try url.writer.print("&q={f}", .{std.fmt.alt(
             @as(std.Uri.Component, .{ .raw = query }),
             .formatEscaped,
         )});

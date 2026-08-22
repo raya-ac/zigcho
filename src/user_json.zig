@@ -65,10 +65,38 @@ fn writeUserCore(writer: *std.Io.Writer, user: domain.User) !void {
     try std.json.Stringify.value(user.name, .{}, writer);
     try writer.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":", .{user.id});
     try std.json.Stringify.value(&user.country, .{}, writer);
+    try writer.writeAll(",\"cover_url\":");
+    if (user.banner_version > 0) {
+        var cover_buf: [128]u8 = undefined;
+        const cover_url = try std.fmt.bufPrint(&cover_buf, "https://assets.kai.ovh/banners/{d}?v={d}", .{ user.id, user.banner_version });
+        try std.json.Stringify.value(cover_url, .{}, writer);
+        try writer.writeAll(",\"cover\":{\"custom_url\":");
+        try std.json.Stringify.value(cover_url, .{}, writer);
+        try writer.writeAll(",\"url\":");
+        try std.json.Stringify.value(cover_url, .{}, writer);
+        try writer.writeAll(",\"id\":null}");
+    } else {
+        try writer.writeAll("\"\",\"cover\":{\"custom_url\":null,\"url\":\"\",\"id\":null}");
+    }
+    try writer.writeAll(",\"team\":");
+    if (user.team) |team| {
+        var flag_buf: [160]u8 = undefined;
+        const flag_url = try std.fmt.bufPrint(&flag_buf, "https://assets.kai.ovh/teams/{d}/flag?v={d}", .{ team.id, team.flag_version });
+        try writer.print("{{\"id\":{d},\"name\":", .{team.id});
+        try std.json.Stringify.value(team.name(), .{}, writer);
+        try writer.writeAll(",\"short_name\":");
+        try std.json.Stringify.value(team.shortName(), .{}, writer);
+        try writer.writeAll(",\"flag_url\":");
+        try std.json.Stringify.value(flag_url, .{}, writer);
+        try writer.writeByte('}');
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"profile_colour\":");
     try std.json.Stringify.value(roleColour(user.privileges), .{}, writer);
-    try writer.print(",\"is_active\":{s},\"is_online\":true,\"is_supporter\":{s},\"support_level\":{d},\"is_admin\":{s},\"is_gmt\":{s},\"is_qat\":false,\"is_bng\":{s},\"is_bot\":{s},\"pm_friends_only\":false", .{
+    try writer.print(",\"is_active\":{s},\"is_online\":{s},\"is_supporter\":{s},\"support_level\":{d},\"is_admin\":{s},\"is_gmt\":{s},\"is_qat\":false,\"is_bng\":{s},\"is_bot\":{s},\"pm_friends_only\":false", .{
         if (user.restricted) "false" else "true",
+        if (user.online or user.id == 3) "true" else "false",
         "true",
         @as(u8, if (user.privileges & (@as(u32, 1) << 5) != 0) 2 else 1),
         if (user.privileges & (@as(u32, 1) << 13) != 0) "true" else "false",
@@ -251,6 +279,8 @@ test "lazer profile JSON owns ruleset stats and role flags" {
         .safe_name = "raya_test",
         .country = .{ 'A', 'U' },
         .privileges = (@as(u32, 1) << 4) | (@as(u32, 1) << 11) | (@as(u32, 1) << 13),
+        .banner_version = 42,
+        .team = try domain.TeamSummary.init(7, "kai team", "KAI", 9),
     };
     const stats: domain.Stats = .{ .pp = 424, .ranked_score = 3_442_127, .total_score = 9_000_000, .plays = 43, .play_time = 100, .total_hits = 1234, .accuracy = 0.9353, .max_combo = 228, .global_rank = 1 };
     const profile = try profileOwned(std.testing.allocator, user, stats, .{ .best = 2, .firsts = 1, .recent = 4 }, .{
@@ -269,6 +299,9 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqual(@as(i64, 1), object.get("support_level").?.integer);
     try std.testing.expect(object.get("is_bng").?.bool);
     try std.testing.expect(object.get("is_admin").?.bool);
+    try std.testing.expectEqualStrings("https://assets.kai.ovh/banners/4?v=42", object.get("cover_url").?.string);
+    try std.testing.expectEqual(@as(i64, 7), object.get("team").?.object.get("id").?.integer);
+    try std.testing.expectEqualStrings("KAI", object.get("team").?.object.get("short_name").?.string);
     try std.testing.expectEqual(@as(i64, 424), object.get("statistics").?.object.get("pp").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 93.53), object.get("statistics").?.object.get("hit_accuracy").?.float, 0.0001);
     const rank_history = object.get("rank_history").?.object;

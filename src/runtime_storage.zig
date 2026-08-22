@@ -11,6 +11,7 @@ pub const AnticheatObservation = backend.AnticheatObservation;
 pub const LazerCommentable = backend.LazerCommentable;
 pub const LazerCommentTarget = backend.LazerCommentTarget;
 pub const LazerCommentSort = backend.LazerCommentSort;
+pub const ReplaySource = backend.ReplaySource;
 pub const is_postgres = backend.is_postgres;
 
 // The SQLite C surface is retained for the offline recalc command. Its call

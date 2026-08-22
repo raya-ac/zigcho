@@ -5,6 +5,7 @@ const domain = @import("domain.zig");
 const lazer = @import("lazer.zig");
 const lazer_bot = @import("lazer_bot.zig");
 const lazer_multiplayer = @import("lazer_multiplayer.zig");
+const lazer_notifications = @import("lazer_notifications.zig");
 const lazer_spectator = @import("lazer_spectator.zig");
 const rijndael = @import("rijndael.zig");
 const multipart = @import("multipart.zig");
@@ -43,6 +44,7 @@ const anticheat_abi = @import("anticheat_abi.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
 const achievements = @import("achievements.zig");
+const changelog = @import("changelog.zig");
 const index_page = @embedFile("index.html");
 
 comptime {
@@ -64,7 +66,9 @@ comptime {
     _ = anticheat_plugin;
     _ = anticheat_replay;
     _ = achievements;
+    _ = changelog;
     _ = lazer_spectator;
+    _ = lazer_notifications;
 }
 
 const stable_login_details = "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
@@ -897,7 +901,7 @@ test "oauth authentication owns a bounded online presence lease" {
     defer std.testing.allocator.free(website_user.safe_name);
 }
 
-test "Stable refuses an account with a live lazer game lease" {
+test "Stable login can take over an account with a live lazer game lease" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -909,11 +913,13 @@ test "Stable refuses an account with a live lazer game lease" {
     _ = try store.issueToken(user_id, "identify scores:write", 3600);
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    var refused = try bancho.login(std.testing.allocator, &store, &sessions, ari_stable_login, .{ 'A', 'U' }, 0, 0);
-    defer refused.deinit();
-    try std.testing.expectEqualStrings("already-online", refused.token);
-    try std.testing.expect(std.mem.indexOf(u8, refused.body, "already online in lazer") != null);
-    try std.testing.expect(sessions.byUser(user_id) == null);
+    var accepted = try bancho.login(std.testing.allocator, &store, &sessions, ari_stable_login, .{ 'A', 'U' }, 0, 0);
+    defer accepted.deinit();
+    try std.testing.expectEqual(user_id, accepted.user_id);
+    try std.testing.expect(sessions.byUser(user_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), try store.revokeGameTokensForUser(user_id));
+    const now = std.Io.Clock.real.now(std.testing.io).toSeconds();
+    try std.testing.expect(!(try store.lazerUserOnline(user_id, now - 120)));
 }
 
 test "login result owns its token after the session is replaced" {
@@ -1263,7 +1269,9 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "online · '+esc(presence.client_label)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "beatmaps.kai.ovh") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "stored sets") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "kick from Stable or lazer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "<option value=\"kick\">kick from game</option>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "<option value=\"revoke_sessions\">revoke every session</option>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "['reports','reports']") != null);
 }
 
 test "stable screenshots survive storage with exact type isolation" {
@@ -1882,10 +1890,27 @@ test "staff web data keeps appeals and moderation actions auditable" {
     try store.exec("UPDATE users SET restricted=1 WHERE id=4; UPDATE users SET privileges=4099 WHERE id=5;");
     const appeal_id = try store.createModerationAppeal(player, "hwid", "this exact hardware match belongs to a shared pc, please review it");
     try std.testing.expectError(error.AppealAlreadyOpen, store.createModerationAppeal(player, "hwid", "a duplicate appeal that must not create another queue row"));
+    try std.testing.expect(try store.addLazerReport(player, "user", moderator, "spam", "sent from the lazer report sheet"));
+    try std.testing.expect(!try store.addLazerReport(player, "user", moderator, "spam", "duplicate"));
 
     const overview = try store.staffOverviewJson(std.testing.allocator);
     defer std.testing.allocator.free(overview);
     try std.testing.expect(std.mem.indexOf(u8, overview, "\"open_appeals\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overview, "\"open_reports\":1") != null);
+    const reports = try store.staffLazerReportsJson(std.testing.allocator);
+    defer std.testing.allocator.free(reports);
+    const parsed_reports = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, reports, .{});
+    defer parsed_reports.deinit();
+    const report = parsed_reports.value.object.get("reports").?.array.items[0].object;
+    const report_id = report.get("id").?.integer;
+    try std.testing.expectEqualStrings("moderator", report.get("target").?.string);
+    try std.testing.expectEqualStrings("open", report.get("status").?.string);
+    try std.testing.expect(try store.resolveLazerReport(moderator, report_id, "resolved"));
+    try std.testing.expect(!try store.resolveLazerReport(moderator, report_id, "dismissed"));
+    const reviewed_reports = try store.staffLazerReportsJson(std.testing.allocator);
+    defer std.testing.allocator.free(reviewed_reports);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed_reports, "\"status\":\"resolved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed_reports, "\"resolver\":\"moderator\"") != null);
     const appeals = try store.staffAppealsJson(std.testing.allocator);
     defer std.testing.allocator.free(appeals);
     try std.testing.expect(std.mem.indexOf(u8, appeals, "\"kind\":\"hwid\"") != null);
@@ -4331,6 +4356,42 @@ test "lazer ruleset profile paths match the pinned client contract" {
     try std.testing.expect(lazer.parseCommentPath("/api/v2/comments/42/vote") == null);
 }
 
+test "lazer beatmap listing filters map to the mirror contract" {
+    try std.testing.expectEqualStrings("1,2,3,4", (try lazer.beatmapSearchCategory("leaderboard")).upstream_status.?);
+    try std.testing.expectEqualStrings("1,2", (try lazer.beatmapSearchCategory("ranked")).upstream_status.?);
+    try std.testing.expectEqualStrings("-1,0", (try lazer.beatmapSearchCategory("pending")).upstream_status.?);
+    try std.testing.expectEqual(lazer.BeatmapSearchSource.favourites, (try lazer.beatmapSearchCategory("favourites")).source);
+    try std.testing.expectEqual(lazer.BeatmapSearchSource.mine, (try lazer.beatmapSearchCategory("mine")).source);
+    try std.testing.expectError(error.InvalidBeatmapSearchCategory, lazer.beatmapSearchCategory("approved"));
+    try std.testing.expectEqualStrings("beatmaps.difficulty_rating:desc", (try lazer.beatmapSearchSort("difficulty_desc")).?);
+    try std.testing.expectEqualStrings("last_updated:asc", (try lazer.beatmapSearchSort("updated_asc")).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try lazer.beatmapSearchSort("relevance_desc"));
+    try std.testing.expectError(error.InvalidBeatmapSearchSort, lazer.beatmapSearchSort("difficulty_sideways"));
+}
+
+test "lazer beatmap tags persist votes and expose the current user state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-tags.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(4,'raya','raya',x'00',x'00'); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper')");
+    try std.testing.expect(try store.setLazerBeatmapTag(4, 75, 5, true));
+    try std.testing.expect(!(try store.setLazerBeatmapTag(4, 75, 5, true)));
+    const state = (try store.lazerBeatmapTagStateJson(std.testing.allocator, 4, 75)).?;
+    defer std.testing.allocator.free(state);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, state, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 5), parsed.value.object.get("top_tag_ids").?.array.items[0].object.get("tag_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("top_tag_ids").?.array.items[0].object.get("count").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), parsed.value.object.get("current_user_tag_ids").?.array.items[0].integer);
+    try std.testing.expect(try store.setLazerBeatmapTag(4, 75, 5, false));
+    try std.testing.expectError(error.InvalidBeatmapTag, store.setLazerBeatmapTag(4, 75, 99, true));
+    try std.testing.expectError(error.BeatmapNotFound, store.setLazerBeatmapTag(4, 76, 5, true));
+}
+
 test "official lazer score bodies allow omitted mods and reject hostile counters" {
     const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[1000,2000]}", .{});
     defer valid.deinit();
@@ -4626,7 +4687,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer std.testing.allocator.free(pinned);
     try std.testing.expectEqualStrings("[]", pinned);
 
-    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,x'7265706c6179','vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid())");
+    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,x'7265706c6179','vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid()); INSERT INTO profile_score_pins(user_id,source,score_id,mode,rank_namespace) SELECT 1,'stable',max(id),0,'vanilla' FROM scores");
     const combined_recent = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, .all, 0, 50);
     defer std.testing.allocator.free(combined_recent);
     var parsed_combined = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined_recent, .{});
@@ -4719,7 +4780,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 32), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 33), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {
@@ -5712,7 +5773,7 @@ test "ranked stable PP is stored and updates normal player stats" {
     const stored_archive = (try store.beatmapArchive(std.testing.allocator, metadata.set_id)).?;
     defer std.testing.allocator.free(stored_archive);
     try std.testing.expectEqualStrings(archive_bytes, stored_archive);
-    const lazer_set = (try store.lazerBeatmapSet(std.testing.allocator, metadata.set_id)).?;
+    const lazer_set = (try store.lazerBeatmapSet(std.testing.allocator, metadata.set_id, null)).?;
     defer std.testing.allocator.free(lazer_set);
     const parsed_set = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_set, .{});
     defer parsed_set.deinit();
@@ -5720,14 +5781,14 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqualStrings("ranked", parsed_set.value.object.get("status").?.string);
     try std.testing.expect(!parsed_set.value.object.get("availability").?.object.get("download_disabled").?.bool);
     try std.testing.expectEqual(@as(usize, 1), parsed_set.value.object.get("beatmaps").?.array.items.len);
-    const lazer_lookup = (try store.lazerBeatmapLookup(std.testing.allocator, null, &hash)).?;
+    const lazer_lookup = (try store.lazerBeatmapLookup(std.testing.allocator, null, &hash, null)).?;
     defer std.testing.allocator.free(lazer_lookup);
     const parsed_lookup = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_lookup, .{});
     defer parsed_lookup.deinit();
     try std.testing.expectEqual(@as(i64, 900000001), parsed_lookup.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("ranked", parsed_lookup.value.object.get("status").?.string);
     try std.testing.expectEqualStrings("ranked", parsed_lookup.value.object.get("beatmapset").?.object.get("status").?.string);
-    const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "Fixture", 0, 0);
+    const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "Fixture", 0, 0, null);
     defer std.testing.allocator.free(lazer_search);
     const parsed_search = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_search, .{});
     defer parsed_search.deinit();
@@ -5740,7 +5801,7 @@ test "ranked stable PP is stored and updates normal player stats" {
     other_metadata.version = "Other Difficulty";
     const other_hash = "1234567890abcdef1234567890abcdef";
     try store.upsertBeatmapMeta(other_metadata, other_hash, 2, 2.5, 20);
-    const ordered_sets = try store.lazerBeatmapSets(std.testing.allocator, &.{ other_metadata.set_id, metadata.set_id });
+    const ordered_sets = try store.lazerBeatmapSets(std.testing.allocator, &.{ other_metadata.set_id, metadata.set_id }, 0, null);
     defer std.testing.allocator.free(ordered_sets);
     const parsed_ordered_sets = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ordered_sets, .{});
     defer parsed_ordered_sets.deinit();

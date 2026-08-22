@@ -298,10 +298,6 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         allocator.free(user.name);
         allocator.free(user.safe_name);
     };
-    const online_cutoff = std.Io.Clock.real.now(store.io).toSeconds() - 120;
-    if (try store.lazerUserOnline(user.id, online_cutoff)) {
-        return loginFailure(allocator, "already-online", "This account is already online in lazer. Close lazer before signing in with Stable.");
-    }
     if (login_country) |value| {
         try store.updateCountry(user.id, value);
         user.country = value;

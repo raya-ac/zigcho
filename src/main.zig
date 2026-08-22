@@ -8,6 +8,7 @@ const bancho = @import("bancho.zig");
 const lazer = @import("lazer.zig");
 const lazer_bot = @import("lazer_bot.zig");
 const lazer_multiplayer = @import("lazer_multiplayer.zig");
+const lazer_notifications = @import("lazer_notifications.zig");
 const lazer_spectator = @import("lazer_spectator.zig");
 const multipart = @import("multipart.zig");
 const score_crypto = @import("score_crypto.zig");
@@ -15,6 +16,7 @@ const stable_score = @import("stable_score.zig");
 const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
 const achievements = @import("achievements.zig");
+const changelog = @import("changelog.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
 const screenshot = @import("screenshot.zig");
@@ -34,6 +36,8 @@ const web_auth = @import("web_auth.zig");
 const proxy = @import("proxy.zig");
 const user_json = @import("user_json.zig");
 const profile_avatar = @import("profile_avatar.zig");
+const profile_banner = @import("profile_banner.zig");
+const team_image = @import("team_image.zig");
 const avatar_cache = @import("avatar_cache.zig");
 const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
@@ -63,6 +67,34 @@ fn randomMessageUuid(io: std.Io) ![36]u8 {
     uuid[23] = '-';
     @memcpy(uuid[24..36], hex[20..32]);
     return uuid;
+}
+
+const TeamPath = struct { id: i32, action: []const u8 = "" };
+const PinPath = struct { source: storage.ReplaySource, id: i64 };
+
+fn parseTeamPath(path: []const u8, prefix: []const u8) ?TeamPath {
+    if (!std.mem.startsWith(u8, path, prefix) or path.len <= prefix.len) return null;
+    const tail = path[prefix.len..];
+    const slash = std.mem.findScalar(u8, tail, '/');
+    const id_text = if (slash) |index| tail[0..index] else tail;
+    const id = std.fmt.parseInt(i32, id_text, 10) catch return null;
+    if (id <= 0) return null;
+    const action = if (slash) |index| tail[index + 1 ..] else "";
+    if (std.mem.indexOfScalar(u8, action, '/') != null) return null;
+    return .{ .id = id, .action = action };
+}
+
+fn parsePinPath(path: []const u8) ?PinPath {
+    const prefix = "/api/v1/account/pins/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    var parts = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    const source_text = parts.next() orelse return null;
+    const id_text = parts.next() orelse return null;
+    if (parts.next() != null) return null;
+    const source: storage.ReplaySource = if (std.mem.eql(u8, source_text, "stable")) .stable else if (std.mem.eql(u8, source_text, "lazer")) .lazer else return null;
+    const id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    if (id <= 0) return null;
+    return .{ .source = source, .id = id };
 }
 
 const LazerPerformance = struct { pp: f64 = 0, stars: f64 = 0, max_combo: u32 = 0, mods: u32 = 0 };
@@ -351,6 +383,34 @@ const App = struct {
         try req.respond(body, .{ .status = status, .extra_headers = all[0 .. headers.len + 1], .keep_alive = false });
     }
 
+    fn serveObjectImage(self: *App, req: *std.http.Server.Request, image_value: storage.Store.CustomAvatar) !void {
+        var stored = image_value;
+        defer stored.deinit();
+        var data = self.avatar_cache.get(stored.object_key) catch |err| cache_error: {
+            std.log.warn("event=object_image_cache_read_failed key={s} error={t}", .{ stored.object_key, err });
+            break :cache_error null;
+        };
+        if (data == null) {
+            const fetched = self.avatar_store.getWithLimit(self.allocator, self.store.io, stored.object_key, stored.content_type, profile_banner.max_bytes) catch |err| {
+                std.log.warn("event=object_image_download_failed key={s} error={t}", .{ stored.object_key, err });
+                return respond(req, .bad_gateway, "application/json", "{\"error\":\"image storage is not available\"}", &.{.{ .name = "cache-control", .value = "no-store" }});
+            };
+            self.avatar_cache.put(stored.object_key, fetched) catch |err| std.log.warn("event=object_image_cache_write_failed key={s} error={t}", .{ stored.object_key, err });
+            data = fetched;
+        }
+        const bytes = data.?;
+        defer self.allocator.free(bytes);
+        var etag_buf: [66]u8 = undefined;
+        const etag = try std.fmt.bufPrint(&etag_buf, "\"{s}\"", .{&stored.etag});
+        const headers = [_]std.http.Header{
+            .{ .name = "cache-control", .value = "public, max-age=300" },
+            .{ .name = "etag", .value = etag },
+            .{ .name = "x-content-type-options", .value = "nosniff" },
+        };
+        if (header(req, "if-none-match")) |current| if (std.mem.eql(u8, current, etag)) return respond(req, .not_modified, stored.content_type, "", &headers);
+        return respond(req, .ok, stored.content_type, bytes, &headers);
+    }
+
     fn serveBeatmapArchive(self: *App, req: *std.http.Server.Request, set_id: i32) !void {
         const stored_download = self.store.beatmapArchiveDownload(self.allocator, set_id) catch |err| blk: {
             std.log.warn("event=beatmap_archive_stream_metadata_failed set_id={d} error={t}", .{ set_id, err });
@@ -461,6 +521,53 @@ const App = struct {
         return field(target[query_start + 1 ..], key);
     }
 
+    fn beatmapSearchOffset(target: []const u8) !u16 {
+        const value = queryField(target, "cursor%5Boffset%5D") orelse queryField(target, "cursor[offset]") orelse queryField(target, "offset") orelse "0";
+        const offset = std.fmt.parseInt(u16, value, 10) catch return error.InvalidSearchOffset;
+        if (offset > 10_000 or offset % 50 != 0) return error.InvalidSearchOffset;
+        return offset;
+    }
+
+    const UserBeatmapsetPath = struct { user_id: i32, kind: []const u8 };
+    const BeatmapTagPath = struct { beatmap_id: i32, tag_id: i32 };
+
+    fn userPathWithSuffix(path: []const u8, suffix: []const u8) ?i32 {
+        const prefix = "/api/v2/users/";
+        if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const id_text = path[prefix.len .. path.len - suffix.len];
+        if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+        const id = std.fmt.parseInt(i32, id_text, 10) catch return null;
+        return if (id > 0) id else null;
+    }
+
+    fn userBeatmapsetPath(path: []const u8) ?UserBeatmapsetPath {
+        const prefix = "/api/v2/users/";
+        if (!std.mem.startsWith(u8, path, prefix)) return null;
+        const rest = path[prefix.len..];
+        const slash = std.mem.findScalar(u8, rest, '/') orelse return null;
+        const id = std.fmt.parseInt(i32, rest[0..slash], 10) catch return null;
+        const resource = "beatmapsets/";
+        const tail = rest[slash + 1 ..];
+        if (id <= 0 or !std.mem.startsWith(u8, tail, resource) or tail.len == resource.len) return null;
+        const kind = tail[resource.len..];
+        if (std.mem.indexOfScalar(u8, kind, '/') != null) return null;
+        return .{ .user_id = id, .kind = kind };
+    }
+
+    fn beatmapTagPath(path: []const u8) ?BeatmapTagPath {
+        const prefix = "/api/v2/beatmaps/";
+        if (!std.mem.startsWith(u8, path, prefix)) return null;
+        const rest = path[prefix.len..];
+        const separator = "/tags/";
+        const middle = std.mem.indexOf(u8, rest, separator) orelse return null;
+        const beatmap_id = std.fmt.parseInt(i32, rest[0..middle], 10) catch return null;
+        const tag_text = rest[middle + separator.len ..];
+        if (std.mem.indexOfScalar(u8, tag_text, '/') != null) return null;
+        const tag_id = std.fmt.parseInt(i32, tag_text, 10) catch return null;
+        if (beatmap_id <= 0 or tag_id <= 0) return null;
+        return .{ .beatmap_id = beatmap_id, .tag_id = tag_id };
+    }
+
     fn lazerRulesetId(name: []const u8) ?u8 {
         if (std.mem.eql(u8, name, "osu")) return 0;
         if (std.mem.eql(u8, name, "taiko")) return 1;
@@ -469,32 +576,16 @@ const App = struct {
         return null;
     }
 
-    fn lazerLeaderboardNamespace(target: []const u8) lazer.Namespace {
-        const query_start = std.mem.findScalar(u8, target, '?') orelse return .vanilla;
-        var relax = false;
-        var autopilot = false;
-        var custom = false;
-        var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
-        while (parameters.next()) |parameter| {
-            const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
-            const key = parameter[0..equals];
-            if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
-            const acronym = parameter[equals + 1 ..];
-            if (std.ascii.eqlIgnoreCase(acronym, "RX")) {
-                relax = true;
-            } else if (std.ascii.eqlIgnoreCase(acronym, "AP")) {
-                autopilot = true;
-            } else if (!std.ascii.eqlIgnoreCase(acronym, "NM") and lazer.validAcronym(acronym) and !lazer.isOfficial(acronym)) {
-                custom = true;
-            }
-        }
-        return if (custom) .custom else if (autopilot) .autopilot else if (relax) .relax else .vanilla;
-    }
-
     fn isAvatarHost(value: ?[]const u8) bool {
         const host = value orelse return false;
         const end = std.mem.findScalar(u8, host, ':') orelse host.len;
         return std.ascii.eqlIgnoreCase(host[0..end], "a.kai.ovh");
+    }
+
+    fn isAssetsHost(value: ?[]const u8) bool {
+        const host = value orelse return false;
+        const end = std.mem.findScalar(u8, host, ':') orelse host.len;
+        return std.ascii.eqlIgnoreCase(host[0..end], "assets.kai.ovh");
     }
 
     fn isBeatmapMirrorHost(value: ?[]const u8) bool {
@@ -528,6 +619,16 @@ const App = struct {
         return self.sessions.byUser(user_id) != null;
     }
 
+    fn userOnlineCombined(self: *App, user_id: i32) !bool {
+        if (user_id == 3 or self.userOnline(user_id)) return true;
+        const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
+        return self.store.lazerUserOnline(user_id, cutoff);
+    }
+
+    fn markOnline(self: *App, user: *domain.User) !void {
+        user.online = try self.userOnlineCombined(user.id);
+    }
+
     fn combinedOnlineCount(self: *App) !usize {
         const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
         const stable_ids = try self.sessions.onlineUserIds(self.allocator);
@@ -540,6 +641,43 @@ const App = struct {
         for (stable_ids) |id| if (id != 3 and std.mem.indexOfScalar(i32, ids.items, id) == null) ids.appendAssumeCapacity(id);
         for (lazer_ids) |id| if (id != 3 and std.mem.indexOfScalar(i32, ids.items, id) == null) ids.appendAssumeCapacity(id);
         return ids.items.len;
+    }
+
+    fn disconnectUser(self: *App, user_id: i32, message: []const u8) !void {
+        {
+            self.sessions.mutex.lockUncancelable(self.sessions.io);
+            defer self.sessions.mutex.unlock(self.sessions.io);
+            if (self.sessions.byUser(user_id)) |online| {
+                var packet = protocol.Writer.init(self.allocator);
+                defer packet.deinit();
+                try packet.packetString(.notification, message);
+                try packet.packetInt(.restart, 0);
+                try online.enqueue(self.allocator, packet.bytes());
+            }
+        }
+        _ = try self.store.revokeAllTokensForUser(user_id);
+        _ = self.lazer_multiplayer.disconnectUser(user_id);
+        _ = self.lazer_spectator.disconnectUser(user_id);
+    }
+
+    fn takeOverGameSessions(self: *App, user_id: i32, entering_client: []const u8) !void {
+        if (std.mem.eql(u8, entering_client, "lazer")) {
+            {
+                self.sessions.mutex.lockUncancelable(self.sessions.io);
+                defer self.sessions.mutex.unlock(self.sessions.io);
+                if (self.sessions.byUser(user_id)) |online| {
+                    var packet = protocol.Writer.init(self.allocator);
+                    defer packet.deinit();
+                    try packet.packetString(.notification, "This account signed in from lazer, so this client has been disconnected.");
+                    try packet.packetInt(.restart, 0);
+                    try online.enqueue(self.allocator, packet.bytes());
+                }
+            }
+        }
+        _ = try self.store.revokeGameTokensForUser(user_id);
+        _ = self.lazer_multiplayer.disconnectUser(user_id);
+        _ = self.lazer_spectator.disconnectUser(user_id);
+        std.log.info("event=cross_client_session_takeover user_id={d} entering_client={s}", .{ user_id, entering_client });
     }
 
     fn stableActionName(action: u8) []const u8 {
@@ -677,7 +815,9 @@ const App = struct {
     fn lazerUser(self: *App, authorization: ?[]const u8, scope: []const u8) !?domain.User {
         const value = authorization orelse return null;
         if (!std.mem.startsWith(u8, value, "Bearer ")) return null;
-        return self.store.authenticateToken(self.allocator, value["Bearer ".len..], scope);
+        var user = (try self.store.authenticateToken(self.allocator, value["Bearer ".len..], scope)) orelse return null;
+        user.online = true;
+        return user;
     }
 
     fn lazerStats(self: *App, user_id: i32) ![4]?domain.Stats {
@@ -736,8 +876,9 @@ const App = struct {
         try output.writer.writeByte('[');
         var written: usize = 0;
         for (ids) |id| {
-            const target_user = (try self.store.userById(self.allocator, id)) orelse continue;
+            var target_user = (try self.store.userById(self.allocator, id)) orelse continue;
             defer freeUser(self.allocator, target_user);
+            try self.markOnline(&target_user);
             if (written != 0) try output.writer.writeByte(',');
             written += 1;
             try output.writer.print("{{\"target_id\":{d},\"relation_type\":\"friend\",\"mutual\":{s},\"target\":", .{ id, if (try self.store.friendsAreMutual(user_id, id)) "true" else "false" });
@@ -756,8 +897,9 @@ const App = struct {
         try output.writer.writeByte('[');
         var written: usize = 0;
         for (ids) |id| {
-            const target_user = (try self.store.userById(self.allocator, id)) orelse continue;
+            var target_user = (try self.store.userById(self.allocator, id)) orelse continue;
             defer freeUser(self.allocator, target_user);
+            try self.markOnline(&target_user);
             if (written != 0) try output.writer.writeByte(',');
             written += 1;
             try output.writer.print("{{\"target_id\":{d},\"relation_type\":\"block\",\"mutual\":false,\"target\":", .{id});
@@ -768,7 +910,9 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
-    fn friendMutationJson(self: *App, user_id: i32, target: domain.User) ![]u8 {
+    fn friendMutationJson(self: *App, user_id: i32, target_value: domain.User) ![]u8 {
+        var target = target_value;
+        try self.markOnline(&target);
         var output: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer output.deinit();
         try output.writer.print("{{\"user_relation\":{{\"target_id\":{d},\"relation_type\":\"friend\",\"mutual\":{s},\"target\":", .{ target.id, if (try self.store.friendsAreMutual(user_id, target.id)) "true" else "false" });
@@ -798,11 +942,13 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/session")) return rate_limit.web_session;
         if ((req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/account")) or ((req.head.method == .PUT or req.head.method == .DELETE) and std.mem.eql(u8, path, "/api/v1/account/avatar"))) return rate_limit.web_action;
         if (req.head.method == .POST and std.mem.startsWith(u8, path, "/api/v1/staff/")) return rate_limit.web_action;
+        if ((req.head.method == .POST or req.head.method == .PUT or req.head.method == .DELETE) and std.mem.startsWith(u8, path, "/api/v1/account")) return rate_limit.web_action;
+        if ((req.head.method == .POST or req.head.method == .PUT or req.head.method == .DELETE) and std.mem.startsWith(u8, path, "/api/v1/teams")) return rate_limit.web_action;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/appeals")) return rate_limit.appeal;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if ((req.head.method == .POST or req.head.method == .PUT) and lazer.parseSoloScorePath(path) != null) return rate_limit.score;
         if ((req.head.method == .POST or req.head.method == .PUT) and lazer_multiplayer.parseRoomScorePath(path) != null) return rate_limit.score;
-        if (std.mem.eql(u8, path, "/multiplayer") or std.mem.eql(u8, path, "/multiplayer/negotiate") or std.mem.eql(u8, path, "/spectator") or std.mem.eql(u8, path, "/spectator/negotiate") or std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/multiplayer") or std.mem.eql(u8, path, "/multiplayer/negotiate") or std.mem.eql(u8, path, "/spectator") or std.mem.eql(u8, path, "/spectator/negotiate") or std.mem.eql(u8, path, "/notification-endpoint") or std.mem.startsWith(u8, path, "/api/v2/rooms")) return rate_limit.authenticated;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php")) return rate_limit.score;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/web/osu-screenshot.php")) return rate_limit.media_upload;
         if (req.head.method == .GET and (std.mem.eql(u8, path, "/web/osu-getfriends.php") or std.mem.eql(u8, path, "/web/osu-getfavourites.php") or std.mem.eql(u8, path, "/web/osu-addfavourite.php"))) return rate_limit.authenticated;
@@ -811,13 +957,16 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
-        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/notifications") or std.mem.startsWith(u8, path, "/api/v2/friends") or std.mem.startsWith(u8, path, "/api/v2/blocks") or std.mem.eql(u8, path, "/api/v2/me/beatmapset-favourites") or lazer.parseFavouritePath(path) != null or std.mem.startsWith(u8, path, "/api/v2/chat/") or std.mem.startsWith(u8, path, "/api/v2/comments") or std.mem.eql(u8, path, "/api/v2/reports") or std.mem.eql(u8, path, "/api/v2/users") or std.mem.startsWith(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
+        if (std.mem.startsWith(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/notifications") or std.mem.startsWith(u8, path, "/api/v2/friends") or std.mem.startsWith(u8, path, "/api/v2/blocks") or lazer.parseFavouritePath(path) != null or std.mem.startsWith(u8, path, "/api/v2/chat/") or std.mem.startsWith(u8, path, "/api/v2/comments") or std.mem.eql(u8, path, "/api/v2/reports") or std.mem.eql(u8, path, "/api/v2/users") or std.mem.startsWith(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
         return null;
     }
 
     fn bodyLimit(path: []const u8) usize {
         if (std.mem.eql(u8, path, "/api/v1/account/avatar")) return profile_avatar.max_bytes;
-        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/session") or std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
+        if (std.mem.eql(u8, path, "/api/v1/account/banner")) return profile_banner.max_bytes;
+        if (std.mem.startsWith(u8, path, "/api/v1/teams/") and (std.mem.endsWith(u8, path, "/flag") or std.mem.endsWith(u8, path, "/header"))) return team_image.header_max_bytes;
+        if (std.mem.eql(u8, path, "/api/v1/teams") or std.mem.startsWith(u8, path, "/api/v1/teams/")) return 16 * 1024;
+        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/session") or std.mem.startsWith(u8, path, "/api/v1/account/") or std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (lazer.parseSoloScorePath(path) != null) return lazer.max_score_body_bytes;
         if (lazer_multiplayer.parseRoomScorePath(path) != null) return lazer.max_score_body_bytes;
@@ -925,13 +1074,32 @@ const App = struct {
             };
             return;
         }
-        if (std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null) {
+        if (std.mem.eql(u8, path, "/notification-endpoint")) {
             if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
             defer freeUser(self.allocator, user);
             if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const key = switch (req.upgradeRequested()) {
+                .websocket => |maybe_key| maybe_key orelse return respond(req, .bad_request, "application/json", "{\"error\":\"websocket key required\"}", &.{}),
+                else => return respond(req, .bad_request, "application/json", "{\"error\":\"websocket upgrade required\"}", &.{}),
+            };
+            var socket = try req.respondWebSocket(.{ .key = key });
+            try socket.flush();
+            lazer_notifications.serve(self.allocator, user.id, &socket) catch |err| {
+                std.log.info("event=lazer_notifications_connection_closed user_id={d} error={t}", .{ user.id, err });
+            };
+            return;
+        }
+        if (req.head.method == .GET and (std.mem.eql(u8, path, "/api/v2/rooms") or lazer_multiplayer.parseRoomPath(path) != null)) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
             const room_id = lazer_multiplayer.parseRoomPath(path);
-            const json = (try self.lazer_multiplayer.roomsJson(self.allocator, room_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{});
+            const list_filter = if (room_id == null)
+                lazer_multiplayer.roomListFilter(user.id, queryField(target, "mode") orelse "open", queryField(target, "status"), queryField(target, "category") orelse "") catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid room filter\"}", &.{})
+            else
+                null;
+            const json = (try self.lazer_multiplayer.roomsJson(self.allocator, room_id, list_filter)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{});
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
@@ -944,6 +1112,62 @@ const App = struct {
             };
         } else &.{};
         defer if (body.len > 0) self.allocator.free(body);
+
+        if (std.mem.eql(u8, path, "/api/v2/rooms") and req.head.method == .POST) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            const json = self.lazer_multiplayer.restCreateRoom(self.allocator, user, body) catch |err| return switch (err) {
+                error.InvalidMultiplayerRoom, error.MultiplayerPayloadTooLarge => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid room\"}", &.{}),
+                error.AlreadyInMultiplayerRoom => respond(req, .conflict, "application/json", "{\"error\":\"already in a room\"}", &.{}),
+                error.MultiplayerRoomLimit => respond(req, .service_unavailable, "application/json", "{\"error\":\"room limit reached\"}", &.{}),
+                else => return err,
+            };
+            defer self.allocator.free(json);
+            return respond(req, .created, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
+        if (lazer_multiplayer.parseRoomUserPath(path)) |room_user_path| {
+            if (req.head.method != .PUT and req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"account restricted\"}", &.{});
+            if (room_user_path.user_id != user.id) return respond(req, .forbidden, "application/json", "{\"error\":\"room user mismatch\"}", &.{});
+            if (req.head.method == .DELETE) {
+                self.lazer_multiplayer.restPartRoom(user.id, room_user_path.room_id) catch |err| return switch (err) {
+                    error.MultiplayerRoomNotFound, error.NotInMultiplayerRoom => respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{}),
+                };
+                return respond(req, .no_content, "application/json", "", &.{.{ .name = "cache-control", .value = "no-store" }});
+            }
+            const encoded_password = queryField(target, "password") orelse "";
+            const password_buf = try self.allocator.dupe(u8, encoded_password);
+            defer self.allocator.free(password_buf);
+            for (password_buf) |*char| {
+                if (char.* == '+') char.* = ' ';
+            }
+            const password = std.Uri.percentDecodeInPlace(password_buf);
+            const json = self.lazer_multiplayer.restJoinRoom(self.allocator, user, room_user_path.room_id, password) catch |err| return switch (err) {
+                error.MultiplayerRoomNotFound => respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{}),
+                error.InvalidMultiplayerPassword => respond(req, .forbidden, "application/json", "{\"error\":\"invalid password\"}", &.{}),
+                error.MultiplayerPermissionDenied => respond(req, .forbidden, "application/json", "{\"error\":\"room access denied\"}", &.{}),
+                error.AlreadyInMultiplayerRoom => respond(req, .conflict, "application/json", "{\"error\":\"already in a room\"}", &.{}),
+                error.MultiplayerRoomFull => respond(req, .conflict, "application/json", "{\"error\":\"room is full\"}", &.{}),
+                else => return err,
+            };
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
+        if (lazer_multiplayer.parseRoomPath(path)) |room_id| {
+            if (req.head.method == .DELETE) {
+                const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
+                defer freeUser(self.allocator, user);
+                self.lazer_multiplayer.restCloseRoom(user.id, room_id) catch |err| return switch (err) {
+                    error.MultiplayerRoomNotFound => respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{}),
+                    error.MultiplayerPermissionDenied => respond(req, .forbidden, "application/json", "{\"error\":\"only the host can close this room\"}", &.{}),
+                };
+                return respond(req, .no_content, "application/json", "", &.{.{ .name = "cache-control", .value = "no-store" }});
+            }
+            return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+        }
 
         if (std.mem.eql(u8, path, "/health")) {
             var buf: [256]u8 = undefined;
@@ -1002,6 +1226,20 @@ const App = struct {
             var buf: [384]u8 = undefined;
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"stable\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/changelog")) {
+            const json = try changelog.indexJson(self.allocator);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "public, max-age=300" }});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/changelog/")) {
+            var parts = std.mem.splitScalar(u8, path["/api/v2/changelog/".len..], '/');
+            const stream = parts.next() orelse return respond(req, .not_found, "application/json", "{\"error\":\"build not found\"}", &.{});
+            const version = parts.next() orelse return respond(req, .not_found, "application/json", "{\"error\":\"build not found\"}", &.{});
+            if (parts.next() != null) return respond(req, .not_found, "application/json", "{\"error\":\"build not found\"}", &.{});
+            const json = (try changelog.buildJson(self.allocator, stream, version)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"build not found\"}", &.{});
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "public, max-age=300" }});
         }
         if (std.mem.eql(u8, path, "/api/v1/mirror/status")) {
             if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
@@ -1090,7 +1328,8 @@ const App = struct {
             }
             return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
         }
-        if (std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/account/avatar")) {
+        const account_pin_path = parsePinPath(path);
+        if (std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/account/avatar") or std.mem.eql(u8, path, "/api/v1/account/banner") or std.mem.eql(u8, path, "/api/v1/account/email") or std.mem.eql(u8, path, "/api/v1/account/password") or std.mem.eql(u8, path, "/api/v1/account/username") or account_pin_path != null) {
             const no_store = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-store" },
                 .{ .name = "pragma", .value = "no-cache" },
@@ -1099,6 +1338,65 @@ const App = struct {
             const token = web_auth.playerSessionToken(cookie_owned) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
             const user = (try self.store.authenticateToken(self.allocator, token, web_auth.player_scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &no_store);
             defer freeUser(self.allocator, user);
+            if (account_pin_path) |pin| {
+                if (req.head.method != .PUT and req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+                if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+                self.store.setScorePinnedById(user.id, pin.source, pin.id, req.head.method == .PUT) catch |err| return switch (err) {
+                    error.TooManyPinnedScores => respond(req, .conflict, "application/json", "{\"error\":\"you can pin three plays per mode and score type\"}", &no_store),
+                    error.NoPassedScore => respond(req, .not_found, "application/json", "{\"error\":\"that passed score is not yours\"}", &no_store),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"pin could not be changed\"}", &no_store),
+                };
+                return respond(req, .ok, "application/json", if (req.head.method == .PUT) "{\"ok\":true,\"pinned\":true}" else "{\"ok\":true,\"pinned\":false}", &no_store);
+            }
+            if (std.mem.eql(u8, path, "/api/v1/account/email") or std.mem.eql(u8, path, "/api/v1/account/password") or std.mem.eql(u8, path, "/api/v1/account/username")) {
+                if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+                if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+                const current_password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"current_password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"current password required\"}", &no_store);
+                defer self.allocator.free(current_password);
+                const current_md5 = web_auth.passwordCredential(current_password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"current password is wrong\"}", &no_store);
+                const verified = (try self.store.authenticate(self.allocator, user.name, &current_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"current password is wrong\"}", &no_store);
+                defer freeUser(self.allocator, verified);
+                if (verified.id != user.id) return respond(req, .unauthorized, "application/json", "{\"error\":\"current password is wrong\"}", &no_store);
+                if (std.mem.eql(u8, path, "/api/v1/account/email")) {
+                    const email_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"email"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"email required\"}", &no_store);
+                    defer self.allocator.free(email_value);
+                    const email = std.mem.trim(u8, email_value, " \t\r\n");
+                    if (!registration.validEmail(email)) return respond(req, .bad_request, "application/json", "{\"error\":\"that email is not valid\"}", &no_store);
+                    self.store.updateAccountEmail(user.id, email) catch |err| return respond(req, if (err == error.EmailExists) .conflict else .internal_server_error, "application/json", if (err == error.EmailExists) "{\"error\":\"that email is already in use\"}" else "{\"error\":\"email could not be changed\"}", &no_store);
+                    const json = (try self.store.siteAccountJson(self.allocator, user.id)).?;
+                    defer self.allocator.free(json);
+                    std.log.info("event=website_email_updated user_id={d}", .{user.id});
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (std.mem.eql(u8, path, "/api/v1/account/password")) {
+                    const new_password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"new_password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"new password required\"}", &no_store);
+                    defer self.allocator.free(new_password);
+                    if (!registration.validPassword(new_password)) return respond(req, .bad_request, "application/json", "{\"error\":\"use 8-32 characters with more than 3 unique characters\"}", &no_store);
+                    const password_md5 = web_auth.passwordCredential(new_password) catch return respond(req, .bad_request, "application/json", "{\"error\":\"new password is not valid\"}", &no_store);
+                    try self.store.updateAccountPassword(user.id, &password_md5);
+                    try self.disconnectUser(user.id, "your password changed. sign in again.");
+                    std.log.info("event=website_password_updated user_id={d}", .{user.id});
+                    return respond(req, .ok, "application/json", "{\"ok\":true,\"reauthenticate\":true}", &.{
+                        .{ .name = "set-cookie", .value = "__Host-kai-account=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" },
+                        .{ .name = "cache-control", .value = "no-store" },
+                    });
+                }
+                const username_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"username required\"}", &no_store);
+                defer self.allocator.free(username_value);
+                const username = std.mem.trim(u8, username_value, " \t\r\n");
+                if (!registration.validUsername(username)) return respond(req, .bad_request, "application/json", "{\"error\":\"use 2-15 allowed username characters\"}", &no_store);
+                self.store.updateAccountUsername(user.id, username) catch |err| return switch (err) {
+                    error.UsernameExists => respond(req, .conflict, "application/json", "{\"error\":\"that username is already in use\"}", &no_store),
+                    error.PremiumRequired => respond(req, .payment_required, "application/json", "{\"error\":\"the free username change was already used; premium is required for another\"}", &no_store),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"username could not be changed\"}", &no_store),
+                };
+                try self.disconnectUser(user.id, "your username changed. sign in again with the new name.");
+                std.log.info("event=website_username_updated user_id={d}", .{user.id});
+                return respond(req, .ok, "application/json", "{\"ok\":true,\"reauthenticate\":true}", &.{
+                    .{ .name = "set-cookie", .value = "__Host-kai-account=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" },
+                    .{ .name = "cache-control", .value = "no-store" },
+                });
+            }
             if (std.mem.eql(u8, path, "/api/v1/account")) {
                 if (req.head.method == .GET) {
                     const json = (try self.store.siteAccountJson(self.allocator, user.id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"account not found\"}", &no_store);
@@ -1153,6 +1451,45 @@ const App = struct {
                 return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
             }
             if ((req.head.method != .PUT and req.head.method != .DELETE) or !web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, if (req.head.method == .PUT or req.head.method == .DELETE) .forbidden else .method_not_allowed, "application/json", if (req.head.method == .PUT or req.head.method == .DELETE) "{\"error\":\"invalid request\"}" else "{\"error\":\"method not allowed\"}", &no_store);
+            if (std.mem.eql(u8, path, "/api/v1/account/banner")) {
+                if (req.head.method == .PUT) {
+                    const image = profile_banner.validate(content_type_owned, body) catch return respond(req, .bad_request, "application/json", "{\"error\":\"use a valid png, jpeg, or gif up to 4 mb and 2000 by 500 px\"}", &no_store);
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+                    const etag = std.fmt.bytesToHex(digest, .lower);
+                    const object_key = try object_keys.banner(self.allocator, user.id, image.content_type, &etag);
+                    defer self.allocator.free(object_key);
+                    const previous = try self.store.customBannerForUser(self.allocator, user.id);
+                    defer if (previous) |value| {
+                        var banner = value;
+                        banner.deinit();
+                    };
+                    self.avatar_store.put(self.allocator, self.store.io, object_key, image.content_type, body) catch return respond(req, .bad_gateway, "application/json", "{\"error\":\"banner storage is not available\"}", &no_store);
+                    self.store.setCustomBanner(user.id, object_key, image.content_type, etag, image.width, image.height) catch |err| {
+                        const replaces_existing = if (previous) |banner| std.mem.eql(u8, banner.object_key, object_key) else false;
+                        if (!replaces_existing) self.avatar_store.delete(self.allocator, self.store.io, object_key) catch {};
+                        return err;
+                    };
+                    self.avatar_cache.put(object_key, body) catch |err| std.log.warn("event=website_banner_cache_write_failed user_id={d} error={t}", .{ user.id, err });
+                    if (previous) |banner| if (!std.mem.eql(u8, banner.object_key, object_key)) {
+                        self.avatar_cache.remove(banner.object_key);
+                        self.avatar_store.delete(self.allocator, self.store.io, banner.object_key) catch |err| std.log.warn("event=website_banner_old_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+                    };
+                    std.log.info("event=website_banner_updated user_id={d} bytes={d}", .{ user.id, body.len });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+                const previous = try self.store.customBannerForUser(self.allocator, user.id);
+                defer if (previous) |value| {
+                    var banner = value;
+                    banner.deinit();
+                };
+                _ = try self.store.deleteCustomBanner(user.id);
+                if (previous) |banner| {
+                    self.avatar_cache.remove(banner.object_key);
+                    self.avatar_store.delete(self.allocator, self.store.io, banner.object_key) catch |err| std.log.warn("event=website_banner_object_delete_failed user_id={d} error={t}", .{ user.id, err });
+                }
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
             if (req.head.method == .PUT) {
                 const image = profile_avatar.validate(content_type_owned, body) catch return respond(req, .bad_request, "application/json", "{\"error\":\"use a valid png, jpeg, or gif up to 2 mb and 4096 px\"}", &no_store);
                 var digest: [32]u8 = undefined;
@@ -1195,6 +1532,167 @@ const App = struct {
             }
             std.log.info("event=website_avatar_reset user_id={d}", .{user.id});
             return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+        }
+        const website_team_path = parseTeamPath(path, "/api/v1/teams/");
+        const lazer_team_path = parseTeamPath(path, "/api/v2/teams/");
+        if (std.mem.eql(u8, path, "/api/v1/teams") or std.mem.eql(u8, path, "/api/v2/teams") or website_team_path != null or lazer_team_path != null) {
+            const no_store = [_]std.http.Header{.{ .name = "cache-control", .value = "no-store" }};
+            const is_lazer_route = std.mem.startsWith(u8, path, "/api/v2/teams");
+            var requester: ?domain.User = null;
+            var requester_token: ?[]const u8 = null;
+            var requester_is_staff = false;
+            if (is_lazer_route) {
+                if (auth_owned) |auth| {
+                    if (std.mem.startsWith(u8, auth, "Bearer ")) requester = try self.store.authenticateToken(self.allocator, auth[7..], "identify");
+                }
+            } else if (web_auth.playerSessionToken(cookie_owned)) |session_token| {
+                requester = try self.store.authenticateToken(self.allocator, session_token, web_auth.player_scope);
+                requester_token = session_token;
+            } else if (web_auth.sessionToken(cookie_owned)) |session_token| {
+                requester = try self.store.authenticateToken(self.allocator, session_token, web_auth.scope);
+                if (requester) |staff_user| {
+                    if (!web_auth.allowed(staff_user) or !web_auth.canAdmin(staff_user)) {
+                        freeUser(self.allocator, staff_user);
+                        requester = null;
+                    } else {
+                        requester_token = session_token;
+                        requester_is_staff = true;
+                    }
+                }
+            }
+            defer if (requester) |value| freeUser(self.allocator, value);
+            const route = if (is_lazer_route) lazer_team_path else website_team_path;
+            if (req.head.method == .GET) {
+                if (route) |team_path| {
+                    if (team_path.action.len != 0) return respond(req, .not_found, "application/json", "{\"error\":\"team not found\"}", &no_store);
+                    const json = (try self.store.teamJson(self.allocator, team_path.id, if (requester) |value| value.id else null, requester_is_staff or if (requester) |value| web_auth.canAdmin(value) else false)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"team not found\"}", &no_store);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                const json = try self.store.teamsJson(self.allocator, if (requester) |value| value.id else null);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+            if (is_lazer_route) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            const session_token = requester_token orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"sign in required\"}", &no_store);
+            const actor = requester orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"sign in required\"}", &no_store);
+            if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(session_token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+            if (route == null and req.head.method == .POST) {
+                const name_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"name"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"team name required\"}", &no_store);
+                defer self.allocator.free(name_value);
+                const tag_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"short_name"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"team tag required\"}", &no_store);
+                defer self.allocator.free(tag_value);
+                const url_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"url"})) orelse try self.allocator.dupe(u8, "");
+                defer self.allocator.free(url_value);
+                const description_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"description"})) orelse try self.allocator.dupe(u8, "");
+                defer self.allocator.free(description_value);
+                const open_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"is_open"})) orelse try self.allocator.dupe(u8, "1");
+                defer self.allocator.free(open_value);
+                const mode_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"default_ruleset_id"})) orelse try self.allocator.dupe(u8, "0");
+                defer self.allocator.free(mode_value);
+                const settings: domain.TeamSettings = .{ .name = std.mem.trim(u8, name_value, " \t\r\n"), .short_name = std.mem.trim(u8, tag_value, " \t\r\n"), .url = std.mem.trim(u8, url_value, " \t\r\n"), .description = std.mem.trim(u8, description_value, " \t\r\n"), .is_open = std.mem.eql(u8, open_value, "1"), .default_ruleset_id = std.fmt.parseInt(u8, mode_value, 10) catch 255 };
+                if ((!settings.is_open and !std.mem.eql(u8, open_value, "0")) or !domain.validTeamSettings(settings)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid team settings\"}", &no_store);
+                const team_id = self.store.createTeam(actor.id, settings) catch |err| return respond(req, if (err == error.TeamExists or err == error.AlreadyInTeam) .conflict else .internal_server_error, "application/json", if (err == error.TeamExists) "{\"error\":\"that team name or tag already exists\"}" else if (err == error.AlreadyInTeam) "{\"error\":\"leave your current team first\"}" else "{\"error\":\"team could not be created\"}", &no_store);
+                var response_buf: [64]u8 = undefined;
+                const json = try std.fmt.bufPrint(&response_buf, "{{\"ok\":true,\"id\":{d}}}", .{team_id});
+                return respond(req, .created, "application/json", json, &no_store);
+            }
+            const team_path = route orelse return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            const is_admin = requester_is_staff or web_auth.canAdmin(actor);
+            if (std.mem.eql(u8, team_path.action, "join") and req.head.method == .POST) {
+                const result = self.store.joinOrApplyTeam(actor.id, team_path.id) catch |err| return respond(req, if (err == error.TeamNotFound) .not_found else .conflict, "application/json", if (err == error.TeamNotFound) "{\"error\":\"team not found\"}" else "{\"error\":\"you already joined a team or applied\"}", &no_store);
+                return respond(req, if (result == .joined) .ok else .accepted, "application/json", if (result == .joined) "{\"ok\":true,\"state\":\"joined\"}" else "{\"ok\":true,\"state\":\"applied\"}", &no_store);
+            }
+            if (std.mem.eql(u8, team_path.action, "leave") and req.head.method == .POST) {
+                self.store.leaveTeam(actor.id, team_path.id) catch return respond(req, .conflict, "application/json", "{\"error\":\"the team leader must transfer leadership or disband the team\"}", &no_store);
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+            if (std.mem.eql(u8, team_path.action, "members") and req.head.method == .POST) {
+                const user_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"user_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                defer self.allocator.free(user_value);
+                const action = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"action"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"action required\"}", &no_store);
+                defer self.allocator.free(action);
+                const target_id = std.fmt.parseInt(i32, user_value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                self.store.teamMemberAction(actor.id, team_path.id, target_id, action, is_admin) catch |err| return respond(req, if (err == error.TeamPermissionDenied) .forbidden else .conflict, "application/json", if (err == error.TeamPermissionDenied) "{\"error\":\"team management access required\"}" else "{\"error\":\"team member action was not accepted\"}", &no_store);
+                var audit_target_buf: [32]u8 = undefined;
+                const audit_target = try std.fmt.bufPrint(&audit_target_buf, "team:{d}", .{team_path.id});
+                try self.store.recordAudit(actor.id, "team.member", audit_target, action);
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+            if ((std.mem.eql(u8, team_path.action, "flag") or std.mem.eql(u8, team_path.action, "header")) and (req.head.method == .PUT or req.head.method == .DELETE)) {
+                if (!try self.store.teamCanManage(actor.id, team_path.id, is_admin)) return respond(req, .forbidden, "application/json", "{\"error\":\"team management access required\"}", &no_store);
+                const kind: team_image.Kind = if (std.mem.eql(u8, team_path.action, "flag")) .flag else .header;
+                if (req.head.method == .PUT) {
+                    const image = team_image.validate(kind, content_type_owned, body) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid team image\"}", &no_store);
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+                    const etag = std.fmt.bytesToHex(digest, .lower);
+                    const object_key = try object_keys.teamAsset(self.allocator, team_path.id, team_path.action, image.content_type, &etag);
+                    defer self.allocator.free(object_key);
+                    const previous = try self.store.teamAsset(self.allocator, team_path.id, team_path.action);
+                    defer if (previous) |value| {
+                        var old = value;
+                        old.deinit();
+                    };
+                    self.avatar_store.put(self.allocator, self.store.io, object_key, image.content_type, body) catch return respond(req, .bad_gateway, "application/json", "{\"error\":\"team image storage is not available\"}", &no_store);
+                    self.store.setTeamAsset(team_path.id, team_path.action, object_key, image.content_type, etag, image.width, image.height) catch |err| {
+                        self.avatar_store.delete(self.allocator, self.store.io, object_key) catch {};
+                        return err;
+                    };
+                    self.avatar_cache.put(object_key, body) catch {};
+                    if (previous) |old| if (!std.mem.eql(u8, old.object_key, object_key)) {
+                        self.avatar_cache.remove(old.object_key);
+                        self.avatar_store.delete(self.allocator, self.store.io, old.object_key) catch {};
+                    };
+                } else {
+                    const previous = try self.store.teamAsset(self.allocator, team_path.id, team_path.action);
+                    defer if (previous) |value| {
+                        var old = value;
+                        old.deinit();
+                    };
+                    _ = try self.store.deleteTeamAsset(team_path.id, team_path.action);
+                    if (previous) |old| {
+                        self.avatar_cache.remove(old.object_key);
+                        self.avatar_store.delete(self.allocator, self.store.io, old.object_key) catch {};
+                    }
+                }
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+            if (team_path.action.len == 0 and req.head.method == .POST) {
+                const name_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"name"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"team name required\"}", &no_store);
+                defer self.allocator.free(name_value);
+                const tag_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"short_name"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"team tag required\"}", &no_store);
+                defer self.allocator.free(tag_value);
+                const url_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"url"})) orelse try self.allocator.dupe(u8, "");
+                defer self.allocator.free(url_value);
+                const description_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"description"})) orelse try self.allocator.dupe(u8, "");
+                defer self.allocator.free(description_value);
+                const open_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"is_open"})) orelse try self.allocator.dupe(u8, "1");
+                defer self.allocator.free(open_value);
+                const mode_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"default_ruleset_id"})) orelse try self.allocator.dupe(u8, "0");
+                defer self.allocator.free(mode_value);
+                const settings: domain.TeamSettings = .{ .name = std.mem.trim(u8, name_value, " \t\r\n"), .short_name = std.mem.trim(u8, tag_value, " \t\r\n"), .url = std.mem.trim(u8, url_value, " \t\r\n"), .description = std.mem.trim(u8, description_value, " \t\r\n"), .is_open = std.mem.eql(u8, open_value, "1"), .default_ruleset_id = std.fmt.parseInt(u8, mode_value, 10) catch 255 };
+                if ((!settings.is_open and !std.mem.eql(u8, open_value, "0")) or !domain.validTeamSettings(settings)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid team settings\"}", &no_store);
+                self.store.updateTeam(actor.id, team_path.id, settings, is_admin) catch |err| return respond(req, if (err == error.TeamPermissionDenied) .forbidden else if (err == error.TeamExists) .conflict else .internal_server_error, "application/json", if (err == error.TeamPermissionDenied) "{\"error\":\"team management access required\"}" else if (err == error.TeamExists) "{\"error\":\"that team name or tag already exists\"}" else "{\"error\":\"team could not be updated\"}", &no_store);
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+            if (team_path.action.len == 0 and req.head.method == .DELETE) {
+                const flag = try self.store.teamAsset(self.allocator, team_path.id, "flag");
+                defer if (flag) |value| {
+                    var old = value;
+                    old.deinit();
+                };
+                const header_image = try self.store.teamAsset(self.allocator, team_path.id, "header");
+                defer if (header_image) |value| {
+                    var old = value;
+                    old.deinit();
+                };
+                self.store.disbandTeam(actor.id, team_path.id, is_admin) catch return respond(req, .forbidden, "application/json", "{\"error\":\"team management access required\"}", &no_store);
+                if (flag) |old| self.avatar_store.delete(self.allocator, self.store.io, old.object_key) catch {};
+                if (header_image) |old| self.avatar_store.delete(self.allocator, self.store.io, old.object_key) catch {};
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+            return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
         }
         if (std.mem.eql(u8, path, "/api/v1/staff/session")) {
             const no_store = [_]std.http.Header{
@@ -1273,6 +1771,20 @@ const App = struct {
                 defer self.allocator.free(json);
                 return respond(req, .ok, "application/json", json, &no_store);
             }
+            if (std.mem.eql(u8, path, "/api/v1/staff/users") and req.head.method == .GET) {
+                if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
+                const encoded_query = queryField(target, "q") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"search text required\"}", &no_store);
+                const query_buffer = try self.allocator.dupe(u8, encoded_query);
+                defer self.allocator.free(query_buffer);
+                for (query_buffer) |*char| if (char.* == '+') {
+                    char.* = ' ';
+                };
+                const query = std.mem.trim(u8, std.Uri.percentDecodeInPlace(query_buffer), " \t\r\n");
+                if (query.len < 1 or query.len > 32) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid search\"}", &no_store);
+                const json = try self.store.staffUserSearchJson(self.allocator, query);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
             if (std.mem.eql(u8, path, "/api/v1/staff/ranking")) {
                 if (!web_auth.canRank(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"ranking access required\"}", &no_store);
                 if (req.head.method == .GET) {
@@ -1334,7 +1846,26 @@ const App = struct {
                     defer freeUser(self.allocator, target_user);
                     if (!web_auth.canManage(staff_user, target_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"protected player\"}", &no_store);
                     const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
-                    if (std.mem.eql(u8, action, "kick")) {
+                    if (std.mem.eql(u8, action, "revoke_sessions")) {
+                        if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
+                        try self.disconnectUser(target_id, trimmed_reason);
+                        try self.store.recordModerationAction(staff_user.id, target_id, "account.sessions_revoke", trimmed_reason);
+                    } else if (std.mem.eql(u8, action, "reset_avatar") or std.mem.eql(u8, action, "reset_banner")) {
+                        if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
+                        const is_avatar = std.mem.eql(u8, action, "reset_avatar");
+                        const previous = if (is_avatar) try self.store.customAvatarForUser(self.allocator, target_id) else try self.store.customBannerForUser(self.allocator, target_id);
+                        defer if (previous) |value| {
+                            var image = value;
+                            image.deinit();
+                        };
+                        if (previous == null) return respond(req, .conflict, "application/json", if (is_avatar) "{\"error\":\"player has no custom avatar\"}" else "{\"error\":\"player has no custom banner\"}", &no_store);
+                        _ = if (is_avatar) try self.store.deleteCustomAvatar(target_id) else try self.store.deleteCustomBanner(target_id);
+                        if (previous) |image| {
+                            self.avatar_cache.remove(image.object_key);
+                            self.avatar_store.delete(self.allocator, self.store.io, image.object_key) catch |err| std.log.warn("event=staff_profile_object_delete_failed user_id={d} kind={s} error={t}", .{ target_id, if (is_avatar) "avatar" else "banner", err });
+                        }
+                        try self.store.recordModerationAction(staff_user.id, target_id, if (is_avatar) "account.avatar_reset" else "account.banner_reset", trimmed_reason);
+                    } else if (std.mem.eql(u8, action, "kick")) {
                         var stable_kicked = false;
                         self.sessions.mutex.lockUncancelable(self.sessions.io);
                         if (self.sessions.byUser(target_id)) |online| {
@@ -1451,6 +1982,25 @@ const App = struct {
                     return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
                 }
             }
+            if (std.mem.eql(u8, path, "/api/v1/staff/reports")) {
+                if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const json = try self.store.staffLazerReportsJson(self.allocator);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const id_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"report_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"report required\"}", &no_store);
+                    defer self.allocator.free(id_text);
+                    const decision = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"decision"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"decision required\"}", &no_store);
+                    defer self.allocator.free(decision);
+                    const report_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid report\"}", &no_store);
+                    if (report_id <= 0 or (!std.mem.eql(u8, decision, "resolved") and !std.mem.eql(u8, decision, "dismissed"))) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid decision\"}", &no_store);
+                    if (!try self.store.resolveLazerReport(staff_user.id, report_id, decision)) return respond(req, .conflict, "application/json", "{\"error\":\"report is not open\"}", &no_store);
+                    std.log.info("event=staff_lazer_report_decision actor_id={d} report_id={d} decision={s}", .{ staff_user.id, report_id, decision });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
             if (std.mem.eql(u8, path, "/api/v1/staff/anticheat")) {
                 if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
                 if (req.head.method == .GET) {
@@ -1503,9 +2053,11 @@ const App = struct {
                 }
             }
             const known_staff_path = std.mem.eql(u8, path, "/api/v1/staff/overview") or
+                std.mem.eql(u8, path, "/api/v1/staff/users") or
                 std.mem.eql(u8, path, "/api/v1/staff/ranking") or
                 std.mem.eql(u8, path, "/api/v1/staff/moderation") or
                 std.mem.eql(u8, path, "/api/v1/staff/appeals") or
+                std.mem.eql(u8, path, "/api/v1/staff/reports") or
                 std.mem.eql(u8, path, "/api/v1/staff/anticheat") or
                 std.mem.eql(u8, path, "/api/v1/staff/audit") or
                 std.mem.eql(u8, path, "/api/v1/staff/channels");
@@ -1514,7 +2066,7 @@ const App = struct {
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v1/rankings")) {
             const source = domain.parseSiteScoreSource(queryField(target, "source") orelse "all") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid source\"}", &.{});
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
-            const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+            const offset = beatmapSearchOffset(target) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
             if (!domain.validSiteMode(source, mode) or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid rankings\"}", &.{});
             const listing = try self.store.siteRankings(self.allocator, source, mode, offset);
             defer self.allocator.free(listing);
@@ -1546,7 +2098,7 @@ const App = struct {
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/beatmapsets/")) {
             const set_id = std.fmt.parseInt(i32, path["/api/v1/beatmapsets/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
             if (set_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
-            const set = (try self.store.lazerBeatmapSet(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
+            const set = (try self.store.lazerBeatmapSet(self.allocator, set_id, null)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(set);
             return respond(req, .ok, "application/json", set, &.{});
         }
@@ -1628,6 +2180,22 @@ const App = struct {
                     .{ .name = "x-content-type-options", .value = "nosniff" },
                 });
             }
+        }
+        if (req.head.method == .GET and isAssetsHost(host_owned) and std.mem.startsWith(u8, path, "/banners/")) {
+            const id_text = path["/banners/".len..];
+            if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
+            const user_id = std.fmt.parseInt(i32, id_text, 10) catch return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
+            const banner = (try self.store.customBannerForUser(self.allocator, user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
+            return self.serveObjectImage(req, banner);
+        }
+        if (req.head.method == .GET and isAssetsHost(host_owned) and std.mem.startsWith(u8, path, "/teams/")) {
+            var parts = std.mem.splitScalar(u8, path["/teams/".len..], '/');
+            const id_text = parts.next() orelse return respond(req, .not_found, "application/json", "{\"error\":\"team image not found\"}", &.{});
+            const kind = parts.next() orelse return respond(req, .not_found, "application/json", "{\"error\":\"team image not found\"}", &.{});
+            if (parts.next() != null or (!std.mem.eql(u8, kind, "flag") and !std.mem.eql(u8, kind, "header"))) return respond(req, .not_found, "application/json", "{\"error\":\"team image not found\"}", &.{});
+            const team_id = std.fmt.parseInt(i32, id_text, 10) catch return respond(req, .not_found, "application/json", "{\"error\":\"team image not found\"}", &.{});
+            const image = (try self.store.teamAsset(self.allocator, team_id, kind)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"team image not found\"}", &.{});
+            return self.serveObjectImage(req, image);
         }
         if (req.head.method == .GET and (isAvatarHost(host_owned) or std.mem.startsWith(u8, path, "/avatars/") or std.mem.startsWith(u8, path, "/avatar/"))) {
             if (avatarUserId(path)) |user_id| {
@@ -1742,9 +2310,7 @@ const App = struct {
             const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            if (self.userOnline(user.id)) return respond(req, .bad_request, "application/json", "{\"error\":\"access_denied\",\"error_description\":\"this account is already online in Stable. close Stable before signing in with lazer.\"}", &.{});
-            const online_cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
-            if (try self.store.lazerUserOnline(user.id, online_cutoff)) return respond(req, .bad_request, "application/json", "{\"error\":\"access_denied\",\"error_description\":\"this account is already online in lazer. close the other client before signing in again.\"}", &.{});
+            try self.takeOverGameSessions(user.id, "lazer");
             const token = try self.store.issueToken(user.id, "identify scores:write", 3600);
             var out: [256]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"token_type\":\"Bearer\",\"expires_in\":3600,\"scope\":\"identify scores:write\",\"access_token\":\"{s}\"}}", .{token});
@@ -1762,6 +2328,98 @@ const App = struct {
         }
         if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"server accepted; separate relax leaderboard\",\"ranked\":true,\"score_multiplier\":0.0,\"settings\":{}},{\"acronym\":\"AP\",\"name\":\"Autopilot\",\"description\":\"server accepted; separate autopilot leaderboard\",\"ranked\":true,\"score_multiplier\":0.0,\"settings\":{}},{\"acronym\":\"CL\",\"name\":\"Classic\",\"description\":\"Stable score leaderboard\",\"ranked\":true,\"score_multiplier\":1.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":true}}", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/seasonal-backgrounds")) return respond(req, .ok, "application/json", "{\"backgrounds\":[]}", &.{});
+        if (std.mem.eql(u8, path, "/api/v2/session/verify") or std.mem.eql(u8, path, "/api/v2/session/verify/reissue") or std.mem.eql(u8, path, "/api/v2/session/verify/mail-fallback")) {
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            return respond(req, .ok, "application/json", "{}", &.{});
+        }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/search")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (!std.mem.eql(u8, queryField(target, "mode") orelse "user", "user")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported search mode\"}", &.{});
+            const encoded = queryField(target, "query") orelse "";
+            const query_buffer = try self.allocator.dupe(u8, encoded);
+            defer self.allocator.free(query_buffer);
+            for (query_buffer) |*char| if (char.* == '+') {
+                char.* = ' ';
+            };
+            const query = std.mem.trim(u8, std.Uri.percentDecodeInPlace(query_buffer), " \t\r\n");
+            if (query.len == 0 or query.len > 32) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid search\"}", &.{});
+            const ids = try self.store.lazerUserSearchIds(self.allocator, query, 20);
+            defer self.allocator.free(ids);
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.print("{{\"total\":{d},\"user\":{{\"data\":[", .{ids.len});
+            var written: usize = 0;
+            for (ids) |id| {
+                var found = (try self.store.userById(self.allocator, id)) orelse continue;
+                defer freeUser(self.allocator, found);
+                try self.markOnline(&found);
+                if (written != 0) try output.writer.writeByte(',');
+                written += 1;
+                try user_json.writeCompact(&output.writer, found);
+            }
+            try output.writer.writeAll("]}}");
+            return respond(req, .ok, "application/json", output.written(), &.{});
+        }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/news")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            return respond(req, .ok, "application/json", "{\"news_posts\":[],\"news_sidebar\":{\"current_year\":2026,\"news_posts\":[],\"years\":[2026]},\"cursor\":null}", &.{});
+        }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/spotlights")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            return respond(req, .ok, "application/json", "{\"spotlights\":[]}", &.{});
+        }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/rankings/kudosu")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            return respond(req, .ok, "application/json", "{\"ranking\":[]}", &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/wiki/")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const rest = path["/api/v2/wiki/".len..];
+            const slash = std.mem.findScalar(u8, rest, '/') orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid wiki path\"}", &.{});
+            if (slash == 0 or slash + 1 >= rest.len or rest.len > 512) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid wiki path\"}", &.{});
+            const locale = rest[0..slash];
+            const article = rest[slash + 1 ..];
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.writeAll("{\"layout\":\"wiki\",\"locale\":");
+            try std.json.Stringify.value(locale, .{}, &output.writer);
+            try output.writer.writeAll(",\"markdown\":\"This upstream wiki page is not mirrored by Zigcho yet.\",\"path\":");
+            try std.json.Stringify.value(article, .{}, &output.writer);
+            try output.writer.writeAll(",\"subtitle\":\"\",\"tags\":[],\"title\":");
+            try std.json.Stringify.value(article, .{}, &output.writer);
+            try output.writer.writeByte('}');
+            return respond(req, .ok, "application/json", output.written(), &.{});
+        }
+        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/chat/updates")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const since = std.fmt.parseInt(i64, queryField(target, "since") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid since\"}", &.{});
+            if (since < 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid since\"}", &.{});
+            const presence = try self.store.lazerChannelListJson(self.allocator, user.id);
+            defer self.allocator.free(presence);
+            const messages = if (queryField(target, "channel")) |channel_text| channel_messages: {
+                const channel_id = std.fmt.parseInt(i64, channel_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel\"}", &.{});
+                if (lazer.privateChannelUser(channel_id)) |target_id| break :channel_messages try self.store.lazerDirectMessagesJson(self.allocator, user.id, target_id, since, 100);
+                if (!lazer.validChannelId(channel_id)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel\"}", &.{});
+                break :channel_messages try self.store.lazerChatMessagesJson(self.allocator, channel_id, since, 100);
+            } else try self.store.lazerAllMessagesJson(self.allocator, user.id, since, 100);
+            defer self.allocator.free(messages);
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.writeAll("{\"presence\":");
+            try output.writer.writeAll(presence);
+            try output.writer.writeAll(",\"messages\":");
+            try output.writer.writeAll(messages);
+            try output.writer.writeByte('}');
+            return respond(req, .ok, "application/json", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
         if (req.head.method == .GET and std.mem.eql(u8, path, "/web/osu-getseasonal.php")) return respond(req, .ok, "application/json", "[]", &.{});
         if (req.head.method == .GET and std.mem.eql(u8, path, "/menu-content.json")) return respond(req, .ok, "application/json", "{\"images\":[]}", &.{});
         if (std.mem.eql(u8, path, "/api/v2/notifications")) {
@@ -1844,16 +2502,24 @@ const App = struct {
             defer freeUser(self.allocator, user);
             const reportable_type = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reportable_type"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reportable_type required\"}", &.{});
             defer self.allocator.free(reportable_type);
-            if (!std.mem.eql(u8, reportable_type, "comment")) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"unsupported report type\"}", &.{});
+            if (!std.mem.eql(u8, reportable_type, "comment") and !std.mem.eql(u8, reportable_type, "user") and !std.mem.eql(u8, reportable_type, "message")) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"unsupported report type\"}", &.{});
             const id_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reportable_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reportable_id required\"}", &.{});
             defer self.allocator.free(id_owned);
-            const comment_id = std.fmt.parseInt(i64, id_owned, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid reportable_id\"}", &.{});
+            const reportable_id = std.fmt.parseInt(i64, id_owned, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid reportable_id\"}", &.{});
             const reason = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &.{});
             defer self.allocator.free(reason);
             const comments = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comments"})) orelse try self.allocator.dupe(u8, "");
             defer self.allocator.free(comments);
-            if (reason.len == 0 or reason.len > 64 or comments.len > 1000 or !std.unicode.utf8ValidateSlice(comments)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid report\"}", &.{});
-            if (!try self.store.reportLazerComment(user.id, comment_id, reason, comments)) return respond(req, .conflict, "application/json", "{\"error\":\"report already submitted or comment not found\"}", &.{});
+            if (reportable_id <= 0 or reason.len == 0 or reason.len > 64 or comments.len > 1000 or !std.unicode.utf8ValidateSlice(comments)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid report\"}", &.{});
+            if (std.mem.eql(u8, reportable_type, "comment") and (try self.store.lazerCommentTarget(reportable_id)) == null) return respond(req, .not_found, "application/json", "{\"error\":\"comment not found\"}", &.{});
+            if (std.mem.eql(u8, reportable_type, "message") and !try self.store.lazerMessageExists(reportable_id)) return respond(req, .not_found, "application/json", "{\"error\":\"message not found\"}", &.{});
+            if (std.mem.eql(u8, reportable_type, "user")) {
+                if (reportable_id > std.math.maxInt(i32)) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+                const reported_user = (try self.store.userById(self.allocator, @intCast(reportable_id))) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+                defer freeUser(self.allocator, reported_user);
+            }
+            if (!try self.store.addLazerReport(user.id, reportable_type, reportable_id, reason, comments)) return respond(req, .conflict, "application/json", "{\"error\":\"report already submitted\"}", &.{});
+            if (std.mem.eql(u8, reportable_type, "comment")) _ = try self.store.reportLazerComment(user.id, reportable_id, reason, comments);
             return respond(req, .created, "application/json", "{}", &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/friends")) {
@@ -2017,9 +2683,10 @@ const App = struct {
             defer freeUser(self.allocator, user);
             if (lazer.privateChannelUser(channel_id)) |other_id| {
                 if (other_id == user.id) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
-                const other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                var other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
                 defer freeUser(self.allocator, other);
                 if (other.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
+                try self.markOnline(&other);
                 var output: std.Io.Writer.Allocating = .init(self.allocator);
                 defer output.deinit();
                 try output.writer.writeAll("{\"channel\":");
@@ -2031,8 +2698,9 @@ const App = struct {
                 try output.writer.writeAll("]}");
                 return respond(req, .ok, "application/json", output.written(), &.{});
             }
-            const kai = (try self.store.userById(self.allocator, 3)) orelse return respond(req, .service_unavailable, "application/json", "{\"error\":\"channel presence unavailable\"}", &.{});
+            var kai = (try self.store.userById(self.allocator, 3)) orelse return respond(req, .service_unavailable, "application/json", "{\"error\":\"channel presence unavailable\"}", &.{});
             defer freeUser(self.allocator, kai);
+            try self.markOnline(&kai);
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
             try output.writer.writeAll("{\"channel\":");
@@ -2125,9 +2793,22 @@ const App = struct {
             if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
-            return respond(req, .ok, "application/json", "{\"tags\":[]}", &.{});
+            return respond(req, .ok, "application/json", "{\"tags\":" ++ lazer.beatmap_tags_array_json ++ "}", &.{});
         }
-        if (req.head.method == .GET and (std.mem.eql(u8, path, "/api/v2/users") or std.mem.eql(u8, path, "/api/v2/users/lookup"))) {
+        if (beatmapTagPath(path)) |tag_path| {
+            if (req.head.method != .PUT and req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"restricted\"}", &.{});
+            if (!lazer.validBeatmapTagId(tag_path.tag_id)) return respond(req, .not_found, "application/json", "{\"error\":\"tag not found\"}", &.{});
+            _ = self.store.setLazerBeatmapTag(user.id, tag_path.beatmap_id, tag_path.tag_id, req.head.method == .PUT) catch |err| switch (err) {
+                error.BeatmapNotFound => return respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found\"}", &.{}),
+                error.InvalidBeatmapTag => return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid tag\"}", &.{}),
+                else => return err,
+            };
+            return respond(req, .no_content, "application/json", "", &.{});
+        }
+        if (req.head.method == .GET and (std.mem.eql(u8, path, "/api/v2/users") or std.mem.eql(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/api/v2/users/lookup") or std.mem.eql(u8, path, "/api/v2/users/lookup/"))) {
             const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, requester);
             const ids = lazer.queryIds(self.allocator, target, 50) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user ids\"}", &.{});
@@ -2137,9 +2818,10 @@ const App = struct {
             try output.writer.writeAll("{\"users\":[");
             var written: usize = 0;
             for (ids) |id| {
-                const found = (try self.store.userById(self.allocator, id)) orelse continue;
+                var found = (try self.store.userById(self.allocator, id)) orelse continue;
                 defer freeUser(self.allocator, found);
                 if (found.restricted and found.id != requester.id) continue;
+                try self.markOnline(&found);
                 if (written != 0) try output.writer.writeByte(',');
                 written += 1;
                 try user_json.writeCompact(&output.writer, found);
@@ -2147,6 +2829,59 @@ const App = struct {
             try output.writer.writeAll("],\"cursor\":null}");
             return respond(req, .ok, "application/json", output.written(), &.{});
         }
+        if (req.head.method == .GET) if (userPathWithSuffix(path, "/kudosu")) |profile_user_id| {
+            const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, requester);
+            const profile_user = (try self.store.userById(self.allocator, profile_user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            defer freeUser(self.allocator, profile_user);
+            if (profile_user.restricted and profile_user.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            return respond(req, .ok, "application/json", "[]", &.{});
+        };
+        if (req.head.method == .GET) if (userPathWithSuffix(path, "/beatmapsets/most_played")) |profile_user_id| {
+            const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, requester);
+            const profile_user = (try self.store.userById(self.allocator, profile_user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            defer freeUser(self.allocator, profile_user);
+            if (profile_user.restricted and profile_user.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+            const limit = std.fmt.parseInt(u8, queryField(target, "limit") orelse "50", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
+            if (offset > 10_000 or limit == 0 or limit > 100) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid pagination\"}", &.{});
+            const json = try self.store.lazerMostPlayedJson(self.allocator, profile_user_id, offset, limit);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{});
+        };
+        if (req.head.method == .GET) if (userBeatmapsetPath(path)) |beatmapset_path| {
+            if (std.mem.eql(u8, beatmapset_path.kind, "most_played")) {} else {
+                const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+                defer freeUser(self.allocator, requester);
+                const profile_user = (try self.store.userById(self.allocator, beatmapset_path.user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+                defer freeUser(self.allocator, profile_user);
+                if (profile_user.restricted and profile_user.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+                const offset = std.fmt.parseInt(usize, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+                const limit = std.fmt.parseInt(usize, queryField(target, "limit") orelse "50", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
+                if (offset > 10_000 or limit == 0 or limit > 100) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid pagination\"}", &.{});
+                var output: std.Io.Writer.Allocating = .init(self.allocator);
+                defer output.deinit();
+                try output.writer.writeByte('[');
+                if (std.mem.eql(u8, beatmapset_path.kind, "favourite")) {
+                    const ids = try self.store.favouriteSetIds(self.allocator, beatmapset_path.user_id);
+                    defer self.allocator.free(ids);
+                    const end = @min(ids.len, offset + limit);
+                    var written: usize = 0;
+                    if (offset < end) for (ids[offset..end]) |set_id| {
+                        const set = (try self.store.lazerBeatmapSet(self.allocator, set_id, requester.id)) orelse continue;
+                        defer self.allocator.free(set);
+                        if (written != 0) try output.writer.writeByte(',');
+                        written += 1;
+                        try output.writer.writeAll(set);
+                    };
+                } else if (!std.mem.eql(u8, beatmapset_path.kind, "ranked") and !std.mem.eql(u8, beatmapset_path.kind, "loved") and !std.mem.eql(u8, beatmapset_path.kind, "pending") and !std.mem.eql(u8, beatmapset_path.kind, "guest") and !std.mem.eql(u8, beatmapset_path.kind, "graveyard") and !std.mem.eql(u8, beatmapset_path.kind, "nominated")) {
+                    return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set type\"}", &.{});
+                }
+                try output.writer.writeByte(']');
+                return respond(req, .ok, "application/json", output.written(), &.{});
+            }
+        };
         if (req.head.method == .GET) if (lazer.parseUserRecentActivityPath(path)) |profile_user_id| {
             const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, requester);
@@ -2191,9 +2926,10 @@ const App = struct {
                 try self.store.userByName(self.allocator, lookup)
             else
                 return respond(req, .bad_request, "application/json", "{\"error\":\"invalid lookup key\"}", &.{});
-            const found = profile_user orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            var found = profile_user orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
             defer freeUser(self.allocator, found);
             if (found.restricted and found.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            try self.markOnline(&found);
             const stats = try self.store.statsForUser(found.id, user_path.ruleset_id);
             const stable_stats = try self.store.sourceStatsForUser(found.id, user_path.ruleset_id, .stable);
             const lazer_stats = try self.store.sourceStatsForUser(found.id, user_path.ruleset_id, .lazer);
@@ -2211,7 +2947,7 @@ const App = struct {
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
-        if (req.head.method == .GET and std.mem.eql(u8, path, "/api/v2/beatmaps")) {
+        if (req.head.method == .GET and (std.mem.eql(u8, path, "/api/v2/beatmaps") or std.mem.eql(u8, path, "/api/v2/beatmaps/"))) {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
             const ids = lazer.queryIds(self.allocator, target, 50) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap ids\"}", &.{});
@@ -2221,11 +2957,11 @@ const App = struct {
             try output.writer.writeAll("{\"beatmaps\":[");
             var written: usize = 0;
             for (ids) |id| {
-                var found = try self.store.lazerBeatmapLookup(self.allocator, id, null);
+                var found = try self.store.lazerBeatmapLookup(self.allocator, id, null, user.id);
                 if (found == null) {
                     _ = self.map_sync.ensureByBeatmapId(&self.store, id, null) catch |err|
                         std.log.warn("event=lazer_beatmap_batch_hydration_failed beatmap_id={d} error={t}", .{ id, err });
-                    found = try self.store.lazerBeatmapLookup(self.allocator, id, null);
+                    found = try self.store.lazerBeatmapLookup(self.allocator, id, null, user.id);
                 }
                 const beatmap = found orelse continue;
                 defer self.allocator.free(beatmap);
@@ -2241,19 +2977,44 @@ const App = struct {
             defer freeUser(self.allocator, user);
             const checksum = queryField(target, "checksum");
             if (checksum) |value| if (!lazer.validHash(value)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid checksum\"}", &.{});
-            const beatmap_id: ?i32 = if (queryField(target, "id")) |value| std.fmt.parseInt(i32, value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap id\"}", &.{}) else null;
+            var beatmap_id: ?i32 = if (queryField(target, "id")) |value| std.fmt.parseInt(i32, value, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap id\"}", &.{}) else null;
             if (beatmap_id) |value| if (value <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap id\"}", &.{});
-            if (checksum == null and beatmap_id == null) return respond(req, .bad_request, "application/json", "{\"error\":\"beatmap lookup required\"}", &.{});
-            if (queryField(target, "filename")) |filename| if (filename.len > 1024) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid filename\"}", &.{});
-            var found = try self.store.lazerBeatmapLookup(self.allocator, beatmap_id, checksum);
+            const encoded_filename = queryField(target, "filename");
+            if (checksum == null and beatmap_id == null and encoded_filename == null) return respond(req, .bad_request, "application/json", "{\"error\":\"beatmap lookup required\"}", &.{});
+            var filename_buffer: ?[]u8 = null;
+            defer if (filename_buffer) |value| self.allocator.free(value);
+            if (encoded_filename) |encoded| {
+                if (encoded.len == 0 or encoded.len > 1024) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid filename\"}", &.{});
+                const owned = try self.allocator.dupe(u8, encoded);
+                filename_buffer = owned;
+                for (owned) |*char| {
+                    if (char.* == '+') char.* = ' ';
+                }
+                const filename = std.Uri.percentDecodeInPlace(owned);
+                if (!std.unicode.utf8ValidateSlice(filename) or std.mem.indexOfScalar(u8, filename, 0) != null) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid filename\"}", &.{});
+                if (beatmap_id == null) {
+                    if (try self.store.stableBeatmapInfoByFilename(user.id, filename)) |info| {
+                        beatmap_id = info.id;
+                    }
+                }
+            }
+            var found = try self.store.lazerBeatmapLookup(self.allocator, beatmap_id, checksum, user.id);
             if (found == null) if (beatmap_id) |id| {
                 _ = self.map_sync.ensureByBeatmapId(&self.store, id, checksum) catch |err|
                     std.log.warn("event=lazer_beatmap_lookup_hydration_failed beatmap_id={d} error={t}", .{ id, err });
-                found = try self.store.lazerBeatmapLookup(self.allocator, id, null);
+                found = try self.store.lazerBeatmapLookup(self.allocator, id, null, user.id);
             };
             const response = found orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found\"}", &.{});
             defer self.allocator.free(response);
             return respond(req, .ok, "application/json", response, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/rankings/") and std.mem.endsWith(u8, path, "/charts")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const spotlight_id = std.fmt.parseInt(i32, queryField(target, "spotlight") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid spotlight\"}", &.{});
+            var output: [384]u8 = undefined;
+            const json = try std.fmt.bufPrint(&output, "{{\"ranking\":[],\"spotlight\":{{\"id\":{d},\"name\":\"zigcho!lazer\",\"type\":\"theme\",\"mode_specific\":false,\"start_date\":\"2026-01-01T00:00:00Z\",\"end_date\":\"2027-01-01T00:00:00Z\",\"participant_count\":0}},\"beatmapsets\":[]}}", .{@max(1, spotlight_id)});
+            return respond(req, .ok, "application/json", json, &.{});
         }
         if (req.head.method == .GET) if (lazer.parseRankingPath(path)) |ranking_path| {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -2281,7 +3042,7 @@ const App = struct {
             if (!std.mem.eql(u8, scope, "global") and !std.mem.eql(u8, scope, "country") and !std.mem.eql(u8, scope, "friend")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported leaderboard scope\"}", &.{});
             const mod_filter = lazer.leaderboardModFilter(self.allocator, target) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid leaderboard mods\"}", &.{});
             defer mod_filter.deinit(self.allocator);
-            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, lazerLeaderboardNamespace(target), mod_filter.exact_json, mod_filter.selected, mod_filter.classic, mod_filter.stable_bits, @intCast(raw_limit));
+            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, mod_filter.namespace, mod_filter.exact_json, mod_filter.selected, mod_filter.classic, mod_filter.stable_bits, @intCast(raw_limit));
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -2351,12 +3112,36 @@ const App = struct {
                     error.LazerScoreTokenMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match submission\"}", &.{}),
                     else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score submission failed\"}", &.{}),
                 };
+                if (replay_data.len != 0) {
+                    _ = self.store.storeReplayObject(.lazer, score_id, replay_data) catch |err| failed: {
+                        std.log.warn("event=replay_object_write_failed source=lazer score_id={d} error={t}", .{ score_id, err });
+                        break :failed false;
+                    };
+                }
                 const placement = self.afterLazerScore(user, score_id, score, performance.pp, mods_json);
                 const json = try self.lazerScoreResponse(user.id, score_id, placement);
                 defer self.allocator.free(json);
                 return respond(req, .ok, "application/json", json, &.{});
             }
             return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+        }
+        if (lazer_multiplayer.parseRoomLeaderboardPath(path)) |room_id| {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const json = (try self.lazer_multiplayer.roomLeaderboardJson(self.allocator, user.id, room_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{});
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+        }
+        if (lazer_multiplayer.parseRoomUserScorePath(path)) |user_score_path| {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const context = self.lazer_multiplayer.scoreContext(user.id, user_score_path.room_id, user_score_path.playlist_item_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
+            const score_id = self.lazer_multiplayer.roomScoreIdForUser(user.id, user_score_path.room_id, user_score_path.playlist_item_id, user_score_path.user_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"score not found\"}", &.{});
+            const json = (try self.store.lazerScoreJson(self.allocator, score_id, context.beatmap_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"score not found\"}", &.{});
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         if (lazer_multiplayer.parseRoomScorePath(path)) |room_score_path| {
             const auth = auth_owned orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -2368,27 +3153,26 @@ const App = struct {
             const score_context = self.lazer_multiplayer.scoreContext(user.id, room_score_path.room_id, room_score_path.playlist_item_id) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
 
             if (room_score_path.token_id == null and req.head.method == .GET) {
-                const board_json = try self.store.lazerLeaderboardJson(self.allocator, user.id, score_context.beatmap_id, score_context.ruleset_id, .vanilla, "[]", false, false, 0, 100);
-                defer self.allocator.free(board_json);
-                const parsed_board = std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{}) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
-                defer parsed_board.deinit();
-                const board = switch (parsed_board.value) {
-                    .object => |object| object,
-                    else => return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{}),
-                };
-                const scores = board.get("scores") orelse return respond(req, .internal_server_error, "application/json", "{\"error\":\"room scores unavailable\"}", &.{});
-                const score_count: i64 = if (board.get("score_count")) |value| switch (value) {
-                    .integer => |integer| integer,
-                    else => 0,
-                } else 0;
+                const ids = (try self.lazer_multiplayer.roomScoreIds(self.allocator, user.id, room_score_path.room_id, room_score_path.playlist_item_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room or playlist item not found\"}", &.{});
+                defer self.allocator.free(ids);
+                const own_score_id = self.lazer_multiplayer.roomScoreIdForUser(user.id, room_score_path.room_id, room_score_path.playlist_item_id, user.id);
                 var output: std.Io.Writer.Allocating = .init(self.allocator);
                 defer output.deinit();
-                try output.writer.writeAll("{\"scores\":");
-                try std.json.Stringify.value(scores, .{}, &output.writer);
-                try output.writer.print(",\"total\":{d},\"user_score\":", .{score_count});
-                if (board.get("user_score")) |own| switch (own) {
-                    .object => |object| if (object.get("score")) |score| try std.json.Stringify.value(score, .{}, &output.writer) else try output.writer.writeAll("null"),
-                    else => try output.writer.writeAll("null"),
+                try output.writer.writeAll("{\"scores\":[");
+                var written: usize = 0;
+                for (ids) |score_id| {
+                    const score_json = (try self.store.lazerScoreJson(self.allocator, score_id, score_context.beatmap_id)) orelse continue;
+                    defer self.allocator.free(score_json);
+                    if (written != 0) try output.writer.writeByte(',');
+                    written += 1;
+                    try output.writer.writeAll(score_json);
+                }
+                try output.writer.print("],\"total\":{d},\"user_score\":", .{written});
+                if (own_score_id) |score_id| {
+                    if (try self.store.lazerScoreJson(self.allocator, score_id, score_context.beatmap_id)) |own_json| {
+                        defer self.allocator.free(own_json);
+                        try output.writer.writeAll(own_json);
+                    } else try output.writer.writeAll("null");
                 } else try output.writer.writeAll("null");
                 try output.writer.writeAll(",\"params\":{},\"cursor_string\":null}");
                 return respond(req, .ok, "application/json", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
@@ -2418,6 +3202,12 @@ const App = struct {
             }
 
             if (room_score_path.token_id) |token_id| {
+                if (req.head.method == .GET) {
+                    if (!self.lazer_multiplayer.roomContainsScore(user.id, room_score_path.room_id, room_score_path.playlist_item_id, token_id)) return respond(req, .not_found, "application/json", "{\"error\":\"score not found\"}", &.{});
+                    const json = (try self.store.lazerScoreJson(self.allocator, token_id, score_context.beatmap_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"score not found\"}", &.{});
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+                }
                 if (req.head.method != .PUT) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
                 const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_json\"}", &.{});
                 defer parsed.deinit();
@@ -2442,8 +3232,15 @@ const App = struct {
                     error.LazerScoreTokenMismatch => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"score token does not match submission\"}", &.{}),
                     else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score submission failed\"}", &.{}),
                 };
+                if (replay_data.len != 0) {
+                    _ = self.store.storeReplayObject(.lazer, score_id, replay_data) catch |err| failed: {
+                        std.log.warn("event=replay_object_write_failed source=lazer score_id={d} error={t}", .{ score_id, err });
+                        break :failed false;
+                    };
+                }
                 const placement = self.afterLazerScore(user, score_id, score, performance.pp, mods_json);
                 self.lazer_multiplayer.recordRoomScore(user.id, room_score_path.room_id, room_score_path.playlist_item_id, .{
+                    .score_id = score_id,
                     .total_score = score.legacy_total_score orelse score.total_score,
                     .accuracy = score.accuracy,
                     .max_combo = @intCast(score.max_combo),
@@ -2462,8 +3259,10 @@ const App = struct {
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
             const mode = std.fmt.parseInt(i8, queryField(target, "m") orelse "-1", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
-            const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
-            if (mode < -1 or mode > 3 or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid search\"}", &.{});
+            const offset = beatmapSearchOffset(target) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+            if (mode < -1 or mode > 3) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid search\"}", &.{});
+            const category = lazer.beatmapSearchCategory(queryField(target, "s") orelse "any") catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid category\"}", &.{});
+            const sort = lazer.beatmapSearchSort(queryField(target, "sort") orelse "ranked_desc") catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid sort\"}", &.{});
             const encoded_query = queryField(target, "q") orelse "";
             const query_buf = try self.allocator.dupe(u8, encoded_query);
             defer self.allocator.free(query_buf);
@@ -2471,15 +3270,26 @@ const App = struct {
                 if (char.* == '+') char.* = ' ';
             }
             const query = std.Uri.percentDecodeInPlace(query_buf);
-            const upstream_ids: ?[]i32 = self.map_sync.searchSets(&self.store, query, mode, offset) catch |err| failed: {
+            if (!std.unicode.utf8ValidateSlice(query) or std.mem.indexOfScalar(u8, query, 0) != null) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid search\"}", &.{});
+            if (category.source == .mine) return respond(req, .ok, "application/json", "{\"beatmapsets\":[],\"total\":0,\"cursor\":null}", &.{});
+            if (category.source == .favourites) {
+                const favourite_ids = try self.store.favouriteSetIds(self.allocator, user.id);
+                defer self.allocator.free(favourite_ids);
+                const start: usize = @min(offset, favourite_ids.len);
+                const end: usize = @min(favourite_ids.len, start + 50);
+                const listing = try self.store.lazerBeatmapSets(self.allocator, favourite_ids[start..end], offset, user.id);
+                defer self.allocator.free(listing);
+                return respond(req, .ok, "application/json", listing, &.{});
+            }
+            const upstream_ids: ?[]i32 = self.map_sync.searchSets(&self.store, query, mode, offset, category.upstream_status, sort) catch |err| failed: {
                 std.log.warn("event=lazer_beatmap_search_upstream_failed mode={d} offset={d} error={t}", .{ mode, offset, err });
                 break :failed null;
             };
             defer if (upstream_ids) |ids| self.allocator.free(ids);
             const listing = if (upstream_ids) |ids|
-                try self.store.lazerBeatmapSets(self.allocator, ids)
+                try self.store.lazerBeatmapSets(self.allocator, ids, offset, user.id)
             else
-                try self.store.lazerBeatmapSearch(self.allocator, query, mode, offset);
+                try self.store.lazerBeatmapSearch(self.allocator, query, mode, offset, user.id);
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
         }
@@ -2496,7 +3306,7 @@ const App = struct {
                 set_id = try self.store.beatmapSetIdForMap(map_id);
             }
             const resolved_set_id = set_id orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
-            const listing = (try self.store.lazerBeatmapSet(self.allocator, resolved_set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
+            const listing = (try self.store.lazerBeatmapSet(self.allocator, resolved_set_id, user.id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
         }
@@ -2508,17 +3318,19 @@ const App = struct {
             const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            var listing = try self.store.lazerBeatmapSet(self.allocator, set_id);
+            var listing = try self.store.lazerBeatmapSet(self.allocator, set_id, user.id);
             if (listing == null) {
                 _ = self.map_sync.ensureBySetId(&self.store, set_id) catch |err|
                     std.log.warn("event=lazer_beatmap_set_hydration_failed set_id={d} error={t}", .{ set_id, err });
-                listing = try self.store.lazerBeatmapSet(self.allocator, set_id);
+                listing = try self.store.lazerBeatmapSet(self.allocator, set_id, user.id);
             }
             const response = listing orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(response);
             return respond(req, .ok, "application/json", response, &.{});
         }
-        if (std.mem.eql(u8, path, "/api/v2/me")) {
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/me/") or std.mem.startsWith(u8, path, "/api/v2/me/")) {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            if (std.mem.startsWith(u8, path, "/api/v2/me/") and path.len > "/api/v2/me/".len and lazerRulesetId(path["/api/v2/me/".len..]) == null) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
             const stats = try self.lazerStats(user.id);
@@ -2581,6 +3393,7 @@ const App = struct {
             const geo = if (client_ip_owned) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
             var result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer result.deinit();
+            if (result.user_id > 0) try self.takeOverGameSessions(result.user_id, "stable");
             self.observeStableLogin(result);
             const token_headers = [_]std.http.Header{
                 .{ .name = "cho-token", .value = result.token },
@@ -2957,6 +3770,12 @@ const App = struct {
                 std.log.warn("stable score insert failed: {t}", .{err});
                 return respond(req, .ok, "text/plain", "error: no", &.{});
             };
+            if (replay.data.len != 0) {
+                _ = self.store.storeReplayObject(.stable, score_id, replay.data) catch |err| failed: {
+                    std.log.warn("event=replay_object_write_failed source=stable score_id={d} error={t}", .{ score_id, err });
+                    break :failed false;
+                };
+            }
             if (has_replay_fingerprint) self.store.recordReplayFingerprint(user.id, score_id, &replay_digest) catch |err| {
                 std.log.warn("event=anticheat_replay_fingerprint_write_failed score_id={d} error={t}", .{ score_id, err });
             };
@@ -3074,7 +3893,7 @@ const App = struct {
             if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
-                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh https://assets.ppy.sh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh https://assets.kai.ovh https://assets.ppy.sh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
             return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", index_page, &headers);
@@ -3476,7 +4295,7 @@ pub fn main(init: std.process.Init) !void {
         store.bindObjectStorage(object_store);
         const maps = try store.migrateBeatmapObjects();
         const avatars = try migrateAvatarObjects(allocator, &store, configuredLegacyAvatarStore(config), object_store);
-        std.log.info("event=object_migration_complete archives={d} media={d} avatars={d} failed={d}", .{ maps.archives, maps.media, avatars.migrated, maps.failed + avatars.failed });
+        std.log.info("event=object_migration_complete archives={d} media={d} replays={d} replay_bytes={d} avatars={d} failed={d}", .{ maps.archives, maps.media, maps.replays, maps.replay_bytes, avatars.migrated, maps.failed + avatars.failed });
         if (maps.failed + avatars.failed != 0) return error.ObjectMigrationIncomplete;
         return;
     }

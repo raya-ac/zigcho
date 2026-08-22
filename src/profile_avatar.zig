@@ -21,10 +21,6 @@ fn be32(bytes: []const u8, index: usize) u32 {
     return (@as(u32, bytes[index]) << 24) | (@as(u32, bytes[index + 1]) << 16) | (@as(u32, bytes[index + 2]) << 8) | bytes[index + 3];
 }
 
-fn dimensionsOk(width: u32, height: u32) bool {
-    return width > 0 and height > 0 and width <= max_dimension and height <= max_dimension;
-}
-
 fn jpegDimensions(data: []const u8) ?struct { width: u32, height: u32 } {
     if (data.len < 4 or data[0] != 0xff or data[1] != 0xd8) return null;
     var cursor: usize = 2;
@@ -49,8 +45,8 @@ fn jpegDimensions(data: []const u8) ?struct { width: u32, height: u32 } {
     return null;
 }
 
-pub fn validate(content_type: ?[]const u8, data: []const u8) !Image {
-    if (data.len == 0 or data.len > max_bytes) return error.InvalidAvatarSize;
+pub fn validateWithLimits(content_type: ?[]const u8, data: []const u8, byte_limit: usize, width_limit: u32, height_limit: u32) !Image {
+    if (data.len == 0 or data.len > byte_limit) return error.InvalidAvatarSize;
     const expected = content_type orelse return error.InvalidAvatarContentType;
     var image: Image = undefined;
     if (data.len >= 24 and std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) {
@@ -63,8 +59,12 @@ pub fn validate(content_type: ?[]const u8, data: []const u8) !Image {
         return error.InvalidAvatarImage;
     }
     if (!std.ascii.eqlIgnoreCase(expected, image.content_type)) return error.InvalidAvatarContentType;
-    if (!dimensionsOk(image.width, image.height)) return error.InvalidAvatarDimensions;
+    if (image.width == 0 or image.height == 0 or image.width > width_limit or image.height > height_limit) return error.InvalidAvatarDimensions;
     return image;
+}
+
+pub fn validate(content_type: ?[]const u8, data: []const u8) !Image {
+    return validateWithLimits(content_type, data, max_bytes, max_dimension, max_dimension);
 }
 
 test "avatar validation uses image bytes and bounded dimensions" {

@@ -17,6 +17,70 @@ pub const SiteProfileSettings = struct {
     show_profile_stats: bool,
     show_recent_scores: bool,
 };
+
+pub const TeamSettings = struct {
+    name: []const u8,
+    short_name: []const u8,
+    url: []const u8,
+    description: []const u8,
+    is_open: bool,
+    default_ruleset_id: u8,
+};
+
+pub const TeamJoinResult = enum { joined, applied };
+
+pub fn validTeamSettings(settings: TeamSettings) bool {
+    if (settings.name.len < 2 or settings.name.len > 40 or settings.short_name.len == 0 or settings.short_name.len > 4 or settings.url.len > 255 or settings.description.len > 2000 or settings.default_ruleset_id > 3) return false;
+    if (!std.unicode.utf8ValidateSlice(settings.name) or !std.unicode.utf8ValidateSlice(settings.description)) return false;
+    for (settings.name) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    for (settings.short_name) |byte| if (!std.ascii.isAlphanumeric(byte)) return false;
+    if (settings.url.len != 0 and (!std.mem.startsWith(u8, settings.url, "https://") or std.mem.indexOfAny(u8, settings.url, "\r\n") != null)) return false;
+    return true;
+}
+
+test "team settings keep public identity bounded" {
+    try std.testing.expect(validTeamSettings(.{ .name = "kai team", .short_name = "KAI", .url = "https://kai.ovh", .description = "hello", .is_open = true, .default_ruleset_id = 0 }));
+    try std.testing.expect(!validTeamSettings(.{ .name = "x", .short_name = "K!", .url = "http://kai.ovh", .description = "", .is_open = true, .default_ruleset_id = 0 }));
+}
+
+pub const TeamSummary = struct {
+    id: i32,
+    name_bytes: [40]u8 = [_]u8{0} ** 40,
+    name_len: u8 = 0,
+    short_name_bytes: [4]u8 = [_]u8{0} ** 4,
+    short_name_len: u8 = 0,
+    flag_version: i64 = 0,
+
+    pub fn init(id: i32, team_name: []const u8, short_name: []const u8, flag_version: i64) !TeamSummary {
+        if (id <= 0 or team_name.len == 0 or team_name.len > 40 or short_name.len == 0 or short_name.len > 4) return error.InvalidTeamSummary;
+        var result: TeamSummary = .{ .id = id, .name_len = @intCast(team_name.len), .short_name_len = @intCast(short_name.len), .flag_version = @max(0, flag_version) };
+        @memcpy(result.name_bytes[0..team_name.len], team_name);
+        @memcpy(result.short_name_bytes[0..short_name.len], short_name);
+        return result;
+    }
+
+    pub fn name(self: *const TeamSummary) []const u8 {
+        return self.name_bytes[0..self.name_len];
+    }
+
+    pub fn shortName(self: *const TeamSummary) []const u8 {
+        return self.short_name_bytes[0..self.short_name_len];
+    }
+};
+
+pub const LazerActivity = struct {
+    allocator: std.mem.Allocator,
+    status: []u8,
+    detail: []u8,
+    beatmap_id: ?i32,
+    ruleset_id: ?u8,
+
+    pub fn deinit(self: *LazerActivity) void {
+        self.allocator.free(self.status);
+        self.allocator.free(self.detail);
+        self.* = undefined;
+    }
+};
 pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, ranked = 3, approved = 4, qualified = 5, loved = 6 };
 pub const BeatmapRankAction = enum { pending, qualify, rank, approve, love, veto, rollback };
 pub const BeatmapRankContext = struct {
@@ -56,6 +120,9 @@ pub const User = struct {
     privileges: u32 = 3,
     silence_end: i64 = 0,
     restricted: bool = false,
+    online: bool = false,
+    banner_version: i64 = 0,
+    team: ?TeamSummary = null,
 };
 
 pub const Stats = struct {

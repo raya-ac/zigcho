@@ -73,6 +73,8 @@ sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<
 score_id=$(sqlite3 "$database" "SELECT id FROM scores WHERE checksum='smoke-score-checksum'")
 sqlite3 "$database" "INSERT INTO anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,rule_revision,objects_checked,matched_clicks) VALUES($social_player_id,$score_id,'stable_score','smoke-private',0,100,0,0,0,7,10,9);"
 anticheat_observation_id=$(sqlite3 "$database" "SELECT id FROM anticheat_observations WHERE score_id=$score_id")
+sqlite3 "$database" "INSERT INTO lazer_reports(reporter_id,reportable_type,reportable_id,reason,comments) VALUES($social_player_id,'user',$player_id,'Other','staff route smoke report');"
+lazer_report_id=$(sqlite3 "$database" "SELECT id FROM lazer_reports WHERE reporter_id=$social_player_id")
 anticheat_player_state=$(sqlite3 "$database" "SELECT restricted||':'||(SELECT total_score||':'||ranked_score||':'||plays FROM stats WHERE user_id=$social_player_id AND mode=0) FROM users WHERE id=$social_player_id")
 
 stable_login_body="social player
@@ -193,7 +195,17 @@ cookie=$(sed -n 's/^set-cookie: \(__Host-kai-session=[^;]*\).*/\1/ip' "$headers"
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/overview" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_overview
-jq -e '.open_appeals == 1 and .ranking_sets == 1 and .restricted_users == 1 and .anticheat_pending == 1' "$response" >/dev/null || fail invalid_overview
+jq -e '.open_appeals == 1 and .open_reports == 1 and .ranking_sets == 1 and .restricted_users == 1 and .anticheat_pending == 1' "$response" >/dev/null || fail invalid_overview
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/reports" --header "Cookie: $cookie")
+expect_status "$code" 200 staff_reports
+jq -e ".reports[] | select(.id == $lazer_report_id and .status == \"open\" and .target == \"restricted\")" "$response" >/dev/null || fail missing_lazer_report
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/reports" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode "report_id=$lazer_report_id" --data-urlencode 'decision=resolved')
+expect_status "$code" 200 staff_report_resolve
+[ "$(sqlite3 "$database" "SELECT status||':'||resolver_id FROM lazer_reports WHERE id=$lazer_report_id")" = "resolved:$staff_id" ] || fail report_resolution_not_saved
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/anticheat" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_anticheat

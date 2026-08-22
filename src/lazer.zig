@@ -1,6 +1,28 @@
 const std = @import("std");
 const stable_mods = @import("stable_mods.zig");
 
+pub const beatmap_tags_array_json =
+    "[{\"id\":1,\"name\":\"aim\",\"description\":\"aim control and wide spacing\",\"ruleset_id\":0}," ++
+    "{\"id\":2,\"name\":\"speed\",\"description\":\"fast tapping and bursts\",\"ruleset_id\":null}," ++
+    "{\"id\":3,\"name\":\"streams\",\"description\":\"sustained streams\",\"ruleset_id\":0}," ++
+    "{\"id\":4,\"name\":\"jumps\",\"description\":\"large aim jumps\",\"ruleset_id\":0}," ++
+    "{\"id\":5,\"name\":\"technical\",\"description\":\"technical patterns and movement\",\"ruleset_id\":null}," ++
+    "{\"id\":6,\"name\":\"reading\",\"description\":\"reading-heavy patterns\",\"ruleset_id\":null}," ++
+    "{\"id\":7,\"name\":\"rhythm\",\"description\":\"rhythm complexity\",\"ruleset_id\":null}," ++
+    "{\"id\":8,\"name\":\"stamina\",\"description\":\"sustained stamina\",\"ruleset_id\":null}," ++
+    "{\"id\":9,\"name\":\"precision\",\"description\":\"small or precise patterns\",\"ruleset_id\":null}," ++
+    "{\"id\":10,\"name\":\"finger-control\",\"description\":\"finger control patterns\",\"ruleset_id\":null}," ++
+    "{\"id\":11,\"name\":\"sliders\",\"description\":\"slider-focused mapping\",\"ruleset_id\":0}," ++
+    "{\"id\":12,\"name\":\"gimmick\",\"description\":\"unusual or gimmick patterns\",\"ruleset_id\":null}," ++
+    "{\"id\":13,\"name\":\"marathon\",\"description\":\"long-form maps\",\"ruleset_id\":null}," ++
+    "{\"id\":14,\"name\":\"alternating\",\"description\":\"alternating patterns\",\"ruleset_id\":null}," ++
+    "{\"id\":15,\"name\":\"tournament\",\"description\":\"suited to tournament pools\",\"ruleset_id\":null}," ++
+    "{\"id\":16,\"name\":\"beginner\",\"description\":\"friendly to newer players\",\"ruleset_id\":null}]";
+
+pub fn validBeatmapTagId(id: i64) bool {
+    return id >= 1 and id <= 16;
+}
+
 pub const stable_score_id_offset: i64 = 4_000_000_000_000_000_000;
 
 pub fn encodeStableScoreId(score_id: i64) ?i64 {
@@ -18,6 +40,7 @@ pub const LeaderboardModFilter = struct {
     selected: bool,
     classic: bool,
     stable_bits: ?i32,
+    namespace: Namespace,
 
     pub fn deinit(self: LeaderboardModFilter, allocator: std.mem.Allocator) void {
         allocator.free(self.exact_json);
@@ -32,6 +55,9 @@ pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !L
     var classic = false;
     var stable_supported = true;
     var stable_bits: i32 = 0;
+    var relax = false;
+    var autopilot = false;
+    var custom = false;
     var first = true;
     if (std.mem.findScalar(u8, target, '?')) |query_start| {
         var parameters = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
@@ -47,6 +73,13 @@ pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !L
                 continue;
             }
             if (!validAcronym(acronym)) return error.InvalidLeaderboardMod;
+            if (std.ascii.eqlIgnoreCase(acronym, "RX")) {
+                relax = true;
+            } else if (std.ascii.eqlIgnoreCase(acronym, "AP")) {
+                autopilot = true;
+            } else if (!isOfficial(acronym)) {
+                custom = true;
+            }
             if (stable_mods.parseCompact(acronym)) |bits| {
                 stable_bits |= bits;
             } else {
@@ -65,6 +98,7 @@ pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !L
         .selected = selected,
         .classic = classic,
         .stable_bits = if (stable_supported) stable_mods.canonical(stable_bits) else null,
+        .namespace = if (autopilot) .autopilot else if (relax) .relax else if (custom) .custom else .vanilla,
     };
 }
 
@@ -80,6 +114,9 @@ pub fn scoreModFilter(allocator: std.mem.Allocator, mods_json: []const u8) !Lead
     try output.writer.writeByte('[');
     var stable_supported = true;
     var stable_bits: i32 = 0;
+    var relax = false;
+    var autopilot = false;
+    var custom = false;
     var first = true;
     for (mods.items) |item| {
         const object = switch (item) {
@@ -92,6 +129,13 @@ pub fn scoreModFilter(allocator: std.mem.Allocator, mods_json: []const u8) !Lead
         };
         if (std.ascii.eqlIgnoreCase(acronym, "NM") or std.ascii.eqlIgnoreCase(acronym, "CL")) continue;
         if (!validAcronym(acronym)) return error.InvalidLeaderboardMod;
+        if (std.ascii.eqlIgnoreCase(acronym, "RX")) {
+            relax = true;
+        } else if (std.ascii.eqlIgnoreCase(acronym, "AP")) {
+            autopilot = true;
+        } else if (!isOfficial(acronym)) {
+            custom = true;
+        }
         if (stable_mods.parseCompact(acronym)) |bits| {
             stable_bits |= bits;
         } else {
@@ -109,6 +153,7 @@ pub fn scoreModFilter(allocator: std.mem.Allocator, mods_json: []const u8) !Lead
         .selected = true,
         .classic = false,
         .stable_bits = if (stable_supported) stable_mods.canonical(stable_bits) else null,
+        .namespace = if (autopilot) .autopilot else if (relax) .relax else if (custom) .custom else .vanilla,
     };
 }
 
@@ -291,6 +336,7 @@ test "leaderboard mod filters distinguish combined exact and classic boards" {
     defer combined.deinit(std.testing.allocator);
     try std.testing.expect(!combined.selected);
     try std.testing.expect(!combined.classic);
+    try std.testing.expectEqual(Namespace.vanilla, combined.namespace);
     try std.testing.expectEqualStrings("[]", combined.exact_json);
     try std.testing.expectEqual(@as(?i32, 0), combined.stable_bits);
 
@@ -319,6 +365,19 @@ test "leaderboard mod filters distinguish combined exact and classic boards" {
     try std.testing.expect(submitted.selected);
     try std.testing.expectEqualStrings("[\"HD\",\"HR\"]", submitted.exact_json);
     try std.testing.expectEqual(@as(?i32, stable_mods.hidden | stable_mods.hard_rock), submitted.stable_bits);
+
+    const relax = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods%5B%5D=HD&mods%5B%5D=RX");
+    defer relax.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Namespace.relax, relax.namespace);
+    try std.testing.expectEqual(@as(?i32, stable_mods.hidden | stable_mods.relax), relax.stable_bits);
+
+    const autopilot = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=RX&mods[]=AP");
+    defer autopilot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Namespace.autopilot, autopilot.namespace);
+
+    const mixed_custom = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=WG&mods[]=RX");
+    defer mixed_custom.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Namespace.relax, mixed_custom.namespace);
 }
 
 test "stable score ids keep source identity for lazer replay downloads" {
@@ -476,6 +535,53 @@ pub const RankingPath = struct {
     ruleset_id: u8,
     kind: RankingKind,
 };
+
+pub const BeatmapSearchSource = enum { upstream, favourites, mine };
+
+pub const BeatmapSearchCategory = struct {
+    source: BeatmapSearchSource = .upstream,
+    upstream_status: ?[]const u8 = null,
+};
+
+pub fn beatmapSearchCategory(value: []const u8) !BeatmapSearchCategory {
+    if (std.mem.eql(u8, value, "any")) return .{};
+    if (std.mem.eql(u8, value, "leaderboard")) return .{ .upstream_status = "1,2,3,4" };
+    if (std.mem.eql(u8, value, "ranked")) return .{ .upstream_status = "1,2" };
+    if (std.mem.eql(u8, value, "qualified")) return .{ .upstream_status = "3" };
+    if (std.mem.eql(u8, value, "loved")) return .{ .upstream_status = "4" };
+    if (std.mem.eql(u8, value, "pending")) return .{ .upstream_status = "-1,0" };
+    if (std.mem.eql(u8, value, "wip")) return .{ .upstream_status = "-1" };
+    if (std.mem.eql(u8, value, "graveyard")) return .{ .upstream_status = "-2" };
+    if (std.mem.eql(u8, value, "favourites")) return .{ .source = .favourites };
+    if (std.mem.eql(u8, value, "mine")) return .{ .source = .mine };
+    return error.InvalidBeatmapSearchCategory;
+}
+
+pub fn beatmapSearchSort(value: []const u8) !?[]const u8 {
+    const direct = [_]struct { lazer: []const u8, upstream: []const u8 }{
+        .{ .lazer = "title_asc", .upstream = "title:asc" },
+        .{ .lazer = "title_desc", .upstream = "title:desc" },
+        .{ .lazer = "artist_asc", .upstream = "artist:asc" },
+        .{ .lazer = "artist_desc", .upstream = "artist:desc" },
+        .{ .lazer = "difficulty_asc", .upstream = "beatmaps.difficulty_rating:asc" },
+        .{ .lazer = "difficulty_desc", .upstream = "beatmaps.difficulty_rating:desc" },
+        .{ .lazer = "updated_asc", .upstream = "last_updated:asc" },
+        .{ .lazer = "updated_desc", .upstream = "last_updated:desc" },
+        .{ .lazer = "ranked_asc", .upstream = "ranked_date:asc" },
+        .{ .lazer = "ranked_desc", .upstream = "ranked_date:desc" },
+        .{ .lazer = "plays_asc", .upstream = "play_count:asc" },
+        .{ .lazer = "plays_desc", .upstream = "play_count:desc" },
+        .{ .lazer = "favourites_asc", .upstream = "favourite_count:asc" },
+        .{ .lazer = "favourites_desc", .upstream = "favourite_count:desc" },
+        .{ .lazer = "rating_asc", .upstream = "favourite_count:asc" },
+        .{ .lazer = "rating_desc", .upstream = "favourite_count:desc" },
+        .{ .lazer = "nominations_asc", .upstream = "ranked_date:asc" },
+        .{ .lazer = "nominations_desc", .upstream = "ranked_date:desc" },
+    };
+    if (std.mem.eql(u8, value, "relevance_asc") or std.mem.eql(u8, value, "relevance_desc")) return null;
+    for (direct) |entry| if (std.mem.eql(u8, value, entry.lazer)) return entry.upstream;
+    return error.InvalidBeatmapSearchSort;
+}
 
 pub const ChannelUserPath = struct {
     channel_id: i64,

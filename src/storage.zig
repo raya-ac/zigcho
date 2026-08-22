@@ -384,7 +384,20 @@ pub const Store = struct {
                 try self.exec(database_sql.sqliteMigration(33));
         }
         if (version < 34) try self.exec(database_sql.sqliteMigration(34));
-        if (version < 35) try self.exec(database_sql.sqliteMigration(35));
+        if (version < 35) {
+            if (try self.hasUpstreamBeatmapSchema())
+                try self.exec(
+                    "BEGIN IMMEDIATE;" ++
+                        "UPDATE bss_counters SET next_id=max(next_id,1000000000);" ++
+                        "CREATE UNIQUE INDEX IF NOT EXISTS beatmap_submissions_replacement ON beatmap_submissions(replacement_set_id) WHERE replacement_set_id IS NOT NULL;" ++
+                        "CREATE INDEX IF NOT EXISTS upstream_users_name ON upstream_users(lower(username),fetched_at DESC,id);" ++
+                        "CREATE INDEX IF NOT EXISTS beatmaps_creator_id ON beatmaps(creator_id,set_id);" ++
+                        "PRAGMA user_version=35;" ++
+                        "COMMIT",
+                )
+            else
+                try self.exec(database_sql.sqliteMigration(35));
+        }
         try self.exec(
             "BEGIN IMMEDIATE;" ++
                 "UPDATE lazer_scores SET best=0;" ++
@@ -518,6 +531,38 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','profile_score_pins','lazer_reports','beatmap_tag_votes')", -1, &tables, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(tables);
         return c.sqlite3_step(tables) == c.SQLITE_ROW and c.sqlite3_column_int(tables, 0) == 11;
+    }
+
+    fn hasUpstreamBeatmapSchema(self: *Store) !bool {
+        var submission_columns: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(beatmap_submissions)", -1, &submission_columns, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(submission_columns);
+        var have_replacement = false;
+        while (c.sqlite3_step(submission_columns) == c.SQLITE_ROW) {
+            if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(submission_columns, 1)), "replacement_set_id")) {
+                have_replacement = true;
+                break;
+            }
+        }
+        if (!have_replacement) return false;
+
+        var beatmap_columns: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(beatmaps)", -1, &beatmap_columns, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(beatmap_columns);
+        var found: u8 = 0;
+        while (c.sqlite3_step(beatmap_columns) == c.SQLITE_ROW) {
+            const name = std.mem.span(c.sqlite3_column_text(beatmap_columns, 1));
+            if (std.mem.eql(u8, name, "creator_id") or
+                std.mem.eql(u8, name, "upstream_plays") or
+                std.mem.eql(u8, name, "upstream_passes") or
+                std.mem.eql(u8, name, "hit_length")) found += 1;
+        }
+        if (found != 4) return false;
+
+        var tables: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('upstream_users','upstream_user_profiles','beatmapset_metadata')", -1, &tables, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(tables);
+        return c.sqlite3_step(tables) == c.SQLITE_ROW and c.sqlite3_column_int(tables, 0) == 3;
     }
 
     fn hasAnticheatReviewSchema(self: *Store) !bool {

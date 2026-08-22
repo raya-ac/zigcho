@@ -1264,7 +1264,7 @@ pub const Store = struct {
         var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT profile_json::text FROM zigcho.upstream_user_profiles WHERE user_id=$1 ORDER BY mode=$2::int DESC,mode=0 DESC,mode LIMIT 1", &.{ id, mode_text });
         defer result.deinit();
         if (result.rows() == 0) return null;
-        return allocator.dupe(u8, result.value(0, 0));
+        return @as(?[]u8, try allocator.dupe(u8, result.value(0, 0)));
     }
 
     pub fn upsertBeatmapSetMetadata(self: *Store, metadata: upstream_user.SetMetadata, fetched_at: i64) !void {

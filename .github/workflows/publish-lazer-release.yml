@@ -1,0 +1,87 @@
+name: publish lazer release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: successful lazer clients run id
+        required: true
+        type: string
+      version:
+        description: client version without a leading v
+        required: true
+        type: string
+      revision:
+        description: exact zigcho commit built by the client run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: verify and publish the client artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: validate the source run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.run_id }}
+          SOURCE_REVISION: ${{ inputs.revision }}
+          CLIENT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CLIENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" --jq .name)" = "lazer clients"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" --jq .status)" = "completed"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" --jq .conclusion)" = "success"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" --jq .head_sha)" = "$SOURCE_REVISION"
+
+      - name: download the exact platform artifacts
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          pattern: zigcho-lazer-*
+          path: artifacts/lazer
+          merge-multiple: true
+
+      - name: verify every package and checksum
+        env:
+          CLIENT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd artifacts/lazer
+          test -f "zigcho-lazer-${CLIENT_VERSION}-windows-x64.zip"
+          test -f "zigcho-lazer-${CLIENT_VERSION}-macos-arm64.zip"
+          test -f "zigcho-lazer-${CLIENT_VERSION}-linux-x64.zip"
+          test -f "zigcho-lazer-${CLIENT_VERSION}-android-arm64.apk"
+          test -f "zigcho-lazer-${CLIENT_VERSION}-ios-arm64.ipa"
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+          done
+          test "$(find . -maxdepth 1 -type f -name '*.sha256' | awk 'END { print NR }')" = 5
+
+      - name: publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLIENT_VERSION: ${{ inputs.version }}
+          SOURCE_REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          tag="lazer-v${CLIENT_VERSION}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists: $tag" >&2
+            exit 1
+          fi
+          gh release create "$tag" artifacts/lazer/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_REVISION" \
+            --title "zigcho!lazer ${CLIENT_VERSION}" \
+            --prerelease \
+            --notes "${CLIENT_VERSION} is the current pinned zigcho!lazer build. it carries the production map, multiplayer and failed BSS reservation fixes from ${SOURCE_REVISION}. every package below was built and checksum-verified on GitHub; nothing was built on a player machine."

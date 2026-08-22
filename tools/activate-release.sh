@@ -100,10 +100,12 @@ fi
 ln -sfn "$candidate" "$current"
 if systemctl start "$service" \
   && curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused "$health_url" >/dev/null \
-  && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$'; then
+  && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$' \
+  && (cd /var/lib/zigcho && "$candidate/zigcho" object-put "backups/postgres/$(basename "$backup")" "$backup"); then
   release_active=yes
   trap - EXIT HUP INT TERM
-  echo "release_active candidate=$candidate rollback=$previous pp_engine=$candidate_pp recalculated=$recalculated"
+  rm -f "$backup" "$backup.sha256"
+  echo "release_active candidate=$candidate rollback=$previous pp_engine=$candidate_pp recalculated=$recalculated backup=object local_backup_removed=true"
   exit 0
 fi
 false

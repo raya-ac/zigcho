@@ -5,14 +5,14 @@ Wants=postgresql.service
 
 [Service]
 Type=oneshot
-User=postgres
-Group=postgres
+User=root
+Group=root
 UMask=0077
 Environment="ZIGCHO_BACKUP_DIR=/var/backups/zigcho"
 Environment="ZIGCHO_POSTGRES_URL=dbname=zigcho"
 Environment="ZIGCHO_POSTGRES_ADMIN_URL=dbname=postgres"
-ExecStart=/opt/zigcho/current/tools/backup-postgres.sh
-ExecStart=/opt/zigcho/current/tools/restore-postgres-drill.sh
+Environment="ZIGCHO_EXPECTED_SCHEMA=31"
+ExecStart=/opt/zigcho/current/tools/backup-postgres-object.sh
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

@@ -135,7 +135,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -5423,6 +5423,9 @@ test "postgres runtime migrates through account and lazer route schema thirty th
     try std.testing.expectEqualStrings("kai", kai.safe_name);
     try std.testing.expect(kai.privileges & (1 << 13) != 0);
     try std.testing.expect(kai.privileges & (1 << 14) != 0);
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
+    defer reopened.close();
+    try reopened.migrate();
 }
 
 test "postgres account auth stats and token slice" {

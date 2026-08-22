@@ -5859,7 +5859,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
         _ = c.sqlite3_bind_int(stmt, 2, mode);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        return allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+        return @as(?[]u8, try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0))));
     }
 
     pub fn upsertBeatmapSetMetadata(self: *Store, metadata: upstream_user.SetMetadata, fetched_at: i64) !void {

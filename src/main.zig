@@ -1114,7 +1114,7 @@ const App = struct {
             defer self.allocator.free(location);
             return respond(req, .permanent_redirect, "text/plain", "", &.{.{ .name = "location", .value = location }});
         }
-        if (std.mem.eql(u8, path, "/multiplayer/negotiate")) {
+        if (web_auth.realtimeHost(host_owned) and std.mem.eql(u8, path, "/multiplayer/negotiate")) {
             if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
             defer freeUser(self.allocator, user);
@@ -1123,7 +1123,7 @@ const App = struct {
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
-        if (std.mem.eql(u8, path, "/multiplayer")) {
+        if (web_auth.realtimeHost(host_owned) and std.mem.eql(u8, path, "/multiplayer")) {
             if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
             defer freeUser(self.allocator, user);
@@ -1139,7 +1139,7 @@ const App = struct {
             };
             return;
         }
-        if (std.mem.eql(u8, path, "/spectator/negotiate")) {
+        if (web_auth.realtimeHost(host_owned) and std.mem.eql(u8, path, "/spectator/negotiate")) {
             if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
             defer freeUser(self.allocator, user);
@@ -1148,7 +1148,7 @@ const App = struct {
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
-        if (std.mem.eql(u8, path, "/spectator")) {
+        if (web_auth.realtimeHost(host_owned) and std.mem.eql(u8, path, "/spectator")) {
             if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
             defer freeUser(self.allocator, user);

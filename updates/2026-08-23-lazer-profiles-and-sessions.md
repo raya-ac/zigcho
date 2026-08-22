@@ -8,7 +8,7 @@ profiles finally agree everywhere. combined stats use the right legacy score and
 
 score stuff has had another full cleanout. Stable Classic, lazer, Relax and Autopilot keep their own identities. exact mod filters are exact, the normal board combines the mods we accept, and a worse play cannot steal a user's place just because its raw score is strange. custom DT and NC rates keep their real speed. replays only get a download when there is a real replay we are allowed to give back. score submits update the correct stats, rank panel, achievements and announcements, including fails without pretending the fail passed.
 
-chat is not three fake systems anymore. Stable, lazer, the website, DMs, kai commands and IRC use the same history and moderation rules. score posts go in `#announce`, not into some random kai DM. rooms, invites, room scores, Quick Play, ranked duels and live spectating all have their actual REST and realtime paths too.
+chat is not three fake systems anymore. Stable, lazer, the website, DMs, kai commands and IRC use the same history and moderation rules. score posts go in `#announce`, not into some random kai DM. rooms, invites, room scores, Quick Play, ranked duels and live spectating all have their actual REST and realtime paths too. the public multiplayer page and the multiplayer websocket are host-scoped now, so opening the website tab does not ask for a game bearer token.
 
 BSS is here for lazer as well. premium users can reserve map ids, upload a full set or patch one, keep ownership of their set and send WIP or Pending maps into the same BN queue as the rest of the server. it is still lazer-only and it does not mess with Stable's map or score rules.
 

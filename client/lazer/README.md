@@ -26,6 +26,6 @@ Windows has its own repeatable production build now. The PowerShell path applies
   -OutputDirectory artifacts/lazer
 ```
 
-The result is `zigcho-lazer-0.1.0-alpha.8-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
+The result is `zigcho-lazer-0.1.0-alpha.9-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
 
 This is a portable alpha. There is no installer. Open `app/osu!.exe` after extracting the whole folder; Windows may warn because the executable is unsigned. Public chat runs over the REST fallback. Leaderboard availability comes from zigcho for every map with an online ID instead of trusting stale local rank metadata. Normal rooms, Quick Play, two-player ranked matches and live spectating all use their real server paths now.

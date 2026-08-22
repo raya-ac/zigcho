@@ -3,6 +3,7 @@ const domain = @import("domain.zig");
 const storage = @import("runtime_storage.zig");
 
 pub const max_rooms = 64;
+pub const Activity = enum { lobby, queue, multiplayer, playing };
 pub const max_connections = 128;
 pub const max_users = 16;
 pub const max_playlist = 32;
@@ -612,6 +613,37 @@ pub const Manager = struct {
             if (connection.alive and connection.user_id == user_id) found = connection;
         }
         return found;
+    }
+
+    pub fn activity(self: *Manager, user_id: i32) ?Activity {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const connection = self.connectionByUserLocked(user_id) orelse return null;
+        if (connection.room_id) |room_id| {
+            const room = self.roomByIdLocked(room_id) orelse return .multiplayer;
+            return if (room.state == 1 or room.state == 2) .playing else .multiplayer;
+        }
+        if (connection.queue_pool_id != null or connection.pending_match_id != null) return .queue;
+        if (connection.lobby_pool_id != null) return .lobby;
+        return null;
+    }
+
+    pub fn disconnectUser(self: *Manager, user_id: i32) bool {
+        var targets: [max_connections]*Connection = undefined;
+        var count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (self.connections.items) |connection| {
+            if (!connection.alive or connection.user_id != user_id or count == targets.len) continue;
+            connection.retain();
+            targets[count] = connection;
+            count += 1;
+        }
+        self.mutex.unlock(self.io);
+        for (targets[0..count]) |connection| {
+            connection.close();
+            connection.release();
+        }
+        return count != 0;
     }
 
     fn pendingMatchByIdLocked(self: *Manager, match_id: u32) ?*PendingMatch {

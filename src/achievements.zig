@@ -1,10 +1,11 @@
 const std = @import("std");
 
 pub const legacy_count = 83;
-pub const count = 203;
+pub const official_count = 109;
+pub const count = 229;
 
 pub const Achievement = struct {
-    id: u8,
+    id: u16,
     file: []const u8,
     name: []const u8,
     description: []const u8,
@@ -19,19 +20,25 @@ pub const Input = struct {
     stars: f64,
     accuracy: f64 = 0,
     pp: f64 = 0,
+    plays: i64 = 0,
+    total_hits: i64 = 0,
+    global_rank: i64 = 0,
+    mod_intro_eligible: bool = false,
+    conversion_mod: bool = false,
+    fun_mod: bool = false,
 };
 
 pub const Unlocks = struct {
-    ids: [count]u8 = [_]u8{0} ** count,
-    len: u8 = 0,
+    ids: [count]u16 = [_]u16{0} ** count,
+    len: usize = 0,
 
-    pub fn append(self: *Unlocks, id: u8) void {
+    pub fn append(self: *Unlocks, id: u16) void {
         if (self.len == count) return;
         self.ids[self.len] = id;
         self.len += 1;
     }
 
-    pub fn slice(self: *const Unlocks) []const u8 {
+    pub fn slice(self: *const Unlocks) []const u16 {
         return self.ids[0..self.len];
     }
 };
@@ -122,12 +129,41 @@ const legacy_catalog = [_]Achievement{
     .{ .id = 83, .file = "all-intro-spunout", .name = "Burned Out", .description = "One cannot always spin to win." },
 };
 
+const official_extra_catalog = [_]Achievement{
+    .{ .id = 204, .file = "all-skill-highranker-1", .name = "I Can See The Top", .description = "Your dedication has paid off. Welcome to the top 50,000!" },
+    .{ .id = 205, .file = "all-skill-highranker-2", .name = "The Gradual Rise", .description = "There's no stopping you, is there? Welcome to the top 10,000!" },
+    .{ .id = 206, .file = "all-skill-highranker-3", .name = "Scaling Up", .description = "Welcome to the top 5,000. Never give up!" },
+    .{ .id = 207, .file = "all-skill-highranker-4", .name = "Approaching The Summit", .description = "Pro tier. Welcome to the top 1,000!" },
+    .{ .id = 208, .file = "osu-plays-5000", .name = "5,000 Plays", .description = "There's a lot more where that came from." },
+    .{ .id = 209, .file = "osu-plays-15000", .name = "15,000 Plays", .description = "Must.. click.. circles.." },
+    .{ .id = 210, .file = "osu-plays-25000", .name = "25,000 Plays", .description = "There's no going back." },
+    .{ .id = 211, .file = "osu-plays-50000", .name = "50,000 Plays", .description = "You're here forever." },
+    .{ .id = 212, .file = "taiko-hits-30000", .name = "30,000 Drum Hits", .description = "Did that drum have a face?" },
+    .{ .id = 213, .file = "taiko-hits-300000", .name = "300,000 Drum Hits", .description = "The rhythm never stops." },
+    .{ .id = 214, .file = "taiko-hits-3000000", .name = "3,000,000 Drum Hits", .description = "Truly, the Don of dons." },
+    .{ .id = 215, .file = "taiko-hits-30000000", .name = "30,000,000 Drum Hits", .description = "Your rhythm, eternal." },
+    .{ .id = 216, .file = "fruits-hits-20000", .name = "Catch 20,000 fruits", .description = "That is a lot of dietary fiber." },
+    .{ .id = 217, .file = "fruits-hits-200000", .name = "Catch 200,000 fruits", .description = "So, I heard you like fruit..." },
+    .{ .id = 218, .file = "fruits-hits-2000000", .name = "Catch 2,000,000 fruits", .description = "Downright healthy." },
+    .{ .id = 219, .file = "fruits-hits-20000000", .name = "Catch 20,000,000 fruits", .description = "Nothing left behind." },
+    .{ .id = 220, .file = "mania-hits-40000", .name = "40,000 Keys", .description = "Just the start of the rainbow." },
+    .{ .id = 221, .file = "mania-hits-400000", .name = "400,000 Keys", .description = "Four hundred thousand and still not even close." },
+    .{ .id = 222, .file = "mania-hits-4000000", .name = "4,000,000 Keys", .description = "Is this the end of the rainbow?" },
+    .{ .id = 223, .file = "mania-hits-40000000", .name = "40,000,000 Keys", .description = "When someone asks which keys you play, the answer is now 'yes'." },
+    .{ .id = 224, .file = "all-intro-conversion", .name = "Gear Shift", .description = "Tailor your experience to your perfect fit." },
+    .{ .id = 225, .file = "all-intro-fun", .name = "Game Night", .description = "Mum said it's my turn with the beatmap!" },
+    .{ .id = 226, .file = "all-skill-dc-1", .name = "Daily Sprout", .description = "Ready for anything." },
+    .{ .id = 227, .file = "all-skill-dc-7", .name = "Weekly Sapling", .description = "Circadian rhythm calibrated." },
+    .{ .id = 228, .file = "all-skill-dc-30", .name = "Monthly Shrub", .description = "In for the grind." },
+    .{ .id = 229, .file = "osu-skill-cyclone", .name = "Cyclone", .description = "Clockwise or anticlockwise, that is the question." },
+};
+
 pub const catalog = blk: {
     @setEvalBranchQuota(250_000);
     var result: [count]Achievement = undefined;
     for (legacy_catalog, 0..) |achievement, index| result[index] = achievement;
     const modes = [_][]const u8{ "osu", "taiko", "catch", "mania" };
-    var id: u8 = legacy_count + 1;
+    var id: u16 = legacy_count + 1;
     for (modes) |mode| for (11..16) |level| {
         result[id - 1] = .{
             .id = id,
@@ -176,11 +212,15 @@ pub const catalog = blk: {
         };
         id += 1;
     }
+    for (official_extra_catalog) |achievement| {
+        result[id - 1] = achievement;
+        id += 1;
+    }
     if (id != count + 1) @compileError("achievement catalogue count is stale");
     break :blk result;
 };
 
-pub fn byId(id: u8) ?Achievement {
+pub fn byId(id: u16) ?Achievement {
     if (id == 0 or id > catalog.len) return null;
     return catalog[id - 1];
 }
@@ -189,55 +229,79 @@ fn starLevel(input: Input, mode: u8, level: u8, requires_perfect: bool) bool {
     return input.mode == mode and (!requires_perfect or input.perfect) and input.stars >= @as(f64, @floatFromInt(level)) and input.stars < @as(f64, @floatFromInt(level + 1));
 }
 
-pub fn matches(id: u8, input: Input) bool {
+pub fn matches(id: u16, input: Input) bool {
+    if (id == 224) return input.mod_intro_eligible and input.conversion_mod;
+    if (id == 225) return input.mod_intro_eligible and input.fun_mod;
     if (!input.eligible or !std.math.isFinite(input.stars) or input.stars < 0) return false;
-    if (id >= 1 and id <= 10) return input.mods & 1 == 0 and starLevel(input, 0, id, false);
-    if (id >= 11 and id <= 20) return starLevel(input, 0, id - 10, true);
-    if (id == 21) return input.mode == 0 and input.max_combo >= 500 and input.max_combo < 750;
-    if (id == 22) return input.mode == 0 and input.max_combo >= 750 and input.max_combo < 1000;
-    if (id == 23) return input.mode == 0 and input.max_combo >= 1000 and input.max_combo < 2000;
+    const difficulty_reduction = @as(u32, 1 | 2 | 256);
+    const skill_eligible = input.mods & difficulty_reduction == 0;
+    if (id >= 1 and id <= 10) return skill_eligible and starLevel(input, 0, @intCast(id), false);
+    if (id >= 11 and id <= 20) return skill_eligible and starLevel(input, 0, @intCast(id - 10), true);
+    if (id == 21) return input.mode == 0 and input.max_combo >= 500;
+    if (id == 22) return input.mode == 0 and input.max_combo >= 750;
+    if (id == 23) return input.mode == 0 and input.max_combo >= 1000;
     if (id == 24) return input.mode == 0 and input.max_combo >= 2000;
-    if (id >= 25 and id <= 32) return input.mods & 1 == 0 and starLevel(input, 1, id - 24, false);
-    if (id >= 33 and id <= 40) return starLevel(input, 1, id - 32, true);
-    if (id >= 41 and id <= 48) return input.mods & 1 == 0 and starLevel(input, 2, id - 40, false);
-    if (id >= 49 and id <= 56) return starLevel(input, 2, id - 48, true);
-    if (id >= 57 and id <= 64) return input.mods & 1 == 0 and starLevel(input, 3, id - 56, false);
-    if (id >= 65 and id <= 72) return starLevel(input, 3, id - 64, true);
+    if (id >= 25 and id <= 32) return skill_eligible and starLevel(input, 1, @intCast(id - 24), false);
+    if (id >= 33 and id <= 40) return skill_eligible and starLevel(input, 1, @intCast(id - 32), true);
+    if (id >= 41 and id <= 48) return skill_eligible and starLevel(input, 2, @intCast(id - 40), false);
+    if (id >= 49 and id <= 56) return skill_eligible and starLevel(input, 2, @intCast(id - 48), true);
+    if (id >= 57 and id <= 64) return skill_eligible and starLevel(input, 3, @intCast(id - 56), false);
+    if (id >= 65 and id <= 72) return skill_eligible and starLevel(input, 3, @intCast(id - 64), true);
     if (id <= legacy_count) return switch (id) {
         73 => input.mods == 32,
-        74 => input.mods & 8 != 0,
-        75 => input.mods & 16_384 != 0,
-        76 => input.mods & 16 != 0,
-        77 => input.mods & 64 != 0,
-        78 => input.mods & 1_024 != 0,
-        79 => input.mods & 2 != 0,
-        80 => input.mods & 1 != 0,
-        81 => input.mods & 512 != 0,
-        82 => input.mods & 256 != 0,
-        83 => input.mods & 4_096 != 0,
+        74 => input.mods == 8,
+        75 => input.mods == 16_416,
+        76 => input.mods == 16,
+        77 => input.mods == 64,
+        78 => input.mods == 1_024,
+        79 => input.mods == 2,
+        80 => input.mods == 1,
+        81 => input.mods == 576,
+        82 => input.mods == 256,
+        83 => input.mode == 0 and input.mods == 4_096,
         else => false,
     };
     if (id >= 84 and id <= 103) {
         const offset = id - 84;
-        return starLevel(input, offset / 5, 11 + offset % 5, false);
+        return starLevel(input, @intCast(offset / 5), @intCast(11 + offset % 5), false);
     }
     if (id >= 104 and id <= 131) {
         const offset = id - 104;
-        return starLevel(input, offset / 7, 9 + offset % 7, true);
+        return starLevel(input, @intCast(offset / 7), @intCast(9 + offset % 7), true);
     }
     if (id >= 132 and id <= 159) {
         const thresholds = [_]f64{ 0.90, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0 };
         const offset = id - 132;
-        return input.mode == offset / 7 and input.accuracy >= thresholds[offset % 7];
+        return input.mode == @as(u8, @intCast(offset / 7)) and input.accuracy >= thresholds[offset % 7];
     }
     if (id >= 160 and id <= 199) {
         const thresholds = [_]f64{ 25, 50, 100, 150, 200, 300, 400, 500, 750, 1000 };
         const offset = id - 160;
-        return input.mode == offset / 10 and input.pp >= thresholds[offset % 10];
+        return input.mode == @as(u8, @intCast(offset / 10)) and input.pp >= thresholds[offset % 10];
     }
     if (id >= 200 and id <= 203) {
         const thresholds = [_]u32{ 3000, 5000, 7500, 10_000 };
         return input.mode == 0 and input.max_combo >= thresholds[id - 200];
+    }
+    if (id >= 204 and id <= 207) {
+        const thresholds = [_]i64{ 50_000, 10_000, 5_000, 1_000 };
+        return input.global_rank > 0 and input.global_rank <= thresholds[id - 204];
+    }
+    if (id >= 208 and id <= 211) {
+        const thresholds = [_]i64{ 5_000, 15_000, 25_000, 50_000 };
+        return input.mode == 0 and input.plays >= thresholds[id - 208];
+    }
+    if (id >= 212 and id <= 215) {
+        const thresholds = [_]i64{ 30_000, 300_000, 3_000_000, 30_000_000 };
+        return input.mode == 1 and input.total_hits >= thresholds[id - 212];
+    }
+    if (id >= 216 and id <= 219) {
+        const thresholds = [_]i64{ 20_000, 200_000, 2_000_000, 20_000_000 };
+        return input.mode == 2 and input.total_hits >= thresholds[id - 216];
+    }
+    if (id >= 220 and id <= 223) {
+        const thresholds = [_]i64{ 40_000, 400_000, 4_000_000, 40_000_000 };
+        return input.mode == 3 and input.total_hits >= thresholds[id - 220];
     }
     return false;
 }
@@ -258,7 +322,7 @@ pub fn writeStable(writer: *std.Io.Writer, unlocks: Unlocks) !void {
     }
 }
 
-pub fn writeJson(writer: *std.Io.Writer, id: u8, achieved_at: i64, include_metadata: bool) !void {
+pub fn writeJson(writer: *std.Io.Writer, id: u16, achieved_at: i64, include_metadata: bool) !void {
     const achievement = byId(id) orelse return error.InvalidAchievement;
     try writer.print("{{\"achievement_id\":{d},\"achieved_at\":{d}", .{ id, achieved_at });
     if (include_metadata) {
@@ -292,10 +356,21 @@ pub fn writeLazerUnlocks(writer: *std.Io.Writer, unlocks: Unlocks, user_id: i32)
 
 test "catalog is dense and compatible conditions stay bounded" {
     try std.testing.expectEqual(@as(usize, count), catalog.len);
-    for (catalog, 1..) |achievement, id| try std.testing.expectEqual(@as(u8, @intCast(id)), achievement.id);
+    for (catalog, 1..) |achievement, id| try std.testing.expectEqual(@as(u16, @intCast(id)), achievement.id);
     const unlocks = candidates(.{ .eligible = true, .mode = 0, .mods = 8, .perfect = true, .max_combo = 750, .stars = 4.2, .accuracy = 0.99, .pp = 210 });
-    try std.testing.expectEqualSlices(u8, &.{ 4, 14, 22, 74, 132, 133, 134, 135, 136, 160, 161, 162, 163, 164 }, unlocks.slice());
+    try std.testing.expectEqualSlices(u16, &.{ 4, 14, 21, 22, 74, 132, 133, 134, 135, 136, 160, 161, 162, 163, 164 }, unlocks.slice());
     try std.testing.expectEqual(@as(usize, 0), candidates(.{ .eligible = false, .mode = 0, .mods = 8, .perfect = true, .max_combo = 750, .stars = 4.2 }).slice().len);
+}
+
+test "official skill dedication and lazer mod medals use exact rules" {
+    try std.testing.expect(!matches(4, .{ .eligible = true, .mode = 0, .mods = 2, .perfect = false, .max_combo = 0, .stars = 4.2 }));
+    try std.testing.expect(!matches(74, .{ .eligible = true, .mode = 0, .mods = 8 | 16, .perfect = false, .max_combo = 0, .stars = 1 }));
+    try std.testing.expect(matches(204, .{ .eligible = true, .mode = 0, .mods = 0, .perfect = false, .max_combo = 0, .stars = 1, .global_rank = 42_000 }));
+    try std.testing.expect(matches(208, .{ .eligible = true, .mode = 0, .mods = 0, .perfect = false, .max_combo = 0, .stars = 1, .plays = 5_000 }));
+    try std.testing.expect(matches(215, .{ .eligible = true, .mode = 1, .mods = 0, .perfect = false, .max_combo = 0, .stars = 1, .total_hits = 30_000_000 }));
+    try std.testing.expect(matches(224, .{ .eligible = false, .mode = 0, .mods = 0, .perfect = false, .max_combo = 0, .stars = 0, .mod_intro_eligible = true, .conversion_mod = true }));
+    try std.testing.expect(matches(225, .{ .eligible = false, .mode = 0, .mods = 0, .perfect = false, .max_combo = 0, .stars = 0, .mod_intro_eligible = true, .fun_mod = true }));
+    try std.testing.expect(!matches(226, .{ .eligible = true, .mode = 0, .mods = 0, .perfect = false, .max_combo = 0, .stars = 1 }));
 }
 
 test "stable unlock text is exact and JSON escapes metadata" {

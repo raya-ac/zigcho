@@ -10,6 +10,7 @@ osu! does not use one neat origin. stable and lazer both expect a collection of 
 - `s` serves the Stable screenshot upload links under `/ss/{filename}`
 - `assets` and `i` serve beatmap covers, previews, and images
 - `b`, `bm6`, and `bm10` are kept for beatmap metadata and archive delivery
+- `beatmaps` is the object-backed `.osz` mirror; a miss is fetched, fully checked, stored, and then served from Contabo
 - `spectator` is kept for lazer spectator and multiplayer streams
 - `bss` is kept for beatmap submission traffic
 

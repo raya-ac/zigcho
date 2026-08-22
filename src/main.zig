@@ -18,7 +18,7 @@ const achievements = @import("achievements.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
 const screenshot = @import("screenshot.zig");
-const status_page = @embedFile("status.html");
+const index_page = @embedFile("index.html");
 const form_urlencoded = @import("form_urlencoded.zig");
 const registration = @import("registration.zig");
 const routing = @import("routing.zig");
@@ -177,6 +177,49 @@ const App = struct {
     avatar_cache: avatar_cache.Cache,
     geo_client: std.http.Client,
     started_at: i64,
+
+    fn prefetchBeatmapMirror(self: *App) void {
+        std.log.info("event=beatmap_mirror_prefetch_started", .{});
+        std.Io.sleep(self.store.io, .fromSeconds(10), .awake) catch return;
+        while (true) {
+            const unknown_sizes = self.store.beatmapArchiveIdsMissingSize(self.allocator, 32) catch |err| {
+                std.log.warn("event=beatmap_mirror_inventory_list_failed error={t}", .{err});
+                std.Io.sleep(self.store.io, .fromSeconds(60), .awake) catch return;
+                continue;
+            };
+            for (unknown_sizes) |set_id| {
+                const archive = self.store.beatmapArchive(self.allocator, set_id) catch |err| {
+                    std.log.warn("event=beatmap_mirror_inventory_read_failed set_id={d} error={t}", .{ set_id, err });
+                    continue;
+                } orelse continue;
+                self.store.setBeatmapArchiveSize(set_id, archive.len) catch |err|
+                    std.log.warn("event=beatmap_mirror_inventory_write_failed set_id={d} error={t}", .{ set_id, err });
+                self.allocator.free(archive);
+                std.Io.sleep(self.store.io, .fromSeconds(1), .awake) catch return;
+            }
+            self.allocator.free(unknown_sizes);
+            const ids = self.store.beatmapSetIdsMissingArchives(self.allocator, 100) catch |err| {
+                std.log.warn("event=beatmap_mirror_prefetch_list_failed error={t}", .{err});
+                std.Io.sleep(self.store.io, .fromSeconds(60), .awake) catch return;
+                continue;
+            };
+            defer self.allocator.free(ids);
+            if (ids.len == 0) {
+                std.Io.sleep(self.store.io, .fromSeconds(900), .awake) catch return;
+                continue;
+            }
+            for (ids) |set_id| {
+                const mirrored = self.map_sync.prefetchMirrorArchive(&self.store, set_id) catch |err| {
+                    std.log.warn("event=beatmap_mirror_prefetch_failed set_id={d} error={t}", .{ set_id, err });
+                    std.Io.sleep(self.store.io, .fromSeconds(10), .awake) catch return;
+                    continue;
+                };
+                self.allocator.free(mirrored.data);
+                std.log.info("event=beatmap_mirror_prefetch_stored set_id={d}", .{set_id});
+                std.Io.sleep(self.store.io, .fromSeconds(3), .awake) catch return;
+            }
+        }
+    }
 
     fn anticheatNamespace(mods: i32) u32 {
         if (mods & stable_mods.autopilot != 0) return anticheat_abi.Namespace.autopilot;
@@ -441,6 +484,12 @@ const App = struct {
         return std.ascii.eqlIgnoreCase(host[0..end], "a.kai.ovh");
     }
 
+    fn isBeatmapMirrorHost(value: ?[]const u8) bool {
+        const raw = value orelse return false;
+        const end = std.mem.findScalar(u8, raw, ':') orelse raw.len;
+        return std.ascii.eqlIgnoreCase(raw[0..end], "beatmaps.kai.ovh");
+    }
+
     fn isLocalMetricsHost(value: ?[]const u8) bool {
         const raw = value orelse return false;
         const host = if (raw.len > 0 and raw[0] == '[') raw else if (std.mem.findScalar(u8, raw, ':')) |colon| raw[0..colon] else raw;
@@ -464,6 +513,83 @@ const App = struct {
         self.sessions.mutex.lockUncancelable(self.sessions.io);
         defer self.sessions.mutex.unlock(self.sessions.io);
         return self.sessions.byUser(user_id) != null;
+    }
+
+    fn combinedOnlineCount(self: *App) !usize {
+        const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
+        const stable_ids = try self.sessions.onlineUserIds(self.allocator);
+        defer self.allocator.free(stable_ids);
+        const lazer_ids = try self.store.recentOauthUserIds(self.allocator, cutoff);
+        defer self.allocator.free(lazer_ids);
+        var ids: std.ArrayList(i32) = .empty;
+        defer ids.deinit(self.allocator);
+        try ids.ensureTotalCapacity(self.allocator, stable_ids.len + lazer_ids.len);
+        for (stable_ids) |id| if (id != 3 and std.mem.indexOfScalar(i32, ids.items, id) == null) ids.appendAssumeCapacity(id);
+        for (lazer_ids) |id| if (id != 3 and std.mem.indexOfScalar(i32, ids.items, id) == null) ids.appendAssumeCapacity(id);
+        return ids.items.len;
+    }
+
+    fn stableActionName(action: u8) []const u8 {
+        return switch (action) {
+            1 => "away",
+            2 => "playing",
+            3 => "editing a beatmap",
+            4 => "modding a beatmap",
+            5 => "in multiplayer",
+            6 => "watching a replay",
+            8 => "testing a beatmap",
+            9 => "submitting a beatmap",
+            10 => "paused",
+            11 => "in the multiplayer lobby",
+            12 => "in multiplayer",
+            else => "idle",
+        };
+    }
+
+    fn profilePresenceJson(self: *App, user_id: i32) ![]u8 {
+        const stable_presence = self.sessions.publicPresence(user_id);
+        const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
+        const lazer_online = if (stable_presence == null) try self.store.lazerUserOnline(user_id, cutoff) else false;
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        if (stable_presence) |presence| {
+            try output.writer.writeAll("{\"online\":true,\"client\":\"stable\",\"client_label\":\"Stable\",\"activity\":");
+            try std.json.Stringify.value(stableActionName(presence.action), .{}, &output.writer);
+            try output.writer.writeAll(",\"detail\":");
+            try std.json.Stringify.value(presence.info(), .{}, &output.writer);
+            try output.writer.print(",\"mode\":{d},\"mods\":{d},\"beatmap_id\":{d}}}", .{ presence.mode, presence.mods, presence.map_id });
+        } else if (lazer_online) {
+            const spectator_activity = self.lazer_spectator.activity(user_id);
+            const multiplayer_activity = self.lazer_multiplayer.activity(user_id);
+            const activity: []const u8 = if (spectator_activity) |current| switch (current) {
+                .playing => "playing",
+                .spectating => "spectating",
+            } else if (multiplayer_activity) |current| switch (current) {
+                .lobby => "in the multiplayer lobby",
+                .queue => "in matchmaking",
+                .multiplayer => "in multiplayer",
+                .playing => "playing multiplayer",
+            } else "in lazer";
+            try output.writer.writeAll("{\"online\":true,\"client\":\"lazer\",\"client_label\":\"lazer\",\"activity\":");
+            try std.json.Stringify.value(activity, .{}, &output.writer);
+            try output.writer.writeAll(",\"detail\":\"\",\"mode\":null,\"mods\":null,\"beatmap_id\":null}");
+        } else {
+            try output.writer.writeAll("{\"online\":false,\"client\":null,\"client_label\":\"offline\",\"activity\":\"offline\",\"detail\":\"\",\"mode\":null,\"mods\":null,\"beatmap_id\":null}");
+        }
+        return output.toOwnedSlice();
+    }
+
+    fn attachProfilePresence(self: *App, profile: []const u8, user_id: i32) ![]u8 {
+        if (profile.len == 0 or profile[profile.len - 1] != '}') return error.InvalidProfileJson;
+        const presence = try self.profilePresenceJson(user_id);
+        defer self.allocator.free(presence);
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll(profile[0 .. profile.len - 1]);
+        try output.writer.writeAll(",\"presence\":");
+        try output.writer.writeAll(presence);
+        try output.writer.writeByte('}');
+        return output.toOwnedSlice();
     }
 
     fn afterLazerScore(self: *App, user: domain.User, score_id: i64, score: lazer.ScoreInput, pp_value: f64, mods_json: []const u8) ?domain.ScorePlacement {
@@ -731,7 +857,7 @@ const App = struct {
         defer if (origin_owned) |v| self.allocator.free(v);
         const client_ip_owned: ?[]u8 = if (proxy.clientIp(peer_ip, trusted_proxy, header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"))) |v| try self.allocator.dupe(u8, v) else null;
         defer if (client_ip_owned) |v| self.allocator.free(v);
-        if ((req.head.method == .GET or req.head.method == .HEAD) and web_auth.protocolHost(host_owned) and routing.websitePage(path)) {
+        if ((req.head.method == .GET or req.head.method == .HEAD) and !std.mem.eql(u8, path, "/") and web_auth.protocolHost(host_owned) and routing.websitePage(path)) {
             const location = try std.fmt.allocPrint(self.allocator, "https://kai.ovh{s}", .{target});
             defer self.allocator.free(location);
             return respond(req, .permanent_redirect, "text/plain", "", &.{.{ .name = "location", .value = location }});
@@ -807,17 +933,13 @@ const App = struct {
         defer if (body.len > 0) self.allocator.free(body);
 
         if (std.mem.eql(u8, path, "/health")) {
-            self.sessions.mutex.lockUncancelable(self.sessions.io);
-            defer self.sessions.mutex.unlock(self.sessions.io);
             var buf: [256]u8 = undefined;
-            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{self.sessions.humanCount()});
+            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{try self.combinedOnlineCount()});
             return respond(req, .ok, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/metrics")) {
             if (req.head.method != .GET or !isLocalMetricsHost(host_owned)) return respond(req, .not_found, "text/plain", "not found\n", &.{});
-            self.sessions.mutex.lockUncancelable(self.sessions.io);
-            const online = self.sessions.humanCount();
-            self.sessions.mutex.unlock(self.sessions.io);
+            const online = try self.combinedOnlineCount();
             const counts = try self.store.serverCounts();
             const cache = try self.store.beatmapCacheStats();
             const media_cache = try self.store.beatmapMediaCacheStats();
@@ -846,24 +968,38 @@ const App = struct {
                     "# TYPE zigcho_beatmap_hydration_capacity_skips counter\nzigcho_beatmap_hydration_capacity_skips {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_pruned_entries counter\nzigcho_beatmap_cache_pruned_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_cache_pruned_bytes counter\nzigcho_beatmap_cache_pruned_bytes {d}\n" ++
+                    "# TYPE zigcho_beatmap_mirror_hits counter\nzigcho_beatmap_mirror_hits {d}\n" ++
+                    "# TYPE zigcho_beatmap_mirror_misses counter\nzigcho_beatmap_mirror_misses {d}\n" ++
+                    "# TYPE zigcho_beatmap_mirror_fills counter\nzigcho_beatmap_mirror_fills {d}\n" ++
+                    "# TYPE zigcho_beatmap_mirror_failures counter\nzigcho_beatmap_mirror_failures {d}\n" ++
+                    "# TYPE zigcho_beatmap_mirror_bytes_served counter\nzigcho_beatmap_mirror_bytes_served {d}\n" ++
                     "# TYPE zigcho_beatmap_media_fetch_attempts counter\nzigcho_beatmap_media_fetch_attempts {d}\n" ++
                     "# TYPE zigcho_beatmap_media_fetch_successes counter\nzigcho_beatmap_media_fetch_successes {d}\n" ++
                     "# TYPE zigcho_beatmap_media_fetch_failures counter\nzigcho_beatmap_media_fetch_failures {d}\n" ++
                     "# TYPE zigcho_beatmap_media_cache_pruned_entries counter\nzigcho_beatmap_media_cache_pruned_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_media_cache_pruned_bytes counter\nzigcho_beatmap_media_cache_pruned_bytes {d}\n" ++
                     "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
-                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.capacity_skips, hydration.pruned_entries, hydration.pruned_bytes, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
+                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.capacity_skips, hydration.pruned_entries, hydration.pruned_bytes, hydration.mirror_hits, hydration.mirror_misses, hydration.mirror_fills, hydration.mirror_failures, hydration.mirror_bytes_served, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
             );
             return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         if (std.mem.eql(u8, path, "/api/v1/status")) {
-            self.sessions.mutex.lockUncancelable(self.sessions.io);
-            const online = self.sessions.humanCount();
-            self.sessions.mutex.unlock(self.sessions.io);
+            const online = try self.combinedOnlineCount();
             const counts = try self.store.serverCounts();
             var buf: [384]u8 = undefined;
             const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"stage\":\"stable\",\"online\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"protocol\":19}}", .{ online, counts.users, counts.plays, counts.passed, counts.maps });
             return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v1/mirror/status")) {
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const cache = try self.store.beatmapCacheStats();
+            const pending = try self.store.beatmapMirrorPendingCount();
+            const metrics = self.map_sync.metrics();
+            const capacity: u64 = 1_500_000_000_000;
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.print("{{\"ok\":true,\"service\":\"beatmap mirror\",\"stored_sets\":{d},\"stored_bytes\":{d},\"capacity_bytes\":{d},\"known_sets_waiting\":{d},\"hits\":{d},\"misses\":{d},\"fills\":{d},\"failures\":{d},\"bytes_served\":{d}}}", .{ cache.entries, cache.bytes, capacity, pending, metrics.mirror_hits, metrics.mirror_misses, metrics.mirror_fills, metrics.mirror_failures, metrics.mirror_bytes_served });
+            return respond(req, .ok, "application/json", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         if (std.mem.eql(u8, path, "/api/v1/appeals")) {
             const no_store = [_]std.http.Header{
@@ -1185,7 +1321,24 @@ const App = struct {
                     defer freeUser(self.allocator, target_user);
                     if (!web_auth.canManage(staff_user, target_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"protected player\"}", &no_store);
                     const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
-                    if (std.mem.eql(u8, action, "note")) {
+                    if (std.mem.eql(u8, action, "kick")) {
+                        var stable_kicked = false;
+                        self.sessions.mutex.lockUncancelable(self.sessions.io);
+                        if (self.sessions.byUser(target_id)) |online| {
+                            var packet = protocol.Writer.init(self.allocator);
+                            defer packet.deinit();
+                            try packet.packetString(.notification, trimmed_reason);
+                            try packet.packetInt(.restart, 0);
+                            try online.enqueue(self.allocator, packet.bytes());
+                            stable_kicked = true;
+                        }
+                        self.sessions.mutex.unlock(self.sessions.io);
+                        const revoked = try self.store.revokeGameTokensForUser(target_id);
+                        const multiplayer_kicked = self.lazer_multiplayer.disconnectUser(target_id);
+                        const spectator_kicked = self.lazer_spectator.disconnectUser(target_id);
+                        if (!stable_kicked and revoked == 0 and !multiplayer_kicked and !spectator_kicked) return respond(req, .conflict, "application/json", "{\"error\":\"player is not online\"}", &no_store);
+                        try self.store.recordModerationAction(staff_user.id, target_id, "account.kick", trimmed_reason);
+                    } else if (std.mem.eql(u8, action, "note")) {
                         try self.store.addModerationNote(staff_user.id, target_id, trimmed_reason);
                     } else if (std.mem.eql(u8, action, "silence") or std.mem.eql(u8, action, "unsilence")) {
                         var seconds: i64 = 0;
@@ -1216,24 +1369,31 @@ const App = struct {
                         const restricted = std.mem.eql(u8, action, "restrict");
                         if (target_user.restricted == restricted) return respond(req, .conflict, "application/json", "{\"error\":\"player already has that state\"}", &no_store);
                         try self.store.setRestricted(staff_user.id, target_id, restricted, trimmed_reason);
-                        self.sessions.mutex.lockUncancelable(self.sessions.io);
-                        defer self.sessions.mutex.unlock(self.sessions.io);
-                        if (self.sessions.byUser(target_id)) |online| {
-                            online.user.restricted = restricted;
-                            var packet = protocol.Writer.init(self.allocator);
-                            defer packet.deinit();
-                            if (restricted) {
-                                try packet.packetEmpty(.account_restricted);
-                                var visibility = protocol.Writer.init(self.allocator);
-                                defer visibility.deinit();
-                                const start = try visibility.begin(.user_logout);
-                                try visibility.int(i32, target_id);
-                                try visibility.byte(0);
-                                visibility.finish(start);
-                                try self.sessions.broadcast(visibility.bytes(), online);
+                        {
+                            self.sessions.mutex.lockUncancelable(self.sessions.io);
+                            defer self.sessions.mutex.unlock(self.sessions.io);
+                            if (self.sessions.byUser(target_id)) |online| {
+                                online.user.restricted = restricted;
+                                var packet = protocol.Writer.init(self.allocator);
+                                defer packet.deinit();
+                                if (restricted) {
+                                    try packet.packetEmpty(.account_restricted);
+                                    var visibility = protocol.Writer.init(self.allocator);
+                                    defer visibility.deinit();
+                                    const start = try visibility.begin(.user_logout);
+                                    try visibility.int(i32, target_id);
+                                    try visibility.byte(0);
+                                    visibility.finish(start);
+                                    try self.sessions.broadcast(visibility.bytes(), online);
+                                }
+                                try packet.packetInt(.restart, 0);
+                                try online.enqueue(self.allocator, packet.bytes());
                             }
-                            try packet.packetInt(.restart, 0);
-                            try online.enqueue(self.allocator, packet.bytes());
+                        }
+                        if (restricted) {
+                            _ = try self.store.revokeGameTokensForUser(target_id);
+                            _ = self.lazer_multiplayer.disconnectUser(target_id);
+                            _ = self.lazer_spectator.disconnectUser(target_id);
                         }
                     } else if (std.mem.eql(u8, action, "add_privilege") or std.mem.eql(u8, action, "remove_privilege")) {
                         if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
@@ -1366,7 +1526,9 @@ const App = struct {
             if (!domain.validSiteMode(source, mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             const profile = (try self.store.siteProfile(self.allocator, user_id, source, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
             defer self.allocator.free(profile);
-            return respond(req, .ok, "application/json", profile, &.{});
+            const with_presence = try self.attachProfilePresence(profile, user_id);
+            defer self.allocator.free(with_presence);
+            return respond(req, .ok, "application/json", with_presence, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/beatmapsets/")) {
             const set_id = std.fmt.parseInt(i32, path["/api/v1/beatmapsets/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
@@ -1499,12 +1661,30 @@ const App = struct {
             const raw_set_id = path[3..];
             const set_id_text = if (std.mem.endsWith(u8, raw_set_id, "n")) raw_set_id[0 .. raw_set_id.len - 1] else raw_set_id;
             const set_id = std.fmt.parseInt(i32, set_id_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
-            const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
-            defer self.allocator.free(archive);
+            if (set_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+            const mirrored = if (isBeatmapMirrorHost(host_owned))
+                self.map_sync.mirrorArchive(&self.store, set_id) catch |err| return switch (err) {
+                    error.MirrorFillInProgress, error.MirrorAtCapacity => respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap mirror fill is already busy\"}", &.{.{ .name = "retry-after", .value = "5" }}),
+                    error.InvalidBeatmapSet => respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{}),
+                    else => blk: {
+                        std.log.warn("event=beatmap_mirror_fill_failed set_id={d} error={t}", .{ set_id, err });
+                        break :blk respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror upstream unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
+                    },
+                }
+            else blk: {
+                const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
+                break :blk beatmap_sync.Sync.MirrorArchive{ .data = archive, .cache_hit = true };
+            };
+            defer self.allocator.free(mirrored.data);
             var disposition_buf: [96]u8 = undefined;
             const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
-            const headers = [_]std.http.Header{.{ .name = "content-disposition", .value = disposition }};
-            return respond(req, .ok, "application/x-osu-beatmap-archive", archive, &headers);
+            const headers = [_]std.http.Header{
+                .{ .name = "content-disposition", .value = disposition },
+                .{ .name = "cache-control", .value = "public, max-age=3600" },
+                .{ .name = "x-zigcho-mirror-cache", .value = if (mirrored.cache_hit) "hit" else "fill" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            return respond(req, .ok, "application/x-osu-beatmap-archive", mirrored.data, &headers);
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") and std.mem.endsWith(u8, path, "/download")) {
             const id_text = path["/api/v2/beatmapsets/".len .. path.len - "/download".len];
@@ -1576,6 +1756,9 @@ const App = struct {
             const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
+            if (self.userOnline(user.id)) return respond(req, .bad_request, "application/json", "{\"error\":\"access_denied\",\"error_description\":\"this account is already online in Stable. close Stable before signing in with lazer.\"}", &.{});
+            const online_cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
+            if (try self.store.lazerUserOnline(user.id, online_cutoff)) return respond(req, .bad_request, "application/json", "{\"error\":\"access_denied\",\"error_description\":\"this account is already online in lazer. close the other client before signing in again.\"}", &.{});
             const token = try self.store.issueToken(user.id, "identify scores:write", 3600);
             var out: [256]u8 = undefined;
             const json = try std.fmt.bufPrint(&out, "{{\"token_type\":\"Bearer\",\"expires_in\":3600,\"scope\":\"identify scores:write\",\"access_token\":\"{s}\"}}", .{token});
@@ -2809,7 +2992,7 @@ const App = struct {
                 .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh https://assets.ppy.sh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
-            return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", status_page, &headers);
+            return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", index_page, &headers);
         }
         return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
     }
@@ -3000,6 +3183,35 @@ fn configuredLegacyAvatarStore(config: config_mod.Config) r2.Storage {
     };
 }
 
+fn objectTransferCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !bool {
+    if (args.len == 0 or (!std.mem.eql(u8, args[0], "object-put") and !std.mem.eql(u8, args[0], "object-get"))) return false;
+    if (args.len != 3) return error.InvalidObjectTransferArguments;
+    var config = try config_mod.load(allocator, io);
+    defer config.deinit();
+    const target = configuredObjectStore(config);
+    if (!target.enabled()) return error.ObjectStorageNotConfigured;
+    const max_backup_bytes: usize = 2 * 1024 * 1024 * 1024;
+    if (std.mem.eql(u8, args[0], "object-put")) {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, args[2], allocator, .limited(max_backup_bytes));
+        defer allocator.free(bytes);
+        try target.put(allocator, io, args[1], "application/octet-stream", bytes);
+        const verified = try target.getWithLimit(allocator, io, args[1], "application/octet-stream", bytes.len);
+        defer allocator.free(verified);
+        var source_hash: [32]u8 = undefined;
+        var stored_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &source_hash, .{});
+        std.crypto.hash.sha2.Sha256.hash(verified, &stored_hash, .{});
+        if (bytes.len != verified.len or !std.mem.eql(u8, &source_hash, &stored_hash)) return error.ObjectVerificationFailed;
+        std.log.info("event=object_backup_uploaded key={s} bytes={d} verified=true", .{ args[1], bytes.len });
+    } else {
+        const bytes = try target.getWithLimit(allocator, io, args[1], "application/octet-stream", max_backup_bytes);
+        defer allocator.free(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[2], .data = bytes, .flags = .{ .exclusive = true } });
+        std.log.info("event=object_backup_downloaded key={s} bytes={d}", .{ args[1], bytes.len });
+    }
+    return true;
+}
+
 const AvatarObjectMigrationStats = struct { migrated: i64 = 0, failed: i64 = 0 };
 
 fn migrateAvatarObjects(allocator: std.mem.Allocator, store: *storage.Store, source: r2.Storage, target: r2.Storage) !AvatarObjectMigrationStats {
@@ -3066,6 +3278,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
+    if (args.len > 1 and try objectTransferCommand(allocator, init.io, args[1..])) return;
     if (args.len > 1 and std.mem.eql(u8, args[1], "check")) {
         if (args.len > 2) return error.UnexpectedCheckArgument;
         const database: [:0]const u8 = if (storage.is_postgres)
@@ -3200,6 +3413,11 @@ pub fn main(init: std.process.Init) !void {
     kai_session.longitude = -21.9426; // reykjavik
     kai_session.latitude = 64.1466;
     if (app.anticheat) |*loaded| std.log.info("event=anticheat_module_loaded module={s} abi={d} mode=observe", .{ loaded.name(), anticheat_abi.version });
+    const mirror_thread: ?std.Thread = std.Thread.spawn(.{}, App.prefetchBeatmapMirror, .{&app}) catch |err| blk: {
+        std.log.warn("event=beatmap_mirror_prefetch_start_failed error={t}", .{err});
+        break :blk null;
+    };
+    if (mirror_thread) |thread| thread.detach();
     defer if (app.anticheat) |*loaded| loaded.close();
     defer app.score_webhook.deinit();
     defer app.avatar_cache.deinit();

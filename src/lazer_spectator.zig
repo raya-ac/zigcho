@@ -10,6 +10,8 @@ pub const max_hub_message = 60 * 1024;
 pub const max_frame_bundles_per_second = 20;
 const max_state_value = 16 * 1024;
 
+pub const Activity = enum { playing, spectating };
+
 fn FixedRaw(comptime capacity: usize) type {
     return struct {
         len: u16 = 0,
@@ -156,6 +158,33 @@ pub const Manager = struct {
             count += 1;
         }
         return count;
+    }
+
+    pub fn activity(self: *Manager, user_id: i32) ?Activity {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const connection = self.connectionByUserLocked(user_id) orelse return null;
+        if (connection.active != null) return .playing;
+        if (connection.subscription_count != 0) return .spectating;
+        return null;
+    }
+
+    pub fn disconnectUser(self: *Manager, user_id: i32) bool {
+        var targets: [max_connections]*Connection = undefined;
+        var count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (self.connections.items) |connection| {
+            if (!connection.alive or connection.user_id != user_id or count == targets.len) continue;
+            connection.retain();
+            targets[count] = connection;
+            count += 1;
+        }
+        self.mutex.unlock(self.io);
+        for (targets[0..count]) |connection| {
+            connection.close();
+            connection.release();
+        }
+        return count != 0;
     }
 
     fn connect(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !*Connection {

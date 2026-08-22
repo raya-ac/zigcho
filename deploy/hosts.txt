@@ -19,3 +19,4 @@ bm6.kai.ovh
 bm10.kai.ovh
 spectator.kai.ovh
 bss.kai.ovh
+beatmaps.kai.ovh

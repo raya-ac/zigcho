@@ -5,6 +5,19 @@ const multiplayer = @import("multiplayer.zig");
 pub const max_queue_bytes = 1024 * 1024;
 pub const ScoreTokenAuthorization = enum { exact, stale_online, foreign_live, offline, missing };
 
+pub const PublicPresence = struct {
+    action: u8,
+    mode: u8,
+    mods: i32,
+    map_id: i32,
+    info_text: [96]u8,
+    info_len: usize,
+
+    pub fn info(self: *const PublicPresence) []const u8 {
+        return self.info_text[0..self.info_len];
+    }
+};
+
 pub const Session = struct {
     token: [64]u8,
     user: domain.User,
@@ -246,6 +259,20 @@ pub const Sessions = struct {
         for (self.items.items) |session| ids.appendAssumeCapacity(session.user.id);
         return ids.toOwnedSlice(allocator);
     }
+    pub fn publicPresence(self: *Sessions, user_id: i32) ?PublicPresence {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const session = self.byUser(user_id) orelse return null;
+        if (session.is_bot or session.user.restricted) return null;
+        return .{
+            .action = session.action,
+            .mode = session.mode,
+            .mods = session.mods,
+            .map_id = session.map_id,
+            .info_text = session.info_text,
+            .info_len = session.info_len,
+        };
+    }
     pub fn channelCount(self: *const Sessions, name: []const u8) usize {
         var count: usize = 0;
         for (self.items.items) |s| if (s.joined(name)) {
@@ -334,4 +361,26 @@ test "online user snapshot includes bot and human sessions" {
     const ids = try sessions.onlineUserIds(allocator);
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i32, &.{ 3, 4 }, ids);
+}
+
+test "public presence copies Stable client activity without borrowing a session" {
+    const allocator = std.testing.allocator;
+    var sessions = Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    const session = try sessions.create(.{
+        .id = 4,
+        .name = try allocator.dupe(u8, "ari"),
+        .safe_name = try allocator.dupe(u8, "ari"),
+    }, 0, 0, 0);
+    session.action = 2;
+    session.mode = 0;
+    session.mods = 64;
+    session.map_id = 75;
+    @memcpy(session.info_text[0..7], "playing");
+    session.info_len = 7;
+    const presence = sessions.publicPresence(4).?;
+    sessions.remove(session);
+    try std.testing.expectEqual(@as(u8, 2), presence.action);
+    try std.testing.expectEqual(@as(i32, 75), presence.map_id);
+    try std.testing.expectEqualStrings("playing", presence.info());
 }

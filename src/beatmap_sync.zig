@@ -88,6 +88,11 @@ pub const Sync = struct {
     capacity_skips: std.atomic.Value(u64) = .init(0),
     pruned_entries: std.atomic.Value(u64) = .init(0),
     pruned_bytes: std.atomic.Value(u64) = .init(0),
+    mirror_hits: std.atomic.Value(u64) = .init(0),
+    mirror_misses: std.atomic.Value(u64) = .init(0),
+    mirror_fills: std.atomic.Value(u64) = .init(0),
+    mirror_failures: std.atomic.Value(u64) = .init(0),
+    mirror_bytes_served: std.atomic.Value(u64) = .init(0),
 
     pub const Metrics = struct {
         attempts: u64,
@@ -97,6 +102,11 @@ pub const Sync = struct {
         capacity_skips: u64,
         pruned_entries: u64,
         pruned_bytes: u64,
+        mirror_hits: u64,
+        mirror_misses: u64,
+        mirror_fills: u64,
+        mirror_failures: u64,
+        mirror_bytes_served: u64,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cache_max_bytes: u64) Sync {
@@ -121,7 +131,58 @@ pub const Sync = struct {
             .capacity_skips = self.capacity_skips.load(.monotonic),
             .pruned_entries = self.pruned_entries.load(.monotonic),
             .pruned_bytes = self.pruned_bytes.load(.monotonic),
+            .mirror_hits = self.mirror_hits.load(.monotonic),
+            .mirror_misses = self.mirror_misses.load(.monotonic),
+            .mirror_fills = self.mirror_fills.load(.monotonic),
+            .mirror_failures = self.mirror_failures.load(.monotonic),
+            .mirror_bytes_served = self.mirror_bytes_served.load(.monotonic),
         };
+    }
+
+    pub const MirrorArchive = struct {
+        data: []u8,
+        cache_hit: bool,
+    };
+
+    /// Serve an already verified archive or fill it through the same full-set
+    /// metadata, archive, hash, and object-storage path used by gameplay.
+    pub fn mirrorArchive(self: *Sync, store: *storage.Store, set_id: i32) !MirrorArchive {
+        return self.resolveMirrorArchive(store, set_id, true);
+    }
+
+    pub fn prefetchMirrorArchive(self: *Sync, store: *storage.Store, set_id: i32) !MirrorArchive {
+        return self.resolveMirrorArchive(store, set_id, false);
+    }
+
+    fn resolveMirrorArchive(self: *Sync, store: *storage.Store, set_id: i32, count_served: bool) !MirrorArchive {
+        if (set_id <= 0) return error.InvalidBeatmapSet;
+        if (try store.beatmapArchive(self.allocator, set_id)) |archive| {
+            if (count_served) {
+                _ = self.mirror_hits.fetchAdd(1, .monotonic);
+                _ = self.mirror_bytes_served.fetchAdd(@intCast(archive.len), .monotonic);
+            }
+            return .{ .data = archive, .cache_hit = true };
+        }
+        if (count_served) _ = self.mirror_misses.fetchAdd(1, .monotonic);
+
+        var key_buffer: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "mirror:{d}", .{set_id});
+        const claim_owned = switch (try self.claim(key)) {
+            .claimed => |value| value,
+            .duplicate => return error.MirrorFillInProgress,
+            .at_capacity => return error.MirrorAtCapacity,
+        };
+        defer self.removeFromProgress(claim_owned);
+        errdefer _ = self.mirror_failures.fetchAdd(1, .monotonic);
+
+        const remote = try self.fetchAndStoreMetadata(store, null, set_id);
+        defer remote.deinit();
+        if (remote.maps.len == 0) return error.MapsetIncomplete;
+        try self.downloadArchive(store, &remote.maps[0].md5, set_id, remote);
+        const archive = (try store.beatmapArchive(self.allocator, set_id)) orelse return error.MirrorArchiveMissing;
+        _ = self.mirror_fills.fetchAdd(1, .monotonic);
+        if (count_served) _ = self.mirror_bytes_served.fetchAdd(@intCast(archive.len), .monotonic);
+        return .{ .data = archive, .cache_hit = false };
     }
 
     pub fn ensure(self: *Sync, store: *storage.Store, wanted_md5: []const u8, expected_set_id: ?i32) !bool {

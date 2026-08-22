@@ -384,7 +384,8 @@ CREATE INDEX oauth_tokens_user ON oauth_tokens(user_id, expires_at);
 CREATE TABLE beatmap_archives (
     set_id integer PRIMARY KEY,
     sha256 char(64) NOT NULL,
-    osz_file bytea NOT NULL,
+    osz_file bytea,
+    object_bytes bigint NOT NULL DEFAULT 0 CHECK(object_bytes >= 0),
     imported_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
     last_accessed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
 );
@@ -450,7 +451,7 @@ CREATE TABLE beatmap_media (
     )),
     content_type text NOT NULL CHECK(content_type IN ('image/jpeg','audio/ogg','audio/mpeg')),
     sha256 char(64) NOT NULL,
-    data bytea NOT NULL CHECK(octet_length(data) BETWEEN 1 AND 4194304),
+    data bytea CHECK(data IS NULL OR octet_length(data) BETWEEN 1 AND 4194304),
     fetched_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
     last_accessed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
     PRIMARY KEY(set_id, kind)
@@ -468,4 +469,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (29);
+INSERT INTO schema_migrations(version) VALUES (31);

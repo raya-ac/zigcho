@@ -919,7 +919,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
          }
  
          protected override void LoadComplete()
-@@ -102,6 +110,100 @@ protected override void LoadComplete()
+@@ -102,6 +110,102 @@ protected override void LoadComplete()
  
          private bool catchingUp;
  
@@ -947,6 +947,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
 +                request.Failure += exception =>
 +                {
 +                    Logger.Log($"Presence poll failed: {exception.Message}", LoggingTarget.Network);
++                    Schedule(clearPollingPresence);
 +                    completion.TrySetResult(false);
 +                };
 +                api.Queue(request);
@@ -958,6 +959,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
 +                    {
 +                        request.Cancel();
 +                        Logger.Log("Presence poll timed out.", LoggingTarget.Network);
++                        Schedule(clearPollingPresence);
 +                    }
 +
 +                    await delayPresencePoll(succeeded ? 5000 : 10000).ConfigureAwait(false);

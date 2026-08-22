@@ -167,6 +167,53 @@ pub fn totalHits(input: ScoreInput) i64 {
     return total;
 }
 
+pub const MedalModCategories = struct {
+    conversion: bool = false,
+    fun: bool = false,
+};
+
+pub fn medalModCategories(allocator: std.mem.Allocator, mods_json: []const u8) !MedalModCategories {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, mods_json, .{});
+    defer parsed.deinit();
+    const mods = switch (parsed.value) {
+        .array => |array| array,
+        else => return error.InvalidMods,
+    };
+    const conversion = [_][]const u8{ "TP", "DA", "CL", "RD", "MR", "AL", "SG", "SW", "CS", "DS", "IN", "HO", "1K", "2K", "3K", "4K", "5K", "6K", "7K", "8K", "9K", "10K" };
+    const fun = [_][]const u8{ "TR", "WG", "SI", "GR", "DF", "WU", "WD", "BR", "AD", "MU", "NS", "MG", "RP", "AS", "FR", "BU", "SY", "DP", "BM", "FF", "MF" };
+    var result: MedalModCategories = .{};
+    for (mods.items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => continue,
+        };
+        const acronym = switch (object.get("acronym") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        for (conversion) |candidate| if (std.ascii.eqlIgnoreCase(acronym, candidate)) {
+            result.conversion = true;
+            break;
+        };
+        for (fun) |candidate| if (std.ascii.eqlIgnoreCase(acronym, candidate)) {
+            result.fun = true;
+            break;
+        };
+    }
+    return result;
+}
+
+test "official lazer medal mod categories follow the pinned client" {
+    const conversion = try medalModCategories(std.testing.allocator, "[{\"acronym\":\"DA\",\"settings\":{}}]");
+    try std.testing.expect(conversion.conversion);
+    try std.testing.expect(!conversion.fun);
+    const fun = try medalModCategories(std.testing.allocator, "[{\"acronym\":\"WG\"},{\"acronym\":\"HD\"}]");
+    try std.testing.expect(!fun.conversion);
+    try std.testing.expect(fun.fun);
+    const ordinary = try medalModCategories(std.testing.allocator, "[{\"acronym\":\"HD\"}]");
+    try std.testing.expect(!ordinary.conversion and !ordinary.fun);
+}
+
 pub const PerformanceState = struct {
     mods: u32,
     max_combo: u32,

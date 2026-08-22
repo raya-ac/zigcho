@@ -43,7 +43,7 @@ const anticheat_abi = @import("anticheat_abi.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
 const achievements = @import("achievements.zig");
-const status_page = @embedFile("status.html");
+const index_page = @embedFile("index.html");
 
 comptime {
     _ = postgres;
@@ -768,6 +768,44 @@ test "beatmap hydration backoff and archive pruning stay bounded" {
     try std.testing.expectEqual(@as(i64, 0), (try store.beatmapCacheStats()).hydration_failures);
 }
 
+test "beatmap mirror serves verified cache hits and tracks stored bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/beatmap-mirror.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(1,900000000,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','a','a','a','a',3),(2,900000001,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','b','b','b','b',3)");
+    const archive = "verified mirror archive";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
+    const sha256 = std.fmt.bytesToHex(digest, .lower);
+    try store.upsertBeatmapArchive(900000000, &sha256, archive);
+
+    var sync = beatmap_sync.Sync.init(std.testing.allocator, std.testing.io, 1024 * 1024);
+    defer sync.deinit();
+    const mirrored = try sync.mirrorArchive(&store, 900000000);
+    defer std.testing.allocator.free(mirrored.data);
+    try std.testing.expect(mirrored.cache_hit);
+    try std.testing.expectEqualStrings(archive, mirrored.data);
+    const metrics = sync.metrics();
+    try std.testing.expectEqual(@as(u64, 1), metrics.mirror_hits);
+    try std.testing.expectEqual(@as(u64, archive.len), metrics.mirror_bytes_served);
+    const prefetched = try sync.prefetchMirrorArchive(&store, 900000000);
+    defer std.testing.allocator.free(prefetched.data);
+    try std.testing.expect(prefetched.cache_hit);
+    try std.testing.expectEqual(@as(u64, 1), sync.metrics().mirror_hits);
+    try std.testing.expectEqual(@as(u64, archive.len), sync.metrics().mirror_bytes_served);
+    const cache = try store.beatmapCacheStats();
+    try std.testing.expectEqual(@as(i64, 1), cache.entries);
+    try std.testing.expectEqual(@as(i64, archive.len), cache.bytes);
+    try std.testing.expectEqual(@as(i64, 1), try store.beatmapMirrorPendingCount());
+    const missing = try store.beatmapSetIdsMissingArchives(std.testing.allocator, 10);
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectEqualSlices(i32, &.{900000001}, missing);
+}
+
 test "legacy credentials authenticate and upgrade outside the read lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -828,13 +866,14 @@ test "oauth authentication owns a bounded online presence lease" {
     defer store.close();
     try store.migrate();
     const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
-    const token = try store.issueToken(user_id, "identify", 60);
+    const web_token = try store.issueToken(user_id, "web:account", 60);
     const now = std.Io.Clock.real.now(std.testing.io).toSeconds();
 
     const before = try store.recentOauthUserIds(std.testing.allocator, now - 10);
     defer std.testing.allocator.free(before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
 
+    const token = try store.issueToken(user_id, "identify scores:write", 60);
     const user = (try store.authenticateToken(std.testing.allocator, &token, "identify")).?;
     defer std.testing.allocator.free(user.name);
     defer std.testing.allocator.free(user.safe_name);
@@ -842,10 +881,32 @@ test "oauth authentication owns a bounded online presence lease" {
     defer std.testing.allocator.free(online);
     try std.testing.expectEqualSlices(i32, &.{user_id}, online);
 
-    try std.testing.expect(try store.revokeToken(&token));
+    try std.testing.expectEqual(@as(usize, 1), try store.revokeGameTokensForUser(user_id));
     const revoked = try store.recentOauthUserIds(std.testing.allocator, now - 10);
     defer std.testing.allocator.free(revoked);
     try std.testing.expectEqual(@as(usize, 0), revoked.len);
+    const website_user = (try store.authenticateToken(std.testing.allocator, &web_token, "web:account")).?;
+    defer std.testing.allocator.free(website_user.name);
+    defer std.testing.allocator.free(website_user.safe_name);
+}
+
+test "Stable refuses an account with a live lazer game lease" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/cross-client-login.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    _ = try store.issueToken(user_id, "identify scores:write", 3600);
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    var refused = try bancho.login(std.testing.allocator, &store, &sessions, ari_stable_login, .{ 'A', 'U' }, 0, 0);
+    defer refused.deinit();
+    try std.testing.expectEqualStrings("already-online", refused.token);
+    try std.testing.expect(std.mem.indexOf(u8, refused.body, "already online in lazer") != null);
+    try std.testing.expect(sessions.byUser(user_id) == null);
 }
 
 test "login result owns its token after the session is replaced" {
@@ -1177,18 +1238,23 @@ test "website profile settings and private avatar metadata stay account scoped" 
 }
 
 test "website profile plays keep an accessible score details dialog" {
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "<dialog class=\"score-dialog\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "aria-labelledby=\"score-dialog-title\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "data-score-detail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "bindScoreDetails()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "scoreDialogTrigger") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "download replay ↓") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "https://assets.ppy.sh/medals/client/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "class=\"achievement-icon\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "custom-achievement-icon") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "kind==='accuracy'?value+'%'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "speed_change") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_page, "toFixed(2)+'×'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "<dialog class=\"score-dialog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "aria-labelledby=\"score-dialog-title\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-score-detail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "bindScoreDetails()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "scoreDialogTrigger") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "download replay ↓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "https://assets.ppy.sh/medals/web/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"achievement-icon\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "custom-achievement-icon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "kind==='accuracy'?value+'%'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "speed_change") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "toFixed(2)+'×'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "recent.insertAdjacentHTML('afterend'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "online · '+esc(presence.client_label)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "beatmaps.kai.ovh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "stored sets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "kick from Stable or lazer") != null);
 }
 
 test "stable screenshots survive storage with exact type isolation" {
@@ -4553,11 +4619,45 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try store.exec(expire_sql);
     try std.testing.expectError(error.LazerScoreTokenExpired, store.submitLazerScoreToken(1, 75, expired, score, 0, mods_json, statistics_json, "{}", "[]", &.{}));
 
+    var failed_score = score;
+    failed_score.passed = false;
+    failed_score.rank = "F";
+    const failed_token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "33333333333333333333333333333333");
+    const failed_id = try store.submitLazerScoreToken(1, 75, failed_token, failed_score, 0, mods_json, statistics_json, maximum_statistics_json, pauses_json, &replay);
+    var failed_row: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT passed,length(replay) FROM lazer_scores WHERE id=?1", -1, &failed_row, null));
+    _ = storage.c.sqlite3_bind_int64(failed_row, 1, failed_id);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(failed_row));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(failed_row, 0));
+    try std.testing.expectEqual(@as(c_int, replay.len), storage.c.sqlite3_column_int(failed_row, 1));
+    _ = storage.c.sqlite3_finalize(failed_row);
+    try std.testing.expect((try store.lazerReplay(std.testing.allocator, failed_id)) == null);
+    const failed_recent = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, .all, 0, 50);
+    defer std.testing.allocator.free(failed_recent);
+    var parsed_failed_recent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, failed_recent, .{});
+    defer parsed_failed_recent.deinit();
+    var failed_recent_found = false;
+    for (parsed_failed_recent.value.array.items) |item| {
+        if (item.object.get("id").?.integer != failed_id) continue;
+        failed_recent_found = true;
+        try std.testing.expect(!item.object.get("has_replay").?.bool);
+    }
+    try std.testing.expect(failed_recent_found);
+
+    try store.exec("INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best) VALUES(999,1,'0123456789abcdef0123456789abcdef',0,0,10000,0,0.5,5,5,0,0,5,0,0,0,0,x'6661696c6564','failed-replay-checksum','vanilla',0)");
+    try std.testing.expect((try store.replay(std.testing.allocator, 999)) == null);
+    try std.testing.expect((try store.siteReplay(std.testing.allocator, 999)) == null);
+    var stored_failed: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT length(replay) FROM scores WHERE id=999", -1, &stored_failed, null));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(stored_failed));
+    try std.testing.expectEqual(@as(c_int, 6), storage.c.sqlite3_column_int(stored_failed, 0));
+    _ = storage.c.sqlite3_finalize(stored_failed);
+
     var version_stmt: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 29), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 31), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {

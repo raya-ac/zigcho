@@ -1558,43 +1558,6 @@ test "beatmap covers and previews survive the bounded media cache" {
     const metadata = try beatmap.parse(map);
     const hash = beatmap.md5(map);
     try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
-    const mapper: upstream_user.Profile = .{
-        .id = 4_452_992,
-        .username = "Ari",
-        .country = .{ 'A', 'U' },
-        .join_date = "2014-05-28T17:34:35Z",
-        .mode = 0,
-        .pp = 6440.47,
-        .global_rank = 50_128,
-        .country_rank = 1563,
-        .ranked_score = 22_490_858_468,
-        .total_score = 91_822_598_773,
-        .play_count = 45_597,
-        .play_time = 1_000,
-        .level = 100.649,
-        .accuracy = 99.301498,
-        .total_hits = 10_002_288,
-        .grade_ssh = 251,
-        .grade_ss = 64,
-        .grade_sh = 1502,
-        .grade_s = 566,
-        .grade_a = 780,
-    };
-    const mapper_json = try upstream_user.jsonOwned(std.testing.allocator, mapper);
-    defer std.testing.allocator.free(mapper_json);
-    try store.upsertUpstreamUserProfile(mapper, mapper_json, 1_787_456_000);
-    try store.linkBeatmapSetCreator(metadata.set_id, mapper.id);
-    try store.upsertBeatmapSetMetadata(.{
-        .set_id = metadata.set_id,
-        .favourites = 39,
-        .submitted_date = "2026-08-20T00:00:00Z",
-        .last_updated = "2026-08-22T05:45:08Z",
-        .ranked_date = "2026-08-22T05:45:08Z",
-        .has_video = true,
-        .genre_id = 4,
-        .language_id = 2,
-    }, 1_787_456_000);
-    try store.updateBeatmapUpstreamStats(metadata.id, 123, 45, 9);
     const jpeg = "\xff\xd8\xffcover bytes\xff\xd9";
     const ogg = "OggSpreview bytes";
     try store.putBeatmapMedia(metadata.set_id, .cover, .jpeg, jpeg);
@@ -6154,6 +6117,43 @@ test "ranked stable PP is stored and updates normal player stats" {
     const metadata = try beatmap.parse(map);
     const hash = beatmap.md5(map);
     try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    const mapper: upstream_user.Profile = .{
+        .id = 4_452_992,
+        .username = "Ari",
+        .country = .{ 'A', 'U' },
+        .join_date = "2014-05-28T17:34:35Z",
+        .mode = 0,
+        .pp = 6440.47,
+        .global_rank = 50_128,
+        .country_rank = 1563,
+        .ranked_score = 22_490_858_468,
+        .total_score = 91_822_598_773,
+        .play_count = 45_597,
+        .play_time = 1_000,
+        .level = 100.649,
+        .accuracy = 99.301498,
+        .total_hits = 10_002_288,
+        .grade_ssh = 251,
+        .grade_ss = 64,
+        .grade_sh = 1502,
+        .grade_s = 566,
+        .grade_a = 780,
+    };
+    const mapper_json = try upstream_user.jsonOwned(std.testing.allocator, mapper);
+    defer std.testing.allocator.free(mapper_json);
+    try store.upsertUpstreamUserProfile(mapper, mapper_json, 1_787_456_000);
+    try store.linkBeatmapSetCreator(metadata.set_id, mapper.id);
+    try store.upsertBeatmapSetMetadata(.{
+        .set_id = metadata.set_id,
+        .favourites = 39,
+        .submitted_date = "2026-08-20T00:00:00Z",
+        .last_updated = "2026-08-22T05:45:08Z",
+        .ranked_date = "2026-08-22T05:45:08Z",
+        .has_video = true,
+        .genre_id = 4,
+        .language_id = 2,
+    }, 1_787_456_000);
+    try store.updateBeatmapUpstreamStats(metadata.id, 123, 45, 9);
     const archive_bytes = "PK\x03\x04synthetic archive fixture";
     var archive_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(archive_bytes, &archive_digest, .{});

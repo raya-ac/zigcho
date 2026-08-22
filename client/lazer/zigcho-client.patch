@@ -1990,7 +1990,21 @@ index 2a195ad45ee7d361622b05f7cd25a4a8b691a27e..59121aaac7a97920584744ee85eb0f87
 +        public override bool Ranked => true;
          public override bool ValidForFreestyleAsRequiredMod => true;
  
-         private readonly Bindable<bool> showHealthBar = new Bindable<bool>();
+        private readonly Bindable<bool> showHealthBar = new Bindable<bool>();
+diff --git a/osu.Game/Screens/Edit/Submission/SubmissionBeatmapExporter.cs b/osu.Game/Screens/Edit/Submission/SubmissionBeatmapExporter.cs
+--- a/osu.Game/Screens/Edit/Submission/SubmissionBeatmapExporter.cs
++++ b/osu.Game/Screens/Edit/Submission/SubmissionBeatmapExporter.cs
+@@ -38,8 +38,9 @@ namespace osu.Game.Screens.Edit.Submission
+                     return;
+                 }
+ 
++                // Failed early Zigcho reservations can be reissued in the current private ID namespace.
+                 if (playableBeatmap.BeatmapInfo.OnlineID > 0)
+-                    throw new InvalidOperationException($@"Difficulty ""{playableBeatmap.BeatmapInfo.DifficultyName}"" has BeatmapID {playableBeatmap.BeatmapInfo.OnlineID} that has not been assigned to it by the server!");
++                    playableBeatmap.BeatmapInfo.OnlineID = -1;
+ 
+                 if (allocatedBeatmapIds.Count == 0)
+                     throw new InvalidOperationException(@"Ran out of new beatmap IDs to assign to unsubmitted beatmaps!");
 diff --git a/osu.Game/Screens/OnlinePlay/Matchmaking/Queue/RatingDistributionGraph.cs b/osu.Game/Screens/OnlinePlay/Matchmaking/Queue/RatingDistributionGraph.cs
 index 8a03e7b5243db91544cdd726bac7dab6a57933ca..f4f2ce92f1574666092257247ccc81844683225e 100644
 --- a/osu.Game/Screens/OnlinePlay/Matchmaking/Queue/RatingDistributionGraph.cs

@@ -15,6 +15,7 @@ const achievements = @import("achievements.zig");
 const bss = @import("bss.zig");
 const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
+const upstream_user = @import("upstream_user.zig");
 const database_sql = @import("database_sql");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
@@ -27,6 +28,8 @@ pub const LazerCommentable = sqlite_storage.LazerCommentable;
 pub const LazerCommentTarget = sqlite_storage.LazerCommentTarget;
 pub const LazerCommentSort = sqlite_storage.LazerCommentSort;
 pub const ReplaySource = sqlite_storage.ReplaySource;
+pub const UpstreamUserCache = sqlite_storage.UpstreamUserCache;
+pub const BeatmapSetCreator = sqlite_storage.BeatmapSetCreator;
 const archive_object_limit: usize = 128 * 1024 * 1024;
 const max_replay_object_bytes: usize = 32 * 1024 * 1024;
 
@@ -66,6 +69,8 @@ pub const Store = struct {
     pub const BeatmapCachePrune = struct { entries: i64, bytes: i64 };
     pub const BeatmapMediaCacheStats = struct { entries: i64, bytes: i64 };
     pub const BeatmapArchiveDownload = sqlite_storage.Store.BeatmapArchiveDownload;
+    pub const UpstreamUserCache = sqlite_storage.UpstreamUserCache;
+    pub const BeatmapSetCreator = sqlite_storage.BeatmapSetCreator;
     pub const ObjectMigrationStats = sqlite_storage.Store.ObjectMigrationStats;
     pub const ObjectPurgeStats = sqlite_storage.Store.ObjectPurgeStats;
     pub const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
@@ -137,7 +142,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -341,6 +346,7 @@ pub const Store = struct {
         if (version <= 31) try postgres.exec(lease.conn, database_sql.postgresMigration(32));
         if (version <= 32) try postgres.exec(lease.conn, database_sql.postgresMigration(33));
         if (version <= 33) try postgres.exec(lease.conn, database_sql.postgresMigration(34));
+        if (version <= 34) try postgres.exec(lease.conn, database_sql.postgresMigration(35));
         try self.refreshExternalOnly(lease.conn);
         try postgres.exec(
             lease.conn,
@@ -809,7 +815,7 @@ pub const Store = struct {
         var counter = try postgres.queryParams(self.allocator, conn, "SELECT next_id FROM zigcho.bss_counters WHERE kind=$1 FOR UPDATE", &.{kind});
         defer counter.deinit();
         if (counter.rows() != 1) return error.DatabaseQueryFailed;
-        var start: i64 = @max(@as(i64, 100_000_000), try counter.int(i64, 0, 0));
+        var start: i64 = @max(@as(i64, bss.private_id_floor), try counter.int(i64, 0, 0));
         var high = try postgres.query(conn, if (std.mem.eql(u8, kind, "set"))
             "SELECT greatest(coalesce((SELECT max(set_id) FROM zigcho.beatmaps),0),coalesce((SELECT max(set_id) FROM zigcho.beatmap_submissions),0))"
         else
@@ -839,38 +845,69 @@ pub const Store = struct {
         errdefer allocator.free(ids);
         var set_id: i32 = undefined;
         var revision: u32 = 1;
+        var reissued_legacy_set: ?i32 = null;
+        var reused_legacy_replacement = false;
         if (input.set_id) |existing_set| {
             var set_buf: [24]u8 = undefined;
             const set = try std.fmt.bufPrint(&set_buf, "{d}", .{existing_set});
-            var submission = try postgres.queryParams(self.allocator, lease.conn, "SELECT owner_id,revision FROM zigcho.beatmap_submissions WHERE set_id=$1 FOR UPDATE", &.{set});
+            var submission = try postgres.queryParams(self.allocator, lease.conn, "SELECT owner_id,revision,state,(SELECT count(*) FROM zigcho.beatmaps WHERE set_id=$1),replacement_set_id FROM zigcho.beatmap_submissions WHERE set_id=$1 FOR UPDATE", &.{set});
             defer submission.deinit();
             if (submission.rows() == 0) return error.BssSubmissionNotFound;
             if (try submission.int(i32, 0, 0) != user_id) return error.BssNotOwner;
             const old_revision = try submission.int(i64, 0, 1);
             if (old_revision <= 0 or old_revision >= std.math.maxInt(u32)) return error.BssIdentifierExhausted;
-            revision = @intCast(old_revision + 1);
-            set_id = existing_set;
+            const reissue = existing_set < bss.private_id_floor and
+                std.mem.eql(u8, submission.value(0, 2), "failed") and
+                (try submission.int(i64, 0, 3)) == 0;
             for (input.keep_ids, 0..) |id, index| {
                 var id_buf: [24]u8 = undefined;
                 const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
                 var owned = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmap_submission_maps WHERE set_id=$1 AND beatmap_id=$2", &.{ set, id_text });
                 defer owned.deinit();
                 if (owned.rows() == 0) return error.BssBeatmapNotOwned;
-                ids[index] = id;
+                if (!reissue) ids[index] = id;
             }
-            var deactivate = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_submission_maps SET active=false WHERE set_id=$1", &.{set});
-            deactivate.deinit();
-            for (input.keep_ids, 0..) |id, position| {
-                var id_buf: [24]u8 = undefined;
-                var position_buf: [24]u8 = undefined;
-                const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
-                const position_text = try std.fmt.bufPrint(&position_buf, "{d}", .{position});
-                var keep = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_submission_maps SET active=true,position=$3 WHERE set_id=$1 AND beatmap_id=$2 RETURNING 1", &.{ set, id_text, position_text });
-                defer keep.deinit();
-                if (keep.rows() != 1) return error.DatabaseQueryFailed;
+            if (reissue) {
+                if (!submission.isNull(0, 4)) {
+                    const replacement = try submission.int(i32, 0, 4);
+                    var replacement_buf: [24]u8 = undefined;
+                    const replacement_text = try std.fmt.bufPrint(&replacement_buf, "{d}", .{replacement});
+                    var replacement_result = try postgres.queryParams(self.allocator, lease.conn, "SELECT owner_id,revision,(SELECT count(*) FROM zigcho.beatmap_submission_maps WHERE set_id=$1 AND active) FROM zigcho.beatmap_submissions WHERE set_id=$1 FOR UPDATE", &.{replacement_text});
+                    defer replacement_result.deinit();
+                    if (replacement_result.rows() != 1 or (try replacement_result.int(i32, 0, 0)) != user_id or (try replacement_result.int(usize, 0, 2)) != total) return error.InvalidBssReservation;
+                    const replacement_revision = try replacement_result.int(i64, 0, 1);
+                    if (replacement_revision <= 0 or replacement_revision >= std.math.maxInt(u32)) return error.BssIdentifierExhausted;
+                    revision = @intCast(replacement_revision + 1);
+                    set_id = replacement;
+                    var replacement_maps = try postgres.queryParams(self.allocator, lease.conn, "SELECT beatmap_id FROM zigcho.beatmap_submission_maps WHERE set_id=$1 AND active ORDER BY position,beatmap_id", &.{replacement_text});
+                    defer replacement_maps.deinit();
+                    if (replacement_maps.rows() != ids.len) return error.InvalidBssReservation;
+                    for (ids, 0..) |*id, row| id.* = try replacement_maps.int(i32, row, 0);
+                    reused_legacy_replacement = true;
+                } else {
+                    reissued_legacy_set = existing_set;
+                    set_id = try self.allocateBssIds(lease.conn, "set", 1);
+                    revision = 1;
+                }
+            } else {
+                revision = @intCast(old_revision + 1);
+                set_id = existing_set;
+                var deactivate = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_submission_maps SET active=false WHERE set_id=$1", &.{set});
+                deactivate.deinit();
+                for (input.keep_ids, 0..) |id, position| {
+                    var id_buf: [24]u8 = undefined;
+                    var position_buf: [24]u8 = undefined;
+                    const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
+                    const position_text = try std.fmt.bufPrint(&position_buf, "{d}", .{position});
+                    var keep = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_submission_maps SET active=true,position=$3 WHERE set_id=$1 AND beatmap_id=$2 RETURNING 1", &.{ set, id_text, position_text });
+                    defer keep.deinit();
+                    if (keep.rows() != 1) return error.DatabaseQueryFailed;
+                }
             }
         } else {
             set_id = try self.allocateBssIds(lease.conn, "set", 1);
+        }
+        if (input.set_id == null or reissued_legacy_set != null) {
             var set_buf: [24]u8 = undefined;
             const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
             var create = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_submissions(set_id,owner_id,target,notify_replies) VALUES($1,$2,$3,$4::boolean)", &.{ set, user, input.target.database(), if (input.notify_replies) "true" else "false" });
@@ -878,11 +915,12 @@ pub const Store = struct {
         }
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
-        if (input.create_count > 0) {
-            const first = try self.allocateBssIds(lease.conn, "beatmap", input.create_count);
-            for (0..input.create_count) |offset| {
+        const allocate_count: u16 = if (reissued_legacy_set != null) @intCast(total) else if (reused_legacy_replacement) 0 else input.create_count;
+        if (allocate_count > 0) {
+            const first = try self.allocateBssIds(lease.conn, "beatmap", allocate_count);
+            for (0..allocate_count) |offset| {
                 const id: i32 = first + @as(i32, @intCast(offset));
-                const position = input.keep_ids.len + offset;
+                const position = if (reissued_legacy_set != null) offset else input.keep_ids.len + offset;
                 ids[position] = id;
                 var id_buf: [24]u8 = undefined;
                 var position_buf: [24]u8 = undefined;
@@ -891,6 +929,13 @@ pub const Store = struct {
                 var insert = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmap_submission_maps(set_id,beatmap_id,position) VALUES($1,$2,$3)", &.{ set, id_text, position_text });
                 insert.deinit();
             }
+        }
+        if (reissued_legacy_set) |legacy_set| {
+            var legacy_buf: [24]u8 = undefined;
+            const legacy = try std.fmt.bufPrint(&legacy_buf, "{d}", .{legacy_set});
+            var alias = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_submissions SET replacement_set_id=$3,updated_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 AND owner_id=$2 AND state='failed' AND replacement_set_id IS NULL RETURNING 1", &.{ legacy, user, set });
+            defer alias.deinit();
+            if (alias.rows() != 1) return error.DatabaseQueryFailed;
         }
         if (input.set_id != null) {
             var revision_buf: [24]u8 = undefined;
@@ -1127,12 +1172,153 @@ pub const Store = struct {
         return try result.int(i64, 0, 0);
     }
 
+    pub fn beatmapSetCreator(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?BeatmapSetCreator {
+        var set_buf: [24]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT creator,min(mode),max(creator_id) FROM zigcho.beatmaps WHERE set_id=$1 GROUP BY creator ORDER BY count(*) DESC,creator LIMIT 1", &.{set});
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        const name = try allocator.dupe(u8, result.value(0, 0));
+        return .{
+            .allocator = allocator,
+            .name = name,
+            .mode = try result.int(u8, 0, 1),
+            .user_id = if (result.isNull(0, 2)) null else try result.int(i32, 0, 2),
+        };
+    }
+
+    pub fn upstreamUserCacheByName(self: *Store, name: []const u8, mode: u8, now: i64, max_age: i64) !?UpstreamUserCache {
+        if (mode > 3 or now < 0 or max_age < 0) return error.InvalidUpstreamUser;
+        var mode_buf: [4]u8 = undefined;
+        var now_buf: [32]u8 = undefined;
+        var age_buf: [32]u8 = undefined;
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        const now_text = try std.fmt.bufPrint(&now_buf, "{d}", .{now});
+        const age_text = try std.fmt.bufPrint(&age_buf, "{d}", .{max_age});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT u.id,coalesce(p.fetched_at>=$3::bigint-$4::bigint,false) FROM zigcho.upstream_users u LEFT JOIN zigcho.upstream_user_profiles p ON p.user_id=u.id AND p.mode=$2 WHERE lower(u.username)=lower($1) ORDER BY u.fetched_at DESC,u.id LIMIT 1", &.{ name, mode_text, now_text, age_text });
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return .{ .id = try result.int(i32, 0, 0), .fresh = try result.boolean(0, 1) };
+    }
+
+    pub fn upstreamUserCacheById(self: *Store, user_id: i32, mode: u8, now: i64, max_age: i64) !?UpstreamUserCache {
+        if (user_id <= 0 or mode > 3 or now < 0 or max_age < 0) return error.InvalidUpstreamUser;
+        var id_buf: [24]u8 = undefined;
+        var mode_buf: [4]u8 = undefined;
+        var now_buf: [32]u8 = undefined;
+        var age_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        const now_text = try std.fmt.bufPrint(&now_buf, "{d}", .{now});
+        const age_text = try std.fmt.bufPrint(&age_buf, "{d}", .{max_age});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT u.id,coalesce(p.fetched_at>=$3::bigint-$4::bigint,false) FROM zigcho.upstream_users u LEFT JOIN zigcho.upstream_user_profiles p ON p.user_id=u.id AND p.mode=$2 WHERE u.id=$1", &.{ id, mode_text, now_text, age_text });
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return .{ .id = try result.int(i32, 0, 0), .fresh = try result.boolean(0, 1) };
+    }
+
+    pub fn upsertUpstreamUserProfile(self: *Store, profile: upstream_user.Profile, profile_json: []const u8, fetched_at: i64) !void {
+        try upstream_user.validate(profile);
+        if (fetched_at < 0 or profile_json.len == 0 or profile_json.len > 128 * 1024 or !std.unicode.utf8ValidateSlice(profile_json)) return error.InvalidUpstreamUser;
+        var id_buf: [24]u8 = undefined;
+        var mode_buf: [4]u8 = undefined;
+        var fetched_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{profile.id});
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{profile.mode});
+        const fetched = try std.fmt.bufPrint(&fetched_buf, "{d}", .{fetched_at});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var user_result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.upstream_users(id,username,country,join_date,fetched_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET username=excluded.username,country=excluded.country,join_date=excluded.join_date,fetched_at=excluded.fetched_at", &.{ id, profile.username, profile.country[0..], profile.join_date, fetched });
+        user_result.deinit();
+        var profile_result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.upstream_user_profiles(user_id,mode,profile_json,fetched_at) VALUES($1,$2,$3::jsonb,$4) ON CONFLICT(user_id,mode) DO UPDATE SET profile_json=excluded.profile_json,fetched_at=excluded.fetched_at", &.{ id, mode_text, profile_json, fetched });
+        profile_result.deinit();
+        try postgres.exec(lease.conn, "COMMIT");
+    }
+
+    pub fn linkBeatmapSetCreator(self: *Store, set_id: i32, user_id: i32) !void {
+        if (set_id <= 0 or user_id <= 0) return error.InvalidUpstreamUser;
+        var set_buf: [24]u8 = undefined;
+        var id_buf: [24]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmaps SET creator_id=$2 WHERE set_id=$1 AND EXISTS(SELECT 1 FROM zigcho.upstream_users WHERE id=$2)", &.{ set, id });
+        result.deinit();
+    }
+
+    pub fn upstreamUserProfileJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, mode: u8) !?[]u8 {
+        if (user_id <= 0 or mode > 3) return null;
+        var id_buf: [24]u8 = undefined;
+        var mode_buf: [4]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT profile_json::text FROM zigcho.upstream_user_profiles WHERE user_id=$1 ORDER BY mode=$2::int DESC,mode=0 DESC,mode LIMIT 1", &.{ id, mode_text });
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return allocator.dupe(u8, result.value(0, 0));
+    }
+
+    pub fn upsertBeatmapSetMetadata(self: *Store, metadata: upstream_user.SetMetadata, fetched_at: i64) !void {
+        if (metadata.set_id <= 0 or metadata.favourites < 0 or metadata.genre_id < 0 or metadata.language_id < 0 or fetched_at < 0 or metadata.submitted_date.len != 20 or metadata.last_updated.len != 20 or (metadata.ranked_date != null and metadata.ranked_date.?.len != 20)) return error.InvalidBeatmapSetMetadata;
+        var set_buf: [24]u8 = undefined;
+        var favourites_buf: [24]u8 = undefined;
+        var genre_buf: [8]u8 = undefined;
+        var language_buf: [8]u8 = undefined;
+        var fetched_buf: [32]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{metadata.set_id});
+        const favourites = try std.fmt.bufPrint(&favourites_buf, "{d}", .{metadata.favourites});
+        const genre = try std.fmt.bufPrint(&genre_buf, "{d}", .{metadata.genre_id});
+        const language = try std.fmt.bufPrint(&language_buf, "{d}", .{metadata.language_id});
+        const fetched = try std.fmt.bufPrint(&fetched_buf, "{d}", .{fetched_at});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.beatmapset_metadata(set_id,favourites,submitted_date,last_updated,ranked_date,has_video,genre_id,language_id,fetched_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(set_id) DO UPDATE SET favourites=excluded.favourites,submitted_date=excluded.submitted_date,last_updated=excluded.last_updated,ranked_date=excluded.ranked_date,has_video=excluded.has_video,genre_id=excluded.genre_id,language_id=excluded.language_id,fetched_at=excluded.fetched_at", &.{ set, favourites, metadata.submitted_date, metadata.last_updated, metadata.ranked_date, if (metadata.has_video) "true" else "false", genre, language, fetched });
+        result.deinit();
+    }
+
+    pub fn updateBeatmapUpstreamStats(self: *Store, beatmap_id: i32, plays: i32, passes: i32, hit_length: i32) !void {
+        if (beatmap_id <= 0 or plays < 0 or passes < 0 or passes > plays or hit_length < 0) return error.InvalidBeatmapSetMetadata;
+        var map_buf: [24]u8 = undefined;
+        var plays_buf: [24]u8 = undefined;
+        var passes_buf: [24]u8 = undefined;
+        var hit_buf: [24]u8 = undefined;
+        const map = try std.fmt.bufPrint(&map_buf, "{d}", .{beatmap_id});
+        const play_count = try std.fmt.bufPrint(&plays_buf, "{d}", .{plays});
+        const pass_count = try std.fmt.bufPrint(&passes_buf, "{d}", .{passes});
+        const hit = try std.fmt.bufPrint(&hit_buf, "{d}", .{hit_length});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmaps SET upstream_plays=$2,upstream_passes=$3,hit_length=$4 WHERE id=$1", &.{ map, play_count, pass_count, hit });
+        result.deinit();
+    }
+
     pub fn beatmapSetIdForMap(self: *Store, beatmap_id: i32) !?i32 {
         var map_buf: [24]u8 = undefined;
         const map = try std.fmt.bufPrint(&map_buf, "{d}", .{beatmap_id});
         var lease = self.pool.acquire();
         defer lease.release();
         var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT set_id FROM zigcho.beatmaps WHERE id=$1", &.{map});
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return try result.int(i32, 0, 0);
+    }
+
+    pub fn beatmapSetIdForChecksum(self: *Store, checksum: []const u8) !?i32 {
+        if (!lazer.validHash(checksum)) return null;
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT set_id FROM zigcho.beatmaps WHERE md5=$1", &.{checksum});
         defer result.deinit();
         if (result.rows() == 0) return null;
         return try result.int(i32, 0, 0);
@@ -1306,6 +1492,11 @@ pub const Store = struct {
             return self.object_store.streamGet(self.allocator, self.io, object_key, "application/octet-stream", writer);
         }
         try writer.writeAll(download.data orelse return error.BeatmapArchiveUnavailable);
+    }
+
+    pub fn beatmapArchiveRedirectUrl(self: *Store, allocator: std.mem.Allocator, download: BeatmapArchiveDownload) !?[]u8 {
+        const object_key = download.object_key orelse return null;
+        return try self.object_store.presignedGetUrl(allocator, self.io, object_key, 15 * 60);
     }
 
     pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
@@ -1712,15 +1903,22 @@ pub const Store = struct {
     }
 
     fn appendLazerMap(self: *Store, conn: *postgres.c.PGconn, writer: *std.Io.Writer, result: postgres.Result, row: usize, requester_id: ?i32) !void {
+        const creator_id = try result.int(i32, row, 20);
         try writer.print("{{\"id\":{d},\"beatmapset_id\":{d},\"status\":", .{ try result.int(i32, row, 0), try result.int(i32, row, 1) });
         try jsonString(writer, lazerStatus(try result.int(i32, row, 2)));
         try writer.writeAll(",\"checksum\":");
         try jsonString(writer, result.value(row, 3));
-        try writer.print(",\"user_id\":1,\"playcount\":{d},\"passcount\":{d},\"mode_int\":{d},\"difficulty_rating\":{d},\"drain\":{d},\"cs\":{d},\"ar\":{d},\"accuracy\":{d},\"total_length\":{d},\"hit_length\":{d},\"convert\":false,\"count_circles\":{d},\"count_sliders\":{d},\"count_spinners\":{d},\"version\":", .{ try result.int(i32, row, 4), try result.int(i32, row, 5), try result.int(i32, row, 6), try result.float(f64, row, 7), try result.float(f64, row, 8), try result.float(f64, row, 9), try result.float(f64, row, 10), try result.float(f64, row, 11), try result.int(i32, row, 12), try result.int(i32, row, 12), try result.int(i32, row, 17), try result.int(i32, row, 18), try result.int(i32, row, 19) });
+        try writer.print(",\"user_id\":{d},\"playcount\":{d},\"passcount\":{d},\"mode_int\":{d},\"difficulty_rating\":{d},\"drain\":{d},\"cs\":{d},\"ar\":{d},\"accuracy\":{d},\"total_length\":{d},\"hit_length\":{d},\"convert\":false,\"count_circles\":{d},\"count_sliders\":{d},\"count_spinners\":{d},\"version\":", .{ creator_id, try result.int(i64, row, 4), try result.int(i64, row, 5), try result.int(i32, row, 6), try result.float(f64, row, 7), try result.float(f64, row, 8), try result.float(f64, row, 9), try result.float(f64, row, 10), try result.float(f64, row, 11), try result.int(i32, row, 12), try result.int(i32, row, 22), try result.int(i32, row, 17), try result.int(i32, row, 18), try result.int(i32, row, 19) });
         try jsonString(writer, result.value(row, 13));
         try writer.print(",\"max_combo\":{d},\"last_updated\":", .{try result.int(i32, row, 14)});
         try jsonString(writer, result.value(row, 15));
-        try writer.print(",\"bpm\":{d},\"owners\":[]", .{try result.float(f64, row, 16)});
+        try writer.print(",\"bpm\":{d},\"owners\":[", .{try result.float(f64, row, 16)});
+        if (creator_id > 0) {
+            try writer.print("{{\"id\":{d},\"username\":", .{creator_id});
+            try jsonString(writer, result.value(row, 21));
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
         try self.appendLazerTagFields(conn, writer, try result.int(i32, row, 0), requester_id);
         try writer.writeByte('}');
     }
@@ -1728,7 +1926,7 @@ pub const Store = struct {
     fn appendLazerSet(self: *Store, conn: *postgres.c.PGconn, writer: *std.Io.Writer, set_id: i32, requester_id: ?i32) !bool {
         var set_buf: [24]u8 = undefined;
         const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
-        var set_result = try postgres.queryParams(self.allocator, conn, "SELECT set_id,min(artist),min(title),min(creator),min(status),max(bpm),min(source),min(tags),coalesce(to_char(to_timestamp(max(last_update)) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z'),NOT EXISTS(SELECT 1 FROM zigcho.beatmap_archives a WHERE a.set_id=$1),sum(plays) FROM zigcho.beatmaps WHERE set_id=$1 GROUP BY set_id", &.{set});
+        var set_result = try postgres.queryParams(self.allocator, conn, "SELECT b.set_id,min(b.artist),min(b.title),min(b.creator),min(b.status),max(b.bpm),min(b.source),min(b.tags),coalesce(max(m.submitted_date),coalesce(to_char(to_timestamp(max(b.last_update)) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),sum(b.plays+b.upstream_plays),coalesce(max(m.favourites),0),coalesce(max(m.last_updated),coalesce(to_char(to_timestamp(max(b.last_update)) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),max(m.ranked_date),coalesce(bool_or(m.has_video),false),coalesce(max(m.genre_id),0),coalesce(max(m.language_id),0),coalesce(max(b.creator_id),0) FROM zigcho.beatmaps b LEFT JOIN zigcho.beatmapset_metadata m ON m.set_id=b.set_id WHERE b.set_id=$1 GROUP BY b.set_id", &.{set});
         defer set_result.deinit();
         if (set_result.rows() == 0) return false;
         try writer.print("{{\"id\":{d},\"status\":", .{set_id});
@@ -1743,18 +1941,33 @@ pub const Store = struct {
         try jsonString(writer, set_result.value(0, 1));
         try writer.writeAll(",\"creator\":");
         try jsonString(writer, set_result.value(0, 3));
-        try writer.print(",\"user_id\":1,\"covers\":{{\"cover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover.jpg\",\"cover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover@2x.jpg\",\"card\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card.jpg\",\"card@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card@2x.jpg\",\"list\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list.jpg\",\"list@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list@2x.jpg\",\"slimcover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover.jpg\",\"slimcover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover@2x.jpg\"}},\"preview_url\":\"https://b.kai.ovh/preview/{d}.mp3\",\"play_count\":{d},\"favourite_count\":0,\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":false,\"storyboard\":false,\"submitted_date\":", .{ set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, try set_result.int(i64, 0, 10), try set_result.float(f64, 0, 5) });
+        const creator_id = try set_result.int(i32, 0, 16);
+        try writer.print(",\"user_id\":{d},\"covers\":{{\"cover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover.jpg\",\"cover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover@2x.jpg\",\"card\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card.jpg\",\"card@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card@2x.jpg\",\"list\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list.jpg\",\"list@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list@2x.jpg\",\"slimcover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover.jpg\",\"slimcover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover@2x.jpg\"}},\"preview_url\":\"https://b.kai.ovh/preview/{d}.mp3\",\"play_count\":{d},\"favourite_count\":{d},\"bpm\":{d},\"nsfw\":false,\"spotlight\":false,\"video\":{s},\"storyboard\":false,\"submitted_date\":", .{ creator_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, try set_result.int(i64, 0, 9), try set_result.int(i32, 0, 10), try set_result.float(f64, 0, 5), if (try set_result.boolean(0, 13)) "true" else "false" });
         try jsonString(writer, set_result.value(0, 8));
         try writer.writeAll(",\"last_updated\":");
-        try jsonString(writer, set_result.value(0, 8));
-        try writer.writeAll(",\"ranked_date\":null,\"ratings\":[],\"availability\":{\"download_disabled\":false,\"more_information\":\"\"},\"genre\":{\"id\":0,\"name\":\"Unspecified\"},\"language\":{\"id\":0,\"name\":\"Unspecified\"},\"source\":");
+        try jsonString(writer, set_result.value(0, 11));
+        try writer.writeAll(",\"ranked_date\":");
+        if (set_result.isNull(0, 12)) try writer.writeAll("null") else try jsonString(writer, set_result.value(0, 12));
+        const genre_id = try set_result.int(i16, 0, 14);
+        const language_id = try set_result.int(i16, 0, 15);
+        try writer.print(",\"ratings\":[],\"availability\":{{\"download_disabled\":false,\"more_information\":\"\"}},\"genre\":{{\"id\":{d},\"name\":", .{genre_id});
+        try jsonString(writer, upstream_user.genreName(genre_id));
+        try writer.print("}},\"language\":{{\"id\":{d},\"name\":", .{language_id});
+        try jsonString(writer, upstream_user.languageName(language_id));
+        try writer.writeAll("},\"source\":");
         try jsonString(writer, set_result.value(0, 6));
         try writer.writeAll(",\"tags\":");
         try jsonString(writer, set_result.value(0, 7));
         try writer.writeAll(",\"related_tags\":");
         try writer.writeAll(lazer.beatmap_tags_array_json);
+        var creator_buf: [24]u8 = undefined;
+        const creator = try std.fmt.bufPrint(&creator_buf, "{d}", .{creator_id});
+        var profile = try postgres.queryParams(self.allocator, conn, "SELECT profile_json::text FROM zigcho.upstream_user_profiles WHERE user_id=$1 ORDER BY mode=0 DESC,mode LIMIT 1", &.{creator});
+        defer profile.deinit();
+        try writer.writeAll(",\"user\":");
+        if (profile.rows() != 0) try writer.writeAll(profile.value(0, 0)) else try writer.writeAll("null");
         try writer.writeAll(",\"beatmaps\":[");
-        var maps = try postgres.queryParams(self.allocator, conn, "SELECT id,set_id,status,md5,plays,passes,mode,star_rating,hp,cs,ar,od,total_length,version,max_combo,coalesce(to_char(to_timestamp(last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z'),bpm,count_circles,count_sliders,count_spinners FROM zigcho.beatmaps WHERE set_id=$1 ORDER BY star_rating,id", &.{set});
+        var maps = try postgres.queryParams(self.allocator, conn, "SELECT b.id,b.set_id,b.status,b.md5,b.plays+b.upstream_plays,b.passes+b.upstream_passes,b.mode,b.star_rating,b.hp,b.cs,b.ar,b.od,b.total_length,b.version,b.max_combo,coalesce(m.last_updated,coalesce(to_char(to_timestamp(b.last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),b.bpm,b.count_circles,b.count_sliders,b.count_spinners,coalesce(b.creator_id,0),b.creator,CASE WHEN b.hit_length>0 THEN b.hit_length ELSE b.total_length END FROM zigcho.beatmaps b LEFT JOIN zigcho.beatmapset_metadata m ON m.set_id=b.set_id WHERE b.set_id=$1 ORDER BY b.star_rating,b.id", &.{set});
         defer maps.deinit();
         for (0..maps.rows()) |row| {
             if (row != 0) try writer.writeByte(',');
@@ -1783,9 +1996,9 @@ pub const Store = struct {
         var id_buf: [24]u8 = undefined;
         const value = checksum orelse try std.fmt.bufPrint(&id_buf, "{d}", .{beatmap_id orelse return null});
         const sql = if (checksum != null)
-            "SELECT id,set_id,status,md5,plays,passes,mode,star_rating,hp,cs,ar,od,total_length,version,max_combo,coalesce(to_char(to_timestamp(last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z'),bpm,count_circles,count_sliders,count_spinners FROM zigcho.beatmaps WHERE md5=$1"
+            "SELECT b.id,b.set_id,b.status,b.md5,b.plays+b.upstream_plays,b.passes+b.upstream_passes,b.mode,b.star_rating,b.hp,b.cs,b.ar,b.od,b.total_length,b.version,b.max_combo,coalesce(m.last_updated,coalesce(to_char(to_timestamp(b.last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),b.bpm,b.count_circles,b.count_sliders,b.count_spinners,coalesce(b.creator_id,0),b.creator,CASE WHEN b.hit_length>0 THEN b.hit_length ELSE b.total_length END FROM zigcho.beatmaps b LEFT JOIN zigcho.beatmapset_metadata m ON m.set_id=b.set_id WHERE b.md5=$1"
         else
-            "SELECT id,set_id,status,md5,plays,passes,mode,star_rating,hp,cs,ar,od,total_length,version,max_combo,coalesce(to_char(to_timestamp(last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z'),bpm,count_circles,count_sliders,count_spinners FROM zigcho.beatmaps WHERE id=$1";
+            "SELECT b.id,b.set_id,b.status,b.md5,b.plays+b.upstream_plays,b.passes+b.upstream_passes,b.mode,b.star_rating,b.hp,b.cs,b.ar,b.od,b.total_length,b.version,b.max_combo,coalesce(m.last_updated,coalesce(to_char(to_timestamp(b.last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),b.bpm,b.count_circles,b.count_sliders,b.count_spinners,coalesce(b.creator_id,0),b.creator,CASE WHEN b.hit_length>0 THEN b.hit_length ELSE b.total_length END FROM zigcho.beatmaps b LEFT JOIN zigcho.beatmapset_metadata m ON m.set_id=b.set_id WHERE b.id=$1";
         var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{value});
         defer result.deinit();
         if (result.rows() == 0) return null;
@@ -1799,9 +2012,9 @@ pub const Store = struct {
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         try output.writer.writeAll(map_json[0 .. map_json.len - 1]);
-        try output.writer.print(",\"beatmapset\":{{\"id\":{d},\"status\":", .{try result.int(i32, 0, 1)});
-        try jsonString(&output.writer, lazerStatus(try result.int(i32, 0, 2)));
-        try output.writer.writeAll("}}");
+        try output.writer.writeAll(",\"beatmapset\":");
+        if (!try self.appendLazerSet(lease.conn, &output.writer, try result.int(i32, 0, 1), requester_id)) return error.InvalidStoredBeatmap;
+        try output.writer.writeByte('}');
         var list = output.toArrayList();
         return try list.toOwnedSlice(allocator);
     }
@@ -1872,7 +2085,7 @@ pub const Store = struct {
             const beatmap_id = try rows.int(i32, row, 0);
             var map_buf: [24]u8 = undefined;
             const map_id = try std.fmt.bufPrint(&map_buf, "{d}", .{beatmap_id});
-            var map = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,status,md5,plays,passes,mode,star_rating,hp,cs,ar,od,total_length,version,max_combo,coalesce(to_char(to_timestamp(last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z'),bpm,count_circles,count_sliders,count_spinners FROM zigcho.beatmaps WHERE id=$1", &.{map_id});
+            var map = try postgres.queryParams(self.allocator, lease.conn, "SELECT b.id,b.set_id,b.status,b.md5,b.plays+b.upstream_plays,b.passes+b.upstream_passes,b.mode,b.star_rating,b.hp,b.cs,b.ar,b.od,b.total_length,b.version,b.max_combo,coalesce(m.last_updated,coalesce(to_char(to_timestamp(b.last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),b.bpm,b.count_circles,b.count_sliders,b.count_spinners,coalesce(b.creator_id,0),b.creator,CASE WHEN b.hit_length>0 THEN b.hit_length ELSE b.total_length END FROM zigcho.beatmaps b LEFT JOIN zigcho.beatmapset_metadata m ON m.set_id=b.set_id WHERE b.id=$1", &.{map_id});
             defer map.deinit();
             if (map.rows() == 0) continue;
             var set: std.Io.Writer.Allocating = .init(allocator);
@@ -5690,7 +5903,7 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates through account lazer and BSS schema thirty four" {
+test "postgres runtime migrates through account lazer metadata and BSS schema thirty five" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -5698,7 +5911,7 @@ test "postgres runtime migrates through account lazer and BSS schema thirty four
         try old_store.migrate();
         var previous = old_store.pool.acquire();
         defer previous.release();
-        try postgres.exec(previous.conn, "DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
+        try postgres.exec(previous.conn, "DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
         try postgres.exec(previous.conn, "ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
         try postgres.exec(previous.conn, "ALTER TABLE zigcho.beatmap_archives ALTER COLUMN osz_file SET NOT NULL; ALTER TABLE zigcho.beatmap_media ALTER COLUMN data SET NOT NULL");
     }
@@ -5710,7 +5923,7 @@ test "postgres runtime migrates through account lazer and BSS schema thirty four
     defer lease.release();
     var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 34), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 35), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -5738,12 +5951,15 @@ test "postgres runtime migrates through account lazer and BSS schema thirty four
     try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 25));
     try std.testing.expectEqual(@as(i32, 12), try result.int(i32, 0, 26));
     try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 27));
-    var bss_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.beatmap_submissions') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_submission_maps') IS NOT NULL)::int,(to_regclass('zigcho.bss_counters') IS NOT NULL)::int,(SELECT count(*) FROM zigcho.bss_counters)");
+    var bss_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.beatmap_submissions') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_submission_maps') IS NOT NULL)::int,(to_regclass('zigcho.bss_counters') IS NOT NULL)::int,(SELECT count(*) FROM zigcho.bss_counters),(SELECT min(next_id) FROM zigcho.bss_counters),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='beatmap_submissions' AND column_name='replacement_set_id'),(to_regclass('zigcho.beatmap_submissions_replacement') IS NOT NULL)::int");
     defer bss_schema.deinit();
     try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 2), try bss_schema.int(i32, 0, 3));
+    try std.testing.expect((try bss_schema.int(i64, 0, 4)) >= @as(i64, bss.private_id_floor));
+    try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 5));
+    try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 6));
     const kai = (try store.userById(std.testing.allocator, 3)).?;
     defer {
         std.testing.allocator.free(kai.name);
@@ -5765,10 +5981,32 @@ test "postgres BSS publishes an owned pending package into the BN queue" {
     store.external_only = false;
     const owner_id = try store.register("bss pg owner", "bss-pg-owner@example.test", "00000000000000000000000000000000");
     const other_id = try store.register("bss pg other", "bss-pg-other@example.test", "11111111111111111111111111111111");
+    {
+        var owner_buf: [24]u8 = undefined;
+        const owner = try std.fmt.bufPrint(&owner_buf, "{d}", .{owner_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var legacy = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.beatmap_submissions(set_id,owner_id,target,state,last_error) VALUES(100000000,$1,'WIP','failed','InvalidBssBeatmaps')", &.{owner});
+        legacy.deinit();
+        var legacy_maps = try postgres.query(lease.conn, "INSERT INTO zigcho.beatmap_submission_maps(set_id,beatmap_id,position) VALUES(100000000,100000000,0),(100000000,100000001,1)");
+        legacy_maps.deinit();
+    }
+    var legacy_retry = try bss.parseReserveInput(std.testing.allocator, "{\"beatmapset_id\":100000000,\"beatmaps_to_create\":0,\"beatmaps_to_keep\":[100000000,100000001],\"target\":\"Pending\",\"notify_on_discussion_replies\":true}");
+    defer legacy_retry.deinit();
+    var legacy_reissued = try store.reserveBssSubmission(std.testing.allocator, owner_id, legacy_retry);
+    defer legacy_reissued.deinit();
+    try std.testing.expect(legacy_reissued.set_id >= bss.private_id_floor);
+    for (legacy_reissued.beatmap_ids) |id| try std.testing.expect(id >= bss.private_id_floor);
+    var legacy_repeat = try store.reserveBssSubmission(std.testing.allocator, owner_id, legacy_retry);
+    defer legacy_repeat.deinit();
+    try std.testing.expectEqual(legacy_reissued.set_id, legacy_repeat.set_id);
+    try std.testing.expectEqualSlices(i32, legacy_reissued.beatmap_ids, legacy_repeat.beatmap_ids);
     var create = try bss.parseReserveInput(std.testing.allocator, "{\"beatmapset_id\":null,\"beatmaps_to_create\":1,\"beatmaps_to_keep\":[],\"target\":\"Pending\",\"notify_on_discussion_replies\":true}");
     defer create.deinit();
     var reservation = try store.reserveBssSubmission(std.testing.allocator, owner_id, create);
     defer reservation.deinit();
+    try std.testing.expect(reservation.set_id >= bss.private_id_floor);
+    try std.testing.expect(reservation.beatmap_ids[0] >= bss.private_id_floor);
     const foreign_ids = store.bssReservedMapIds(std.testing.allocator, other_id, reservation.set_id);
     try std.testing.expectError(error.BssNotOwner, foreign_ids);
 

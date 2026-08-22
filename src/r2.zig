@@ -57,6 +57,34 @@ pub const Storage = struct {
         }
     }
 
+    /// Return a short-lived URL which lets a client read an object directly.
+    /// Large beatmap archives must not be buffered by the public HTTP/2 proxy.
+    pub fn presignedGetUrl(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, expires_seconds: u32) ![]u8 {
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        return self.presignedGetUrlAt(allocator, object_key, expires_seconds, @intCast(now));
+    }
+
+    fn presignedGetUrlAt(self: Storage, allocator: std.mem.Allocator, object_key: []const u8, expires_seconds: u32, unix_seconds: u64) ![]u8 {
+        if (!self.enabled()) return error.R2NotConfigured;
+        if (!validObjectKey(object_key)) return error.InvalidR2ObjectKey;
+        if (expires_seconds == 0 or expires_seconds > 604_800) return error.InvalidR2PresignExpiry;
+        const host = endpointHost(self.endpoint) orelse return error.InvalidR2Endpoint;
+        const canonical_uri = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ self.bucket, object_key });
+        defer allocator.free(canonical_uri);
+        return presignedUrlAt(
+            allocator,
+            std.mem.trimEnd(u8, self.endpoint, "/"),
+            host,
+            canonical_uri,
+            self.access_key_id,
+            self.secret_access_key,
+            self.region,
+            expires_seconds,
+            unix_seconds,
+        );
+    }
+
     pub fn delete(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8) !void {
         if (!self.enabled()) return error.R2NotConfigured;
         const result = try self.request(allocator, io, .DELETE, object_key, "application/octet-stream", "", null);
@@ -150,6 +178,67 @@ fn deriveSigningKey(allocator: std.mem.Allocator, secret: []const u8, date: []co
     return allocator.dupe(u8, &signing_key);
 }
 
+fn percentEncodeQueryValue(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const hex = "0123456789ABCDEF";
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
+            try output.writer.writeByte(byte);
+        } else {
+            try output.writer.writeByte('%');
+            try output.writer.writeByte(hex[byte >> 4]);
+            try output.writer.writeByte(hex[byte & 0x0f]);
+        }
+    }
+    return output.toOwnedSlice();
+}
+
+fn presignedUrlAt(
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    host: []const u8,
+    canonical_uri: []const u8,
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+    region: []const u8,
+    expires_seconds: u32,
+    unix_seconds: u64,
+) ![]u8 {
+    if (!std.mem.startsWith(u8, endpoint, "https://") or host.len == 0 or canonical_uri.len < 2 or canonical_uri[0] != '/' or access_key_id.len == 0 or secret_access_key.len == 0 or !validRegion(region)) return error.InvalidR2Configuration;
+    if (expires_seconds == 0 or expires_seconds > 604_800) return error.InvalidR2PresignExpiry;
+    const timestamp = awsTimestamp(unix_seconds);
+    const credential_scope = try std.fmt.allocPrint(allocator, "{s}/{s}/s3/aws4_request", .{ &timestamp.date, region });
+    defer allocator.free(credential_scope);
+    const credential = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ access_key_id, credential_scope });
+    defer allocator.free(credential);
+    const encoded_credential = try percentEncodeQueryValue(allocator, credential);
+    defer allocator.free(encoded_credential);
+    const canonical_query = try std.fmt.allocPrint(
+        allocator,
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={s}&X-Amz-Date={s}&X-Amz-Expires={d}&X-Amz-SignedHeaders=host",
+        .{ encoded_credential, &timestamp.amz, expires_seconds },
+    );
+    defer allocator.free(canonical_query);
+    const canonical_request = try std.fmt.allocPrint(
+        allocator,
+        "GET\n{s}\n{s}\nhost:{s}\n\nhost\nUNSIGNED-PAYLOAD",
+        .{ canonical_uri, canonical_query, host },
+    );
+    defer allocator.free(canonical_request);
+    var request_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical_request, &request_digest, .{});
+    const request_hash = std.fmt.bytesToHex(request_digest, .lower);
+    const string_to_sign = try std.fmt.allocPrint(allocator, "AWS4-HMAC-SHA256\n{s}\n{s}\n{s}", .{ &timestamp.amz, credential_scope, &request_hash });
+    defer allocator.free(string_to_sign);
+    const signing_key = try deriveSigningKey(allocator, secret_access_key, &timestamp.date, region);
+    defer allocator.free(signing_key);
+    var signature_digest: [32]u8 = undefined;
+    HmacSha256.create(&signature_digest, string_to_sign, signing_key);
+    const signature = std.fmt.bytesToHex(signature_digest, .lower);
+    return std.fmt.allocPrint(allocator, "{s}{s}?{s}&X-Amz-Signature={s}", .{ endpoint, canonical_uri, canonical_query, &signature });
+}
+
 fn validEndpoint(value: []const u8) bool {
     return endpointHost(value) != null;
 }
@@ -203,4 +292,24 @@ test "r2 signing key matches the official s3 signature fixture" {
     HmacSha256.create(&digest, string_to_sign, key);
     const signature = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41", &signature);
+}
+
+test "r2 presigned get matches the official s3 query fixture" {
+    const url = try presignedUrlAt(
+        std.testing.allocator,
+        "https://examplebucket.s3.amazonaws.com",
+        "examplebucket.s3.amazonaws.com",
+        "/test.txt",
+        "AKIAIOSFODNN7EXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "us-east-1",
+        86_400,
+        1_369_353_600,
+    );
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+        url,
+    );
+    try std.testing.expectError(error.InvalidR2PresignExpiry, presignedUrlAt(std.testing.allocator, "https://example.test", "example.test", "/object", "key", "secret", "default", 0, 1_369_353_600));
 }

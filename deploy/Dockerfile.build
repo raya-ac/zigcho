@@ -28,6 +28,7 @@ WORKDIR /src
 COPY . .
 
 RUN zig build test \
+    && zig build test -Doptimize=ReleaseSafe \
     && zig build -Doptimize=ReleaseSafe \
     && zig build -Dpostgres=true -Doptimize=ReleaseSafe \
     && mkdir -p /out/tools /out/deploy/systemd /out/deploy/stunnel /out/deploy/certbot \

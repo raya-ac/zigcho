@@ -6,6 +6,7 @@ pub fn validIrcBind(value: []const u8) bool {
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
+    osu_api_key: []u8,
     score_webhook: []u8,
     anticheat_module_path: []u8,
     anticheat_allow_sample_modulus: u32,
@@ -24,6 +25,8 @@ pub const Config = struct {
     irc_port: u16,
 
     pub fn empty(allocator: std.mem.Allocator) !Config {
+        const osu_api_key = try allocator.dupe(u8, "");
+        errdefer allocator.free(osu_api_key);
         const score_webhook = try allocator.dupe(u8, "");
         errdefer allocator.free(score_webhook);
         const anticheat_module_path = try allocator.dupe(u8, "");
@@ -50,6 +53,7 @@ pub const Config = struct {
         errdefer allocator.free(irc_bind);
         return .{
             .allocator = allocator,
+            .osu_api_key = osu_api_key,
             .score_webhook = score_webhook,
             .anticheat_module_path = anticheat_module_path,
             .anticheat_allow_sample_modulus = 100,
@@ -70,6 +74,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        self.allocator.free(self.osu_api_key);
         self.allocator.free(self.score_webhook);
         self.allocator.free(self.anticheat_module_path);
         self.allocator.free(self.avatar_r2_endpoint);
@@ -102,7 +107,10 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
         const eq = std.mem.findScalar(u8, trimmed, '=') orelse continue;
         const key = std.mem.trim(u8, trimmed[0..eq], " \t");
         const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "score_webhook")) {
+        if (std.mem.eql(u8, key, "osu_api_key")) {
+            if (value.len <= 256 and std.mem.indexOfScalar(u8, value, 0) == null)
+                try result.replace(&result.osu_api_key, value);
+        } else if (std.mem.eql(u8, key, "score_webhook")) {
             try result.replace(&result.score_webhook, value);
         } else if (std.mem.eql(u8, key, "anticheat_module_path")) {
             if (value.len <= 4096 and std.mem.indexOfScalar(u8, value, 0) == null)

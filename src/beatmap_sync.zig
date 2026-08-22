@@ -2,6 +2,7 @@ const std = @import("std");
 const beatmap = @import("beatmap.zig");
 const pp = @import("exact_pp.zig");
 const storage = @import("runtime_storage.zig");
+const upstream_user = @import("upstream_user.zig");
 
 const metadata_limit = 256 * 1024;
 const search_limit = 8 * 1024 * 1024;
@@ -9,12 +10,15 @@ const archive_limit = 128 * 1024 * 1024;
 const map_limit = 16 * 1024 * 1024;
 const entry_limit = 4096;
 const mapset_map_limit = 256;
+const upstream_profile_limit = 128 * 1024;
+const upstream_profile_ttl_seconds: i64 = 24 * 60 * 60;
 pub const max_concurrent_hydrations = 4;
 
 const CheesegullMap = struct {
     ParentSetID: i32,
     BeatmapID: i32,
     TotalLength: i32 = 0,
+    HitLength: i32 = 0,
     DiffName: []const u8,
     FileMD5: []const u8,
     CS: ?f64 = null,
@@ -25,6 +29,8 @@ const CheesegullMap = struct {
     BPM: ?f64 = null,
     MaxCombo: ?u32 = null,
     DifficultyRating: ?f64 = null,
+    Playcount: i64 = 0,
+    Passcount: i64 = 0,
 };
 
 const CheesegullSet = struct {
@@ -36,7 +42,75 @@ const CheesegullSet = struct {
     Creator: []const u8 = "",
     Source: ?[]const u8 = null,
     Tags: ?[]const u8 = null,
+    ApprovedDate: ?[]const u8 = null,
+    SubmittedDate: ?[]const u8 = null,
+    LastUpdate: ?[]const u8 = null,
+    Favourites: i64 = 0,
+    Genre: i16 = 0,
+    Language: i16 = 0,
+    HasVideo: bool = false,
 };
+
+const OsuV1User = struct {
+    user_id: []const u8,
+    username: []const u8,
+    country: []const u8 = "XX",
+    join_date: []const u8 = "1970-01-01 00:00:00",
+    pp_raw: []const u8 = "0",
+    pp_rank: []const u8 = "0",
+    pp_country_rank: []const u8 = "0",
+    ranked_score: []const u8 = "0",
+    total_score: []const u8 = "0",
+    playcount: []const u8 = "0",
+    total_seconds_played: []const u8 = "0",
+    level: []const u8 = "0",
+    accuracy: []const u8 = "0",
+    count300: []const u8 = "0",
+    count100: []const u8 = "0",
+    count50: []const u8 = "0",
+    count_rank_ss: []const u8 = "0",
+    count_rank_ssh: []const u8 = "0",
+    count_rank_s: []const u8 = "0",
+    count_rank_sh: []const u8 = "0",
+    count_rank_a: []const u8 = "0",
+};
+
+fn profileFromV1(user: OsuV1User, mode: u8, expected_id: ?i32, join_date: *[20]u8) !upstream_user.Profile {
+    const id = try parseBoundedInteger(i32, user.user_id, 1, std.math.maxInt(i32));
+    if (expected_id) |wanted| if (id != wanted) return error.InvalidUpstreamUser;
+    if (mode > 3 or user.username.len == 0 or user.username.len > 64 or !std.unicode.utf8ValidateSlice(user.username) or user.country.len != 2 or !std.ascii.isAlphabetic(user.country[0]) or !std.ascii.isAlphabetic(user.country[1])) return error.InvalidUpstreamUser;
+    if (user.join_date.len != 19 or user.join_date[4] != '-' or user.join_date[7] != '-' or user.join_date[10] != ' ' or user.join_date[13] != ':' or user.join_date[16] != ':') return error.InvalidUpstreamUser;
+    @memcpy(join_date[0..10], user.join_date[0..10]);
+    join_date[10] = 'T';
+    @memcpy(join_date[11..19], user.join_date[11..19]);
+    join_date[19] = 'Z';
+    const count_300 = try parseBoundedInteger(i64, user.count300, 0, std.math.maxInt(i64));
+    const count_100 = try parseBoundedInteger(i64, user.count100, 0, std.math.maxInt(i64));
+    const count_50 = try parseBoundedInteger(i64, user.count50, 0, std.math.maxInt(i64));
+    const total_hits = std.math.add(i64, std.math.add(i64, count_300, count_100) catch return error.InvalidUpstreamUser, count_50) catch return error.InvalidUpstreamUser;
+    return .{
+        .id = id,
+        .username = user.username,
+        .country = .{ std.ascii.toUpper(user.country[0]), std.ascii.toUpper(user.country[1]) },
+        .join_date = join_date,
+        .mode = mode,
+        .pp = try parseBoundedFloat(user.pp_raw, 0, 1_000_000),
+        .global_rank = try parseBoundedInteger(i32, user.pp_rank, 0, std.math.maxInt(i32)),
+        .country_rank = try parseBoundedInteger(i32, user.pp_country_rank, 0, std.math.maxInt(i32)),
+        .ranked_score = try parseBoundedInteger(i64, user.ranked_score, 0, std.math.maxInt(i64)),
+        .total_score = try parseBoundedInteger(i64, user.total_score, 0, std.math.maxInt(i64)),
+        .play_count = try parseBoundedInteger(i32, user.playcount, 0, std.math.maxInt(i32)),
+        .play_time = try parseBoundedInteger(i64, user.total_seconds_played, 0, std.math.maxInt(i64)),
+        .level = try parseBoundedFloat(user.level, 0, 10_000),
+        .accuracy = try parseBoundedFloat(user.accuracy, 0, 100),
+        .total_hits = total_hits,
+        .grade_ssh = try parseBoundedInteger(i32, user.count_rank_ssh, 0, std.math.maxInt(i32)),
+        .grade_ss = try parseBoundedInteger(i32, user.count_rank_ss, 0, std.math.maxInt(i32)),
+        .grade_sh = try parseBoundedInteger(i32, user.count_rank_sh, 0, std.math.maxInt(i32)),
+        .grade_s = try parseBoundedInteger(i32, user.count_rank_s, 0, std.math.maxInt(i32)),
+        .grade_a = try parseBoundedInteger(i32, user.count_rank_a, 0, std.math.maxInt(i32)),
+    };
+}
 
 const BeatmapIdentity = struct {
     set_id: i32,
@@ -79,6 +153,7 @@ pub const Sync = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     cache_max_bytes: u64,
+    osu_api_key: []const u8 = "",
     in_progress: std.StringHashMap(void),
     in_progress_mutex: std.Io.Mutex = .init,
     attempts: std.atomic.Value(u64) = .init(0),
@@ -122,6 +197,10 @@ pub const Sync = struct {
         self.in_progress.deinit();
     }
 
+    pub fn bindOsuApiKey(self: *Sync, api_key: []const u8) void {
+        self.osu_api_key = api_key;
+    }
+
     pub fn metrics(self: *const Sync) Metrics {
         return .{
             .attempts = self.attempts.load(.monotonic),
@@ -144,6 +223,11 @@ pub const Sync = struct {
         cache_hit: bool,
     };
 
+    pub const PreparedMirrorArchive = struct {
+        bytes: usize,
+        cache_hit: bool,
+    };
+
     /// Serve an already verified archive or fill it through the same full-set
     /// metadata, archive, hash, and object-storage path used by gameplay.
     pub fn mirrorArchive(self: *Sync, store: *storage.Store, set_id: i32) !MirrorArchive {
@@ -160,13 +244,28 @@ pub const Sync = struct {
     }
 
     fn resolveMirrorArchive(self: *Sync, store: *storage.Store, set_id: i32, count_served: bool) !MirrorArchive {
+        const prepared = try self.prepareMirrorArchive(store, set_id, count_served);
+        const archive = (try store.beatmapArchive(self.allocator, set_id)) orelse return error.MirrorArchiveMissing;
+        if (archive.len != prepared.bytes) {
+            self.allocator.free(archive);
+            return error.InvalidStoredBeatmapArchive;
+        }
+        return .{ .data = archive, .cache_hit = prepared.cache_hit };
+    }
+
+    /// Ensure the verified archive exists without reading the whole stored
+    /// object back through Zigcho. Download routes use this before issuing a
+    /// short-lived object-store redirect.
+    pub fn prepareMirrorArchive(self: *Sync, store: *storage.Store, set_id: i32, count_served: bool) !PreparedMirrorArchive {
         if (set_id <= 0) return error.InvalidBeatmapSet;
-        if (try store.beatmapArchive(self.allocator, set_id)) |archive| {
+        if (try store.beatmapArchiveDownload(self.allocator, set_id)) |download_value| {
+            var download = download_value;
+            defer download.deinit();
             if (count_served) {
                 _ = self.mirror_hits.fetchAdd(1, .monotonic);
-                _ = self.mirror_bytes_served.fetchAdd(@intCast(archive.len), .monotonic);
+                _ = self.mirror_bytes_served.fetchAdd(@intCast(download.bytes), .monotonic);
             }
-            return .{ .data = archive, .cache_hit = true };
+            return .{ .bytes = download.bytes, .cache_hit = true };
         }
         if (count_served) _ = self.mirror_misses.fetchAdd(1, .monotonic);
 
@@ -184,10 +283,37 @@ pub const Sync = struct {
         defer remote.deinit();
         if (remote.maps.len == 0) return error.MapsetIncomplete;
         try self.downloadArchive(store, &remote.maps[0].md5, set_id, remote);
-        const archive = (try store.beatmapArchive(self.allocator, set_id)) orelse return error.MirrorArchiveMissing;
+        var download = (try store.beatmapArchiveDownload(self.allocator, set_id)) orelse return error.MirrorArchiveMissing;
+        defer download.deinit();
         _ = self.mirror_fills.fetchAdd(1, .monotonic);
-        if (count_served) _ = self.mirror_bytes_served.fetchAdd(@intCast(archive.len), .monotonic);
-        return .{ .data = archive, .cache_hit = false };
+        if (count_served) _ = self.mirror_bytes_served.fetchAdd(@intCast(download.bytes), .monotonic);
+        return .{ .bytes = download.bytes, .cache_hit = false };
+    }
+
+    /// Let a cold client download immediately from the upstream mirror while
+    /// Zigcho fills its own object in the background. The next request is then
+    /// served through a short-lived URL for our verified stored object.
+    pub fn queueMirrorArchive(self: *Sync, store: *storage.Store, set_id: i32) !bool {
+        if (set_id <= 0) return error.InvalidBeatmapSet;
+        if (try store.beatmapArchiveDownload(self.allocator, set_id)) |download_value| {
+            var download = download_value;
+            download.deinit();
+            return false;
+        }
+        _ = self.mirror_misses.fetchAdd(1, .monotonic);
+        var key_buffer: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "mirror:{d}", .{set_id});
+        const claim_owned = switch (try self.claim(key)) {
+            .claimed => |value| value,
+            .duplicate, .at_capacity => return false,
+        };
+        const thread = std.Thread.spawn(.{}, backgroundMirrorFill, .{ self, store, claim_owned, set_id }) catch |err| {
+            self.removeFromProgress(claim_owned);
+            _ = self.mirror_failures.fetchAdd(1, .monotonic);
+            return err;
+        };
+        thread.detach();
+        return true;
     }
 
     pub fn ensure(self: *Sync, store: *storage.Store, wanted_md5: []const u8, expected_set_id: ?i32) !bool {
@@ -271,6 +397,12 @@ pub const Sync = struct {
         };
         thread.detach();
         return true;
+    }
+
+    pub fn ensureByChecksum(self: *Sync, store: *storage.Store, checksum: []const u8) !bool {
+        if (!validMd5(checksum)) return false;
+        const identity = try self.fetchBeatmapIdentityByChecksum(checksum);
+        return self.ensureByBeatmapId(store, identity.beatmap_id, checksum);
     }
 
     /// Score submission needs the actual .osu payload, not just the public
@@ -478,11 +610,106 @@ pub const Sync = struct {
         return identity;
     }
 
-    fn storeSetMetadata(self: *Sync, store: *storage.Store, set: CheesegullSet) !void {
+    fn fetchBeatmapIdentityByChecksum(self: *Sync, checksum: []const u8) !struct { beatmap_id: i32, set_id: i32, md5: [32]u8 } {
+        if (!validMd5(checksum)) return error.InvalidBeatmapHash;
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        const url = try std.fmt.allocPrint(self.allocator, "https://osu.direct/api/md5/{s}", .{checksum});
+        defer self.allocator.free(url);
+        const body = try fetchFn(&client, self.allocator, url, metadata_limit);
+        defer self.allocator.free(body);
+        const parsed = std.json.parseFromSlice(CheesegullMap, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidUpstreamBeatmap;
+        defer parsed.deinit();
+        if (parsed.value.BeatmapID <= 0 or parsed.value.ParentSetID <= 0 or !std.ascii.eqlIgnoreCase(parsed.value.FileMD5, checksum)) return error.InvalidUpstreamBeatmap;
+        var md5: [32]u8 = undefined;
+        @memcpy(&md5, parsed.value.FileMD5);
+        return .{ .beatmap_id = parsed.value.BeatmapID, .set_id = parsed.value.ParentSetID, .md5 = md5 };
+    }
+
+    fn upstreamProfileCacheByLookup(self: *Sync, store: *storage.Store, lookup: []const u8, lookup_by_id: bool, mode: u8, now: i64) !?storage.UpstreamUserCache {
         _ = self;
+        return if (lookup_by_id)
+            store.upstreamUserCacheById(std.fmt.parseInt(i32, lookup, 10) catch return null, mode, now, upstream_profile_ttl_seconds)
+        else
+            store.upstreamUserCacheByName(lookup, mode, now, upstream_profile_ttl_seconds);
+    }
+
+    fn fetchUpstreamProfile(self: *Sync, store: *storage.Store, lookup: []const u8, lookup_by_id: bool, mode: u8, now: i64) !i32 {
+        if (self.osu_api_key.len == 0 or mode > 3 or lookup.len == 0 or lookup.len > 96) return error.OsuApiNotConfigured;
+        var url: std.Io.Writer.Allocating = .init(self.allocator);
+        defer url.deinit();
+        try url.writer.print("https://osu.ppy.sh/api/get_user?k={f}&u={f}&type={s}&m={d}", .{
+            std.fmt.alt(@as(std.Uri.Component, .{ .raw = self.osu_api_key }), .formatEscaped),
+            std.fmt.alt(@as(std.Uri.Component, .{ .raw = lookup }), .formatEscaped),
+            if (lookup_by_id) "id" else "string",
+            mode,
+        });
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        const body = try fetchSensitive(&client, self.allocator, url.written(), upstream_profile_limit);
+        defer self.allocator.free(body);
+        const parsed = std.json.parseFromSlice([]OsuV1User, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidUpstreamUser;
+        defer parsed.deinit();
+        if (parsed.value.len != 1) return error.UpstreamUserNotFound;
+        var join_date: [20]u8 = undefined;
+        const expected_id = if (lookup_by_id) std.fmt.parseInt(i32, lookup, 10) catch return error.InvalidUpstreamUser else null;
+        const profile = try profileFromV1(parsed.value[0], mode, expected_id, &join_date);
+        const json = try upstream_user.jsonOwned(self.allocator, profile);
+        defer self.allocator.free(json);
+        try store.upsertUpstreamUserProfile(profile, json, now);
+        return profile.id;
+    }
+
+    fn ensureUpstreamProfile(self: *Sync, store: *storage.Store, lookup: []const u8, lookup_by_id: bool, mode: u8) !?i32 {
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        const cached = try self.upstreamProfileCacheByLookup(store, lookup, lookup_by_id, mode, now);
+        if (cached) |entry| if (entry.fresh) return entry.id;
+        const fetched = self.fetchUpstreamProfile(store, lookup, lookup_by_id, mode, now) catch |err| {
+            if (cached) |entry| return entry.id;
+            return err;
+        };
+        return fetched;
+    }
+
+    pub fn ensureMapperProfile(self: *Sync, store: *storage.Store, set_id: i32) !bool {
+        var creator = (try store.beatmapSetCreator(self.allocator, set_id)) orelse return false;
+        defer creator.deinit();
+        const user_id = (try self.ensureUpstreamProfile(store, creator.name, false, creator.mode)) orelse return false;
+        try store.linkBeatmapSetCreator(set_id, user_id);
+        return true;
+    }
+
+    pub fn ensureUpstreamProfileById(self: *Sync, store: *storage.Store, user_id: i32, mode: u8) !?i32 {
+        var id_buffer: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "{d}", .{user_id});
+        return self.ensureUpstreamProfile(store, id, true, mode);
+    }
+
+    pub fn ensureUpstreamProfileByName(self: *Sync, store: *storage.Store, username: []const u8, mode: u8) !?i32 {
+        return self.ensureUpstreamProfile(store, username, false, mode);
+    }
+
+    fn storeSetMetadata(self: *Sync, store: *storage.Store, set: CheesegullSet) !void {
         if (set.SetID <= 0 or set.ChildrenBeatmaps.len == 0 or set.ChildrenBeatmaps.len > mapset_map_limit) return error.IdMismatch;
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        const submitted_date = validIsoTimestamp(set.SubmittedDate orelse "") orelse "1970-01-01T00:00:00Z";
+        const last_updated = validIsoTimestamp(set.LastUpdate orelse "") orelse submitted_date;
+        const ranked_date = validIsoTimestamp(set.ApprovedDate orelse "");
+        if (set.Favourites < 0 or set.Favourites > std.math.maxInt(i32) or set.Genre < 0 or set.Language < 0) return error.IdMismatch;
+        try store.upsertBeatmapSetMetadata(.{
+            .set_id = set.SetID,
+            .favourites = @intCast(set.Favourites),
+            .submitted_date = submitted_date,
+            .last_updated = last_updated,
+            .ranked_date = ranked_date,
+            .has_video = set.HasVideo,
+            .genre_id = set.Genre,
+            .language_id = set.Language,
+        }, now);
         for (set.ChildrenBeatmaps, 0..) |candidate, index| {
-            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set.SetID or !validMd5(candidate.FileMD5) or candidate.Mode > 3) return error.IdMismatch;
+            if (candidate.BeatmapID <= 0 or candidate.ParentSetID != set.SetID or !validMd5(candidate.FileMD5) or candidate.Mode > 3 or candidate.Playcount < 0 or candidate.Playcount > std.math.maxInt(i32) or candidate.Passcount < 0 or candidate.Passcount > candidate.Playcount or candidate.HitLength < 0 or candidate.HitLength > candidate.TotalLength) return error.IdMismatch;
             for (set.ChildrenBeatmaps[0..index]) |previous| {
                 if (previous.BeatmapID == candidate.BeatmapID or std.ascii.eqlIgnoreCase(previous.FileMD5, candidate.FileMD5)) return error.IdMismatch;
             }
@@ -508,6 +735,7 @@ pub const Sync = struct {
                 .object_count = 0,
             };
             try store.upsertBeatmapMeta(meta, candidate.FileMD5, localStatus(set.RankedStatus), candidate.DifficultyRating orelse 0, candidate.MaxCombo orelse 0);
+            try store.updateBeatmapUpstreamStats(candidate.BeatmapID, @intCast(candidate.Playcount), @intCast(candidate.Passcount), candidate.HitLength);
         }
     }
 
@@ -599,6 +827,27 @@ pub const Sync = struct {
         };
         store.clearHydrationFailure(md5_owned) catch |err| std.log.warn("[hydrate] could not clear failure state md5={s}: {t}", .{ md5_owned, err });
         _ = self.successes.fetchAdd(1, .monotonic);
+    }
+
+    fn backgroundMirrorFill(self: *Sync, store: *storage.Store, claim_owned: []const u8, set_id: i32) void {
+        defer self.removeFromProgress(claim_owned);
+        const remote = self.fetchAndStoreMetadata(store, null, set_id) catch |err| {
+            _ = self.mirror_failures.fetchAdd(1, .monotonic);
+            std.log.warn("event=beatmap_mirror_background_metadata_failed set_id={d} error={t}", .{ set_id, err });
+            return;
+        };
+        defer remote.deinit();
+        if (remote.maps.len == 0) {
+            _ = self.mirror_failures.fetchAdd(1, .monotonic);
+            return;
+        }
+        self.downloadArchive(store, &remote.maps[0].md5, set_id, remote) catch |err| {
+            _ = self.mirror_failures.fetchAdd(1, .monotonic);
+            std.log.warn("event=beatmap_mirror_background_fill_failed set_id={d} error={t}", .{ set_id, err });
+            return;
+        };
+        _ = self.mirror_fills.fetchAdd(1, .monotonic);
+        std.log.info("event=beatmap_mirror_background_filled set_id={d}", .{set_id});
     }
 
     fn recordFailure(self: *Sync, store: *storage.Store, md5: []const u8, set_id: i32, err: anyerror) void {
@@ -801,6 +1050,25 @@ test "osu direct metadata keeps cheese gull map and set fields" {
     try std.testing.expectEqualStrings("normal", parsed_set.value.ChildrenBeatmaps[0].DiffName);
 }
 
+test "official osu api mapper fixture becomes a real lazer profile" {
+    const body =
+        \\[{"user_id":"4452992","username":"Sotarks","country":"FR","join_date":"2014-05-28 17:34:35","pp_raw":"6440.47","pp_rank":"50128","pp_country_rank":"1563","ranked_score":"22490858468","total_score":"91822598773","playcount":"45597","total_seconds_played":"1000","level":"100.649","accuracy":"99.301498","count300":"10000000","count100":"2000","count50":"288","count_rank_ss":"64","count_rank_ssh":"251","count_rank_s":"566","count_rank_sh":"1502","count_rank_a":"780"}]
+    ;
+    const parsed = try std.json.parseFromSlice([]OsuV1User, std.testing.allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var join_date: [20]u8 = undefined;
+    const profile = try profileFromV1(parsed.value[0], 0, 4_452_992, &join_date);
+    try std.testing.expectEqual(@as(i32, 4_452_992), profile.id);
+    try std.testing.expectEqualStrings("Sotarks", profile.username);
+    try std.testing.expectEqualStrings("2014-05-28T17:34:35Z", profile.join_date);
+    try std.testing.expectEqual(@as(i64, 10_002_288), profile.total_hits);
+    const json = try upstream_user.jsonOwned(std.testing.allocator, profile);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"avatar_url\":\"https://a.ppy.sh/4452992\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"global_rank\":50128") != null);
+    try std.testing.expectError(error.InvalidUpstreamUser, profileFromV1(parsed.value[0], 0, 99, &join_date));
+}
+
 pub fn needsHydration(store: *storage.Store, wanted_md5: []const u8) !bool {
     return !try store.beatmapHasFile(wanted_md5);
 }
@@ -825,6 +1093,55 @@ fn fetchFn(client: *std.http.Client, allocator: std.mem.Allocator, url: []const 
         return error.UpstreamUnavailable;
     }
     return try allocator.realloc(buffer, writer.end);
+}
+
+/// The osu!api v1 key is a query parameter, so this request path must never
+/// include the URL in logs. Callers may log the mapper or set id separately.
+fn fetchSensitive(client: *std.http.Client, allocator: std.mem.Allocator, url: []const u8, limit: usize) ![]u8 {
+    if (limit == 0 or limit == std.math.maxInt(usize)) return error.InvalidUpstreamLimit;
+    const buffer = try allocator.alloc(u8, limit + 1);
+    errdefer allocator.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &writer,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+            .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/raya-ac/zigcho)" },
+        },
+    }) catch |err| {
+        std.log.warn("event=osu_api_profile_request_failed error={t}", .{err});
+        return error.UpstreamUnavailable;
+    };
+    if (result.status != .ok) {
+        std.log.warn("event=osu_api_profile_status status={d}", .{@intFromEnum(result.status)});
+        return error.UpstreamUnavailable;
+    }
+    if (writer.end > limit) return error.UpstreamResponseTooLarge;
+    return try allocator.realloc(buffer, writer.end);
+}
+
+fn parseBoundedInteger(comptime T: type, value: []const u8, minimum: T, maximum: T) !T {
+    if (value.len == 0 or value.len > 32) return error.InvalidUpstreamUser;
+    const parsed = std.fmt.parseInt(T, value, 10) catch return error.InvalidUpstreamUser;
+    if (parsed < minimum or parsed > maximum) return error.InvalidUpstreamUser;
+    return parsed;
+}
+
+fn parseBoundedFloat(value: []const u8, minimum: f64, maximum: f64) !f64 {
+    if (value.len == 0 or value.len > 64) return error.InvalidUpstreamUser;
+    const parsed = std.fmt.parseFloat(f64, value) catch return error.InvalidUpstreamUser;
+    if (!std.math.isFinite(parsed) or parsed < minimum or parsed > maximum) return error.InvalidUpstreamUser;
+    return parsed;
+}
+
+fn validIsoTimestamp(value: []const u8) ?[]const u8 {
+    if (value.len != 20 or value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':' or value[19] != 'Z') return null;
+    for (value, 0..) |char, index| switch (index) {
+        4, 7, 10, 13, 16, 19 => {},
+        else => if (!std.ascii.isDigit(char)) return null,
+    };
+    return value;
 }
 
 pub fn localStatus(upstream: i32) i8 {

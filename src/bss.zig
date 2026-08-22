@@ -10,6 +10,8 @@ pub const max_file_bytes: usize = 64 * 1024 * 1024;
 pub const max_osu_bytes: usize = 16 * 1024 * 1024;
 pub const max_entries: usize = 4096;
 pub const max_beatmaps: usize = 256;
+pub const legacy_private_id_floor: i32 = 100_000_000;
+pub const private_id_floor: i32 = 1_000_000_000;
 
 pub const Path = union(enum) {
     collection,
@@ -23,7 +25,7 @@ pub fn parsePath(path: []const u8) ?Path {
     const value = path[prefix.len..];
     if (value.len == 0 or std.mem.indexOfScalar(u8, value, '/') != null) return null;
     const set_id = std.fmt.parseInt(i32, value, 10) catch return null;
-    return if (set_id >= 100_000_000) .{ .set = set_id } else null;
+    return if (set_id >= legacy_private_id_floor) .{ .set = set_id } else null;
 }
 
 pub const Target = enum {
@@ -82,7 +84,7 @@ pub fn parseReserveInput(allocator: std.mem.Allocator, body: []const u8) !Reserv
 
     const set_id: ?i32 = if (object.get("beatmapset_id")) |value| switch (value) {
         .null => null,
-        .integer => if (value.integer >= 100_000_000 and value.integer <= std.math.maxInt(i32)) @intCast(value.integer) else return error.InvalidBssReservation,
+        .integer => if (value.integer >= legacy_private_id_floor and value.integer <= std.math.maxInt(i32)) @intCast(value.integer) else return error.InvalidBssReservation,
         else => return error.InvalidBssReservation,
     } else null;
 
@@ -91,7 +93,7 @@ pub fn parseReserveInput(allocator: std.mem.Allocator, body: []const u8) !Reserv
     const keep_ids = try allocator.alloc(i32, raw_keep.array.items.len);
     errdefer allocator.free(keep_ids);
     for (raw_keep.array.items, 0..) |value, index| {
-        if (value != .integer or value.integer < 100_000_000 or value.integer > std.math.maxInt(i32)) return error.InvalidBssReservation;
+        if (value != .integer or value.integer < legacy_private_id_floor or value.integer > std.math.maxInt(i32)) return error.InvalidBssReservation;
         const id: i32 = @intCast(value.integer);
         if (std.mem.indexOfScalar(i32, keep_ids[0..index], id) != null) return error.InvalidBssReservation;
         keep_ids[index] = id;
@@ -388,10 +390,13 @@ pub fn preparePackage(allocator: std.mem.Allocator, bytes: []const u8, set_id: i
     var count: usize = 0;
     for (archive.entries.items) |entry| {
         if (!std.ascii.endsWithIgnoreCase(entry.name, ".osu")) continue;
-        if (entry.data.len > max_osu_bytes or count >= maps.len) return error.InvalidBssBeatmaps;
-        const metadata = beatmap.parse(entry.data) catch return error.InvalidBssBeatmaps;
-        if (!metadataBounded(metadata) or metadata.set_id != set_id or std.mem.indexOfScalar(i32, expected_ids, metadata.id) == null) return error.InvalidBssBeatmaps;
-        for (maps[0..count]) |existing| if (existing.metadata.id == metadata.id or std.ascii.eqlIgnoreCase(&existing.md5, &beatmap.md5(entry.data))) return error.InvalidBssBeatmaps;
+        if (entry.data.len > max_osu_bytes) return error.BssBeatmapTooLarge;
+        if (count >= maps.len) return error.BssBeatmapCountMismatch;
+        const metadata = beatmap.parse(entry.data) catch return error.BssBeatmapParseFailed;
+        if (!metadataBounded(metadata)) return error.BssBeatmapMetadataTooLarge;
+        if (metadata.set_id != set_id) return error.BssBeatmapSetIdMismatch;
+        if (std.mem.indexOfScalar(i32, expected_ids, metadata.id) == null) return error.BssBeatmapIdMismatch;
+        for (maps[0..count]) |existing| if (existing.metadata.id == metadata.id or std.ascii.eqlIgnoreCase(&existing.md5, &beatmap.md5(entry.data))) return error.DuplicateBssBeatmap;
         const digest = beatmap.md5(entry.data);
         const attributes = pp.calculate(entry.data, .{
             .mode = metadata.mode,
@@ -405,20 +410,33 @@ pub fn preparePackage(allocator: std.mem.Allocator, bytes: []const u8, set_id: i
             .n50 = 0,
             .misses = 0,
             .legacy_total_score = 1_000_000,
-        }) catch return error.InvalidBssBeatmaps;
+        }) catch pp.Output{ .stars = 0, .max_combo = metadata.object_count };
         maps[count] = .{ .metadata = metadata, .md5 = digest, .stars = attributes.stars, .max_combo = attributes.max_combo, .contents = entry.data };
         count += 1;
     }
-    if (count != expected_ids.len) return error.InvalidBssBeatmaps;
+    if (count != expected_ids.len) return error.BssBeatmapCountMismatch;
     for (expected_ids) |id| {
         var found = false;
         for (maps) |map| if (map.metadata.id == id) {
             found = true;
             break;
         };
-        if (!found) return error.InvalidBssBeatmaps;
+        if (!found) return error.BssBeatmapIdMismatch;
     }
     return .{ .allocator = allocator, .archive = archive, .maps = maps };
+}
+
+pub fn packageErrorJson(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BssBeatmapTooLarge => "{\"error\":\"a beatmap file is too large\"}",
+        error.BssBeatmapCountMismatch => "{\"error\":\"beatmap count does not match the reservation\"}",
+        error.BssBeatmapParseFailed => "{\"error\":\"one of the .osu files could not be read\"}",
+        error.BssBeatmapMetadataTooLarge => "{\"error\":\"beatmap metadata is too large\"}",
+        error.BssBeatmapSetIdMismatch => "{\"error\":\"beatmap set ids do not match the reservation\"}",
+        error.BssBeatmapIdMismatch => "{\"error\":\"beatmap ids do not match the reservation\"}",
+        error.DuplicateBssBeatmap => "{\"error\":\"the package contains a duplicate beatmap\"}",
+        else => "{\"error\":\"invalid beatmap package\"}",
+    };
 }
 
 pub fn archiveSha256(bytes: []const u8) [64]u8 {
@@ -450,8 +468,10 @@ pub fn reservationJson(allocator: std.mem.Allocator, reservation: Reservation, a
 }
 
 test "BSS paths and reservation payload stay lazer-specific and bounded" {
+    try std.testing.expect(private_id_floor > legacy_private_id_floor);
     try std.testing.expect(parsePath("/beatmapsets") != null);
     try std.testing.expectEqual(@as(i32, 100_000_004), parsePath("/beatmapsets/100000004").?.set);
+    try std.testing.expectEqual(@as(i32, 1_000_000_004), parsePath("/beatmapsets/1000000004").?.set);
     try std.testing.expect(parsePath("/beatmapsets/4") == null);
     var input = try parseReserveInput(std.testing.allocator, "{\"beatmapset_id\":null,\"beatmaps_to_create\":2,\"beatmaps_to_keep\":[],\"target\":\"Pending\",\"notify_on_discussion_replies\":true}");
     defer input.deinit();

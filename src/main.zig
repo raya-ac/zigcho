@@ -436,59 +436,60 @@ const App = struct {
     }
 
     fn serveBeatmapArchive(self: *App, req: *std.http.Server.Request, set_id: i32) !void {
-        const stored_download = self.store.beatmapArchiveDownload(self.allocator, set_id) catch |err| blk: {
-            std.log.warn("event=beatmap_archive_stream_metadata_failed set_id={d} error={t}", .{ set_id, err });
-            break :blk null;
+        if (set_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+        const download_optional = self.store.beatmapArchiveDownload(self.allocator, set_id) catch |err| {
+            std.log.warn("event=beatmap_archive_download_metadata_failed set_id={d} error={t}", .{ set_id, err });
+            return respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror storage unavailable\"}", &.{});
         };
-        if (stored_download) |download_value| {
-            var download = download_value;
-            defer download.deinit();
-            var disposition_buf: [96]u8 = undefined;
-            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
-            const headers = [_]std.http.Header{
-                .{ .name = "content-type", .value = "application/x-osu-beatmap-archive" },
-                .{ .name = "content-disposition", .value = disposition },
-                .{ .name = "cache-control", .value = "public, max-age=3600" },
-                .{ .name = "cdn-cache-control", .value = "public, max-age=86400" },
+        if (download_optional == null) {
+            _ = self.map_sync.queueMirrorArchive(&self.store, set_id) catch |err|
+                std.log.warn("event=beatmap_mirror_background_queue_failed set_id={d} error={t}", .{ set_id, err });
+            var upstream_buffer: [128]u8 = undefined;
+            const upstream = try std.fmt.bufPrint(&upstream_buffer, "https://beatmaps.akatsuki.gg/api/d/{d}", .{set_id});
+            return respond(req, .temporary_redirect, "text/plain", "", &.{
+                .{ .name = "location", .value = upstream },
+                .{ .name = "cache-control", .value = "private, no-store" },
+                .{ .name = "x-zigcho-mirror-cache", .value = "fill" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            });
+        }
+        var download = download_optional.?;
+        defer download.deinit();
+        self.map_sync.recordMirrorCacheHit(download.bytes);
+        const redirect_url = self.store.beatmapArchiveRedirectUrl(self.allocator, download) catch |err| {
+            std.log.warn("event=beatmap_archive_redirect_failed set_id={d} error={t}", .{ set_id, err });
+            return respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror storage unavailable\"}", &.{});
+        };
+        if (redirect_url) |location| {
+            defer self.allocator.free(location);
+            return respond(req, .temporary_redirect, "text/plain", "", &.{
+                .{ .name = "location", .value = location },
+                .{ .name = "cache-control", .value = "private, no-store" },
                 .{ .name = "x-zigcho-mirror-cache", .value = "hit" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
-            };
-            var stream_buffer: [64 * 1024]u8 = undefined;
-            var body_writer = try req.respondStreaming(&stream_buffer, .{
-                .content_length = download.bytes,
-                .respond_options = .{ .status = .ok, .extra_headers = &headers, .keep_alive = false },
             });
-            try body_writer.flush();
-            self.store.streamBeatmapArchive(download, &body_writer.writer) catch |err| {
-                std.log.warn("event=beatmap_archive_stream_failed set_id={d} bytes={d} error={t}", .{ set_id, download.bytes, err });
-                return err;
-            };
-            try body_writer.end();
-            self.map_sync.recordMirrorCacheHit(download.bytes);
-            return;
         }
-
-        const mirrored = self.map_sync.mirrorArchive(&self.store, set_id) catch |err| return switch (err) {
-            error.MirrorFillInProgress, error.MirrorAtCapacity => respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap mirror fill is already busy\"}", &.{.{ .name = "retry-after", .value = "5" }}),
-            error.InvalidBeatmapSet => respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{}),
-            else => blk: {
-                std.log.warn("event=beatmap_mirror_fill_failed set_id={d} error={t}", .{ set_id, err });
-                break :blk respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror upstream unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
-            },
-        };
-        defer self.allocator.free(mirrored.data);
-        if (mirrored.cache_hit) self.store.setBeatmapArchiveSize(set_id, mirrored.data.len) catch |err|
-            std.log.warn("event=beatmap_archive_size_write_failed set_id={d} error={t}", .{ set_id, err });
         var disposition_buf: [96]u8 = undefined;
         const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
         const headers = [_]std.http.Header{
+            .{ .name = "content-type", .value = "application/x-osu-beatmap-archive" },
             .{ .name = "content-disposition", .value = disposition },
             .{ .name = "cache-control", .value = "public, max-age=3600" },
             .{ .name = "cdn-cache-control", .value = "public, max-age=86400" },
-            .{ .name = "x-zigcho-mirror-cache", .value = if (mirrored.cache_hit) "hit" else "fill" },
+            .{ .name = "x-zigcho-mirror-cache", .value = "hit" },
             .{ .name = "x-content-type-options", .value = "nosniff" },
         };
-        return respond(req, .ok, "application/x-osu-beatmap-archive", mirrored.data, &headers);
+        var stream_buffer: [64 * 1024]u8 = undefined;
+        var body_writer = try req.respondStreaming(&stream_buffer, .{
+            .content_length = download.bytes,
+            .respond_options = .{ .status = .ok, .extra_headers = &headers, .keep_alive = false },
+        });
+        try body_writer.flush();
+        self.store.streamBeatmapArchive(download, &body_writer.writer) catch |err| {
+            std.log.warn("event=beatmap_archive_stream_failed set_id={d} bytes={d} error={t}", .{ set_id, download.bytes, err });
+            return err;
+        };
+        try body_writer.end();
     }
 
     const GeoResult = struct { lon: f32, lat: f32 };
@@ -669,6 +670,21 @@ const App = struct {
 
     fn markOnline(self: *App, user: *domain.User) !void {
         user.online = try self.userOnlineCombined(user.id);
+    }
+
+    fn ensureMapperForSet(self: *App, set_id: i32) void {
+        _ = self.map_sync.ensureMapperProfile(&self.store, set_id) catch |err| switch (err) {
+            error.OsuApiNotConfigured, error.UpstreamUserNotFound => {},
+            else => std.log.warn("event=beatmap_mapper_profile_failed set_id={d} error={t}", .{ set_id, err }),
+        };
+    }
+
+    fn ensureMapperForMap(self: *App, beatmap_id: i32) void {
+        const set_id = self.store.beatmapSetIdForMap(beatmap_id) catch |err| {
+            std.log.warn("event=beatmap_mapper_lookup_failed beatmap_id={d} error={t}", .{ beatmap_id, err });
+            return;
+        };
+        if (set_id) |id| self.ensureMapperForSet(id);
     }
 
     fn combinedOnlineCount(self: *App) !usize {
@@ -1089,7 +1105,13 @@ const App = struct {
                 return respond(req, .too_many_requests, "application/json", "{\"error\":\"rate limit exceeded\"}", &headers);
             }
         }
-        const auth_owned: ?[]u8 = if (header(req, "authorization")) |v| try self.allocator.dupe(u8, v) else null;
+        const realtime_access_token = if (std.mem.eql(u8, path, "/multiplayer") or std.mem.eql(u8, path, "/multiplayer/negotiate") or std.mem.eql(u8, path, "/spectator") or std.mem.eql(u8, path, "/spectator/negotiate") or std.mem.eql(u8, path, "/notification-endpoint")) queryField(target, "access_token") else null;
+        const auth_owned: ?[]u8 = if (header(req, "authorization")) |v|
+            try self.allocator.dupe(u8, v)
+        else if (realtime_access_token) |token|
+            try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token})
+        else
+            null;
         defer if (auth_owned) |v| self.allocator.free(v);
         const osu_token_owned: ?[]u8 = if (header(req, "osu-token")) |v| try self.allocator.dupe(u8, v) else null;
         defer if (osu_token_owned) |v| self.allocator.free(v);
@@ -1294,7 +1316,7 @@ const App = struct {
                 var package = bss.preparePackage(self.allocator, archive, set_id, expected_ids) catch |err| {
                     self.store.failBssSubmission(bss_user.?.id, set_id, @errorName(err)) catch {};
                     std.log.warn("event=bss_package_rejected user_id={d} set_id={d} error={t}", .{ bss_user.?.id, set_id, err });
-                    return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid beatmap package\"}", &.{});
+                    return respond(req, .unprocessable_entity, "application/json", bss.packageErrorJson(err), &.{});
                 };
                 defer package.deinit();
                 const digest = bss.archiveSha256(archive);
@@ -2471,6 +2493,9 @@ const App = struct {
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/beatmapsets/")) {
             const set_id = std.fmt.parseInt(i32, path["/api/v1/beatmapsets/".len..], 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
             if (set_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
+            if (!try self.store.beatmapSetExists(set_id)) _ = self.map_sync.ensureBySetId(&self.store, set_id) catch |err|
+                std.log.warn("event=site_beatmap_set_hydration_failed set_id={d} error={t}", .{ set_id, err });
+            self.ensureMapperForSet(set_id);
             const set = (try self.store.lazerBeatmapSet(self.allocator, set_id, null)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(set);
             return respond(req, .ok, "application/json", set, &.{});
@@ -3198,13 +3223,26 @@ const App = struct {
             try output.writer.writeAll("{\"users\":[");
             var written: usize = 0;
             for (ids) |id| {
-                var found = (try self.store.userById(self.allocator, id)) orelse continue;
-                defer freeUser(self.allocator, found);
-                if (found.restricted and found.id != requester.id) continue;
-                try self.markOnline(&found);
+                if (try self.store.userById(self.allocator, id)) |local_value| {
+                    var found = local_value;
+                    defer freeUser(self.allocator, found);
+                    if (found.restricted and found.id != requester.id) continue;
+                    try self.markOnline(&found);
+                    if (written != 0) try output.writer.writeByte(',');
+                    written += 1;
+                    try user_json.writeCompact(&output.writer, found);
+                    continue;
+                }
+                const upstream_id = self.map_sync.ensureUpstreamProfileById(&self.store, id, 0) catch |err| failed: {
+                    std.log.warn("event=upstream_user_batch_failed user_id={d} error={t}", .{ id, err });
+                    break :failed null;
+                };
+                const resolved_id = upstream_id orelse continue;
+                const profile = (try self.store.upstreamUserProfileJson(self.allocator, resolved_id, 0)) orelse continue;
+                defer self.allocator.free(profile);
                 if (written != 0) try output.writer.writeByte(',');
                 written += 1;
-                try user_json.writeCompact(&output.writer, found);
+                try output.writer.writeAll(profile);
             }
             try output.writer.writeAll("],\"cursor\":null}");
             return respond(req, .ok, "application/json", output.written(), &.{});
@@ -3306,7 +3344,23 @@ const App = struct {
                 try self.store.userByName(self.allocator, lookup)
             else
                 return respond(req, .bad_request, "application/json", "{\"error\":\"invalid lookup key\"}", &.{});
-            var found = profile_user orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            if (profile_user == null) {
+                const upstream_id = if (std.mem.eql(u8, key, "id")) by_id: {
+                    const id = std.fmt.parseInt(i32, lookup, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid user id\"}", &.{});
+                    break :by_id self.map_sync.ensureUpstreamProfileById(&self.store, id, user_path.ruleset_id) catch |err| failed: {
+                        std.log.warn("event=upstream_user_profile_failed user_id={d} mode={d} error={t}", .{ id, user_path.ruleset_id, err });
+                        break :failed null;
+                    };
+                } else self.map_sync.ensureUpstreamProfileByName(&self.store, lookup, user_path.ruleset_id) catch |err| failed: {
+                    std.log.warn("event=upstream_user_profile_failed username={s} mode={d} error={t}", .{ lookup, user_path.ruleset_id, err });
+                    break :failed null;
+                };
+                const resolved_id = upstream_id orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+                const profile = (try self.store.upstreamUserProfileJson(self.allocator, resolved_id, user_path.ruleset_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+                defer self.allocator.free(profile);
+                return respond(req, .ok, "application/json", profile, &.{});
+            }
+            var found = profile_user.?;
             defer freeUser(self.allocator, found);
             if (found.restricted and found.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
             try self.markOnline(&found);
@@ -3337,10 +3391,12 @@ const App = struct {
             try output.writer.writeAll("{\"beatmaps\":[");
             var written: usize = 0;
             for (ids) |id| {
+                self.ensureMapperForMap(id);
                 var found = try self.store.lazerBeatmapLookup(self.allocator, id, null, user.id);
                 if (found == null) {
                     _ = self.map_sync.ensureByBeatmapId(&self.store, id, null) catch |err|
                         std.log.warn("event=lazer_beatmap_batch_hydration_failed beatmap_id={d} error={t}", .{ id, err });
+                    self.ensureMapperForMap(id);
                     found = try self.store.lazerBeatmapLookup(self.allocator, id, null, user.id);
                 }
                 const beatmap = found orelse continue;
@@ -3378,11 +3434,19 @@ const App = struct {
                     }
                 }
             }
+            if (beatmap_id) |id| self.ensureMapperForMap(id);
+            if (beatmap_id == null) if (checksum) |value| if (try self.store.beatmapSetIdForChecksum(value)) |set_id| self.ensureMapperForSet(set_id);
             var found = try self.store.lazerBeatmapLookup(self.allocator, beatmap_id, checksum, user.id);
             if (found == null) if (beatmap_id) |id| {
                 _ = self.map_sync.ensureByBeatmapId(&self.store, id, checksum) catch |err|
                     std.log.warn("event=lazer_beatmap_lookup_hydration_failed beatmap_id={d} error={t}", .{ id, err });
+                self.ensureMapperForMap(id);
                 found = try self.store.lazerBeatmapLookup(self.allocator, id, null, user.id);
+            } else if (checksum) |value| {
+                _ = self.map_sync.ensureByChecksum(&self.store, value) catch |err|
+                    std.log.warn("event=lazer_beatmap_checksum_hydration_failed checksum={s} error={t}", .{ value, err });
+                if (try self.store.beatmapSetIdForChecksum(value)) |set_id| self.ensureMapperForSet(set_id);
+                found = try self.store.lazerBeatmapLookup(self.allocator, null, value, user.id);
             };
             const response = found orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap not found\"}", &.{});
             defer self.allocator.free(response);
@@ -3685,6 +3749,7 @@ const App = struct {
                 set_id = try self.store.beatmapSetIdForMap(map_id);
             }
             const resolved_set_id = set_id orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
+            self.ensureMapperForSet(resolved_set_id);
             const listing = (try self.store.lazerBeatmapSet(self.allocator, resolved_set_id, user.id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
@@ -3697,13 +3762,12 @@ const App = struct {
             const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            var listing = try self.store.lazerBeatmapSet(self.allocator, set_id, user.id);
-            if (listing == null) {
+            if (!try self.store.beatmapSetExists(set_id)) {
                 _ = self.map_sync.ensureBySetId(&self.store, set_id) catch |err|
                     std.log.warn("event=lazer_beatmap_set_hydration_failed set_id={d} error={t}", .{ set_id, err });
-                listing = try self.store.lazerBeatmapSet(self.allocator, set_id, user.id);
             }
-            const response = listing orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
+            self.ensureMapperForSet(set_id);
+            const response = (try self.store.lazerBeatmapSet(self.allocator, set_id, user.id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{});
             defer self.allocator.free(response);
             return respond(req, .ok, "application/json", response, &.{});
         }
@@ -5142,6 +5206,7 @@ fn mirrorWorkerCommand(allocator: std.mem.Allocator, io: std.Io, args: []const [
     store.bindObjectStorage(object_store);
     var sync = beatmap_sync.Sync.init(allocator, io, config.beatmap_cache_max_bytes);
     defer sync.deinit();
+    sync.bindOsuApiKey(config.osu_api_key);
     std.log.info("event=beatmap_mirror_worker_started mode=continuous", .{});
     while (true) {
         const unknown_sizes = store.beatmapArchiveIdsMissingSize(allocator, 1) catch |err| {
@@ -5323,8 +5388,10 @@ pub fn main(init: std.process.Init) !void {
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
     };
+    app.map_sync.bindOsuApiKey(config.osu_api_key);
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
     app.lazer_multiplayer.bindStore(&app.store);
+    app.lazer_multiplayer.bindBeatmapSync(&app.map_sync);
     app.lazer_multiplayer.refreshMatchmakingMaps() catch |err| std.log.warn("event=lazer_matchmaking_pool_startup_failed error={t}", .{err});
     app.lazer_spectator.bindStore(&app.store);
     kai.country = .{ 'I', 'S' };

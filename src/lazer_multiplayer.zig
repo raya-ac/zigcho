@@ -1,6 +1,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const storage = @import("runtime_storage.zig");
+const beatmap_sync = @import("beatmap_sync.zig");
 
 pub const max_rooms = 64;
 pub const Activity = enum { lobby, queue, multiplayer, playing };
@@ -634,6 +635,7 @@ pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     store: ?*storage.Store = null,
+    map_sync: ?*beatmap_sync.Sync = null,
     mutex: std.Io.Mutex = .init,
     rooms: [max_rooms]?*Room = [_]?*Room{null} ** max_rooms,
     connections: std.ArrayList(*Connection) = .empty,
@@ -651,9 +653,19 @@ pub const Manager = struct {
         self.store = store;
     }
 
+    pub fn bindBeatmapSync(self: *Manager, sync: *beatmap_sync.Sync) void {
+        self.map_sync = sync;
+    }
+
     fn hydratePlaylistItem(self: *Manager, item: *PlaylistItem) !void {
         const store = self.store orelse return;
-        const info = (try store.beatmapInfoById(self.allocator, item.beatmap_id)) orelse return;
+        var info_optional = try store.beatmapInfoById(self.allocator, item.beatmap_id);
+        if (info_optional == null) if (self.map_sync) |sync| {
+            _ = sync.ensureByBeatmapId(store, item.beatmap_id, null) catch |err|
+                std.log.warn("event=lazer_multiplayer_beatmap_hydration_failed beatmap_id={d} error={t}", .{ item.beatmap_id, err });
+            info_optional = try store.beatmapInfoById(self.allocator, item.beatmap_id);
+        };
+        const info = info_optional orelse return;
         defer self.allocator.free(info.artist);
         defer self.allocator.free(info.title);
         defer self.allocator.free(info.version);
@@ -915,6 +927,7 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
         if (self.connections.items.len >= max_connections) return error.MultiplayerConnectionLimit;
         try self.connections.append(self.allocator, connection);
+        std.log.info("event=lazer_multiplayer_connected user_id={d}", .{user.id});
         return connection;
     }
 
@@ -1007,6 +1020,7 @@ pub const Manager = struct {
         defer if (queue_peer) |peer| peer.release();
         self.removeConnectionLocked(connection);
         self.mutex.unlock(self.io);
+        std.log.info("event=lazer_multiplayer_disconnected user_id={d}", .{connection.user_id});
         if (queue_peer) |peer| {
             const frame_result = if (queue_peer_left)
                 eventNoArgsOwned(self.allocator, "MatchmakingQueueLeft")
@@ -4458,6 +4472,35 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     try std.testing.expectEqualStrings("stored song", set.get("title").?.string);
     try std.testing.expectEqualStrings("stored mapper", set.get("creator").?.string);
     try std.testing.expectEqualStrings("https://assets.kai.ovh/beatmaps/900/covers/cover.jpg", set.get("covers").?.object.get("cover").?.string);
+
+    var client_room: Room = .{ .id = 0, .settings = .{}, .host_id = host.id, .host_country = host.country };
+    try client_room.settings.name.set("client snapshot");
+    client_room.settings.playlist_item_id = 1;
+    try client_room.settings.auto_start.set(&.{0xc0});
+    try client_room.host_name.set(host.name);
+    var client_item: PlaylistItem = .{ .id = 1, .owner_id = host.id, .beatmap_id = 75 };
+    try client_item.required_mods.set(&.{0x90});
+    try client_item.allowed_mods.set(&.{0x90});
+    try client_item.played_at.set(&.{0xc0});
+    client_room.playlist[0] = client_item;
+    client_room.playlist_count = 1;
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try writeRoom(.{ .writer = &encoded.writer }, &client_room);
+    var connection: Connection = .{ .allocator = std.testing.allocator, .user_id = host.id, .user_country = host.country, .io = std.testing.io };
+    try connection.user_name.set(host.name);
+    const decoded = try parseRoom(std.testing.allocator, encoded.written(), &connection);
+    defer std.testing.allocator.destroy(decoded);
+    try manager.hydrateRoom(decoded);
+    var client_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer client_json.deinit();
+    try writeRoomJson(&client_json.writer, decoded);
+    var parsed_client = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, client_json.written(), .{});
+    defer parsed_client.deinit();
+    const client_beatmap = parsed_client.value.object.get("playlist").?.array.items[0].object.get("beatmap").?.object;
+    try std.testing.expectEqual(@as(i64, 900), client_beatmap.get("beatmapset_id").?.integer);
+    try std.testing.expectEqualStrings("stored song", client_beatmap.get("beatmapset").?.object.get("title").?.string);
+    try std.testing.expectEqualStrings("stored diff", client_beatmap.get("version").?.string);
 }
 
 test "signalr accepts messagepack handshake bytes independent of websocket opcode" {

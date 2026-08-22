@@ -51,6 +51,7 @@ jobs:
       - name: verify player-facing identity
         run: |
           grep -Fq 'zigcho!lazer' work/osu-client/osu.Game/Overlays/DevBuildBanner.cs
+          grep -Fq 'playableBeatmap.BeatmapInfo.OnlineID = -1' work/osu-client/osu.Game/Screens/Edit/Submission/SubmissionBeatmapExporter.cs
           grep -Fq 'ovh.kai.zigcholazer' work/osu-client/osu.Android/AndroidManifest.xml
           grep -Fq 'ovh.kai.zigcholazer' work/osu-client/osu.iOS/Info.plist
           if grep -R -n -E 'DEVELOPER BUILD|osu! \(development\)' work/osu-client/osu.Game work/osu-client/osu.Desktop; then

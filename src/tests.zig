@@ -22,6 +22,7 @@ const form_urlencoded = @import("form_urlencoded.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const bss = @import("bss.zig");
+const upstream_user = @import("upstream_user.zig");
 const sessions_mod = @import("sessions.zig");
 const country = @import("country.zig");
 const config_mod = @import("config.zig");
@@ -550,6 +551,7 @@ test "config values stay owned after the source buffer changes" {
     @memset(source, 'x');
     std.testing.allocator.free(source);
 
+    try std.testing.expectEqualStrings("final-key", config.osu_api_key);
     try std.testing.expectEqualStrings("https://discord.invalid/first", config.score_webhook);
     try std.testing.expectEqualStrings("/opt/zigcho/private/anticheat.so", config.anticheat_module_path);
     try std.testing.expectEqual(@as(u32, 250), config.anticheat_allow_sample_modulus);
@@ -1411,9 +1413,9 @@ test "lazer BSS reserves owned ids publishes pending and returns WIP through one
     defer create.deinit();
     var reservation = try store.reserveBssSubmission(std.testing.allocator, owner_id, create);
     defer reservation.deinit();
-    try std.testing.expect(reservation.set_id >= 100_000_000);
+    try std.testing.expect(reservation.set_id >= bss.private_id_floor);
     try std.testing.expectEqual(@as(usize, 1), reservation.beatmap_ids.len);
-    try std.testing.expect(reservation.beatmap_ids[0] >= 100_000_000);
+    try std.testing.expect(reservation.beatmap_ids[0] >= bss.private_id_floor);
 
     const foreign_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"beatmapset_id\":{d},\"beatmaps_to_create\":0,\"beatmaps_to_keep\":[{d}],\"target\":\"WIP\",\"notify_on_discussion_replies\":false}}", .{ reservation.set_id, reservation.beatmap_ids[0] });
     defer std.testing.allocator.free(foreign_json);
@@ -1486,6 +1488,46 @@ test "lazer BSS reserves owned ids publishes pending and returns WIP through one
     try std.testing.expectError(error.InvalidBssFilename, bss.parseArchive(std.testing.allocator, traversal));
 }
 
+test "failed legacy BSS reservations are atomically reissued above one billion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/bss-legacy-reissue.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const owner_id = try store.register("bss legacy owner", "bss-legacy-owner@example.test", "00000000000000000000000000000000");
+    var fixture_sql_buf: [1024]u8 = undefined;
+    const fixture_sql = try std.fmt.bufPrintZ(
+        &fixture_sql_buf,
+        "INSERT INTO beatmap_submissions(set_id,owner_id,target,state,last_error) VALUES(100000000,{d},'WIP','failed','InvalidBssBeatmaps');" ++
+            "INSERT INTO beatmap_submission_maps(set_id,beatmap_id,position) VALUES(100000000,100000000,0),(100000000,100000001,1);",
+        .{owner_id},
+    );
+    try store.exec(fixture_sql);
+
+    var retry = try bss.parseReserveInput(std.testing.allocator, "{\"beatmapset_id\":100000000,\"beatmaps_to_create\":0,\"beatmaps_to_keep\":[100000000,100000001],\"target\":\"Pending\",\"notify_on_discussion_replies\":true}");
+    defer retry.deinit();
+    var reservation = try store.reserveBssSubmission(std.testing.allocator, owner_id, retry);
+    defer reservation.deinit();
+    try std.testing.expect(reservation.set_id >= bss.private_id_floor);
+    try std.testing.expectEqual(@as(u32, 1), reservation.revision);
+    try std.testing.expectEqual(@as(usize, 2), reservation.beatmap_ids.len);
+    for (reservation.beatmap_ids) |id| try std.testing.expect(id >= bss.private_id_floor);
+
+    var legacy_alias: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT replacement_set_id FROM beatmap_submissions WHERE set_id=100000000", -1, &legacy_alias, null));
+    defer _ = storage.c.sqlite3_finalize(legacy_alias);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(legacy_alias));
+    try std.testing.expectEqual(@as(i64, reservation.set_id), storage.c.sqlite3_column_int64(legacy_alias, 0));
+
+    var retried = try store.reserveBssSubmission(std.testing.allocator, owner_id, retry);
+    defer retried.deinit();
+    try std.testing.expectEqual(reservation.set_id, retried.set_id);
+    try std.testing.expectEqual(@as(u32, 2), retried.revision);
+    try std.testing.expectEqualSlices(i32, reservation.beatmap_ids, retried.beatmap_ids);
+}
+
 test "stable screenshots survive storage with exact type isolation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1516,6 +1558,43 @@ test "beatmap covers and previews survive the bounded media cache" {
     const metadata = try beatmap.parse(map);
     const hash = beatmap.md5(map);
     try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
+    const mapper: upstream_user.Profile = .{
+        .id = 4_452_992,
+        .username = "Ari",
+        .country = .{ 'A', 'U' },
+        .join_date = "2014-05-28T17:34:35Z",
+        .mode = 0,
+        .pp = 6440.47,
+        .global_rank = 50_128,
+        .country_rank = 1563,
+        .ranked_score = 22_490_858_468,
+        .total_score = 91_822_598_773,
+        .play_count = 45_597,
+        .play_time = 1_000,
+        .level = 100.649,
+        .accuracy = 99.301498,
+        .total_hits = 10_002_288,
+        .grade_ssh = 251,
+        .grade_ss = 64,
+        .grade_sh = 1502,
+        .grade_s = 566,
+        .grade_a = 780,
+    };
+    const mapper_json = try upstream_user.jsonOwned(std.testing.allocator, mapper);
+    defer std.testing.allocator.free(mapper_json);
+    try store.upsertUpstreamUserProfile(mapper, mapper_json, 1_787_456_000);
+    try store.linkBeatmapSetCreator(metadata.set_id, mapper.id);
+    try store.upsertBeatmapSetMetadata(.{
+        .set_id = metadata.set_id,
+        .favourites = 39,
+        .submitted_date = "2026-08-20T00:00:00Z",
+        .last_updated = "2026-08-22T05:45:08Z",
+        .ranked_date = "2026-08-22T05:45:08Z",
+        .has_video = true,
+        .genre_id = 4,
+        .language_id = 2,
+    }, 1_787_456_000);
+    try store.updateBeatmapUpstreamStats(metadata.id, 123, 45, 9);
     const jpeg = "\xff\xd8\xffcover bytes\xff\xd9";
     const ogg = "OggSpreview bytes";
     try store.putBeatmapMedia(metadata.set_id, .cover, .jpeg, jpeg);
@@ -5039,7 +5118,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 34), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 35), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {
@@ -6089,8 +6168,19 @@ test "ranked stable PP is stored and updates normal player stats" {
     defer parsed_set.deinit();
     try std.testing.expectEqual(@as(i64, 900000000), parsed_set.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("ranked", parsed_set.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, mapper.id), parsed_set.value.object.get("user_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 39), parsed_set.value.object.get("favourite_count").?.integer);
+    try std.testing.expect(parsed_set.value.object.get("video").?.bool);
+    try std.testing.expectEqualStrings("Rock", parsed_set.value.object.get("genre").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("English", parsed_set.value.object.get("language").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("https://a.ppy.sh/4452992", parsed_set.value.object.get("user").?.object.get("avatar_url").?.string);
     try std.testing.expect(!parsed_set.value.object.get("availability").?.object.get("download_disabled").?.bool);
     try std.testing.expectEqual(@as(usize, 1), parsed_set.value.object.get("beatmaps").?.array.items.len);
+    const detailed_map = parsed_set.value.object.get("beatmaps").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 123), detailed_map.get("playcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 45), detailed_map.get("passcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), detailed_map.get("hit_length").?.integer);
+    try std.testing.expectEqual(@as(i64, mapper.id), detailed_map.get("owners").?.array.items[0].object.get("id").?.integer);
     const lazer_lookup = (try store.lazerBeatmapLookup(std.testing.allocator, null, &hash, null)).?;
     defer std.testing.allocator.free(lazer_lookup);
     const parsed_lookup = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_lookup, .{});

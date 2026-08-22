@@ -34,7 +34,7 @@ jobs:
   linux-x64:
     name: pinned linux x64 release
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:17-bookworm
@@ -78,6 +78,22 @@ jobs:
             exit 1
           fi
 
+      - name: run PostgreSQL integration tests
+        shell: bash
+        env:
+          PGPASSWORD: zigcho-gate
+        run: |
+          set -euo pipefail
+          createdb -h 127.0.0.1 -U zigcho zigcho_store
+          createdb -h 127.0.0.1 -U zigcho zigcho_migrate
+          createdb -h 127.0.0.1 -U zigcho zigcho_bss
+          docker run --rm --network host \
+            -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_BSS_URL=host=127.0.0.1 port=5432 dbname=zigcho_bss user=zigcho password=zigcho-gate connect_timeout=5' \
+            "zigcho-release-gate:${GITHUB_SHA}" \
+            zig build test -Doptimize=ReleaseSafe
+
       - name: boot the exact binary on PostgreSQL
         shell: bash
         env:
@@ -86,7 +102,8 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 34
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 35
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' EXIT

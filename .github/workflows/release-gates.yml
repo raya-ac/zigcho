@@ -73,6 +73,7 @@ jobs:
           printf '%s\n' "$binary_type"
           [[ "$binary_type" == *'ELF 64-bit LSB'* ]]
           [[ "$binary_type" == *'x86-64'* ]]
+          [[ "$binary_type" != *'not stripped'* ]]
           if test -n "$(find artifacts/server -type f -name '*.pdb' -print -quit)"; then
             exit 1
           fi
@@ -104,7 +105,7 @@ jobs:
           kill "$server_pid"
           wait "$server_pid" || true
           trap - EXIT
-          sha256sum artifacts/server/zigcho > artifacts/server/zigcho.sha256
+          (cd artifacts/server && sha256sum zigcho > zigcho.sha256 && sha256sum --check zigcho.sha256)
 
       - name: upload the deployable release
         uses: actions/upload-artifact@v7

@@ -849,7 +849,9 @@ pub const Sync = struct {
             try store.updateBeatmapUpstreamStats(map_id, playcount, passcount, hit_length);
             maps[index] = .{ .md5 = undefined, .beatmap_id = map_id };
             @memcpy(&maps[index].md5, row.file_md5);
-            if (wanted_md5) |md5| if (std.ascii.eqlIgnoreCase(md5, row.file_md5)) requested_index = index;
+            if (wanted_md5) |md5| {
+                if (std.ascii.eqlIgnoreCase(md5, row.file_md5)) requested_index = index;
+            }
         }
         const requested = requested_index orelse return error.Md5NotFound;
         return .{
@@ -897,7 +899,7 @@ pub const Sync = struct {
         const metadata_url = try std.fmt.allocPrint(self.allocator, "https://osu.direct/api/s/{d}", .{set_id});
         defer self.allocator.free(metadata_url);
         const metadata_json = fetchFn(&client, self.allocator, metadata_url, metadata_limit) catch |err| {
-            std.log.warn("[hydrate] metadata fetch failed: {t}", .{err});
+            std.log.info("[hydrate] metadata fetch failed; trying official fallback: {t}", .{err});
             return err;
         };
         defer self.allocator.free(metadata_json);

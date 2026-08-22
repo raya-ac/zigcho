@@ -27,10 +27,10 @@ RUN curl --fail --location --silent --show-error \
 WORKDIR /src
 COPY . .
 
-RUN zig build test -Dtarget=x86_64-linux-gnu -Dcpu=baseline \
-    && zig build test -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSafe \
-    && zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSafe \
-    && zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dpostgres=true -Doptimize=ReleaseSafe \
+RUN zig build test -Dcpu=baseline \
+    && zig build test -Dcpu=baseline -Doptimize=ReleaseSafe \
+    && zig build -Dcpu=baseline -Doptimize=ReleaseSafe \
+    && zig build -Dcpu=baseline -Dpostgres=true -Doptimize=ReleaseSafe \
     && mkdir -p /out/tools /out/deploy/systemd /out/deploy/stunnel /out/deploy/certbot \
     && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/ \
     && strip --strip-all /out/zigcho /out/zigcho-import /out/zigcho-import-archive /out/zigcho-migrate-postgres \

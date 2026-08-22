@@ -3050,6 +3050,8 @@ pub const Store = struct {
             }
             try lazer.writeLeaderboardScore(&output.writer, .{
                 .id = c.sqlite3_column_int64(stmt, 1),
+                .legacy_score_id = if (stable) lazer.decodeStableScoreId(c.sqlite3_column_int64(stmt, 1)) else null,
+                .legacy_total_score = if (stable) c.sqlite3_column_int64(stmt, 7) else null,
                 .user_id = c.sqlite3_column_int(stmt, 2),
                 .username = std.mem.span(c.sqlite3_column_text(stmt, 3)),
                 .country = std.mem.span(c.sqlite3_column_text(stmt, 4)),
@@ -3121,6 +3123,8 @@ pub const Store = struct {
             try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, c.sqlite3_column_int(stmt, 12), c.sqlite3_column_int(stmt, 13), c.sqlite3_column_int(stmt, 14), c.sqlite3_column_int(stmt, 15), c.sqlite3_column_int(stmt, 16), c.sqlite3_column_int(stmt, 17));
             const score: lazer.LeaderboardScore = .{
                 .id = c.sqlite3_column_int64(stmt, 2),
+                .legacy_score_id = c.sqlite3_column_int64(stmt, 2),
+                .legacy_total_score = c.sqlite3_column_int64(stmt, 8),
                 .user_id = c.sqlite3_column_int(stmt, 3),
                 .username = std.mem.span(c.sqlite3_column_text(stmt, 4)),
                 .country = std.mem.span(c.sqlite3_column_text(stmt, 5)),
@@ -3233,6 +3237,8 @@ pub const Store = struct {
             }
             const score: lazer.LeaderboardScore = .{
                 .id = c.sqlite3_column_int64(stmt, 3),
+                .legacy_score_id = if (stable) lazer.decodeStableScoreId(c.sqlite3_column_int64(stmt, 3)) else null,
+                .legacy_total_score = if (stable) c.sqlite3_column_int64(stmt, 9) else null,
                 .user_id = c.sqlite3_column_int(stmt, 4),
                 .username = std.mem.span(c.sqlite3_column_text(stmt, 5)),
                 .country = std.mem.span(c.sqlite3_column_text(stmt, 6)),

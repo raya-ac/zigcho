@@ -478,6 +478,8 @@ pub const ChatMessage = struct {
 
 pub const LeaderboardScore = struct {
     id: i64,
+    legacy_score_id: ?i64 = null,
+    legacy_total_score: ?i64 = null,
     user_id: i32,
     username: []const u8,
     country: []const u8,
@@ -521,8 +523,11 @@ pub const UserScoresPath = struct {
 };
 
 pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !void {
-    try writer.print("{{\"id\":{d},\"user_id\":{d},\"beatmap_id\":{d},\"ruleset_id\":{d},\"passed\":{s},\"total_score\":{d},\"total_score_without_mods\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"rank\":", .{
-        score.id,
+    try writer.print("{{\"id\":{d},\"legacy_score_id\":", .{score.id});
+    if (score.legacy_score_id) |value| try writer.print("{d}", .{value}) else try writer.writeAll("null");
+    try writer.writeAll(",\"legacy_total_score\":");
+    if (score.legacy_total_score) |value| try writer.print("{d}", .{value}) else try writer.writeAll("null");
+    try writer.print(",\"user_id\":{d},\"beatmap_id\":{d},\"ruleset_id\":{d},\"passed\":{s},\"total_score\":{d},\"total_score_without_mods\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"rank\":", .{
         score.user_id,
         score.beatmap_id,
         score.ruleset_id,
@@ -917,6 +922,19 @@ pub fn modsDisplay(allocator: std.mem.Allocator, mods_json: []const u8) ![]u8 {
         };
         if (!validAcronym(acronym)) return error.InvalidMod;
         try output.writer.writeAll(acronym);
+        if (std.ascii.eqlIgnoreCase(acronym, "DT") or std.ascii.eqlIgnoreCase(acronym, "NC")) {
+            if (object.get("settings")) |settings_value| switch (settings_value) {
+                .object => |settings| if (settings.get("speed_change")) |rate_value| {
+                    const rate = switch (rate_value) {
+                        .float => |value| value,
+                        .integer => |value| @as(f64, @floatFromInt(value)),
+                        else => continue,
+                    };
+                    if (std.math.isFinite(rate)) try output.writer.print(" {d:.2}×", .{rate});
+                },
+                else => {},
+            };
+        }
     }
     return output.toOwnedSlice();
 }

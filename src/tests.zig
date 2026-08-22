@@ -1187,6 +1187,8 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, status_page, "class=\"achievement-icon\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_page, "custom-achievement-icon") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_page, "kind==='accuracy'?value+'%'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "speed_change") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_page, "toFixed(2)+'×'") != null);
 }
 
 test "stable screenshots survive storage with exact type isolation" {
@@ -4273,6 +4275,16 @@ test "lazer performance state maps official hit results and legacy mods" {
     }));
 }
 
+test "lazer mod display keeps custom DT and NC rates for announcements" {
+    const dt = try lazer.modsDisplay(std.testing.allocator, "[{\"acronym\":\"DT\",\"settings\":{\"speed_change\":1.25}}]");
+    defer std.testing.allocator.free(dt);
+    try std.testing.expectEqualStrings("+DT 1.25×", dt);
+
+    const nc = try lazer.modsDisplay(std.testing.allocator, "[{\"acronym\":\"HD\"},{\"acronym\":\"NC\",\"settings\":{\"speed_change\":1.75}}]");
+    defer std.testing.allocator.free(nc);
+    try std.testing.expectEqualStrings("+HDNC 1.75×", nc);
+}
+
 test "vanilla lazer performance matches the pinned 2026.730.0 calculator" {
     const Fixture = struct {
         mode: u8,
@@ -4323,6 +4335,85 @@ test "vanilla lazer performance matches the pinned 2026.730.0 calculator" {
     });
     try std.testing.expectApproxEqAbs(@as(f64, 39.036597621743), custom_rate.pp, 0.0000001);
     try std.testing.expectApproxEqAbs(@as(f64, 1.703730093981), custom_rate.stars, 0.0000001);
+
+    const nightcore_custom_rate = try pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"NC\",\"settings\":{\"speed_change\":1.25}}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = (1 << 6) | (1 << 9),
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 0,
+    });
+    try std.testing.expectApproxEqAbs(custom_rate.pp, nightcore_custom_rate.pp, 0.0000001);
+    try std.testing.expectApproxEqAbs(custom_rate.stars, nightcore_custom_rate.stars, 0.0000001);
+
+    const dt_slow = try pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"DT\",\"settings\":{\"speed_change\":1.10}}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = 1 << 6,
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 0,
+    });
+    const dt_fast = try pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"DT\",\"settings\":{\"speed_change\":1.90}}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = 1 << 6,
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 0,
+    });
+    const nc_slow = try pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"NC\",\"settings\":{\"speed_change\":1.10}}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = (1 << 6) | (1 << 9),
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 0,
+    });
+    const nc_fast = try pp.calculateLazer(@embedFile("testdata/synthetic-standard.osu"), "[{\"acronym\":\"NC\",\"settings\":{\"speed_change\":1.90}}]", .{
+        .mode = 0,
+        .lazer = 1,
+        .mods = (1 << 6) | (1 << 9),
+        .max_combo = 10,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 0,
+    });
+    try std.testing.expectApproxEqAbs(@as(f64, 31.801852944415), dt_slow.pp, 0.0000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.744607222530), dt_slow.stars, 0.0000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 71.644213191228), dt_fast.pp, 0.0000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.098350925561), dt_fast.stars, 0.0000001);
+    try std.testing.expect(dt_slow.pp < custom_rate.pp);
+    try std.testing.expect(dt_fast.pp > custom_rate.pp);
+    try std.testing.expectApproxEqAbs(dt_slow.pp, nc_slow.pp, 0.0000001);
+    try std.testing.expectApproxEqAbs(dt_fast.pp, nc_fast.pp, 0.0000001);
+    try std.testing.expectApproxEqAbs(dt_slow.stars, nc_slow.stars, 0.0000001);
+    try std.testing.expectApproxEqAbs(dt_fast.stars, nc_fast.stars, 0.0000001);
 }
 
 test "lazer solo score tokens are user bound expiring and single use" {
@@ -4541,6 +4632,8 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
     try std.testing.expectEqual(@as(i64, 1), parsed_relax.value.object.get("score_count").?.integer);
     const stable_relax = parsed_relax.value.object.get("scores").?.array.items[0].object;
     try std.testing.expect(stable_relax.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(lazer.decodeStableScoreId(stable_relax.get("id").?.integer).?, stable_relax.get("legacy_score_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 600), stable_relax.get("legacy_total_score").?.integer);
     try std.testing.expect(stable_relax.get("ranked").?.bool);
     try std.testing.expect(stable_relax.get("has_replay").?.bool);
     try std.testing.expectEqualStrings("CL", stable_relax.get("mods").?.array.items[0].object.get("acronym").?.string);
@@ -4557,6 +4650,8 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
     try std.testing.expectEqual(@as(i64, 1), parsed_autopilot.value.object.get("score_count").?.integer);
     const stable_autopilot = parsed_autopilot.value.object.get("scores").?.array.items[0].object;
     try std.testing.expect(stable_autopilot.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(lazer.decodeStableScoreId(stable_autopilot.get("id").?.integer).?, stable_autopilot.get("legacy_score_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 620), stable_autopilot.get("legacy_total_score").?.integer);
     try std.testing.expect(stable_autopilot.get("ranked").?.bool);
     try std.testing.expect(stable_autopilot.get("has_replay").?.bool);
     try std.testing.expectEqualStrings("AP", stable_autopilot.get("mods").?.array.items[1].object.get("acronym").?.string);

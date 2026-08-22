@@ -3250,6 +3250,8 @@ pub const Store = struct {
             }
             try lazer.writeLeaderboardScore(&output.writer, .{
                 .id = try result.int(i64, row, 1),
+                .legacy_score_id = if (stable) lazer.decodeStableScoreId(try result.int(i64, row, 1)) else null,
+                .legacy_total_score = if (stable) try result.int(i64, row, 7) else null,
                 .user_id = try result.int(i32, row, 2),
                 .username = result.value(row, 3),
                 .country = result.value(row, 4),
@@ -3332,6 +3334,8 @@ pub const Store = struct {
             const status = try result.int(i32, row, 21);
             const score: lazer.LeaderboardScore = .{
                 .id = try result.int(i64, row, 2),
+                .legacy_score_id = try result.int(i64, row, 2),
+                .legacy_total_score = try result.int(i64, row, 8),
                 .user_id = try result.int(i32, row, 3),
                 .username = result.value(row, 4),
                 .country = result.value(row, 5),
@@ -3443,6 +3447,8 @@ pub const Store = struct {
             }
             const score: lazer.LeaderboardScore = .{
                 .id = try result.int(i64, row, 3),
+                .legacy_score_id = if (stable) lazer.decodeStableScoreId(try result.int(i64, row, 3)) else null,
+                .legacy_total_score = if (stable) try result.int(i64, row, 9) else null,
                 .user_id = try result.int(i32, row, 4),
                 .username = result.value(row, 5),
                 .country = result.value(row, 6),
@@ -4582,6 +4588,8 @@ test "postgres account auth stats and token slice" {
     try std.testing.expectEqual(@as(i64, 1), parsed_stable_relax.value.object.get("score_count").?.integer);
     const relax_board_score = parsed_stable_relax.value.object.get("scores").?.array.items[0].object;
     try std.testing.expect(relax_board_score.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(stable_relax_id, relax_board_score.get("legacy_score_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 600), relax_board_score.get("legacy_total_score").?.integer);
     try std.testing.expect(relax_board_score.get("ranked").?.bool);
     try std.testing.expect(relax_board_score.get("has_replay").?.bool);
     try std.testing.expectEqualStrings("RX", relax_board_score.get("mods").?.array.items[1].object.get("acronym").?.string);
@@ -4596,6 +4604,8 @@ test "postgres account auth stats and token slice" {
     try std.testing.expectEqual(@as(i64, 1), parsed_stable_autopilot.value.object.get("score_count").?.integer);
     const autopilot_board_score = parsed_stable_autopilot.value.object.get("scores").?.array.items[0].object;
     try std.testing.expect(autopilot_board_score.get("id").?.integer >= lazer.stable_score_id_offset);
+    try std.testing.expectEqual(stable_autopilot_id, autopilot_board_score.get("legacy_score_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 620), autopilot_board_score.get("legacy_total_score").?.integer);
     try std.testing.expect(autopilot_board_score.get("ranked").?.bool);
     try std.testing.expect(autopilot_board_score.get("has_replay").?.bool);
     try std.testing.expectEqualStrings("AP", autopilot_board_score.get("mods").?.array.items[1].object.get("acronym").?.string);

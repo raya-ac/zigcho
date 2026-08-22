@@ -1,1 +1,1 @@
-stable-rosu-4.0.1-akatsuki-591de0d.1
+stable-rosu-4.0.1-lazer-2026.730.0-1129a7e-akatsuki-591de0d.1

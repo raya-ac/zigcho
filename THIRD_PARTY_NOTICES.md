@@ -2,7 +2,8 @@
 
 zigcho links the following MIT-licensed projects into its Stable PP calculator:
 
-- `rosu-pp` 4.0.1 — Copyright (c) 2021 Max — https://github.com/MaxOhn/rosu-pp
+- `rosu-pp` 4.0.1 for Stable — Copyright (c) 2021 Max — https://github.com/MaxOhn/rosu-pp
+- `rosu-pp` 5.0.0 at `1129a7e79d689fc705bf93fb2f2a6411825ba545` for lazer 2026.730.0 parity — Copyright (c) 2021 Max — https://github.com/kaibi-dev/rosu-pp
 - `akatsuki-pp` 1.1.2 at `591de0db4948f2c504ca6e2ca3db442f09103ef1` — Copyright (c) 2021 Max — https://github.com/osuAkatsuki/akatsuki-pp-rs
 
 Stable protocol and achievement compatibility also reference the MIT-licensed

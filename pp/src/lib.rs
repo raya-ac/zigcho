@@ -5,11 +5,15 @@ use akatsuki_pp::{
     any::ScoreState as AkatsukiScoreState,
 };
 use rosu_map::section::general::GameMode as AkatsukiGameMode;
-use rosu_pp::{
-    Beatmap as RosuBeatmap, Performance as RosuPerformance, any::ScoreState as RosuScoreState,
-    model::mode::GameMode as RosuGameMode,
+use rosu_mods::{GameMod, GameModSimple, GameMode, GameMods, serde::GameModSeed};
+use rosu_pp_lazer::{
+    Beatmap as LazerBeatmap, Performance as LazerPerformance, any::ScoreState as LazerScoreState,
+    model::mode::GameMode as LazerGameMode,
 };
-use rosu_mods::{GameMod, GameModSimple, GameMods, GameMode, serde::GameModSeed};
+use rosu_pp_stable::{
+    Beatmap as StableBeatmap, Performance as StablePerformance,
+    any::ScoreState as StableScoreState, model::mode::GameMode as StableGameMode,
+};
 
 const RELAX: u32 = 1 << 7;
 const AUTOPILOT: u32 = 1 << 13;
@@ -71,12 +75,22 @@ fn passed_objects(input: &ZigchoPpInput) -> Option<u32> {
     (total > 0).then_some(total)
 }
 
-fn rosu_mode(value: u8) -> Option<RosuGameMode> {
+fn stable_mode(value: u8) -> Option<StableGameMode> {
     match value {
-        0 => Some(RosuGameMode::Osu),
-        1 => Some(RosuGameMode::Taiko),
-        2 => Some(RosuGameMode::Catch),
-        3 => Some(RosuGameMode::Mania),
+        0 => Some(StableGameMode::Osu),
+        1 => Some(StableGameMode::Taiko),
+        2 => Some(StableGameMode::Catch),
+        3 => Some(StableGameMode::Mania),
+        _ => None,
+    }
+}
+
+fn lazer_mode(value: u8) -> Option<LazerGameMode> {
+    match value {
+        0 => Some(LazerGameMode::Osu),
+        1 => Some(LazerGameMode::Taiko),
+        2 => Some(LazerGameMode::Catch),
+        3 => Some(LazerGameMode::Mania),
         _ => None,
     }
 }
@@ -91,15 +105,14 @@ fn akatsuki_mode(value: u8) -> Option<AkatsukiGameMode> {
     }
 }
 
-fn calculate_vanilla(
+fn calculate_stable_vanilla(
     map_bytes: &[u8],
     input: &ZigchoPpInput,
     passed: u32,
-    lazer_mods: Option<GameMods>,
 ) -> Result<ZigchoPpOutput, ()> {
-    let map = RosuBeatmap::from_bytes(map_bytes).map_err(|_| ())?;
-    let mode = rosu_mode(input.mode).ok_or(())?;
-    let state = RosuScoreState {
+    let map = StableBeatmap::from_bytes(map_bytes).map_err(|_| ())?;
+    let mode = stable_mode(input.mode).ok_or(())?;
+    let state = StableScoreState {
         max_combo: input.max_combo,
         osu_large_tick_hits: input.large_tick_hits,
         osu_small_tick_hits: input.small_tick_hits,
@@ -112,15 +125,48 @@ fn calculate_vanilla(
         misses: input.misses,
         legacy_total_score: (input.legacy_total_score > 0).then_some(input.legacy_total_score),
     };
-    let performance = RosuPerformance::new(&map)
+    let attributes = StablePerformance::new(&map)
         .try_mode(mode)
-        .map_err(|_| ())?;
-    let performance = match lazer_mods {
-        Some(mods) => performance.mods(mods),
-        None => performance.mods(input.mods),
+        .map_err(|_| ())?
+        .mods(input.mods)
+        .lazer(false)
+        .passed_objects(passed)
+        .state(state)
+        .calculate();
+
+    Ok(ZigchoPpOutput {
+        pp: attributes.pp(),
+        stars: attributes.stars(),
+        max_combo: attributes.max_combo(),
+    })
+}
+
+fn calculate_lazer_vanilla(
+    map_bytes: &[u8],
+    input: &ZigchoPpInput,
+    passed: u32,
+    mods: GameMods,
+) -> Result<ZigchoPpOutput, ()> {
+    let map = LazerBeatmap::from_bytes(map_bytes).map_err(|_| ())?;
+    let mode = lazer_mode(input.mode).ok_or(())?;
+    let state = LazerScoreState {
+        max_combo: input.max_combo,
+        osu_large_tick_hits: input.large_tick_hits,
+        osu_small_tick_hits: input.small_tick_hits,
+        slider_end_hits: input.slider_end_hits,
+        n_geki: input.n_geki,
+        n_katu: input.n_katu,
+        n300: input.n300,
+        n100: input.n100,
+        n50: input.n50,
+        misses: input.misses,
+        legacy_total_score: None,
     };
-    let attributes = performance
-        .lazer(input.lazer != 0)
+    let attributes = LazerPerformance::new(&map)
+        .try_mode(mode)
+        .map_err(|_| ())?
+        .mods(mods)
+        .lazer(true)
         .passed_objects(passed)
         .state(state)
         .calculate();
@@ -171,7 +217,7 @@ fn calculate(map_bytes: &[u8], input: &ZigchoPpInput) -> Result<ZigchoPpOutput, 
     if input.mods & (RELAX | AUTOPILOT) != 0 {
         calculate_custom(map_bytes, input, passed)
     } else {
-        calculate_vanilla(map_bytes, input, passed, None)
+        calculate_stable_vanilla(map_bytes, input, passed)
     }
 }
 
@@ -266,7 +312,7 @@ pub unsafe extern "C" fn zigcho_lazer_pp_calculate(
         let input = unsafe { &*input };
         let passed = passed_objects(input).ok_or(())?;
         let mods = parse_lazer_mods(mods_bytes, input.mode)?;
-        calculate_vanilla(map_bytes, input, passed, Some(mods))
+        calculate_lazer_vanilla(map_bytes, input, passed, mods)
     });
 
     match result {

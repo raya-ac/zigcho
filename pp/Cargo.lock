@@ -177,6 +177,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rosu-pp"
+version = "5.0.0"
+source = "git+https://github.com/kaibi-dev/rosu-pp?rev=1129a7e79d689fc705bf93fb2f2a6411825ba545#1129a7e79d689fc705bf93fb2f2a6411825ba545"
+dependencies = [
+ "divan",
+ "rosu-map",
+ "rosu-mods 0.4.1",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -292,7 +302,8 @@ dependencies = [
  "akatsuki-pp",
  "rosu-map",
  "rosu-mods 0.4.1",
- "rosu-pp",
+ "rosu-pp 4.0.1",
+ "rosu-pp 5.0.0",
  "serde_json",
 ]
 

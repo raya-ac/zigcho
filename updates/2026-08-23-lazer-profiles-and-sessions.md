@@ -16,6 +16,6 @@ the map surface also stopped inventing mapper data. the full set is cached, map 
 
 i also finally cleaned the repo up. schema 35 matches between SQLite and PostgreSQL, every schema and migration is under `database/` instead of being dumped through `src/`, object backups are restore-tested and read back before the local copy goes, and IRC has proper release files. the in-game changelog has the full checked-in history now instead of randomly forgetting most of it.
 
-the client says `zigcho!lazer` everywhere the player can see it. GitHub builds Windows x64, Apple Silicon macOS, Linux x64, Android arm64 and an unsigned iOS arm64 build from the same pinned osu commit. not my mac. not anybody's laptop.
+the client says `zigcho!lazer` everywhere the player can see it. GitHub builds Windows x64, Apple Silicon macOS, Linux x64, Android arm64 and an unsigned iOS arm64 build from the same pinned osu commit. the Linux server is pinned to baseline x86-64 too, so it cannot quietly inherit AVX-512 from whichever GitHub runner happens to build it. not my mac. not anybody's laptop.
 
 i am calling the server itself pretty much finished at this point. what is left is running every packaged client path against production and fixing the real bugs that finds. we are past the part where an entire foundation is missing.

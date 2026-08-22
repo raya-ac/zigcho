@@ -739,14 +739,18 @@ pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !v
     try std.json.Stringify.value(score.country, .{}, writer);
     try writer.writeAll(",\"team\":");
     if (score.team) |team| {
-        var flag_buf: [160]u8 = undefined;
-        const flag_url = try std.fmt.bufPrint(&flag_buf, "https://assets.kai.ovh/teams/{d}/flag?v={d}", .{ team.id, team.flag_version });
         try writer.print("{{\"id\":{d},\"name\":", .{team.id});
         try std.json.Stringify.value(team.name(), .{}, writer);
         try writer.writeAll(",\"short_name\":");
         try std.json.Stringify.value(team.shortName(), .{}, writer);
         try writer.writeAll(",\"flag_url\":");
-        try std.json.Stringify.value(flag_url, .{}, writer);
+        if (team.flag_version > 0) {
+            var flag_buf: [160]u8 = undefined;
+            const flag_url = try std.fmt.bufPrint(&flag_buf, "https://assets.kai.ovh/teams/{d}/flag?v={d}", .{ team.id, team.flag_version });
+            try std.json.Stringify.value(flag_url, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
         try writer.writeByte('}');
     } else {
         try writer.writeAll("null");

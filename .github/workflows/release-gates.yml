@@ -104,6 +104,8 @@ jobs:
           [[ "$bot" == *'"is_bot":true'* ]]
           multiplayer_page=$(curl --fail --silent --show-error -H 'Host: kai.ovh' 'http://127.0.0.1:18099/multiplayer')
           [[ "$multiplayer_page" == *'<title>kai</title>'* ]]
+          chat_page=$(curl --fail --silent --show-error -H 'Host: kai.ovh' 'http://127.0.0.1:18099/chat')
+          [[ "$chat_page" == *'<title>kai</title>'* ]]
           realtime_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' -H 'Host: spectator.kai.ovh' 'http://127.0.0.1:18099/multiplayer')
           test "$realtime_status" = 401
           kill "$server_pid"

@@ -19,6 +19,7 @@ pub fn websitePage(path: []const u8) bool {
         std.mem.eql(u8, path, "/rankings") or
         std.mem.eql(u8, path, "/multiplayer") or
         std.mem.eql(u8, path, "/teams") or
+        std.mem.eql(u8, path, "/chat") or
         std.mem.eql(u8, path, "/changelog") or
         std.mem.eql(u8, path, "/login") or
         std.mem.eql(u8, path, "/settings") or
@@ -60,6 +61,7 @@ test "website pages stay limited to real browser routes" {
     try std.testing.expect(websitePage("/login"));
     try std.testing.expect(websitePage("/settings"));
     try std.testing.expect(websitePage("/multiplayer"));
+    try std.testing.expect(websitePage("/chat"));
     try std.testing.expect(websitePage("/multiplayer/42"));
     try std.testing.expect(websitePage("/users/4"));
     try std.testing.expect(websitePage("/u/4"));

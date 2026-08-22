@@ -1348,6 +1348,36 @@ test "team JSON does not publish dead asset URLs" {
     try std.testing.expect(stored.value.object.get("header_url").? == .null);
 }
 
+test "lazer leaderboard teams do not publish a version zero flag" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try lazer.writeLeaderboardScore(&output.writer, .{
+        .id = 1,
+        .user_id = 4,
+        .username = "raya",
+        .country = "AU",
+        .beatmap_id = 75,
+        .ruleset_id = 0,
+        .total_score = 1_000_000,
+        .total_score_without_mods = 1_000_000,
+        .pp = 100,
+        .accuracy = 1,
+        .max_combo = 100,
+        .passed = true,
+        .rank = "S",
+        .mods_json = "[]",
+        .statistics_json = "{}",
+        .maximum_statistics_json = "{}",
+        .pauses_json = "[]",
+        .ended_at = "2026-08-23T00:00:00Z",
+        .ranked = true,
+        .team = try domain.TeamSummary.init(1, "uwu", "uwu", 0),
+    });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("user").?.object.get("team").?.object.get("flag_url").? == .null);
+}
+
 test "website multiplayer exposes normal quick and ranked room views" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-nav=\"multiplayer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "async function multiplayerRooms()") != null);

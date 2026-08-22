@@ -880,7 +880,7 @@ pub const Sync = struct {
     fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteSet {
         return self.fetchAndStoreOsuDirectMetadata(store, wanted_md5, set_id) catch |direct_error| {
             if (self.osu_api_key.len == 0) return direct_error;
-            std.log.warn("event=beatmap_metadata_official_fallback set_id={d} direct_error={t}", .{ set_id, direct_error });
+            std.log.info("event=beatmap_metadata_official_fallback set_id={d} direct_error={t}", .{ set_id, direct_error });
             return self.fetchAndStoreOfficialMetadata(store, wanted_md5, set_id);
         };
     }
@@ -902,7 +902,7 @@ pub const Sync = struct {
         };
         defer self.allocator.free(metadata_json);
         const parsed = std.json.parseFromSlice(CheesegullSet, self.allocator, metadata_json, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.warn("[hydrate] metadata parse failed: {t}", .{err});
+            std.log.info("[hydrate] metadata parse failed; trying official fallback: {t}", .{err});
             return err;
         };
         defer parsed.deinit();

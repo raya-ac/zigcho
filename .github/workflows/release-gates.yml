@@ -69,7 +69,10 @@ jobs:
           test -x artifacts/server/zigcho-import-archive
           test -x artifacts/server/zigcho-migrate-postgres
           test -s artifacts/server/pp-engine-version
-          file artifacts/server/zigcho | grep -F 'ELF 64-bit LSB pie executable, x86-64' >/dev/null
+          binary_type=$(file -b artifacts/server/zigcho)
+          printf '%s\n' "$binary_type"
+          [[ "$binary_type" == *'ELF 64-bit LSB'* ]]
+          [[ "$binary_type" == *'x86-64'* ]]
           if test -n "$(find artifacts/server -type f -name '*.pdb' -print -quit)"; then
             exit 1
           fi

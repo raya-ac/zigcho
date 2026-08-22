@@ -224,6 +224,10 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: pin the upstream .NET SDK
+        shell: bash
+        run: cp work/osu-client/global.json global.json
+
       - name: install the Android workload
         run: dotnet workload install android
 
@@ -279,6 +283,9 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 8.0.x
+
+      - name: pin the upstream .NET SDK
+        run: cp work/osu-client/global.json global.json
 
       - name: install the iOS workload
         run: dotnet workload install ios

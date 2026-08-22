@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const max_parts: usize = 4096;
+
 pub const Part = struct {
     name: []const u8,
     filename: ?[]const u8,
@@ -84,7 +86,7 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8, boundary: []const u
             }
         }
         try form.parts.append(allocator, .{ .name = name orelse return error.MissingPartName, .filename = filename, .content_type = part_type, .data = data });
-        if (form.parts.items.len > 64) return error.TooManyParts;
+        if (form.parts.items.len > max_parts) return error.TooManyParts;
     }
 }
 

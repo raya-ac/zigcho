@@ -51,6 +51,7 @@ the main test suite covers the wire formats, authentication, sessions, Stable sc
 ## layout
 
 - `src/` — server, protocol, storage and embedded website
+- `database/` — SQLite and PostgreSQL schemas plus ordered migrations
 - `client/lazer/` — pinned custom lazer patch and packaging work
 - `pp/` — pinned local PP bridge
 - `deploy/` — Linux build, service and host configuration

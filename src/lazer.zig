@@ -26,6 +26,17 @@ pub fn validBeatmapTagId(id: i64) bool {
 
 pub const stable_score_id_offset: i64 = 4_000_000_000_000_000_000;
 
+pub const LeaderboardScope = enum {
+    global,
+    country,
+    friend,
+    team,
+
+    pub fn parse(value: []const u8) ?LeaderboardScope {
+        return std.meta.stringToEnum(LeaderboardScope, value);
+    }
+};
+
 pub fn encodeStableScoreId(score_id: i64) ?i64 {
     if (score_id <= 0 or score_id > std.math.maxInt(i64) - stable_score_id_offset) return null;
     return stable_score_id_offset + score_id;
@@ -66,9 +77,11 @@ pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !L
             const equals = std.mem.findScalar(u8, parameter, '=') orelse continue;
             const key = parameter[0..equals];
             if (!std.mem.eql(u8, key, "mods[]") and !std.ascii.eqlIgnoreCase(key, "mods%5B%5D")) continue;
-            selected = true;
             const acronym = parameter[equals + 1 ..];
-            if (std.ascii.eqlIgnoreCase(acronym, "NM")) continue;
+            if (std.ascii.eqlIgnoreCase(acronym, "NM")) {
+                selected = true;
+                continue;
+            }
             if (std.ascii.eqlIgnoreCase(acronym, "CL")) {
                 classic = true;
                 continue;
@@ -80,6 +93,9 @@ pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !L
                 autopilot = true;
             } else if (!isOfficial(acronym)) {
                 custom = true;
+                selected = true;
+            } else {
+                selected = true;
             }
             if (stable_mods.parseCompact(acronym)) |bits| {
                 stable_bits |= bits;
@@ -98,7 +114,7 @@ pub fn leaderboardModFilter(allocator: std.mem.Allocator, target: []const u8) !L
         .exact_json = try output.toOwnedSlice(),
         .selected = selected,
         .classic = classic,
-        .stable_bits = if (stable_supported) stable_mods.canonical(stable_bits) else null,
+        .stable_bits = if (stable_supported) stable_mods.leaderboardGameplayBits(stable_bits) else null,
         .namespace = if (autopilot) .autopilot else if (relax) .relax else if (custom) .custom else .vanilla,
     };
 }
@@ -153,7 +169,7 @@ pub fn scoreModFilter(allocator: std.mem.Allocator, mods_json: []const u8) !Lead
         .exact_json = try output.toOwnedSlice(),
         .selected = true,
         .classic = false,
-        .stable_bits = if (stable_supported) stable_mods.canonical(stable_bits) else null,
+        .stable_bits = if (stable_supported) stable_mods.leaderboardGameplayBits(stable_bits) else null,
         .namespace = if (autopilot) .autopilot else if (relax) .relax else if (custom) .custom else .vanilla,
     };
 }
@@ -333,6 +349,9 @@ pub fn isOfficial(a: []const u8) bool {
 }
 
 test "leaderboard mod filters distinguish combined exact and classic boards" {
+    try std.testing.expectEqual(LeaderboardScope.team, LeaderboardScope.parse("team").?);
+    try std.testing.expect(LeaderboardScope.parse("local") == null);
+
     const combined = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?type=global");
     defer combined.deinit(std.testing.allocator);
     try std.testing.expect(!combined.selected);
@@ -369,12 +388,22 @@ test "leaderboard mod filters distinguish combined exact and classic boards" {
 
     const relax = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods%5B%5D=HD&mods%5B%5D=RX");
     defer relax.deinit(std.testing.allocator);
+    try std.testing.expect(relax.selected);
     try std.testing.expectEqual(Namespace.relax, relax.namespace);
-    try std.testing.expectEqual(@as(?i32, stable_mods.hidden | stable_mods.relax), relax.stable_bits);
+    try std.testing.expectEqual(@as(?i32, stable_mods.hidden), relax.stable_bits);
+
+    const relax_namespace = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=CL&mods[]=RX");
+    defer relax_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(!relax_namespace.selected);
+    try std.testing.expect(relax_namespace.classic);
+    try std.testing.expectEqual(Namespace.relax, relax_namespace.namespace);
+    try std.testing.expectEqual(@as(?i32, 0), relax_namespace.stable_bits);
 
     const autopilot = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=RX&mods[]=AP");
     defer autopilot.deinit(std.testing.allocator);
+    try std.testing.expect(!autopilot.selected);
     try std.testing.expectEqual(Namespace.autopilot, autopilot.namespace);
+    try std.testing.expectEqual(@as(?i32, 0), autopilot.stable_bits);
 
     const mixed_custom = try leaderboardModFilter(std.testing.allocator, "/api/v2/beatmaps/1/scores?mods[]=WG&mods[]=RX");
     defer mixed_custom.deinit(std.testing.allocator);

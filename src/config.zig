@@ -1,5 +1,9 @@
 const std = @import("std");
 
+pub fn validIrcBind(value: []const u8) bool {
+    return std.mem.eql(u8, value, "127.0.0.1") or std.mem.eql(u8, value, "::1") or std.ascii.eqlIgnoreCase(value, "localhost");
+}
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     score_webhook: []u8,
@@ -16,6 +20,8 @@ pub const Config = struct {
     object_storage_secret_access_key: []u8,
     beatmap_cache_max_bytes: u64,
     beatmap_media_cache_max_bytes: u64,
+    irc_bind: []u8,
+    irc_port: u16,
 
     pub fn empty(allocator: std.mem.Allocator) !Config {
         const score_webhook = try allocator.dupe(u8, "");
@@ -40,6 +46,8 @@ pub const Config = struct {
         errdefer allocator.free(object_storage_access_key_id);
         const object_storage_secret_access_key = try allocator.dupe(u8, "");
         errdefer allocator.free(object_storage_secret_access_key);
+        const irc_bind = try allocator.dupe(u8, "127.0.0.1");
+        errdefer allocator.free(irc_bind);
         return .{
             .allocator = allocator,
             .score_webhook = score_webhook,
@@ -56,6 +64,8 @@ pub const Config = struct {
             .object_storage_secret_access_key = object_storage_secret_access_key,
             .beatmap_cache_max_bytes = 2 * 1024 * 1024 * 1024,
             .beatmap_media_cache_max_bytes = 512 * 1024 * 1024,
+            .irc_bind = irc_bind,
+            .irc_port = 0,
         };
     }
 
@@ -71,6 +81,7 @@ pub const Config = struct {
         self.allocator.free(self.object_storage_region);
         self.allocator.free(self.object_storage_access_key_id);
         self.allocator.free(self.object_storage_secret_access_key);
+        self.allocator.free(self.irc_bind);
         self.* = undefined;
     }
 
@@ -125,6 +136,10 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
             const parsed = std.fmt.parseInt(u64, value, 10) catch continue;
             if (parsed >= 32 * 1024 * 1024 and parsed <= 16 * 1024 * 1024 * 1024)
                 result.beatmap_media_cache_max_bytes = parsed;
+        } else if (std.mem.eql(u8, key, "irc_bind")) {
+            if (validIrcBind(value)) try result.replace(&result.irc_bind, value);
+        } else if (std.mem.eql(u8, key, "irc_port")) {
+            result.irc_port = std.fmt.parseInt(u16, value, 10) catch continue;
         }
     }
     return result;

@@ -1,4 +1,5 @@
 const profile_avatar = @import("profile_avatar.zig");
+const std = @import("std");
 
 pub const max_bytes: usize = 4_000_000;
 pub const max_width: u32 = 2000;
@@ -6,6 +7,17 @@ pub const max_height: u32 = 500;
 
 pub fn validate(content_type: ?[]const u8, data: []const u8) !profile_avatar.Image {
     return profile_avatar.validateWithLimits(content_type, data, max_bytes, max_width, max_height);
+}
+
+pub fn assetUserId(path: []const u8) ?i32 {
+    const prefix = "/banners/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const suffix = "/cover.jpg";
+    const id_text = if (std.mem.endsWith(u8, rest, suffix)) rest[0 .. rest.len - suffix.len] else rest;
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const id = std.fmt.parseInt(i32, id_text, 10) catch return null;
+    return if (id > 0) id else null;
 }
 
 test "profile banners follow the lazer cover limits" {
@@ -17,4 +29,11 @@ test "profile banners follow the lazer cover limits" {
     var too_wide = png;
     too_wide[19] = 0xd1;
     try @import("std").testing.expectError(error.InvalidAvatarDimensions, validate("image/png", &too_wide));
+}
+
+test "profile banner asset paths keep the official image-style suffix" {
+    try std.testing.expectEqual(@as(?i32, 4), assetUserId("/banners/4/cover.jpg"));
+    try std.testing.expectEqual(@as(?i32, 4), assetUserId("/banners/4"));
+    try std.testing.expect(assetUserId("/banners/4/cover.png") == null);
+    try std.testing.expect(assetUserId("/banners/nope/cover.jpg") == null);
 }

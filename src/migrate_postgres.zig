@@ -1,5 +1,6 @@
 const std = @import("std");
 const postgres = @import("postgres.zig");
+const database_sql = @import("database_sql");
 
 const sqlite = @cImport({
     @cInclude("sqlite3.h");
@@ -436,7 +437,7 @@ fn migrate(allocator: std.mem.Allocator, sqlite_path: [:0]const u8, conninfo: [:
 
     try postgres.exec(target, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     errdefer postgres.exec(target, "ROLLBACK") catch {};
-    try postgres.exec(target, @embedFile("postgres_schema.sql"));
+    try postgres.exec(target, database_sql.postgres_schema);
     // The runtime schema is independently bootable, so it seeds kai, the RX
     // mod, and the public channels. An imported v20 SQLite database already
     // contains those canonical rows. Clear only the schema seeds before the

@@ -406,6 +406,15 @@ fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, byte
 const lobby_channel = "#lobby";
 const multiplayer_channel = "#multiplayer";
 
+fn writeDmBlocked(out: *protocol.Writer, target_name: []const u8) !void {
+    const start = try out.begin(.user_dm_blocked);
+    try out.string("");
+    try out.string("");
+    try out.string(target_name);
+    try out.int(i32, 0);
+    out.finish(start);
+}
+
 fn packetMatchId(payload: []const u8) ?u16 {
     if (payload.len != @sizeOf(i32)) return null;
     const raw = std.mem.readInt(i32, payload[0..4], .little);
@@ -919,12 +928,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                 if (sessions.byName(target_name)) |target| {
                     if (!target.is_bot) {
                         if (target.block_non_friend_dms and !target.isFriend(session.user.id)) {
-                            const start = try out.begin(.user_dm_blocked);
-                            try out.string("");
-                            try out.string("");
-                            try out.string(target.user.name);
-                            try out.int(i32, 0);
-                            out.finish(start);
+                            try writeDmBlocked(&out, target.user.name);
                             continue;
                         }
                         if (target.user.silence_end > now or target.user.restricted) {
@@ -939,11 +943,22 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                             try out.raw(blocked.bytes());
                             continue;
                         }
+                        if (!try store.directMessageAllowed(session.user.id, target.user.id)) {
+                            try writeDmBlocked(&out, target.user.name);
+                            continue;
+                        }
                         if (target.action == 1 and target.away().len != 0) {
                             try protocol.writeMessage(&out, target.user.name, target.away(), session.user.name, target.user.id);
                         }
+                        store.storeDirectMessage(session.user.id, target.user.id, text) catch |err| switch (err) {
+                            error.DirectMessageBlocked => {
+                                try writeDmBlocked(&out, target.user.name);
+                                continue;
+                            },
+                            else => return err,
+                        };
                         try queuePacket(target, allocator, message.bytes());
-                        store.storeDirectMessage(session.user.id, target.user.id, text) catch |err| std.log.warn("direct message write failed: {s}", .{@errorName(err)});
+                        store.markDirectMessagesRead(target.user.id, session.user.id) catch |err| std.log.warn("direct message read state failed: {s}", .{@errorName(err)});
                     }
                 } else if (try store.userByName(allocator, target_name)) |target_user| {
                     defer {
@@ -959,7 +974,17 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                         out.finish(start);
                         continue;
                     }
-                    try store.storeDirectMessage(session.user.id, target_user.id, text);
+                    if (!try store.directMessageAllowed(session.user.id, target_user.id)) {
+                        try writeDmBlocked(&out, target_user.name);
+                        continue;
+                    }
+                    store.storeDirectMessage(session.user.id, target_user.id, text) catch |err| switch (err) {
+                        error.DirectMessageBlocked => {
+                            try writeDmBlocked(&out, target_user.name);
+                            continue;
+                        },
+                        else => return err,
+                    };
                     var notice_buf: [192]u8 = undefined;
                     const notice = try std.fmt.bufPrint(&notice_buf, "{s} is offline, but they'll get your message when they next log in.", .{target_user.name});
                     try out.packetString(.notification, notice);

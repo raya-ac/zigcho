@@ -143,6 +143,13 @@ fn FixedRaw(comptime capacity: usize) type {
             self.len = @intCast(value.len);
         }
 
+        fn setText(self: *Self, value: []const u8) void {
+            var len = @min(value.len, self.bytes.len);
+            while (len != 0 and !std.unicode.utf8ValidateSlice(value[0..len])) len -= 1;
+            @memcpy(self.bytes[0..len], value[0..len]);
+            self.len = @intCast(len);
+        }
+
         fn slice(self: *const Self) []const u8 {
             return self.bytes[0..self.len];
         }
@@ -154,6 +161,7 @@ const Raw128 = FixedRaw(128);
 const Raw2048 = FixedRaw(2048);
 const Text64 = FixedRaw(64);
 const Text128 = FixedRaw(128);
+const Text256 = FixedRaw(256);
 
 pub const MessagePackReader = struct {
     data: []const u8,
@@ -394,8 +402,14 @@ const PlaylistItem = struct {
     id: i64 = 0,
     owner_id: i32 = 0,
     beatmap_id: i32 = 0,
+    beatmapset_id: i32 = 0,
     checksum: Text64 = .{},
     ruleset_id: u8 = 0,
+    artist: Text256 = .{},
+    title: Text256 = .{},
+    version: Text128 = .{},
+    creator: Text128 = .{},
+    status: i8 = 3,
     required_mods: Raw2048 = .{},
     allowed_mods: Raw2048 = .{},
     expired: bool = false,
@@ -637,6 +651,26 @@ pub const Manager = struct {
         self.store = store;
     }
 
+    fn hydratePlaylistItem(self: *Manager, item: *PlaylistItem) !void {
+        const store = self.store orelse return;
+        const info = (try store.beatmapInfoById(self.allocator, item.beatmap_id)) orelse return;
+        defer self.allocator.free(info.artist);
+        defer self.allocator.free(info.title);
+        defer self.allocator.free(info.version);
+        defer self.allocator.free(info.creator);
+        item.beatmapset_id = info.set_id;
+        item.artist.setText(info.artist);
+        item.title.setText(info.title);
+        item.version.setText(info.version);
+        item.creator.setText(info.creator);
+        item.status = info.status;
+        item.star_rating = info.star_rating;
+    }
+
+    fn hydrateRoom(self: *Manager, room: *Room) !void {
+        for (&room.playlist) |*entry| if (entry.*) |*item| try self.hydratePlaylistItem(item);
+    }
+
     pub fn refreshMatchmakingMaps(self: *Manager) !void {
         const store = self.store orelse return error.MatchmakingStoreUnavailable;
         var loaded: [4][]storage.Store.MatchmakingBeatmap = undefined;
@@ -725,6 +759,7 @@ pub const Manager = struct {
     pub fn restCreateRoom(self: *Manager, allocator: std.mem.Allocator, user: domain.User, body: []const u8) ![]u8 {
         const room = try parseRestRoom(self.allocator, user, body);
         errdefer self.allocator.destroy(room);
+        try self.hydrateRoom(room);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.rooms) |entry| if (entry) |existing| if (existing.userIndex(user.id) != null) return error.AlreadyInMultiplayerRoom;
@@ -1358,6 +1393,7 @@ pub const Manager = struct {
         if (connection.room_id != null) return error.AlreadyInMultiplayerRoom;
         const room = try parseRoom(self.allocator, encoded_room, connection);
         errdefer self.allocator.destroy(room);
+        try self.hydrateRoom(room);
         var response: []u8 = undefined;
         self.mutex.lockUncancelable(self.io);
         const slot = self.roomSlotLocked() orelse {
@@ -2065,6 +2101,7 @@ pub const Manager = struct {
 
     fn addPlaylistItem(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, encoded: []const u8) !void {
         var item = try parsePlaylistItem(encoded);
+        try self.hydratePlaylistItem(&item);
         var recipients: [max_connections]*Connection = undefined;
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
@@ -2101,7 +2138,8 @@ pub const Manager = struct {
     }
 
     fn editPlaylistItem(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, encoded: []const u8) !void {
-        const item = try parsePlaylistItem(encoded);
+        var item = try parsePlaylistItem(encoded);
+        try self.hydratePlaylistItem(&item);
         var recipients: [max_connections]*Connection = undefined;
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
@@ -2607,6 +2645,7 @@ pub const Manager = struct {
                 .star_rating = map.stars,
             };
             try item.checksum.set(&map.md5);
+            try self.hydratePlaylistItem(&item);
             item.required_mods.bytes[0] = 0x90;
             item.required_mods.len = 1;
             item.allowed_mods.bytes[0] = 0x90;
@@ -3063,6 +3102,22 @@ fn jsonString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     };
 }
 
+fn jsonOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    return switch (object.get(key) orelse return null) {
+        .null => null,
+        .string => |value| value,
+        else => error.InvalidMultiplayerRoom,
+    };
+}
+
+fn beatmapStatusValue(value: std.json.Value) !i8 {
+    return switch (value) {
+        .integer => |status| std.math.cast(i8, status) orelse error.InvalidMultiplayerRoom,
+        .string => |status| if (std.mem.eql(u8, status, "graveyard")) 0 else if (std.mem.eql(u8, status, "wip")) 1 else if (std.mem.eql(u8, status, "pending")) 2 else if (std.mem.eql(u8, status, "ranked")) 3 else if (std.mem.eql(u8, status, "approved")) 4 else if (std.mem.eql(u8, status, "qualified")) 5 else if (std.mem.eql(u8, status, "loved")) 6 else return error.InvalidMultiplayerRoom,
+        else => error.InvalidMultiplayerRoom,
+    };
+}
+
 fn jsonOptionalInteger(object: std.json.ObjectMap, key: []const u8) !?i64 {
     const value = object.get(key) orelse return null;
     return switch (value) {
@@ -3234,6 +3289,21 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
                     item.star_rating = try jsonNumber(rating);
                     if (item.star_rating < 0 or item.star_rating > 100) return error.InvalidMultiplayerRoom;
                 }
+                if (try jsonOptionalInteger(beatmap, "beatmapset_id")) |set_id| {
+                    if (set_id <= 0 or set_id > std.math.maxInt(i32)) return error.InvalidMultiplayerRoom;
+                    item.beatmapset_id = @intCast(set_id);
+                }
+                if (try jsonOptionalString(beatmap, "version")) |version| item.version.setText(version);
+                if (beatmap.get("status")) |status| item.status = try beatmapStatusValue(status);
+                if (beatmap.get("beatmapset")) |set_value| switch (set_value) {
+                    .object => |set| {
+                        if (try jsonOptionalString(set, "artist")) |artist| item.artist.setText(artist);
+                        if (try jsonOptionalString(set, "title")) |title| item.title.setText(title);
+                        if (try jsonOptionalString(set, "creator")) |creator| item.creator.setText(creator);
+                    },
+                    .null => {},
+                    else => return error.InvalidMultiplayerRoom,
+                };
             },
             .null => {},
             else => return error.InvalidMultiplayerRoom,
@@ -3679,6 +3749,85 @@ fn writeApiUserJson(writer: *std.Io.Writer, id: i32, name: []const u8, country: 
     try writer.writeAll(",\"is_active\":true,\"is_supporter\":true}");
 }
 
+fn beatmapStatusName(status: i8) []const u8 {
+    return switch (status) {
+        1 => "wip",
+        2 => "pending",
+        3 => "ranked",
+        4 => "approved",
+        5 => "qualified",
+        6 => "loved",
+        else => "graveyard",
+    };
+}
+
+fn matchmakingStageName(stage: u8) []const u8 {
+    return switch (stage) {
+        matchmaking_stage.waiting_for_clients_join => "waiting for players",
+        matchmaking_stage.round_warmup => "round warmup",
+        matchmaking_stage.user_beatmap_select => "choosing a beatmap",
+        matchmaking_stage.server_beatmap_finalised => "beatmap selected",
+        matchmaking_stage.waiting_for_beatmap_download => "waiting for downloads",
+        matchmaking_stage.gameplay_warmup => "gameplay warmup",
+        matchmaking_stage.gameplay => "playing",
+        matchmaking_stage.results => "results",
+        else => "finished",
+    };
+}
+
+fn rankedStageName(stage: u8) []const u8 {
+    return switch (stage) {
+        ranked_stage.wait_for_join => "waiting for players",
+        ranked_stage.round_warmup => "round warmup",
+        ranked_stage.card_discard => "discarding cards",
+        ranked_stage.finish_card_discard => "locking discards",
+        ranked_stage.card_play => "playing cards",
+        ranked_stage.finish_card_play => "locking cards",
+        ranked_stage.gameplay_warmup => "gameplay warmup",
+        ranked_stage.gameplay => "playing",
+        ranked_stage.results => "results",
+        else => "finished",
+    };
+}
+
+fn writeRoomModeJson(writer: *std.Io.Writer, room: *const Room) !void {
+    try writer.writeAll(",\"zigcho\":{");
+    if (room.ranked_play) |ranked| {
+        try writer.writeAll("\"kind\":\"ranked_play\",\"phase\":");
+        try std.json.Stringify.value(rankedStageName(ranked.stage), .{}, writer);
+        try writer.print(",\"round\":{d},\"star_rating\":{d},\"active_user_id\":", .{ ranked.current_round, ranked.star_rating });
+        if (ranked.active_user_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+        try writer.writeAll(",\"winner_id\":");
+        if (ranked.winning_user_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+        try writer.writeAll(",\"players\":[");
+        var written: usize = 0;
+        for (ranked.users) |entry| if (entry) |user| {
+            if (written != 0) try writer.writeByte(',');
+            try writer.print("{{\"user_id\":{d},\"rating\":{d},\"rating_after\":{d},\"life\":{d},\"rounds_won\":{d},\"total_score\":{d}}}", .{ user.id, user.rating, user.rating_after, user.life, user.rounds_won, user.total_score });
+            written += 1;
+        };
+        try writer.writeByte(']');
+    } else if (room.matchmaking) |matchmaking| {
+        try writer.writeAll("\"kind\":\"quick_play\",\"phase\":");
+        try std.json.Stringify.value(matchmakingStageName(matchmaking.stage), .{}, writer);
+        try writer.print(",\"round\":{d},\"gameplay_item_id\":{d},\"players\":[", .{ matchmaking.current_round, matchmaking.gameplay_item });
+        var written: usize = 0;
+        for (matchmaking.users) |entry| if (entry) |user| {
+            if (written != 0) try writer.writeByte(',');
+            try writer.print("{{\"user_id\":{d},\"points\":{d},\"placement\":", .{ user.id, user.points });
+            if (user.placement) |placement| try writer.print("{d}", .{placement}) else try writer.writeAll("null");
+            try writer.writeByte('}');
+            written += 1;
+        };
+        try writer.writeByte(']');
+    } else {
+        try writer.writeAll("\"kind\":\"room\",\"phase\":");
+        try std.json.Stringify.value(if (room.state == 0) "waiting" else "playing", .{}, writer);
+        try writer.writeAll(",\"round\":0,\"players\":[]");
+    }
+    try writer.writeByte('}');
+}
+
 fn writePlaylistItemJson(writer: *std.Io.Writer, item: PlaylistItem) !void {
     const mode: []const u8 = switch (item.ruleset_id) {
         0 => "osu",
@@ -3686,12 +3835,34 @@ fn writePlaylistItemJson(writer: *std.Io.Writer, item: PlaylistItem) !void {
         2 => "fruits",
         else => "mania",
     };
-    try writer.print("{{\"id\":{d},\"owner_id\":{d},\"ruleset_id\":{d},\"expired\":{s},\"playlist_order\":{d},\"played_at\":null,\"allowed_mods\":[],\"required_mods\":[],\"beatmap_id\":{d},\"beatmap\":{{\"id\":{d},\"beatmapset_id\":{d},\"mode\":", .{ item.id, item.owner_id, item.ruleset_id, if (item.expired) "true" else "false", item.order, item.beatmap_id, item.beatmap_id, item.beatmap_id });
+    const set_id = if (item.beatmapset_id > 0) item.beatmapset_id else item.beatmap_id;
+    const artist = if (item.artist.len != 0) item.artist.slice() else "online beatmap";
+    const title = if (item.title.len != 0) item.title.slice() else "unknown song";
+    const version = if (item.version.len != 0) item.version.slice() else "online difficulty";
+    const creator = if (item.creator.len != 0) item.creator.slice() else "unknown";
+    const status = beatmapStatusName(item.status);
+    try writer.print("{{\"id\":{d},\"owner_id\":{d},\"ruleset_id\":{d},\"expired\":{s},\"playlist_order\":{d},\"played_at\":null,\"allowed_mods\":[],\"required_mods\":[],\"beatmap_id\":{d},\"beatmap\":{{\"id\":{d},\"beatmapset_id\":{d},\"mode\":", .{ item.id, item.owner_id, item.ruleset_id, if (item.expired) "true" else "false", item.order, item.beatmap_id, item.beatmap_id, set_id });
     try std.json.Stringify.value(mode, .{}, writer);
-    try writer.writeAll(",\"status\":\"ranked\",\"version\":\"online beatmap\",\"difficulty_rating\":");
+    try writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(status, .{}, writer);
+    try writer.writeAll(",\"version\":");
+    try std.json.Stringify.value(version, .{}, writer);
+    try writer.writeAll(",\"difficulty_rating\":");
     try writer.print("{d},\"checksum\":", .{item.star_rating});
     try std.json.Stringify.value(item.checksum.slice(), .{}, writer);
-    try writer.print(",\"beatmapset\":{{\"id\":{d},\"artist\":\"online beatmap\",\"artist_unicode\":\"online beatmap\",\"title\":\"beatmap {d}\",\"title_unicode\":\"beatmap {d}\",\"creator\":\"unknown\",\"covers\":{{}}}}}},\"freestyle\":{s}}}", .{ item.beatmap_id, item.beatmap_id, item.beatmap_id, if (item.freestyle) "true" else "false" });
+    try writer.print(",\"beatmapset\":{{\"id\":{d},\"status\":", .{set_id});
+    try std.json.Stringify.value(status, .{}, writer);
+    try writer.writeAll(",\"artist\":");
+    try std.json.Stringify.value(artist, .{}, writer);
+    try writer.writeAll(",\"artist_unicode\":");
+    try std.json.Stringify.value(artist, .{}, writer);
+    try writer.writeAll(",\"title\":");
+    try std.json.Stringify.value(title, .{}, writer);
+    try writer.writeAll(",\"title_unicode\":");
+    try std.json.Stringify.value(title, .{}, writer);
+    try writer.writeAll(",\"creator\":");
+    try std.json.Stringify.value(creator, .{}, writer);
+    try writer.print(",\"covers\":{{\"cover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover.jpg\",\"cover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover@2x.jpg\",\"card\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card.jpg\",\"card@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card@2x.jpg\",\"list\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list.jpg\",\"list@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list@2x.jpg\",\"slimcover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover.jpg\",\"slimcover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover@2x.jpg\"}},\"preview_url\":\"https://b.kai.ovh/preview/{d}.mp3\"}}}},\"freestyle\":{s}}}", .{ set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, if (item.freestyle) "true" else "false" });
 }
 
 fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
@@ -3738,7 +3909,9 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     try writer.print(",\"auto_skip\":{s},\"auto_start_duration\":0,\"current_user_score\":null,\"current_playlist_item\":", .{if (room.settings.auto_skip) "true" else "false"});
     const current = room.playlist[room.itemIndex(room.settings.playlist_item_id) orelse 0] orelse return error.MultiplayerPlaylistItemNotFound;
     try writePlaylistItemJson(writer, current);
-    try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false}}", .{ room.channel_id, if (room.state == 0) "idle" else "playing" });
+    try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false", .{ room.channel_id, if (room.state == 0) "idle" else "playing" });
+    try writeRoomModeJson(writer, room);
+    try writer.writeByte('}');
 }
 
 pub fn frameOwned(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -4189,7 +4362,7 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
     const guest: domain.User = .{ .id = 7, .name = "guest", .safe_name = "guest", .country = .{ 'G', 'B' } };
     const room_body =
-        \\{"name":"route test","password":"secret","type":"head_to_head","queue_mode":"host_only","max_participants":2,"auto_start_duration":5,"playlist":[{"id":8,"owner_id":4,"beatmap_id":75,"ruleset_id":0,"playlist_order":0,"required_mods":[{"acronym":"HD"}],"allowed_mods":[{"acronym":"DT","settings":{"speed_change":1.25}}],"beatmap":{"checksum":"0123456789abcdef0123456789abcdef","difficulty_rating":5.25}}]}
+        \\{"name":"route test","password":"secret","type":"head_to_head","queue_mode":"host_only","max_participants":2,"auto_start_duration":5,"playlist":[{"id":8,"owner_id":4,"beatmap_id":75,"ruleset_id":0,"playlist_order":0,"required_mods":[{"acronym":"HD"}],"allowed_mods":[{"acronym":"DT","settings":{"speed_change":1.25}}],"beatmap":{"checksum":"0123456789abcdef0123456789abcdef","difficulty_rating":5.25,"beatmapset_id":750,"status":"loved","version":"night drive","beatmapset":{"artist":"fixture artist","title":"fixture song","creator":"fixture mapper"}}}]}
     ;
     const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
     defer std.testing.allocator.free(created);
@@ -4198,6 +4371,15 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     try std.testing.expectEqual(@as(i64, 1), parsed_created.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("head_to_head", parsed_created.value.object.get("type").?.string);
     try std.testing.expectEqual(@as(usize, 1), parsed_created.value.object.get("playlist").?.array.items.len);
+    const created_beatmap = parsed_created.value.object.get("playlist").?.array.items[0].object.get("beatmap").?.object;
+    try std.testing.expectEqual(@as(i64, 750), created_beatmap.get("beatmapset_id").?.integer);
+    try std.testing.expectEqualStrings("night drive", created_beatmap.get("version").?.string);
+    try std.testing.expectEqualStrings("loved", created_beatmap.get("status").?.string);
+    const created_set = created_beatmap.get("beatmapset").?.object;
+    try std.testing.expectEqualStrings("fixture artist", created_set.get("artist").?.string);
+    try std.testing.expectEqualStrings("fixture song", created_set.get("title").?.string);
+    try std.testing.expectEqualStrings("fixture mapper", created_set.get("creator").?.string);
+    try std.testing.expectEqualStrings("https://assets.kai.ovh/beatmaps/750/covers/card@2x.jpg", created_set.get("covers").?.object.get("card@2x").?.string);
     try std.testing.expectError(error.InvalidMultiplayerPassword, manager.restJoinRoom(std.testing.allocator, guest, 1, "wrong"));
 
     const joined = try manager.restJoinRoom(std.testing.allocator, guest, 1, "secret");
@@ -4244,6 +4426,38 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     try std.testing.expectError(error.MultiplayerPermissionDenied, manager.restCloseRoom(guest.id, 1));
     try manager.restCloseRoom(host.id, 1);
     try std.testing.expect((try manager.roomsJson(std.testing.allocator, 1, null)) == null);
+}
+
+test "multiplayer room cards use stored beatmap metadata and cover ids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/multiplayer-metadata.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,star_rating) VALUES(75,900,'0123456789abcdef0123456789abcdef','stored artist','stored song','stored diff','stored mapper',3,6.25)");
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    manager.bindStore(&store);
+    const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
+    const room_body =
+        \\{"name":"metadata","type":"head_to_head","queue_mode":"host_only","playlist":[{"id":1,"owner_id":4,"beatmap_id":75,"ruleset_id":0,"beatmap":{"checksum":"0123456789abcdef0123456789abcdef","difficulty_rating":1,"beatmapset_id":75,"status":"pending","version":"stale","beatmapset":{"artist":"stale","title":"stale","creator":"stale"}}}]}
+    ;
+    const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
+    defer std.testing.allocator.free(created);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+    defer parsed.deinit();
+    const beatmap = parsed.value.object.get("playlist").?.array.items[0].object.get("beatmap").?.object;
+    try std.testing.expectEqual(@as(i64, 900), beatmap.get("beatmapset_id").?.integer);
+    try std.testing.expectEqualStrings("stored diff", beatmap.get("version").?.string);
+    try std.testing.expectEqualStrings("ranked", beatmap.get("status").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.25), beatmap.get("difficulty_rating").?.float, 0.0001);
+    const set = beatmap.get("beatmapset").?.object;
+    try std.testing.expectEqualStrings("stored artist", set.get("artist").?.string);
+    try std.testing.expectEqualStrings("stored song", set.get("title").?.string);
+    try std.testing.expectEqualStrings("stored mapper", set.get("creator").?.string);
+    try std.testing.expectEqualStrings("https://assets.kai.ovh/beatmaps/900/covers/cover.jpg", set.get("covers").?.object.get("cover").?.string);
 }
 
 test "signalr accepts messagepack handshake bytes independent of websocket opcode" {

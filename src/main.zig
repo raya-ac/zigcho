@@ -16,7 +16,7 @@ const stable_score = @import("stable_score.zig");
 const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
 const achievements = @import("achievements.zig");
-const changelog = @import("changelog.zig");
+const changelog = @import("changelog");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
 const screenshot = @import("screenshot.zig");
@@ -26,6 +26,8 @@ const registration = @import("registration.zig");
 const routing = @import("routing.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const beatmap_media = @import("beatmap_media.zig");
+const bss = @import("bss.zig");
+const irc = @import("irc.zig");
 const media_contract = @import("media_contract.zig");
 const webhook = @import("webhook.zig");
 const protocol = @import("protocol.zig");
@@ -46,6 +48,13 @@ const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
+const lazer_access_lifetime_seconds: i64 = 3600;
+const lazer_refresh_lifetime_seconds: i64 = 90 * 24 * 60 * 60;
+
+const LazerOAuthTokens = struct {
+    access: [64]u8,
+    refresh: [64]u8,
+};
 
 fn freeUser(allocator: std.mem.Allocator, user: domain.User) void {
     allocator.free(user.name);
@@ -71,6 +80,15 @@ fn randomMessageUuid(io: std.Io) ![36]u8 {
 
 const TeamPath = struct { id: i32, action: []const u8 = "" };
 const PinPath = struct { source: storage.ReplaySource, id: i64 };
+
+fn parseWebsiteRoomPath(path: []const u8) ?i64 {
+    const prefix = "/api/v1/multiplayer/rooms/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const id_text = path[prefix.len..];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    return if (id > 0) id else null;
+}
 
 fn parseTeamPath(path: []const u8, prefix: []const u8) ?TeamPath {
     if (!std.mem.startsWith(u8, path, prefix) or path.len <= prefix.len) return null;
@@ -209,6 +227,7 @@ const App = struct {
     avatar_cache: avatar_cache.Cache,
     geo_client: std.http.Client,
     started_at: i64,
+    irc_clients: std.atomic.Value(u32) = .init(0),
 
     fn anticheatNamespace(mods: i32) u32 {
         if (mods & stable_mods.autopilot != 0) return anticheat_abi.Namespace.autopilot;
@@ -381,6 +400,11 @@ const App = struct {
         if (headers.len > all.len - 1) return error.TooManyHeaders;
         @memcpy(all[1..][0..headers.len], headers);
         try req.respond(body, .{ .status = status, .extra_headers = all[0 .. headers.len + 1], .keep_alive = false });
+    }
+
+    fn respondWithoutContinue(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
+        req.head.expect = null;
+        return respond(req, status, "application/json", body, &.{});
     }
 
     fn serveObjectImage(self: *App, req: *std.http.Server.Request, image_value: storage.Store.CustomAvatar) !void {
@@ -594,6 +618,24 @@ const App = struct {
         return std.ascii.eqlIgnoreCase(raw[0..end], "beatmaps.kai.ovh");
     }
 
+    fn isBssHost(value: ?[]const u8) bool {
+        const raw = value orelse return false;
+        const end = std.mem.findScalar(u8, raw, ':') orelse raw.len;
+        const host = raw[0..end];
+        return std.ascii.eqlIgnoreCase(host, "bss.kai.ovh") or std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1");
+    }
+
+    fn bssStorageFailure(err: anyerror) bool {
+        const name = @errorName(err);
+        return std.mem.startsWith(u8, name, "R2") or
+            std.mem.startsWith(u8, name, "Connection") or
+            std.mem.startsWith(u8, name, "Tls") or
+            std.mem.startsWith(u8, name, "Http") or
+            std.mem.startsWith(u8, name, "Dns") or
+            std.mem.startsWith(u8, name, "Certificate") or
+            std.mem.eql(u8, name, "BssObjectStorageRequired");
+    }
+
     fn isLocalMetricsHost(value: ?[]const u8) bool {
         const raw = value orelse return false;
         const host = if (raw.len > 0 and raw[0] == '[') raw else if (std.mem.findScalar(u8, raw, ':')) |colon| raw[0..colon] else raw;
@@ -680,6 +722,24 @@ const App = struct {
         std.log.info("event=cross_client_session_takeover user_id={d} entering_client={s}", .{ user_id, entering_client });
     }
 
+    fn issueLazerOAuthTokens(self: *App, user_id: i32) !LazerOAuthTokens {
+        const access = try self.store.issueToken(user_id, "identify scores:write", lazer_access_lifetime_seconds);
+        errdefer _ = self.store.revokeToken(&access) catch false;
+        const refresh = try self.store.issueToken(user_id, "game:refresh", lazer_refresh_lifetime_seconds);
+        return .{ .access = access, .refresh = refresh };
+    }
+
+    fn respondLazerOAuthTokens(self: *App, req: *std.http.Server.Request, user_id: i32) !void {
+        const tokens = try self.issueLazerOAuthTokens(user_id);
+        var out: [384]u8 = undefined;
+        const json = try std.fmt.bufPrint(&out, "{{\"token_type\":\"Bearer\",\"expires_in\":{d},\"scope\":\"identify scores:write\",\"access_token\":\"{s}\",\"refresh_token\":\"{s}\"}}", .{ lazer_access_lifetime_seconds, &tokens.access, &tokens.refresh });
+        const token_headers = [_]std.http.Header{
+            .{ .name = "cache-control", .value = "no-store" },
+            .{ .name = "pragma", .value = "no-cache" },
+        };
+        return respond(req, .ok, "application/json", json, &token_headers);
+    }
+
     fn stableActionName(action: u8) []const u8 {
         return switch (action) {
             1 => "away",
@@ -760,6 +820,7 @@ const App = struct {
         defer self.allocator.free(info.artist);
         defer self.allocator.free(info.title);
         defer self.allocator.free(info.version);
+        defer self.allocator.free(info.creator);
         const mods = lazer.modsDisplay(self.allocator, mods_json) catch |err| {
             std.log.warn("event=lazer_score_announcement_mods_failed score_id={d} error={t}", .{ score_id, err });
             return placement;
@@ -810,6 +871,24 @@ const App = struct {
         self.sessions.mutex.lockUncancelable(self.sessions.io);
         defer self.sessions.mutex.unlock(self.sessions.io);
         try self.sessions.broadcastChannel(target, packet.bytes(), null);
+    }
+
+    fn deliverDirectMessageToStable(self: *App, sender: domain.User, target_id: i32, message: []const u8) !void {
+        var delivered = false;
+        {
+            self.sessions.mutex.lockUncancelable(self.sessions.io);
+            defer self.sessions.mutex.unlock(self.sessions.io);
+            if (self.sessions.byUser(target_id)) |target| {
+                if (!target.is_bot) {
+                    var packet = protocol.Writer.init(self.allocator);
+                    defer packet.deinit();
+                    try protocol.writeMessage(&packet, sender.name, message, target.user.name, sender.id);
+                    try target.enqueue(self.allocator, packet.bytes());
+                    delivered = true;
+                }
+            }
+        }
+        if (delivered) try self.store.markDirectMessagesRead(target_id, sender.id);
     }
 
     fn lazerUser(self: *App, authorization: ?[]const u8, scope: []const u8) !?domain.User {
@@ -866,6 +945,14 @@ const App = struct {
             return;
         };
         self.allocator.free(reply.json);
+        if (reply.inserted) {
+            const kai = self.store.userById(self.allocator, 3) catch null;
+            if (kai) |bot| {
+                defer freeUser(self.allocator, bot);
+                self.deliverDirectMessageToStable(bot, user.id, reply_text) catch |err|
+                    std.log.warn("event=bot_dm_stable_delivery_failed user_id={d} error={t}", .{ user.id, err });
+            }
+        }
     }
 
     fn friendRelationsJson(self: *App, user_id: i32) ![]u8 {
@@ -936,6 +1023,7 @@ const App = struct {
     }
 
     fn requestRule(req: *const std.http.Server.Request, path: []const u8) ?rate_limit.Rule {
+        if ((req.head.method == .PUT or req.head.method == .PATCH) and bss.parsePath(path) != null) return rate_limit.media_upload;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/users")) return rate_limit.registration;
         if (req.head.method == .POST and (std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke"))) return rate_limit.token;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/staff/session")) return rate_limit.web_session;
@@ -944,6 +1032,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.startsWith(u8, path, "/api/v1/staff/")) return rate_limit.web_action;
         if ((req.head.method == .POST or req.head.method == .PUT or req.head.method == .DELETE) and std.mem.startsWith(u8, path, "/api/v1/account")) return rate_limit.web_action;
         if ((req.head.method == .POST or req.head.method == .PUT or req.head.method == .DELETE) and std.mem.startsWith(u8, path, "/api/v1/teams")) return rate_limit.web_action;
+        if (req.head.method == .POST and std.mem.startsWith(u8, path, "/api/v1/chat/")) return rate_limit.web_action;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v1/appeals")) return rate_limit.appeal;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/api/v2/scores")) return rate_limit.score;
         if ((req.head.method == .POST or req.head.method == .PUT) and lazer.parseSoloScorePath(path) != null) return rate_limit.score;
@@ -962,11 +1051,12 @@ const App = struct {
     }
 
     fn bodyLimit(path: []const u8) usize {
+        if (bss.parsePath(path) != null) return bss.max_upload_bytes + 1024 * 1024;
         if (std.mem.eql(u8, path, "/api/v1/account/avatar")) return profile_avatar.max_bytes;
         if (std.mem.eql(u8, path, "/api/v1/account/banner")) return profile_banner.max_bytes;
         if (std.mem.startsWith(u8, path, "/api/v1/teams/") and (std.mem.endsWith(u8, path, "/flag") or std.mem.endsWith(u8, path, "/header"))) return team_image.header_max_bytes;
         if (std.mem.eql(u8, path, "/api/v1/teams") or std.mem.startsWith(u8, path, "/api/v1/teams/")) return 16 * 1024;
-        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/session") or std.mem.startsWith(u8, path, "/api/v1/account/") or std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
+        if (std.mem.eql(u8, path, "/users") or std.mem.eql(u8, path, "/oauth/token") or std.mem.eql(u8, path, "/oauth/revoke") or std.mem.eql(u8, path, "/api/v1/session") or std.mem.startsWith(u8, path, "/api/v1/account/") or std.mem.eql(u8, path, "/api/v1/account") or std.mem.startsWith(u8, path, "/api/v1/chat/") or std.mem.eql(u8, path, "/api/v1/staff/session") or std.mem.eql(u8, path, "/api/v1/appeals") or std.mem.startsWith(u8, path, "/api/v1/staff/")) return 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v2/scores")) return 1024 * 1024;
         if (lazer.parseSoloScorePath(path) != null) return lazer.max_score_body_bytes;
         if (lazer_multiplayer.parseRoomScorePath(path) != null) return lazer.max_score_body_bytes;
@@ -1103,6 +1193,28 @@ const App = struct {
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
+        const bss_path = bss.parsePath(path);
+        var bss_user: ?domain.User = null;
+        defer if (bss_user) |user| freeUser(self.allocator, user);
+        if (bss_path) |route| {
+            if (!isBssHost(host_owned)) return respondWithoutContinue(req, .not_found, "{\"error\":\"not found\"}");
+            const method_allowed = switch (route) {
+                .collection => req.head.method == .PUT,
+                .set => req.head.method == .PUT or req.head.method == .PATCH,
+            };
+            if (!method_allowed) return respondWithoutContinue(req, .method_not_allowed, "{\"error\":\"method not allowed\"}");
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respondWithoutContinue(req, .unauthorized, "{\"error\":\"authentication required\"}");
+            if (user.restricted) {
+                freeUser(self.allocator, user);
+                return respondWithoutContinue(req, .forbidden, "{\"error\":\"account restricted\"}");
+            }
+            if (user.privileges & bss.premium_privilege == 0) {
+                freeUser(self.allocator, user);
+                return respondWithoutContinue(req, .forbidden, "{\"error\":\"premium required\"}");
+            }
+            bss_user = user;
+        }
+
         const body_is_framed = req.head.content_length != null or req.head.transfer_encoding != .none;
         const body: []u8 = if (req.head.method.requestHasBody() and body_is_framed) b: {
             const r = req.readerExpectContinue(&.{}) catch return error.BadBody;
@@ -1112,6 +1224,93 @@ const App = struct {
             };
         } else &.{};
         defer if (body.len > 0) self.allocator.free(body);
+
+        if (bss_path) |route| switch (route) {
+            .collection => {
+                const content_type = content_type_owned orelse return respond(req, .unsupported_media_type, "application/json", "{\"error\":\"application/json required\"}", &.{});
+                if (!std.ascii.startsWithIgnoreCase(content_type, "application/json")) return respond(req, .unsupported_media_type, "application/json", "{\"error\":\"application/json required\"}", &.{});
+                var input = bss.parseReserveInput(self.allocator, body) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid beatmap reservation\"}", &.{});
+                defer input.deinit();
+                var reservation = self.store.reserveBssSubmission(self.allocator, bss_user.?.id, input) catch |err| return switch (err) {
+                    error.BssSubmissionNotFound => respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{}),
+                    error.BssNotOwner, error.BssBeatmapNotOwned => respond(req, .forbidden, "application/json", "{\"error\":\"this beatmap set belongs to another mapper\"}", &.{}),
+                    error.InvalidBssReservation => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid beatmap reservation\"}", &.{}),
+                    error.BssIdentifierExhausted => respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap identifiers unavailable\"}", &.{}),
+                    else => return err,
+                };
+                defer reservation.deinit();
+                var old_bytes: ?[]u8 = null;
+                defer if (old_bytes) |value| self.allocator.free(value);
+                var old_archive: ?bss.Archive = null;
+                defer if (old_archive) |*value| value.deinit();
+                if (input.set_id != null) {
+                    old_bytes = self.store.beatmapArchive(self.allocator, reservation.set_id) catch |err| blk: {
+                        std.log.warn("event=bss_manifest_load_failed set_id={d} error={t}", .{ reservation.set_id, err });
+                        break :blk null;
+                    };
+                    if (old_bytes) |value| old_archive = bss.parseArchive(self.allocator, value) catch |err| blk: {
+                        std.log.warn("event=bss_manifest_parse_failed set_id={d} error={t}", .{ reservation.set_id, err });
+                        break :blk null;
+                    };
+                }
+                const json = try bss.reservationJson(self.allocator, reservation, if (old_archive) |*value| value else null);
+                defer self.allocator.free(json);
+                std.log.info("event=bss_reserved user_id={d} set_id={d} maps={d} revision={d} target={s}", .{ bss_user.?.id, reservation.set_id, reservation.beatmap_ids.len, reservation.revision, input.target.database() });
+                return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
+            },
+            .set => |set_id| {
+                const expected_ids = self.store.bssReservedMapIds(self.allocator, bss_user.?.id, set_id) catch |err| return switch (err) {
+                    error.BssSubmissionNotFound => respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{}),
+                    error.BssNotOwner => respond(req, .forbidden, "application/json", "{\"error\":\"this beatmap set belongs to another mapper\"}", &.{}),
+                    else => return err,
+                };
+                defer self.allocator.free(expected_ids);
+                const content_type = content_type_owned orelse return respond(req, .unsupported_media_type, "application/json", "{\"error\":\"multipart/form-data required\"}", &.{});
+                const boundary = multipart.boundaryFromContentType(content_type) catch return respond(req, .unsupported_media_type, "application/json", "{\"error\":\"multipart/form-data required\"}", &.{});
+                var form = multipart.parse(self.allocator, body, boundary) catch |err| {
+                    self.store.failBssSubmission(bss_user.?.id, set_id, @errorName(err)) catch {};
+                    return respond(req, .bad_request, "application/json", "{\"error\":\"invalid upload form\"}", &.{});
+                };
+                defer form.deinit();
+                var rebuilt: ?[]u8 = null;
+                defer if (rebuilt) |value| self.allocator.free(value);
+                var current: ?[]u8 = null;
+                defer if (current) |value| self.allocator.free(value);
+                const archive = if (req.head.method == .PUT) blk: {
+                    const part = form.first("beatmapArchive") orelse {
+                        self.store.failBssSubmission(bss_user.?.id, set_id, "missing beatmapArchive") catch {};
+                        return respond(req, .bad_request, "application/json", "{\"error\":\"beatmapArchive required\"}", &.{});
+                    };
+                    if (part.filename == null) return respond(req, .bad_request, "application/json", "{\"error\":\"beatmapArchive filename required\"}", &.{});
+                    break :blk part.data;
+                } else blk: {
+                    current = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .conflict, "application/json", "{\"error\":\"full package upload required\"}", &.{});
+                    rebuilt = bss.applyPatch(self.allocator, current.?, &form) catch |err| {
+                        self.store.failBssSubmission(bss_user.?.id, set_id, @errorName(err)) catch {};
+                        return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid beatmap package patch\"}", &.{});
+                    };
+                    break :blk rebuilt.?;
+                };
+                var package = bss.preparePackage(self.allocator, archive, set_id, expected_ids) catch |err| {
+                    self.store.failBssSubmission(bss_user.?.id, set_id, @errorName(err)) catch {};
+                    std.log.warn("event=bss_package_rejected user_id={d} set_id={d} error={t}", .{ bss_user.?.id, set_id, err });
+                    return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid beatmap package\"}", &.{});
+                };
+                defer package.deinit();
+                const digest = bss.archiveSha256(archive);
+                self.store.publishBssSubmission(bss_user.?.id, set_id, &package, archive, &digest) catch |err| {
+                    if (bssStorageFailure(err)) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap storage unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
+                    return switch (err) {
+                        error.BssSubmissionNotFound => respond(req, .not_found, "application/json", "{\"error\":\"beatmap set not found\"}", &.{}),
+                        error.BssNotOwner => respond(req, .forbidden, "application/json", "{\"error\":\"this beatmap set belongs to another mapper\"}", &.{}),
+                        error.BssRevisionMismatch => respond(req, .conflict, "application/json", "{\"error\":\"beatmap set changed; submit it again\"}", &.{}),
+                        else => return err,
+                    };
+                };
+                std.log.info("event=bss_published user_id={d} set_id={d} maps={d} bytes={d} sha256={s}", .{ bss_user.?.id, set_id, package.maps.len, archive.len, &digest });
+                return respond(req, .no_content, "application/json", "", &.{.{ .name = "cache-control", .value = "no-store" }});
+            },
+        };
 
         if (std.mem.eql(u8, path, "/api/v2/rooms") and req.head.method == .POST) {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"authentication required\"}", &.{});
@@ -1328,6 +1527,164 @@ const App = struct {
             }
             return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
         }
+        if (std.mem.eql(u8, path, "/api/v1/multiplayer/rooms") or parseWebsiteRoomPath(path) != null) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            if (parseWebsiteRoomPath(path)) |room_id| {
+                const room = (try self.lazer_multiplayer.roomsJson(self.allocator, room_id, null)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &no_store);
+                defer self.allocator.free(room);
+                const leaderboard = (try self.lazer_multiplayer.roomLeaderboardJson(self.allocator, 0, room_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &no_store);
+                defer self.allocator.free(leaderboard);
+                var output: std.Io.Writer.Allocating = .init(self.allocator);
+                defer output.deinit();
+                try output.writer.writeAll("{\"room\":");
+                try output.writer.writeAll(room);
+                try output.writer.writeAll(",\"scores\":");
+                try output.writer.writeAll(leaderboard);
+                try output.writer.writeByte('}');
+                return respond(req, .ok, "application/json", output.written(), &no_store);
+            }
+            const rooms_value = try self.lazer_multiplayer.roomsJson(self.allocator, null, null);
+            const rooms = rooms_value orelse "[]";
+            defer if (rooms_value != null) self.allocator.free(rooms);
+            return respond(req, .ok, "application/json", rooms, &no_store);
+        }
+        if (std.mem.eql(u8, path, "/api/v1/chat/channels") or std.mem.eql(u8, path, "/api/v1/chat/messages") or std.mem.eql(u8, path, "/api/v1/chat/read") or std.mem.eql(u8, path, "/api/v1/chat/threads") or std.mem.eql(u8, path, "/api/v1/chat/dms") or std.mem.eql(u8, path, "/api/v1/chat/dms/read")) {
+            const no_store = [_]std.http.Header{
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "pragma", .value = "no-cache" },
+            };
+            if (!web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &no_store);
+            const token = web_auth.playerSessionToken(cookie_owned) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"sign in required\"}", &no_store);
+            const user = (try self.store.authenticateToken(self.allocator, token, web_auth.player_scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"session ended\"}", &no_store);
+            defer freeUser(self.allocator, user);
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/channels")) {
+                if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+                const json = try self.store.lazerChannelListJson(self.allocator, user.id);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/threads")) {
+                if (req.head.method != .GET) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+                const json = try self.store.directMessageThreadsJson(self.allocator, user.id, 100);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/dms") and req.head.method == .GET) {
+                const other_id = std.fmt.parseInt(i32, queryField(target, "user") orelse "", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                if (other_id <= 0 or other_id == user.id) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                var other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                defer freeUser(self.allocator, other);
+                if (other.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                try self.markOnline(&other);
+                const since = std.fmt.parseInt(i64, queryField(target, "since") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid cursor\"}", &no_store);
+                if (since < 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid cursor\"}", &no_store);
+                const messages = try self.store.lazerDirectMessagesJson(self.allocator, user.id, other.id, since, 100);
+                defer self.allocator.free(messages);
+                var output: std.Io.Writer.Allocating = .init(self.allocator);
+                defer output.deinit();
+                try output.writer.writeAll("{\"user\":");
+                try user_json.writeCompact(&output.writer, other);
+                try output.writer.writeAll(",\"messages\":");
+                try output.writer.writeAll(messages);
+                try output.writer.writeByte('}');
+                return respond(req, .ok, "application/json", output.written(), &no_store);
+            }
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/messages") and req.head.method == .GET) {
+                const channel_id = std.fmt.parseInt(i64, queryField(target, "channel") orelse "", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel\"}", &no_store);
+                if (!lazer.validChannelId(channel_id)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel\"}", &no_store);
+                const since = std.fmt.parseInt(i64, queryField(target, "since") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid cursor\"}", &no_store);
+                if (since < 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid cursor\"}", &no_store);
+                const json = try self.store.lazerChatMessagesJson(self.allocator, channel_id, since, 100);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &no_store);
+            }
+
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            if (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/dms/read")) {
+                const other_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"user"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                defer self.allocator.free(other_text);
+                const other_id = std.fmt.parseInt(i32, other_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                if (other_id <= 0 or other_id == user.id) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                const other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                defer freeUser(self.allocator, other);
+                try self.store.markDirectMessagesRead(user.id, other.id);
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/dms")) {
+                if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"restricted accounts cannot chat\"}", &no_store);
+                const now = std.Io.Clock.real.now(self.sessions.io).toSeconds();
+                if (user.silence_end > now) return respond(req, .forbidden, "application/json", "{\"error\":\"you are silenced\"}", &no_store);
+                const other_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"user"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                defer self.allocator.free(other_text);
+                const other_id = std.fmt.parseInt(i32, other_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                if (other_id <= 0 or other_id == user.id) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                const other = (try self.store.userById(self.allocator, other_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                defer freeUser(self.allocator, other);
+                if (other.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                const message_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"message"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"message required\"}", &no_store);
+                defer self.allocator.free(message_owned);
+                const message = std.mem.trim(u8, message_owned, " \t\r\n");
+                if (!validWebText(message, 1, 2000) or std.mem.indexOfScalar(u8, message, 0) != null) return respond(req, .bad_request, "application/json", "{\"error\":\"message must be 1-2000 characters\"}", &no_store);
+                const uuid = try randomMessageUuid(self.sessions.io);
+                const written = self.store.recordLazerDirectMessage(self.allocator, user.id, other.id, message, false, &uuid) catch |err| return switch (err) {
+                    error.DirectMessageBlocked => respond(req, .forbidden, "application/json", "{\"error\":\"direct messages are blocked\"}", &no_store),
+                    error.ChatUuidConflict => respond(req, .conflict, "application/json", "{\"error\":\"message could not be retried\"}", &no_store),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message could not be sent\"}", &no_store),
+                };
+                defer self.allocator.free(written.json);
+                if (written.inserted) {
+                    self.deliverDirectMessageToStable(user, other.id, message) catch |err|
+                        std.log.warn("event=website_dm_stable_delivery_failed user_id={d} target_id={d} error={t}", .{ user.id, other.id, err });
+                    if (other.id == 3) self.recordLazerBotReply(user, message, false);
+                }
+                return respond(req, .created, "application/json", written.json, &no_store);
+            }
+
+            const channel_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"channel"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"channel required\"}", &no_store);
+            defer self.allocator.free(channel_text);
+            const channel_id = std.fmt.parseInt(i64, channel_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel\"}", &no_store);
+            const channel_name = lazer.channelName(channel_id) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid channel\"}", &no_store);
+
+            if (std.mem.eql(u8, path, "/api/v1/chat/read")) {
+                const message_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"message_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"message required\"}", &no_store);
+                defer self.allocator.free(message_text);
+                const message_id = std.fmt.parseInt(i64, message_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid message\"}", &no_store);
+                self.store.markLazerChannelRead(user.id, channel_id, message_id) catch |err| return switch (err) {
+                    error.ChatMessageNotFound => respond(req, .not_found, "application/json", "{\"error\":\"message not found\"}", &no_store),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"read state unavailable\"}", &no_store),
+                };
+                return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+            }
+
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"restricted accounts cannot chat\"}", &no_store);
+            const now = std.Io.Clock.real.now(self.sessions.io).toSeconds();
+            if (user.silence_end > now) return respond(req, .forbidden, "application/json", "{\"error\":\"you are silenced\"}", &no_store);
+            const message_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"message"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"message required\"}", &no_store);
+            defer self.allocator.free(message_owned);
+            const message = std.mem.trim(u8, message_owned, " \t\r\n");
+            if (!validWebText(message, 1, 2000) or std.mem.indexOfScalar(u8, message, 0) != null) return respond(req, .bad_request, "application/json", "{\"error\":\"message must be 1-2000 characters\"}", &no_store);
+            const uuid = try randomMessageUuid(self.sessions.io);
+            const written = self.store.recordLazerPublicMessage(self.allocator, user.id, channel_name, message, false, &uuid) catch |err| return switch (err) {
+                error.ChannelReadOnly => respond(req, .forbidden, "application/json", "{\"error\":\"that channel is read only\"}", &no_store),
+                error.UnknownChannel => respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &no_store),
+                else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message could not be sent\"}", &no_store),
+            };
+            defer self.allocator.free(written.json);
+            self.broadcastLazerChatToStable(user, channel_name, message) catch |err| std.log.warn("event=website_chat_stable_broadcast_failed user_id={d} channel={s} error={t}", .{ user.id, channel_name, err });
+            return respond(req, .created, "application/json", written.json, &no_store);
+        }
         const account_pin_path = parsePinPath(path);
         if (std.mem.eql(u8, path, "/api/v1/account") or std.mem.eql(u8, path, "/api/v1/account/avatar") or std.mem.eql(u8, path, "/api/v1/account/banner") or std.mem.eql(u8, path, "/api/v1/account/email") or std.mem.eql(u8, path, "/api/v1/account/password") or std.mem.eql(u8, path, "/api/v1/account/username") or account_pin_path != null) {
             const no_store = [_]std.http.Header{
@@ -1453,7 +1810,12 @@ const App = struct {
             if ((req.head.method != .PUT and req.head.method != .DELETE) or !web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(token, csrf_owned)) return respond(req, if (req.head.method == .PUT or req.head.method == .DELETE) .forbidden else .method_not_allowed, "application/json", if (req.head.method == .PUT or req.head.method == .DELETE) "{\"error\":\"invalid request\"}" else "{\"error\":\"method not allowed\"}", &no_store);
             if (std.mem.eql(u8, path, "/api/v1/account/banner")) {
                 if (req.head.method == .PUT) {
-                    const image = profile_banner.validate(content_type_owned, body) catch return respond(req, .bad_request, "application/json", "{\"error\":\"use a valid png, jpeg, or gif up to 4 mb and 2000 by 500 px\"}", &no_store);
+                    const image = profile_banner.validate(content_type_owned, body) catch |err| return respond(req, .bad_request, "application/json", switch (err) {
+                        error.InvalidAvatarSize => "{\"error\":\"profile banners must be under 4 mb\"}",
+                        error.InvalidAvatarDimensions => "{\"error\":\"profile banners must fit inside 2000 by 500 px\"}",
+                        error.InvalidAvatarContentType => "{\"error\":\"the image type does not match its file\"}",
+                        else => "{\"error\":\"use a valid png, jpeg, or gif image\"}",
+                    }, &no_store);
                     var digest: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
                     const etag = std.fmt.bytesToHex(digest, .lower);
@@ -1623,7 +1985,12 @@ const App = struct {
                 if (!try self.store.teamCanManage(actor.id, team_path.id, is_admin)) return respond(req, .forbidden, "application/json", "{\"error\":\"team management access required\"}", &no_store);
                 const kind: team_image.Kind = if (std.mem.eql(u8, team_path.action, "flag")) .flag else .header;
                 if (req.head.method == .PUT) {
-                    const image = team_image.validate(kind, content_type_owned, body) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid team image\"}", &no_store);
+                    const image = team_image.validate(kind, content_type_owned, body) catch |err| return respond(req, .bad_request, "application/json", switch (err) {
+                        error.InvalidAvatarSize => if (kind == .flag) "{\"error\":\"team flags must be under 200 kb\"}" else "{\"error\":\"team headers must be under 4 mb\"}",
+                        error.InvalidAvatarDimensions => if (kind == .flag) "{\"error\":\"team flags must fit inside 512 by 256 px\"}" else "{\"error\":\"team headers must fit inside 2000 by 500 px\"}",
+                        error.InvalidAvatarContentType => "{\"error\":\"the image type does not match its file\"}",
+                        else => "{\"error\":\"use a valid png, jpeg, or gif image\"}",
+                    }, &no_store);
                     var digest: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
                     const etag = std.fmt.bytesToHex(digest, .lower);
@@ -2089,7 +2456,13 @@ const App = struct {
             const source = domain.parseSiteScoreSource(queryField(target, "source") orelse "all") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid source\"}", &.{});
             const mode = std.fmt.parseInt(u8, queryField(target, "mode") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             if (!domain.validSiteMode(source, mode)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
-            const profile = (try self.store.siteProfile(self.allocator, user_id, source, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const profile = if (user_id == 3) bot_profile: {
+                const bot_user = (try self.store.userById(self.allocator, user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+                defer freeUser(self.allocator, bot_user);
+                break :bot_profile try user_json.siteBotProfileOwned(self.allocator, bot_user);
+            } else player_profile: {
+                break :player_profile (try self.store.siteProfile(self.allocator, user_id, source, mode)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            };
             defer self.allocator.free(profile);
             const with_presence = try self.attachProfilePresence(profile, user_id);
             defer self.allocator.free(with_presence);
@@ -2182,9 +2555,7 @@ const App = struct {
             }
         }
         if (req.head.method == .GET and isAssetsHost(host_owned) and std.mem.startsWith(u8, path, "/banners/")) {
-            const id_text = path["/banners/".len..];
-            if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
-            const user_id = std.fmt.parseInt(i32, id_text, 10) catch return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
+            const user_id = profile_banner.assetUserId(path) orelse return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
             const banner = (try self.store.customBannerForUser(self.allocator, user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"banner not found\"}", &.{});
             return self.serveObjectImage(req, banner);
         }
@@ -2301,6 +2672,13 @@ const App = struct {
         if (std.mem.eql(u8, path, "/oauth/token") and req.head.method == .POST) {
             const grant = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"grant_type"})) orelse try self.allocator.dupe(u8, "password");
             defer self.allocator.free(grant);
+            if (std.mem.eql(u8, grant, "refresh_token")) {
+                const refresh = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"refresh_token"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
+                defer self.allocator.free(refresh);
+                const user = (try self.store.consumeGameRefreshToken(self.allocator, refresh)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
+                defer freeUser(self.allocator, user);
+                return self.respondLazerOAuthTokens(req, user.id);
+            }
             if (!std.mem.eql(u8, grant, "password")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported_grant_type\"}", &.{});
             const name = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"username"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
             defer self.allocator.free(name);
@@ -2308,17 +2686,9 @@ const App = struct {
             defer self.allocator.free(password);
             const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
             const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
-            defer self.allocator.free(user.name);
-            defer self.allocator.free(user.safe_name);
+            defer freeUser(self.allocator, user);
             try self.takeOverGameSessions(user.id, "lazer");
-            const token = try self.store.issueToken(user.id, "identify scores:write", 3600);
-            var out: [256]u8 = undefined;
-            const json = try std.fmt.bufPrint(&out, "{{\"token_type\":\"Bearer\",\"expires_in\":3600,\"scope\":\"identify scores:write\",\"access_token\":\"{s}\"}}", .{token});
-            const token_headers = [_]std.http.Header{
-                .{ .name = "cache-control", .value = "no-store" },
-                .{ .name = "pragma", .value = "no-cache" },
-            };
-            return respond(req, .ok, "application/json", json, &token_headers);
+            return self.respondLazerOAuthTokens(req, user.id);
         }
         if (std.mem.eql(u8, path, "/oauth/revoke") and req.head.method == .POST) {
             const token = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"token"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
@@ -2647,10 +3017,15 @@ const App = struct {
             const written = self.store.recordLazerDirectMessage(self.allocator, user.id, target_id, content, is_action, uuid) catch |err| return switch (err) {
                 error.ChatUuidConflict => respond(req, .conflict, "application/json", "{\"error\":\"message uuid conflict\"}", &.{}),
                 error.InvalidDirectMessage => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid target\"}", &.{}),
+                error.DirectMessageBlocked => respond(req, .forbidden, "application/json", "{\"error\":\"direct messages are blocked\"}", &.{}),
                 else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message unavailable\"}", &.{}),
             };
             defer self.allocator.free(written.json);
-            if (written.inserted and target_id == 3) self.recordLazerBotReply(user, content, is_action);
+            if (written.inserted) {
+                self.deliverDirectMessageToStable(user, target_id, content) catch |err|
+                    std.log.warn("event=lazer_dm_stable_delivery_failed user_id={d} target_id={d} error={t}", .{ user.id, target_id, err });
+                if (target_id == 3) self.recordLazerBotReply(user, content, is_action);
+            }
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
             try output.writer.print("{{\"new_channel_id\":{d},\"message\":", .{lazer.privateChannelId(target_id).?});
@@ -2771,6 +3146,7 @@ const App = struct {
                 self.store.recordLazerPublicMessage(self.allocator, user.id, lazer.channelName(channel_path.channel_id).?, content, is_action, uuid)) catch |err| return switch (err) {
                 error.ChannelReadOnly => respond(req, .forbidden, "application/json", "{\"error\":\"channel is read-only\"}", &.{}),
                 error.ChatUuidConflict => respond(req, .conflict, "application/json", "{\"error\":\"message uuid conflict\"}", &.{}),
+                error.DirectMessageBlocked => respond(req, .forbidden, "application/json", "{\"error\":\"direct messages are blocked\"}", &.{}),
                 error.UnknownChannel => respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{}),
                 else => respond(req, .internal_server_error, "application/json", "{\"error\":\"message unavailable\"}", &.{}),
             };
@@ -2780,7 +3156,11 @@ const App = struct {
                 self.broadcastLazerChatToStable(user, channel_name, content) catch |err|
                     std.log.warn("event=lazer_chat_stable_broadcast_failed channel={s} error={t}", .{ channel_name, err });
             }
-            if (written.inserted and private_target_id == 3) self.recordLazerBotReply(user, content, is_action);
+            if (written.inserted) if (private_target_id) |target_id| {
+                self.deliverDirectMessageToStable(user, target_id, content) catch |err|
+                    std.log.warn("event=lazer_dm_stable_delivery_failed user_id={d} target_id={d} error={t}", .{ user.id, target_id, err });
+                if (target_id == 3) self.recordLazerBotReply(user, content, is_action);
+            };
             return respond(req, .created, "application/json", written.json, &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/chat/ack")) {
@@ -3038,11 +3418,10 @@ const App = struct {
             const ruleset_id = lazerRulesetId(queryField(target, "mode") orelse "osu") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid mode\"}", &.{});
             const raw_limit = std.fmt.parseInt(u16, queryField(target, "limit") orelse "50", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
             if (raw_limit == 0 or raw_limit > 100) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
-            const scope = queryField(target, "type") orelse "global";
-            if (!std.mem.eql(u8, scope, "global") and !std.mem.eql(u8, scope, "country") and !std.mem.eql(u8, scope, "friend")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported leaderboard scope\"}", &.{});
+            const scope = lazer.LeaderboardScope.parse(queryField(target, "type") orelse "global") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported leaderboard scope\"}", &.{});
             const mod_filter = lazer.leaderboardModFilter(self.allocator, target) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid leaderboard mods\"}", &.{});
             defer mod_filter.deinit(self.allocator);
-            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, mod_filter.namespace, mod_filter.exact_json, mod_filter.selected, mod_filter.classic, mod_filter.stable_bits, @intCast(raw_limit));
+            const json = try self.store.lazerLeaderboardJson(self.allocator, user.id, leaderboard_path.beatmap_id, ruleset_id, mod_filter.namespace, mod_filter.exact_json, mod_filter.selected, mod_filter.classic, mod_filter.stable_bits, scope, @intCast(raw_limit));
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -3800,6 +4179,7 @@ const App = struct {
                     defer self.allocator.free(info.artist);
                     defer self.allocator.free(info.title);
                     defer self.allocator.free(info.version);
+                    defer self.allocator.free(info.creator);
                     announceScore(self.allocator, &self.sessions, user.name, score, performance.pp, placed, info) catch {};
                     self.score_webhook.postScore(.{
                         .username = user.name,
@@ -3936,6 +4316,573 @@ fn peerIp(stream: std.Io.net.Stream, buffer: []u8) ?[]const u8 {
         },
         else => null,
     };
+}
+
+const max_irc_clients: u32 = 512;
+
+const IrcConnection = struct {
+    app: *App,
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    writer: std.Io.net.Stream.Writer = undefined,
+    send_buffer: [4096]u8 = undefined,
+    write_mutex: std.Io.Mutex = .init,
+    alive: std.atomic.Value(bool) = .init(true),
+    registered: std.atomic.Value(bool) = .init(false),
+    joined: std.atomic.Value(u8) = .init(0),
+    user: ?domain.User = null,
+    nick: [32]u8 = undefined,
+    nick_len: u8 = 0,
+    password: [128]u8 = [_]u8{0} ** 128,
+    password_len: u8 = 0,
+    user_seen: bool = false,
+    cap_pending: bool = false,
+    authentication_attempts: u8 = 0,
+    cursor: i64 = 0,
+    connected_at: i64,
+    last_ping_at: i64,
+
+    fn init(self: *IrcConnection, app: *App, stream: std.Io.net.Stream, io: std.Io) void {
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        self.* = .{
+            .app = app,
+            .stream = stream,
+            .io = io,
+            .connected_at = now,
+            .last_ping_at = now,
+        };
+        self.writer = stream.writer(io, &self.send_buffer);
+    }
+
+    fn deinit(self: *IrcConnection) void {
+        @memset(&self.password, 0);
+        if (self.user) |user| freeUser(self.app.allocator, user);
+        self.* = undefined;
+    }
+
+    fn currentNick(self: *const IrcConnection) []const u8 {
+        if (self.user) |user| return user.safe_name;
+        if (self.nick_len != 0) return self.nick[0..self.nick_len];
+        return "*";
+    }
+
+    fn close(self: *IrcConnection) void {
+        if (!self.alive.swap(false, .acq_rel)) return;
+        self.stream.shutdown(self.io, .both) catch {};
+    }
+
+    fn sendRaw(self: *IrcConnection, bytes: []const u8) bool {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (!self.alive.load(.acquire)) return false;
+        self.writer.interface.writeAll(bytes) catch {
+            self.close();
+            return false;
+        };
+        self.writer.interface.flush() catch {
+            self.close();
+            return false;
+        };
+        return true;
+    }
+
+    fn sendNumeric(self: *IrcConnection, comptime code: []const u8, comptime format: []const u8, args: anytype) void {
+        var output: std.Io.Writer.Allocating = .init(self.app.allocator);
+        defer output.deinit();
+        output.writer.print(":" ++ irc.server_name ++ " " ++ code ++ " {s} ", .{self.currentNick()}) catch return self.close();
+        output.writer.print(format, args) catch return self.close();
+        output.writer.writeAll("\r\n") catch return self.close();
+        _ = self.sendRaw(output.written());
+    }
+
+    fn sendServer(self: *IrcConnection, comptime format: []const u8, args: anytype) void {
+        var output: std.Io.Writer.Allocating = .init(self.app.allocator);
+        defer output.deinit();
+        output.writer.print(":" ++ irc.server_name ++ " " ++ format ++ "\r\n", args) catch return self.close();
+        _ = self.sendRaw(output.written());
+    }
+
+    fn sendLine(self: *IrcConnection, comptime format: []const u8, args: anytype) void {
+        var output: std.Io.Writer.Allocating = .init(self.app.allocator);
+        defer output.deinit();
+        output.writer.print(format ++ "\r\n", args) catch return self.close();
+        _ = self.sendRaw(output.written());
+    }
+
+    fn sendJoin(self: *IrcConnection, channel: []const u8) void {
+        const mask = irc.channelMask(channel) orelse return;
+        _ = self.joined.fetchOr(mask, .acq_rel);
+        self.sendLine(":{s}!zigcho@kai.ovh JOIN {s}", .{ self.currentNick(), channel });
+        const topic = if (std.mem.eql(u8, channel, "#announce")) "server and score updates" else if (std.mem.eql(u8, channel, "#lobby")) "multiplayer lobby" else if (std.mem.eql(u8, channel, "#lazer")) "lazer chat" else "general chat";
+        self.sendNumeric("332", "{s} :{s}", .{ channel, topic });
+        self.sendNames(channel);
+    }
+
+    fn sendNames(self: *IrcConnection, channel: []const u8) void {
+        if (irc.channelMask(channel)) |mask| if (self.joined.load(.acquire) & mask == 0) return;
+        self.sendNumeric("353", "= {s} :@kai {s}", .{ channel, self.currentNick() });
+        self.sendNumeric("366", "{s} :End of /NAMES list", .{channel});
+    }
+
+    fn sendChat(self: *IrcConnection, sender: []const u8, target: []const u8, content: []const u8, action: bool) void {
+        var remaining = content;
+        while (remaining.len != 0) {
+            var take = @min(remaining.len, 350);
+            while (take > 0 and !std.unicode.utf8ValidateSlice(remaining[0..take])) take -= 1;
+            if (take == 0) return;
+            var output: std.Io.Writer.Allocating = .init(self.app.allocator);
+            defer output.deinit();
+            irc.writeMessage(&output.writer, sender, target, remaining[0..take], action) catch return self.close();
+            if (!self.sendRaw(output.written())) return;
+            remaining = remaining[take..];
+        }
+    }
+};
+
+fn ircJsonInteger(object: std.json.ObjectMap, name: []const u8) ?i64 {
+    return switch (object.get(name) orelse return null) {
+        .integer => |value| value,
+        else => null,
+    };
+}
+
+fn ircLatestCursor(connection: *IrcConnection) !i64 {
+    const user = connection.user orelse return 0;
+    const json = try connection.app.store.lazerAllMessagesJson(connection.app.allocator, user.id, 0, 100);
+    defer connection.app.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, connection.app.allocator, json, .{});
+    defer parsed.deinit();
+    const items = switch (parsed.value) {
+        .array => |array| array.items,
+        else => return error.InvalidChatPayload,
+    };
+    var cursor: i64 = 0;
+    for (items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => continue,
+        };
+        cursor = @max(cursor, ircJsonInteger(object, "message_id") orelse 0);
+    }
+    return cursor;
+}
+
+fn ircRegister(connection: *IrcConnection) void {
+    if (connection.registered.load(.acquire) or connection.nick_len == 0 or connection.password_len == 0 or !connection.user_seen or connection.cap_pending) return;
+    const password = connection.password[0..connection.password_len];
+    if (password.len < 8) {
+        connection.sendNumeric("464", ":Password incorrect", .{});
+        connection.password_len = 0;
+        @memset(&connection.password, 0);
+        return;
+    }
+    var digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+    std.crypto.hash.Md5.hash(password, &digest, .{});
+    const password_md5 = std.fmt.bytesToHex(digest, .lower);
+    @memset(&connection.password, 0);
+    connection.password_len = 0;
+    const user = connection.app.store.authenticate(connection.app.allocator, connection.nick[0..connection.nick_len], &password_md5) catch |err| {
+        std.log.warn("event=irc_authentication_failed nick={s} error={t}", .{ connection.nick[0..connection.nick_len], err });
+        connection.sendNumeric("464", ":Password incorrect", .{});
+        return;
+    } orelse {
+        connection.authentication_attempts += 1;
+        connection.sendNumeric("464", ":Password incorrect", .{});
+        if (connection.authentication_attempts >= 3) connection.close();
+        return;
+    };
+    connection.user = user;
+    connection.cursor = ircLatestCursor(connection) catch |err| cursor: {
+        std.log.warn("event=irc_cursor_prime_failed user_id={d} error={t}", .{ user.id, err });
+        break :cursor 0;
+    };
+    connection.registered.store(true, .release);
+    connection.sendNumeric("001", ":Welcome to kai IRC, {s}", .{user.safe_name});
+    connection.sendNumeric("002", ":Your host is {s}", .{irc.server_name});
+    connection.sendNumeric("003", ":This server is the shared Zigcho chat bridge", .{});
+    connection.sendNumeric("004", "{s} zigcho o o", .{irc.server_name});
+    connection.sendNumeric("005", "CHANTYPES=# CASEMAPPING=ascii NICKLEN=32 CHANNELLEN=32 TOPICLEN=300 :are supported by this server", .{});
+    connection.sendNumeric("375", ":- {s} Message of the Day -", .{irc.server_name});
+    connection.sendNumeric("372", ":Stable, lazer, web and IRC share this history.", .{});
+    connection.sendNumeric("376", ":End of /MOTD command", .{});
+    connection.sendJoin("#osu");
+    connection.sendJoin("#announce");
+    std.log.info("event=irc_authenticated user_id={d} nick={s}", .{ user.id, user.safe_name });
+}
+
+fn ircActionText(value: []const u8) struct { text: []const u8, action: bool } {
+    if (value.len >= 9 and value[0] == 0x01 and value[value.len - 1] == 0x01 and std.mem.startsWith(u8, value[1..], "ACTION "))
+        return .{ .text = value[8 .. value.len - 1], .action = true };
+    return .{ .text = value, .action = false };
+}
+
+fn ircHandleMessage(connection: *IrcConnection, command: irc.Command) void {
+    const user = connection.user orelse return;
+    const target = command.parameter(0) orelse return connection.sendNumeric("411", ":No recipient given", .{});
+    const raw = command.parameter(1) orelse return connection.sendNumeric("412", ":No text to send", .{});
+    const action = ircActionText(raw);
+    const message = std.mem.trim(u8, action.text, " \t\r\n");
+    if (message.len == 0 or message.len > 2000 or std.mem.indexOfScalar(u8, message, 0) != null or !std.unicode.utf8ValidateSlice(message)) return connection.sendNumeric("412", ":Invalid message", .{});
+    const now = std.Io.Clock.real.now(connection.io).toSeconds();
+    if (user.restricted) return connection.sendNumeric("404", "{s} :Restricted accounts cannot chat", .{target});
+    if (user.silence_end > now) return connection.sendNumeric("404", "{s} :You are silenced", .{target});
+
+    if (target.len != 0 and target[0] == '#') {
+        const channel = irc.canonicalChannel(target) orelse return connection.sendNumeric("403", "{s} :No such channel", .{target});
+        const mask = irc.channelMask(channel).?;
+        if (connection.joined.load(.acquire) & mask == 0) return connection.sendNumeric("442", "{s} :You're not on that channel", .{channel});
+        const uuid = randomMessageUuid(connection.io) catch return connection.sendNumeric("400", ":Message unavailable", .{});
+        const written = connection.app.store.recordLazerPublicMessage(connection.app.allocator, user.id, channel, message, action.action, &uuid) catch |err| return switch (err) {
+            error.ChannelReadOnly => connection.sendNumeric("404", "{s} :Cannot send to channel", .{channel}),
+            error.UnknownChannel => connection.sendNumeric("403", "{s} :No such channel", .{channel}),
+            else => connection.sendNumeric("400", ":Message unavailable", .{}),
+        };
+        defer connection.app.allocator.free(written.json);
+        if (written.inserted) connection.app.broadcastLazerChatToStable(user, channel, message) catch |err|
+            std.log.warn("event=irc_chat_stable_broadcast_failed user_id={d} channel={s} error={t}", .{ user.id, channel, err });
+        return;
+    }
+
+    const recipient_value = connection.app.store.userByName(connection.app.allocator, target) catch {
+        connection.sendNumeric("400", ":Message unavailable", .{});
+        return;
+    };
+    const recipient = recipient_value orelse {
+        connection.sendNumeric("401", "{s} :No such nick", .{target});
+        return;
+    };
+    defer freeUser(connection.app.allocator, recipient);
+    if (recipient.id == user.id or recipient.restricted) return connection.sendNumeric("401", "{s} :No such nick", .{target});
+    const uuid = randomMessageUuid(connection.io) catch return connection.sendNumeric("400", ":Message unavailable", .{});
+    const written = connection.app.store.recordLazerDirectMessage(connection.app.allocator, user.id, recipient.id, message, action.action, &uuid) catch |err| return switch (err) {
+        error.DirectMessageBlocked => connection.sendNumeric("404", "{s} :Direct messages are blocked", .{recipient.safe_name}),
+        else => connection.sendNumeric("400", ":Message unavailable", .{}),
+    };
+    defer connection.app.allocator.free(written.json);
+    if (written.inserted) {
+        connection.app.deliverDirectMessageToStable(user, recipient.id, message) catch |err|
+            std.log.warn("event=irc_dm_stable_delivery_failed user_id={d} target_id={d} error={t}", .{ user.id, recipient.id, err });
+        if (recipient.id == 3) connection.app.recordLazerBotReply(user, message, action.action);
+    }
+}
+
+fn ircHandleCommand(connection: *IrcConnection, command: irc.Command) bool {
+    if (command.is("CAP")) {
+        const subcommand = command.parameter(0) orelse "LS";
+        if (std.ascii.eqlIgnoreCase(subcommand, "LS")) {
+            connection.cap_pending = true;
+            connection.sendServer("CAP * LS :", .{});
+        } else if (std.ascii.eqlIgnoreCase(subcommand, "REQ")) {
+            connection.sendServer("CAP * NAK :{s}", .{command.parameter(1) orelse ""});
+        } else if (std.ascii.eqlIgnoreCase(subcommand, "END")) {
+            connection.cap_pending = false;
+            ircRegister(connection);
+        }
+        return true;
+    }
+    if (command.is("PASS")) {
+        if (connection.registered.load(.acquire)) {
+            connection.sendNumeric("462", ":You may not reregister", .{});
+            return true;
+        }
+        const password = command.parameter(0) orelse {
+            connection.sendNumeric("461", "PASS :Not enough parameters", .{});
+            return true;
+        };
+        if (password.len > connection.password.len) {
+            connection.sendNumeric("464", ":Password incorrect", .{});
+            return true;
+        }
+        @memset(&connection.password, 0);
+        @memcpy(connection.password[0..password.len], password);
+        connection.password_len = @intCast(password.len);
+        ircRegister(connection);
+        return true;
+    }
+    if (command.is("NICK")) {
+        if (connection.registered.load(.acquire)) {
+            connection.sendNumeric("433", "{s} :Nickname changes are disabled; it is your account name", .{command.parameter(0) orelse "*"});
+            return true;
+        }
+        const nick = command.parameter(0) orelse {
+            connection.sendNumeric("431", ":No nickname given", .{});
+            return true;
+        };
+        if (!irc.validNick(nick)) {
+            connection.sendNumeric("432", "{s} :Erroneous nickname", .{nick});
+            return true;
+        }
+        @memcpy(connection.nick[0..nick.len], nick);
+        connection.nick_len = @intCast(nick.len);
+        ircRegister(connection);
+        return true;
+    }
+    if (command.is("USER")) {
+        if (connection.registered.load(.acquire)) {
+            connection.sendNumeric("462", ":You may not reregister", .{});
+            return true;
+        }
+        if (command.parameter(0) == null) {
+            connection.sendNumeric("461", "USER :Not enough parameters", .{});
+            return true;
+        }
+        connection.user_seen = true;
+        ircRegister(connection);
+        return true;
+    }
+    if (command.is("PING")) {
+        connection.sendServer("PONG {s} :{s}", .{ irc.server_name, command.parameter(0) orelse irc.server_name });
+        return true;
+    }
+    if (command.is("PONG")) return true;
+    if (command.is("QUIT")) {
+        connection.sendServer("ERROR :Closing Link: {s}", .{connection.currentNick()});
+        return false;
+    }
+    if (!connection.registered.load(.acquire)) {
+        connection.sendNumeric("451", ":You have not registered", .{});
+        return true;
+    }
+    if (command.is("JOIN")) {
+        const names = command.parameter(0) orelse {
+            connection.sendNumeric("461", "JOIN :Not enough parameters", .{});
+            return true;
+        };
+        if (std.mem.eql(u8, names, "0")) {
+            inline for (.{ "#osu", "#announce", "#lobby", "#lazer" }) |channel| if (connection.joined.load(.acquire) & irc.channelMask(channel).? != 0) {
+                _ = connection.joined.fetchAnd(~irc.channelMask(channel).?, .acq_rel);
+                connection.sendLine(":{s}!zigcho@kai.ovh PART {s}", .{ connection.currentNick(), channel });
+            };
+            return true;
+        }
+        var channels = std.mem.splitScalar(u8, names, ',');
+        while (channels.next()) |requested| {
+            const channel = irc.canonicalChannel(requested) orelse {
+                connection.sendNumeric("403", "{s} :No such channel", .{requested});
+                continue;
+            };
+            if (connection.joined.load(.acquire) & irc.channelMask(channel).? == 0) connection.sendJoin(channel);
+        }
+        return true;
+    }
+    if (command.is("PART")) {
+        const requested = command.parameter(0) orelse {
+            connection.sendNumeric("461", "PART :Not enough parameters", .{});
+            return true;
+        };
+        const channel = irc.canonicalChannel(requested) orelse {
+            connection.sendNumeric("403", "{s} :No such channel", .{requested});
+            return true;
+        };
+        const mask = irc.channelMask(channel).?;
+        if (connection.joined.load(.acquire) & mask == 0) {
+            connection.sendNumeric("442", "{s} :You're not on that channel", .{channel});
+            return true;
+        }
+        _ = connection.joined.fetchAnd(~mask, .acq_rel);
+        connection.sendLine(":{s}!zigcho@kai.ovh PART {s}", .{ connection.currentNick(), channel });
+        return true;
+    }
+    if (command.is("PRIVMSG") or command.is("NOTICE")) {
+        ircHandleMessage(connection, command);
+        return true;
+    }
+    if (command.is("NAMES")) {
+        if (command.parameter(0)) |requested| {
+            if (irc.canonicalChannel(requested)) |channel| connection.sendNames(channel) else connection.sendNumeric("403", "{s} :No such channel", .{requested});
+        } else inline for (.{ "#osu", "#announce", "#lobby", "#lazer" }) |channel| connection.sendNames(channel);
+        return true;
+    }
+    if (command.is("LIST")) {
+        connection.sendNumeric("321", "Channel :Users Name", .{});
+        inline for (.{ "#osu", "#announce", "#lobby", "#lazer" }) |channel| connection.sendNumeric("322", "{s} 2 :shared Zigcho chat", .{channel});
+        connection.sendNumeric("323", ":End of /LIST", .{});
+        return true;
+    }
+    if (command.is("WHO")) {
+        const channel = command.parameter(0) orelse "#osu";
+        connection.sendNumeric("352", "{s} zigcho kai.ovh {s} kai H@ :0 kai", .{ channel, irc.server_name });
+        connection.sendNumeric("352", "{s} zigcho kai.ovh {s} {s} H :0 {s}", .{ channel, irc.server_name, connection.currentNick(), connection.currentNick() });
+        connection.sendNumeric("315", "{s} :End of /WHO list", .{channel});
+        return true;
+    }
+    if (command.is("WHOIS")) {
+        const requested = command.parameter(0) orelse connection.currentNick();
+        const found = connection.app.store.userByName(connection.app.allocator, requested) catch null;
+        if (found) |user| {
+            defer freeUser(connection.app.allocator, user);
+            connection.sendNumeric("311", "{s} zigcho kai.ovh * :{s}", .{ user.safe_name, user.name });
+            connection.sendNumeric("318", "{s} :End of /WHOIS list", .{user.safe_name});
+        } else connection.sendNumeric("401", "{s} :No such nick", .{requested});
+        return true;
+    }
+    if (command.is("TOPIC")) {
+        const requested = command.parameter(0) orelse "#osu";
+        if (irc.canonicalChannel(requested)) |channel| connection.sendNumeric("332", "{s} :shared Zigcho chat", .{channel}) else connection.sendNumeric("403", "{s} :No such channel", .{requested});
+        return true;
+    }
+    if (command.is("MODE")) {
+        const target = command.parameter(0) orelse connection.currentNick();
+        if (target.len != 0 and target[0] == '#') connection.sendNumeric("324", "{s} +nt", .{target}) else connection.sendNumeric("221", "+i", .{});
+        return true;
+    }
+    if (command.is("AWAY")) {
+        if (command.parameter(0) != null) connection.sendNumeric("306", ":You have been marked as being away", .{}) else connection.sendNumeric("305", ":You are no longer marked as being away", .{});
+        return true;
+    }
+    connection.sendNumeric("421", "{s} :Unknown command", .{command.verb});
+    return true;
+}
+
+fn ircPollMessages(connection: *IrcConnection) std.Io.Cancelable!void {
+    while (connection.alive.load(.acquire)) {
+        const now = std.Io.Clock.real.now(connection.io).toSeconds();
+        if (!connection.registered.load(.acquire)) {
+            if (now - connection.connected_at >= 30) {
+                connection.sendServer("ERROR :Registration timed out", .{});
+                connection.close();
+                return;
+            }
+            try std.Io.sleep(connection.io, .fromSeconds(1), .awake);
+            continue;
+        }
+        if (now - connection.last_ping_at >= 90) {
+            connection.sendServer("PING :{d}", .{now});
+            connection.last_ping_at = now;
+        }
+        const user = connection.user orelse return;
+        const json = connection.app.store.lazerAllMessagesJson(connection.app.allocator, user.id, connection.cursor, 100) catch |err| {
+            std.log.warn("event=irc_chat_poll_failed user_id={d} error={t}", .{ user.id, err });
+            try std.Io.sleep(connection.io, .fromSeconds(2), .awake);
+            continue;
+        };
+        defer connection.app.allocator.free(json);
+        var parsed = std.json.parseFromSlice(std.json.Value, connection.app.allocator, json, .{}) catch |err| {
+            std.log.warn("event=irc_chat_payload_invalid user_id={d} error={t}", .{ user.id, err });
+            try std.Io.sleep(connection.io, .fromSeconds(2), .awake);
+            continue;
+        };
+        defer parsed.deinit();
+        const items = switch (parsed.value) {
+            .array => |array| array.items,
+            else => {
+                try std.Io.sleep(connection.io, .fromSeconds(2), .awake);
+                continue;
+            },
+        };
+        for (items) |item| {
+            const object = switch (item) {
+                .object => |value| value,
+                else => continue,
+            };
+            const message_id = ircJsonInteger(object, "message_id") orelse continue;
+            if (message_id <= connection.cursor) continue;
+            connection.cursor = message_id;
+            const sender_id: i32 = @intCast(ircJsonInteger(object, "sender_id") orelse continue);
+            if (sender_id == user.id) continue;
+            const channel_id = ircJsonInteger(object, "channel_id") orelse continue;
+            const content = switch (object.get("content") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            const action = switch (object.get("is_action") orelse continue) {
+                .bool => |value| value,
+                else => false,
+            };
+            const sender_object = switch (object.get("sender") orelse continue) {
+                .object => |value| value,
+                else => continue,
+            };
+            const sender_display = switch (sender_object.get("username") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            const sender_nick = domain.safeName(connection.app.allocator, sender_display) catch continue;
+            defer connection.app.allocator.free(sender_nick);
+            if (irc.channelForId(channel_id)) |channel| {
+                const mask = irc.channelMask(channel).?;
+                if (connection.joined.load(.acquire) & mask != 0) connection.sendChat(sender_nick, channel, content, action);
+            } else if (lazer.privateChannelUser(channel_id) != null) {
+                connection.sendChat(sender_nick, user.safe_name, content, action);
+                connection.app.store.markDirectMessagesRead(user.id, sender_id) catch |err|
+                    std.log.warn("event=irc_dm_read_failed user_id={d} sender_id={d} error={t}", .{ user.id, sender_id, err });
+            }
+        }
+        try std.Io.sleep(connection.io, .fromMilliseconds(500), .awake);
+    }
+}
+
+fn serveIrcConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) std.Io.Cancelable!void {
+    const previous = app.irc_clients.fetchAdd(1, .acq_rel);
+    defer _ = app.irc_clients.fetchSub(1, .acq_rel);
+    var stream = stream_value;
+    defer stream.close(io);
+    if (previous >= max_irc_clients) {
+        var send_buffer: [256]u8 = undefined;
+        var writer = stream.writer(io, &send_buffer);
+        writer.interface.writeAll(":irc.kai.ovh ERROR :Server is full\r\n") catch return;
+        writer.interface.flush() catch return;
+        return;
+    }
+    var connection: IrcConnection = undefined;
+    connection.init(app, stream, io);
+    defer connection.deinit();
+    var poller: std.Io.Group = .init;
+    defer poller.cancel(io);
+    poller.concurrent(io, ircPollMessages, .{&connection}) catch {
+        connection.sendServer("ERROR :Server is busy", .{});
+        connection.close();
+        return;
+    };
+
+    var receive_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(io, &receive_buffer);
+    while (connection.alive.load(.acquire)) {
+        const line_value = reader.interface.takeDelimiter('\n') catch |err| {
+            if (err == error.StreamTooLong) connection.sendServer("ERROR :Input line is too long", .{});
+            break;
+        };
+        const line = line_value orelse break;
+        const command = irc.parseCommand(line) catch |err| {
+            if (err == error.LineTooLong) {
+                connection.sendServer("ERROR :Input line is too long", .{});
+                break;
+            }
+            connection.sendNumeric("417", ":Invalid input line", .{});
+            continue;
+        } orelse continue;
+        if (!ircHandleCommand(&connection, command)) break;
+    }
+    connection.close();
+}
+
+fn serveIrcListener(app: *App, bind: []const u8, port: u16, io: std.Io) std.Io.Cancelable!void {
+    const address = std.Io.net.IpAddress.parse(bind, port) catch |err| {
+        std.log.err("event=irc_listener_address_invalid bind={s} port={d} error={t}", .{ bind, port, err });
+        return;
+    };
+    var listener = address.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.log.err("event=irc_listener_start_failed bind={s} port={d} error={t}", .{ bind, port, err });
+        return;
+    };
+    defer listener.deinit(io);
+    var connections: std.Io.Group = .init;
+    defer connections.cancel(io);
+    std.log.info("event=irc_listener_started bind={s} port={d} tls=proxy_required", .{ bind, port });
+    while (true) {
+        const stream = listener.accept(io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                std.log.warn("event=irc_accept_failed error={t}", .{err});
+                continue;
+            },
+        };
+        connections.concurrent(io, serveIrcConnection, .{ app, stream, io }) catch |err| {
+            std.log.warn("event=irc_connection_spawn_failed error={t}", .{err});
+            var rejected = stream;
+            rejected.close(io);
+        };
+    }
 }
 
 fn serveConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) void {
@@ -4400,6 +5347,7 @@ pub fn main(init: std.process.Init) !void {
     defer listener.deinit(init.io);
     var connections: std.Io.Group = .init;
     defer connections.cancel(init.io);
+    if (config.irc_port != 0) try connections.concurrent(init.io, serveIrcListener, .{ &app, config.irc_bind, config.irc_port, init.io });
     std.log.info("event=server_started bind={s} port={d} storage={s}", .{ bind, port, if (storage.is_postgres) "postgres" else "sqlite" });
     while (true) {
         const stream = listener.accept(init.io) catch |err| {

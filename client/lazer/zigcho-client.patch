@@ -1,3 +1,24 @@
+diff --git a/osu.Android/AndroidManifest.xml b/osu.Android/AndroidManifest.xml
+index d334888a5faa71354ea5b74a9ae1e641b24b4f68..3ed32f7f33edf9b851715db061ff7cb06db6aba7 100644
+--- a/osu.Android/AndroidManifest.xml
++++ b/osu.Android/AndroidManifest.xml
+@@ -1,13 +1,13 @@
+ ﻿<?xml version="1.0" encoding="utf-8"?>
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="sh.ppy.osulazer" android:installLocation="auto">
++<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="ovh.kai.zigcholazer" android:installLocation="auto">
+ 	<uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+ 	<application android:allowBackup="true"
+ 				 android:supportsRtl="true"
+-				 android:label="osu!"
++				 android:label="zigcho!lazer"
+ 				 android:icon="@mipmap/ic_launcher"
+ 				 android:roundIcon="@mipmap/ic_launcher">
+         <provider android:name="androidx.core.content.FileProvider"
+-                  android:authorities="sh.ppy.osulazer.fileprovider"
++                  android:authorities="ovh.kai.zigcholazer.fileprovider"
+                   android:grantUriPermissions="true"
+                   android:exported="false">
+             <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
 diff --git a/osu.Desktop/DiscordRichPresence.cs b/osu.Desktop/DiscordRichPresence.cs
 index c24cc2132b067c1114f71eefaa8d6c10a1d0a3fd..a4c15f1f2d938331a6b8ae2bf4c578de92bee6ab 100644
 --- a/osu.Desktop/DiscordRichPresence.cs
@@ -311,6 +332,55 @@ index 0000000000000000000000000000000000000000..638d4632bf5bad040b2e45cd592a06b5
 +        }
 +    }
 +}
+diff --git a/osu.Game.Tests/ZigchoLeaderboardModsTest.cs b/osu.Game.Tests/ZigchoLeaderboardModsTest.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb77d7c36138ebcfc3b02cdc31d018d9baa6782a
+--- /dev/null
++++ b/osu.Game.Tests/ZigchoLeaderboardModsTest.cs
+@@ -0,0 +1,43 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the repository root for full licence text.
++
++using NUnit.Framework;
++using osu.Game.Online.Leaderboards;
++using osu.Game.Rulesets.Mods;
++using osu.Game.Rulesets.Osu.Mods;
++
++namespace osu.Game.Tests
++{
++    [TestFixture]
++    public class ZigchoLeaderboardModsTest
++    {
++        [Test]
++        public void GameplayNamespaceIsSentWithoutMakingEveryGameplayModExact()
++        {
++            Mod[] gameplay = [new OsuModHidden(), new OsuModRelax()];
++            var resolved = ZigchoLeaderboardMods.ResolveGameplayFilter(null, gameplay);
++
++            Assert.That(resolved, Has.Length.EqualTo(1));
++            Assert.That(resolved![0].Acronym.ToString(), Is.EqualTo("RX"));
++            Assert.That(ZigchoLeaderboardMods.UsesPerformanceOrder(resolved), Is.True);
++        }
++
++        [Test]
++        public void ExplicitFilterIsKeptExact()
++        {
++            Mod[] exact = [new OsuModHidden(), new OsuModAutopilot()];
++            Mod[] gameplay = [new OsuModAutopilot()];
++
++            Assert.That(ZigchoLeaderboardMods.ResolveGameplayFilter(exact, gameplay), Is.SameAs(exact));
++        }
++
++        [Test]
++        public void VanillaGameplayKeepsCombinedBoard()
++        {
++            Mod[] gameplay = [new OsuModHidden()];
++
++            Assert.That(ZigchoLeaderboardMods.ResolveGameplayFilter(null, gameplay), Is.Null);
++            Assert.That(ZigchoLeaderboardMods.UsesPerformanceOrder(gameplay), Is.False);
++        }
++    }
++}
 diff --git a/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
 new file mode 100644
 index 0000000000000000000000000000000000000000..756a04d4ebfec32affc8a8361f33a02328fc89c8
@@ -440,25 +510,15 @@ index c09947434165a94eb189ffe8c179c82129f44a3a..3221769d5da2e882b9ee22a0aa3f84ea
          public RegistrationRequest.RegistrationRequestErrors CreateAccount(string email, string username, string password)
          {
 diff --git a/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs b/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs
-index 836a5bc485c024fa5b2d9223ea07d5ed7c63f5d4..7da04ac439faef618802567c02331ff379c52bfd 100644
+index 836a5bc485c024fa5b2d9223ea07d5ed7c63f5d4..c1d451900bd7abe63a7c1d195cd327eeffd8d537 100644
 --- a/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs
 +++ b/osu.Game/Online/API/Requests/Responses/APIUserAchievement.cs
-@@ -1,7 +1,6 @@
- ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
- // See the LICENCE file in the repository root for full licence text.
- 
--using System;
- using Newtonsoft.Json;
- 
- namespace osu.Game.Online.API.Requests.Responses
-@@ -12,6 +11,15 @@ public class APIUserAchievement
-         public int ID;
+@@ -13,5 +13,32 @@ public class APIUserAchievement
  
          [JsonProperty("achieved_at")]
--        public DateTimeOffset AchievedAt;
-+        public long AchievedAt;
+         public DateTimeOffset AchievedAt;
 +
-+        [JsonProperty("file")]
++        [JsonProperty("slug")]
 +        public string Slug = string.Empty;
 +
 +        [JsonProperty("name")]
@@ -466,6 +526,24 @@ index 836a5bc485c024fa5b2d9223ea07d5ed7c63f5d4..7da04ac439faef618802567c02331ff3
 +
 +        [JsonProperty("description")]
 +        public string Description = string.Empty;
++
++        [JsonProperty("grouping")]
++        public string Grouping = string.Empty;
++
++        [JsonProperty("ordering")]
++        public int Ordering;
++
++        [JsonProperty("mode")]
++        public string? Mode;
++
++        [JsonProperty("icon_url")]
++        public string IconUrl = string.Empty;
++
++        [JsonProperty("achieved_count")]
++        public int AchievedCount;
++
++        [JsonProperty("achieved_percent")]
++        public double? AchievedPercent;
      }
  }
 diff --git a/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs b/osu.Game/Online/API/ZigchoRealtimeServicePolicy.cs
@@ -492,10 +570,26 @@ index 0000000000000000000000000000000000000000..1f9c4387fc6012197691408b4f0b7828
 +    }
 +}
 diff --git a/osu.Game/Online/Chat/ChannelManager.cs b/osu.Game/Online/Chat/ChannelManager.cs
-index 031c4fbec70de628a98ea9bdb7b8208c4f99510e..30c0d44b687440e5357d03d791453e069e3f1177 100644
+index 031c4fbec70de628a98ea9bdb7b8208c4f99510e..cb4375659d62236c4b3e039bf66e1373a881c6d2 100644
 --- a/osu.Game/Online/Chat/ChannelManager.cs
 +++ b/osu.Game/Online/Chat/ChannelManager.cs
-@@ -231,7 +231,15 @@ void dequeueAndRun()
+@@ -43,6 +43,7 @@ public partial class ChannelManager : CompositeComponent, IChannelPostTarget
+         /// </summary>
+         private readonly string[] defaultChannels =
+         {
++            @"#announce",
+             @"#lazer",
+             @"#osu",
+             @"#lobby"
+@@ -99,6 +100,7 @@ public partial class ChannelManager : CompositeComponent, IChannelPostTarget
+         private ScheduledDelegate scheduledAck;
+ 
+         private IChatClient chatClient = null!;
++        private readonly List<Message> pendingPublicMessages = new List<Message>();
+         private long? lastSilenceMessageId;
+         private uint? lastSilenceId;
+ 
+@@ -231,7 +233,15 @@ void dequeueAndRun()
                  {
                      var createNewPrivateMessageRequest = new CreateNewPrivateMessageRequest(target.Users.First(), message);
  
@@ -512,13 +606,29 @@ index 031c4fbec70de628a98ea9bdb7b8208c4f99510e..30c0d44b687440e5357d03d791453e06
                      createNewPrivateMessageRequest.Failure += exception =>
                      {
                          handlePostException(exception);
-@@ -437,7 +445,24 @@ private void addMessages(List<Message> messages)
+@@ -437,7 +447,40 @@ private void addMessages(List<Message> messages)
              var blockedUserIds = localUserBlocks.Select(b => b.TargetID).ToList();
  
              foreach (var group in messages.Where(m => !blockedUserIds.Contains(m.SenderId)).GroupBy(m => m.ChannelId))
 -                channels.Find(c => c.Id == group.Key)?.AddNewMessages(group.ToArray());
 +            {
 +                var channel = channels.Find(c => c.Id == group.Key);
++
++                if (channel == null)
++                {
++                    var availableChannel = AvailableChannels.FirstOrDefault(c => c.Id == group.Key);
++
++                    if (availableChannel != null)
++                    {
++                        channel = joinChannel(availableChannel);
++                        channels.Add(channel);
++                    }
++                    else if (group.Key > 0 && group.Key < 1_000_000)
++                    {
++                        pendingPublicMessages.AddRange(group);
++                        continue;
++                    }
++                }
 +
 +                if (channel == null)
 +                {
@@ -538,6 +648,20 @@ index 031c4fbec70de628a98ea9bdb7b8208c4f99510e..30c0d44b687440e5357d03d791453e06
  
              lastSilenceMessageId ??= messages.LastOrDefault()?.Id;
          }
+@@ -463,6 +506,13 @@ private void initializeChannels()
+                     if (joinDefaults && defaultChannels.Any(c => c.Equals(channel.Name, StringComparison.OrdinalIgnoreCase)))
+                         joinChannel(ch);
+                 }
++
++                if (pendingPublicMessages.Count > 0)
++                {
++                    var pending = pendingPublicMessages.ToList();
++                    pendingPublicMessages.Clear();
++                    addMessages(pending);
++                }
+             };
+ 
+             req.Failure += error =>
 diff --git a/osu.Game/Online/Chat/PollingChatClient.cs b/osu.Game/Online/Chat/PollingChatClient.cs
 new file mode 100644
 index 0000000000000000000000000000000000000000..2fc96e18260fd7461783b665f53c49a8081b39c1
@@ -760,7 +884,7 @@ index 2ce14320ec3760ca20e06ad001da1476e8e7db1b..df9ce31e20ef1ef0e694858fee3467ff
          /// The OAuth client secret.
          /// </summary>
 diff --git a/osu.Game/Online/Leaderboards/LeaderboardManager.cs b/osu.Game/Online/Leaderboards/LeaderboardManager.cs
-index d4a258a3079eb047d6c526375ce55b9150c909cc..a86f0a90af6b29489b613205b19995e89f8e6b4c 100644
+index d4a258a3079eb047d6c526375ce55b9150c909cc..dd424888bd6bf16a154896947b65d1eac26a0f03 100644
 --- a/osu.Game/Online/Leaderboards/LeaderboardManager.cs
 +++ b/osu.Game/Online/Leaderboards/LeaderboardManager.cs
 @@ -46,6 +46,14 @@ public partial class LeaderboardManager : Component
@@ -823,7 +947,24 @@ index d4a258a3079eb047d6c526375ce55b9150c909cc..a86f0a90af6b29489b613205b19995e8
  
                      if ((newCriteria.Scope.RequiresSupporter(newCriteria.ExactMods != null)) && !api.LocalUser.Value.IsSupporter)
                      {
-@@ -164,6 +202,20 @@ public void FetchWithCriteria(LeaderboardCriteria newCriteria, bool forceRefresh
+@@ -134,10 +172,14 @@ public void FetchWithCriteria(LeaderboardCriteria newCriteria, bool forceRefresh
+                         if (inFlightOnlineRequest != null && !newRequest.Equals(inFlightOnlineRequest))
+                             return;
+ 
++                        var convertedScores = response.Scores.Select(s => s.ToScoreInfo(rulesets, newCriteria.Beatmap));
++
++                        if (!ZigchoLeaderboardMods.UsesPerformanceOrder(requestMods ?? Array.Empty<Mod>()))
++                            convertedScores = convertedScores.OrderByTotalScore();
++
+                         var result = LeaderboardScores.Success
+                         (
+-                            response.Scores.Select(s => s.ToScoreInfo(rulesets, newCriteria.Beatmap))
+-                                    .OrderByTotalScore()
++                            convertedScores
+                                     .Select((s, idx) =>
+                                     {
+                                         s.Position = idx + 1;
+@@ -164,6 +206,20 @@ public void FetchWithCriteria(LeaderboardCriteria newCriteria, bool forceRefresh
              }
          }
  
@@ -864,8 +1005,43 @@ index 0000000000000000000000000000000000000000..1cc0400594f3811f17e69d9aa789d033
 +        public static bool RequiresMetadataRefresh(BeatmapInfo? beatmap) => beatmap == null || beatmap.OnlineID <= 0 || beatmap.Status == BeatmapOnlineStatus.None;
 +    }
 +}
+diff --git a/osu.Game/Online/Leaderboards/ZigchoLeaderboardMods.cs b/osu.Game/Online/Leaderboards/ZigchoLeaderboardMods.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0839ad4f72f042ab4379abb48660f7249eaa700
+--- /dev/null
++++ b/osu.Game/Online/Leaderboards/ZigchoLeaderboardMods.cs
+@@ -0,0 +1,29 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the repository root for full licence text.
++
++using System.Collections.Generic;
++using System.Linq;
++using osu.Game.Rulesets.Mods;
++
++namespace osu.Game.Online.Leaderboards
++{
++    public static class ZigchoLeaderboardMods
++    {
++        public static bool UsesPerformanceOrder(IEnumerable<IMod> mods) => mods.Any(isNamespaceMod);
++
++        public static Mod[]? ResolveGameplayFilter(Mod[]? exactMods, IReadOnlyList<Mod> gameplayMods)
++        {
++            if (exactMods != null)
++                return exactMods;
++
++            var namespaceMods = gameplayMods.Where(isNamespaceMod).ToArray();
++            return namespaceMods.Length == 0 ? null : namespaceMods;
++        }
++
++        private static bool isNamespaceMod(IMod mod)
++        {
++            string acronym = mod.Acronym.ToString();
++            return acronym is "RX" or "AP";
++        }
++    }
++}
 diff --git a/osu.Game/Online/Metadata/OnlineMetadataClient.cs b/osu.Game/Online/Metadata/OnlineMetadataClient.cs
-index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9a651c13d 100644
+index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610aeeac815d6 100644
 --- a/osu.Game/Online/Metadata/OnlineMetadataClient.cs
 +++ b/osu.Game/Online/Metadata/OnlineMetadataClient.cs
 @@ -2,10 +2,13 @@
@@ -1022,7 +1198,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
          private void isConnectedChanged(ValueChangedEvent<bool> connected)
          {
              if (!connected.NewValue)
-@@ -188,6 +290,17 @@ public override Task<BeatmapUpdates> GetChangesSince(int queueId)
+@@ -188,6 +292,17 @@ public override Task<BeatmapUpdates> GetChangesSince(int queueId)
  
          public override Task UpdateActivity(UserActivity? activity)
          {
@@ -1040,7 +1216,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
              if (connector?.IsConnected.Value != true)
                  return Task.FromCanceled(new CancellationToken(true));
  
-@@ -197,6 +310,17 @@ public override Task UpdateActivity(UserActivity? activity)
+@@ -197,6 +312,17 @@ public override Task UpdateActivity(UserActivity? activity)
  
          public override Task UpdateStatus(UserStatus? status)
          {
@@ -1058,7 +1234,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
              if (connector?.IsConnected.Value != true)
                  return Task.FromCanceled(new CancellationToken(true));
  
-@@ -271,6 +395,12 @@ public override Task DailyChallengeUpdated(DailyChallengeInfo? info)
+@@ -271,6 +397,12 @@ public override Task DailyChallengeUpdated(DailyChallengeInfo? info)
  
          public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultiplayerRoom(long id)
          {
@@ -1071,7 +1247,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
              if (connector?.IsConnected.Value != true)
                  throw new OperationCanceledException();
  
-@@ -284,6 +414,12 @@ public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultipla
+@@ -284,6 +416,12 @@ public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultipla
  
          public override async Task EndWatchingMultiplayerRoom(long id)
          {
@@ -1084,7 +1260,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
              if (connector?.IsConnected.Value != true)
                  throw new OperationCanceledException();
  
-@@ -296,6 +432,9 @@ public override async Task EndWatchingMultiplayerRoom(long id)
+@@ -296,6 +434,9 @@ public override async Task EndWatchingMultiplayerRoom(long id)
  
          public override async Task RefreshFriends()
          {
@@ -1094,7 +1270,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
              if (connector?.IsConnected.Value != true)
                  throw new OperationCanceledException();
  
-@@ -305,6 +444,8 @@ public override async Task RefreshFriends()
+@@ -305,6 +446,8 @@ public override async Task RefreshFriends()
  
          protected override void Dispose(bool isDisposing)
          {
@@ -1103,7 +1279,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..8f951a5cdd4e251edfc65fb519ba72a9
              base.Dispose(isDisposing);
              connector?.Dispose();
          }
-@@ -320,5 +461,16 @@ protected override async Task DisconnectInternal()
+@@ -320,5 +463,16 @@ protected override async Task DisconnectInternal()
              if (connector != null)
                  await connector.Disconnect().ConfigureAwait(false);
          }
@@ -1371,10 +1547,10 @@ index cc4fa5b618ca150045442116f3aef2f20cc628eb..3b49c32d3f93949d938cd06283566d4d
  
          public const string OSU_PROTOCOL = "osu://";
 diff --git a/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs b/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs
-index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454e2338166 100644
+index 63729319dba1ee08a06ba30e704f3f06a6c442c7..0876fdb529f50058b1115d573f1b0d1ac59725fe 100644
 --- a/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs
 +++ b/osu.Game/Overlays/BeatmapSet/Scores/ScoresContainer.cs
-@@ -13,6 +13,7 @@
+@@ -13,10 +13,12 @@
  using osu.Framework.Graphics.Shapes;
  using osu.Game.Beatmaps;
  using osu.Game.Extensions;
@@ -1382,7 +1558,12 @@ index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454
  using osu.Game.Graphics.UserInterface;
  using osu.Game.Online.API;
  using osu.Game.Online.API.Requests;
-@@ -39,6 +40,7 @@ public partial class ScoresContainer : BeatmapSetLayoutSection
+ using osu.Game.Online.API.Requests.Responses;
++using osu.Game.Online.Leaderboards;
+ using osu.Game.Rulesets;
+ using osu.Game.Scoring;
+ using osu.Game.Screens.Play.Leaderboards;
+@@ -39,6 +41,7 @@ public partial class ScoresContainer : BeatmapSetLayoutSection
          private readonly FillFlowContainer topScoresContainer;
          private readonly LoadingLayer loading;
          private readonly LeaderboardModSelector modSelector;
@@ -1390,7 +1571,21 @@ index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454
          private readonly NoScoresPlaceholder noScoresPlaceholder;
          private readonly NotSupporterPlaceholder notSupporterPlaceholder;
          private readonly NoTeamPlaceholder noTeamPlaceholder;
-@@ -133,6 +135,12 @@ public ScoresContainer()
+@@ -84,7 +87,12 @@ protected APIScoresCollection Scores
+                     MD5Hash = apiBeatmap.MD5Hash
+                 };
+ 
+-                var scores = value.Scores.Select(s => s.ToScoreInfo(rulesets, beatmapInfo)).OrderByTotalScore().ToArray();
++                var convertedScores = value.Scores.Select(s => s.ToScoreInfo(rulesets, beatmapInfo));
++
++                if (!ZigchoLeaderboardMods.UsesPerformanceOrder(modSelector.SelectedMods))
++                    convertedScores = convertedScores.OrderByTotalScore();
++
++                var scores = convertedScores.ToArray();
+                 var topScore = scores.First();
+ 
+                 scoreTable.DisplayScores(scores, apiBeatmap.Status.GrantsPerformancePoints());
+@@ -133,6 +141,12 @@ public ScoresContainer()
                                      Origin = Anchor.TopCentre,
                                      Current = { BindTarget = scope }
                                  },
@@ -1403,7 +1598,7 @@ index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454
                                  modSelector = new LeaderboardModSelector
                                  {
                                      Anchor = Anchor.TopCentre,
-@@ -214,7 +222,11 @@ protected override void LoadComplete()
+@@ -214,7 +228,11 @@ protected override void LoadComplete()
              scope.BindValueChanged(_ => getScores());
              ruleset.BindValueChanged(_ => getScores());
  
@@ -1416,7 +1611,7 @@ index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454
  
              Beatmap.BindValueChanged(onBeatmapChanged);
              user.BindValueChanged(onUserChanged, true);
-@@ -252,7 +264,7 @@ private void getScores()
+@@ -252,7 +270,7 @@ private void getScores()
              noTeamPlaceholder.Hide();
              notSupporterPlaceholder.Hide();
  
@@ -1425,7 +1620,7 @@ index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454
              {
                  Scores = null;
                  Hide();
-@@ -288,6 +300,16 @@ private void getScores()
+@@ -288,6 +306,16 @@ private void getScores()
              api.Queue(getScoresRequest);
          }
  
@@ -1442,11 +1637,24 @@ index 63729319dba1ee08a06ba30e704f3f06a6c442c7..9f6871c4260a465b0db1337d89f5f454
          private bool userIsSupporter => api.IsLoggedIn && api.LocalUser.Value.IsSupporter;
      }
  }
+diff --git a/osu.Game/Overlays/DevBuildBanner.cs b/osu.Game/Overlays/DevBuildBanner.cs
+index f514483e76048a04b164ff206ea241d0bbf6c9bf..68610fa0b44acb43e4d4a7497cd3c3470b291723 100644
+--- a/osu.Game/Overlays/DevBuildBanner.cs
++++ b/osu.Game/Overlays/DevBuildBanner.cs
+@@ -32,7 +32,7 @@ private void load(OsuColour colours, TextureStore textures, OsuGameBase game)
+                     Origin = Anchor.BottomCentre,
+                     Font = OsuFont.Numeric.With(weight: FontWeight.Bold, size: 12),
+                     Colour = colours.YellowDark,
+-                    Text = @"DEVELOPER BUILD",
++                    Text = @"zigcho!lazer",
+                 },
+                 new Sprite
+                 {
 diff --git a/osu.Game/Overlays/MedalOverlay.cs b/osu.Game/Overlays/MedalOverlay.cs
-index 25e22ffbda36b67f8cbd6d1969442bb491b1bcee..72971ab686184773888321c24ab056df896845a9 100644
+index 25e22ffbda36b67f8cbd6d1969442bb491b1bcee..ec8cbaaf6178a93509ec6a3d094325e284a7308a 100644
 --- a/osu.Game/Overlays/MedalOverlay.cs
 +++ b/osu.Game/Overlays/MedalOverlay.cs
-@@ -74,6 +74,11 @@ private void handleMedalMessages(SocketMessage obj)
+@@ -74,10 +74,16 @@ private void handleMedalMessages(SocketMessage obj)
              if (details == null)
                  return;
  
@@ -1458,62 +1666,52 @@ index 25e22ffbda36b67f8cbd6d1969442bb491b1bcee..72971ab686184773888321c24ab056df
              var medal = new Medal
              {
                  Name = details.Title,
-diff --git a/osu.Game/Overlays/MedalSplash/DrawableMedal.cs b/osu.Game/Overlays/MedalSplash/DrawableMedal.cs
-index 6b7ffbd1db410ec1fe384d72af85aae1c3c45a7c..0e45f6e02c3c56efc2b6ad6452a5f2fe8ca36833 100644
---- a/osu.Game/Overlays/MedalSplash/DrawableMedal.cs
-+++ b/osu.Game/Overlays/MedalSplash/DrawableMedal.cs
-@@ -119,7 +119,9 @@ public DrawableMedal(Medal medal)
-         [BackgroundDependencyLoader]
-         private void load(OsuColour colours, TextureStore textures, LargeTextureStore largeTextures)
-         {
--            medalSprite.Texture = largeTextures.Get(medal.ImageUrl);
-+            medalSprite.Texture = medal.InternalName.StartsWith("kai-", StringComparison.Ordinal)
-+                ? textures.Get(@"MedalSplash/medal-glow")
-+                : largeTextures.Get(medal.ImageUrl);
-             medalGlow.Texture = textures.Get(@"MedalSplash/medal-glow");
-             description.Colour = colours.BlueLight;
-         }
+                 InternalName = details.Slug,
++                ImageUrlOverride = details.CoverUrl,
+                 Description = details.Description,
+             };
+ 
 diff --git a/osu.Game/Overlays/Profile/Sections/MedalsSection.cs b/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
-index 42f241d66275993f7d15ccff7c9a54a909cd6123..780325af4d 100644
+index 42f241d66275993f7d15ccff7c9a54a909cd6123..46ad5d99dcd9cdd144b8cf5f61911f5d5784ca3e 100644
 --- a/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
 +++ b/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
 @@ -1,8 +1,21 @@
  ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
  // See the LICENCE file in the repository root for full licence text.
  
-+using System;
++using System.Linq;
++using osu.Framework.Allocation;
 +using osu.Framework.Bindables;
 +using osu.Framework.Graphics;
 +using osu.Framework.Graphics.Containers;
 +using osu.Framework.Graphics.Cursor;
 +using osu.Framework.Graphics.Shapes;
 +using osu.Framework.Graphics.Sprites;
++using osu.Framework.Graphics.Textures;
  using osu.Framework.Localisation;
 +using osu.Game.Graphics;
-+using osu.Game.Graphics.Containers;
 +using osu.Game.Graphics.Sprites;
 +using osu.Game.Online.API.Requests.Responses;
-+using osu.Game.Overlays.Profile.Sections.Recent;
  using osu.Game.Resources.Localisation.Web;
 +using osuTK;
  
  namespace osu.Game.Overlays.Profile.Sections
  {
-@@ -11,5 +24,112 @@ public partial class MedalsSection : ProfileSection
+@@ -11,5 +24,134 @@ public partial class MedalsSection : ProfileSection
          public override LocalisableString Title => UsersStrings.ShowExtraMedalsTitle;
  
          public override string Identifier => @"medals";
 +
-+        private readonly FillFlowContainer medalList;
++        private readonly FillFlowContainer content;
 +
 +        public MedalsSection()
 +        {
-+            Child = medalList = new FillFlowContainer
++            Child = content = new FillFlowContainer
 +            {
 +                RelativeSizeAxes = Axes.X,
 +                AutoSizeAxes = Axes.Y,
-+                Direction = FillDirection.Full,
-+                Spacing = new Vector2(12, 18),
++                Direction = FillDirection.Vertical,
++                Spacing = new Vector2(0, 30),
 +            };
 +
 +            User.BindValueChanged(userChanged, true);
@@ -1521,48 +1719,84 @@ index 42f241d66275993f7d15ccff7c9a54a909cd6123..780325af4d 100644
 +
 +        private void userChanged(ValueChangedEvent<UserProfileData?> user)
 +        {
-+            medalList.Clear();
++            content.Clear();
 +
-+            foreach (APIUserAchievement achievement in user.NewValue?.User.Achievements ?? [])
-+                medalList.Add(new MedalEntry(achievement));
++            APIUserAchievement[] achievements = user.NewValue?.User.Achievements ?? [];
++            if (achievements.Length == 0)
++                return;
++
++            APIUserAchievement[] recent = achievements.OrderByDescending(achievement => achievement.AchievedAt).Take(8).ToArray();
++            content.Add(new MedalGroup("recent", recent, true));
++
++            foreach (var group in achievements.GroupBy(achievement => achievement.Grouping)
++                                              .OrderBy(group => group.Key))
++            {
++                content.Add(new MedalGroup(
++                    string.IsNullOrEmpty(group.Key) ? "achievements" : group.Key,
++                    group.OrderBy(achievement => achievement.Ordering)
++                         .ThenBy(achievement => achievement.ID)
++                         .ToArray(),
++                    false));
++            }
++        }
++
++        private partial class MedalGroup : FillFlowContainer
++        {
++            public MedalGroup(string title, APIUserAchievement[] achievements, bool recent)
++            {
++                RelativeSizeAxes = Axes.X;
++                AutoSizeAxes = Axes.Y;
++                Direction = FillDirection.Vertical;
++                Spacing = new Vector2(0, 10);
++
++                Add(new GroupHeader(title));
++                Add(new FillFlowContainer
++                {
++                    RelativeSizeAxes = Axes.X,
++                    AutoSizeAxes = Axes.Y,
++                    Direction = FillDirection.Full,
++                    Spacing = new Vector2(recent ? 14 : 20, 10),
++                    Children = achievements.Select(achievement => new MedalEntry(achievement, recent)).ToArray(),
++                });
++            }
++        }
++
++        private partial class GroupHeader : CompositeDrawable
++        {
++            public GroupHeader(string title)
++            {
++                RelativeSizeAxes = Axes.X;
++                Height = 26;
++
++                InternalChildren = new Drawable[]
++                {
++                    new Box
++                    {
++                        RelativeSizeAxes = Axes.X,
++                        Height = 2,
++                        Colour = new Colour4(237, 131, 182, 255),
++                    },
++                    new OsuSpriteText
++                    {
++                        Y = 8,
++                        Text = title,
++                        Font = OsuFont.GetFont(size: 15, weight: FontWeight.Bold),
++                    },
++                };
++            }
 +        }
 +
 +        private partial class MedalEntry : CompositeDrawable, IHasTooltip
 +        {
 +            public LocalisableString TooltipText { get; }
 +
-+            public MedalEntry(APIUserAchievement achievement)
++            public MedalEntry(APIUserAchievement achievement, bool recent)
 +            {
-+                Width = 142;
-+                Height = 104;
-+                TooltipText = $"{achievement.Name}\n{achievement.Description}";
++                Width = recent ? 88 : 70;
++                Height = recent ? 95 : 76;
++                TooltipText = $"{achievement.Grouping}\n{achievement.Name}\n{achievement.Description}\nachieved {achievement.AchievedAt.LocalDateTime:d}";
 +
-+                Drawable icon = createIcon(achievement);
-+                icon.Anchor = Anchor.TopCentre;
-+                icon.Origin = Anchor.TopCentre;
-+                icon.Size = new Vector2(66);
-+
-+                InternalChildren = new Drawable[]
-+                {
-+                    icon,
-+                    new OsuTextFlowContainer(text => text.Font = OsuFont.GetFont(size: 12, weight: FontWeight.SemiBold))
-+                    {
-+                        Anchor = Anchor.BottomCentre,
-+                        Origin = Anchor.BottomCentre,
-+                        RelativeSizeAxes = Axes.X,
-+                        AutoSizeAxes = Axes.Y,
-+                        TextAnchor = Anchor.TopCentre,
-+                        Text = string.IsNullOrEmpty(achievement.Name) ? $"achievement #{achievement.ID}" : achievement.Name,
-+                    },
-+                };
-+            }
-+
-+            private static Drawable createIcon(APIUserAchievement achievement)
-+            {
-+                if (achievement.Slug.StartsWith("kai-", StringComparison.Ordinal))
-+                    return new CustomMedalIcon(achievement.Slug);
-+
-+                return new DelayedLoadWrapper(new MedalIcon(achievement.Slug)
++                InternalChild = new DelayedLoadWrapper(new AchievementIcon(achievement.IconUrl)
 +                {
 +                    RelativeSizeAxes = Axes.Both,
 +                    FillMode = FillMode.Fit,
@@ -1573,42 +1807,28 @@ index 42f241d66275993f7d15ccff7c9a54a909cd6123..780325af4d 100644
 +            }
 +        }
 +
-+        private partial class CustomMedalIcon : CircularContainer
++        [LongRunningLoad]
++        private partial class AchievementIcon : Container
 +        {
-+            public CustomMedalIcon(string slug)
++            private readonly string url;
++            private readonly Sprite sprite;
++
++            public AchievementIcon(string url)
 +            {
-+                Masking = true;
-+                BorderThickness = 2;
-+                BorderColour = accentFor(slug);
-+
-+                IconUsage icon = slug.Contains("-fc-", StringComparison.Ordinal) ? FontAwesome.Solid.Check
-+                    : slug.Contains("-accuracy-", StringComparison.Ordinal) ? FontAwesome.Solid.Crosshairs
-+                    : slug.Contains("-pp-", StringComparison.Ordinal) ? FontAwesome.Solid.Bolt
-+                    : slug.Contains("-combo-", StringComparison.Ordinal) ? FontAwesome.Solid.Link
-+                    : FontAwesome.Solid.Star;
-+
-+                Children = new Drawable[]
++                this.url = url;
++                Child = sprite = new Sprite
 +                {
-+                    new Box
-+                    {
-+                        RelativeSizeAxes = Axes.Both,
-+                        Colour = accentFor(slug).Opacity(0.16f),
-+                    },
-+                    new SpriteIcon
-+                    {
-+                        Anchor = Anchor.Centre,
-+                        Origin = Anchor.Centre,
-+                        Size = new Vector2(25),
-+                        Icon = icon,
-+                        Colour = accentFor(slug),
-+                    },
++                    RelativeSizeAxes = Axes.Both,
++                    Anchor = Anchor.Centre,
++                    Origin = Anchor.Centre,
 +                };
 +            }
 +
-+            private static Colour4 accentFor(string slug) => slug.Contains("-taiko-", StringComparison.Ordinal) ? new Colour4(230, 109, 114, 255)
-+                : slug.Contains("-catch-", StringComparison.Ordinal) ? new Colour4(130, 213, 187, 255)
-+                : slug.Contains("-mania-", StringComparison.Ordinal) ? new Colour4(171, 148, 255, 255)
-+                : new Colour4(239, 134, 186, 255);
++            [BackgroundDependencyLoader]
++            private void load(LargeTextureStore textures)
++            {
++                sprite.Texture = textures.Get(url);
++            }
 +        }
      }
  }
@@ -1816,6 +2036,25 @@ index 8a03e7b5243db91544cdd726bac7dab6a57933ca..f4f2ce92f1574666092257247ccc8184
                  return new Vector2(pointOnGraph(d.x, 0).X, 1 - p);
              }).Append(new Vector2(1, 0)).ToArray();
          });
+diff --git a/osu.Game/Screens/Play/PlayerLoader.cs b/osu.Game/Screens/Play/PlayerLoader.cs
+index 06a177bd427beab65f711405b102ffb73264a485..17bd8940d4f306956bb1d3e621e80980d1ed6a5b 100644
+--- a/osu.Game/Screens/Play/PlayerLoader.cs
++++ b/osu.Game/Screens/Play/PlayerLoader.cs
+@@ -356,11 +356,13 @@ protected override void LoadComplete()
+ 
+         private void refetchLeaderboard(bool force)
+         {
++            var exactMods = ZigchoLeaderboardMods.ResolveGameplayFilter(leaderboardManager?.CurrentCriteria?.ExactMods, Mods.Value);
++
+             leaderboardManager?.FetchWithCriteria(new LeaderboardCriteria(
+                 Beatmap.Value.BeatmapInfo,
+                 Ruleset.Value,
+                 leaderboardManager?.CurrentCriteria?.Scope ?? BeatmapLeaderboardScope.Global,
+-                leaderboardManager?.CurrentCriteria?.ExactMods), force);
++                exactMods), force);
+         }
+ 
+         #region Screen handling
 diff --git a/osu.Game/Screens/Play/RoomSubmittingPlayer.cs b/osu.Game/Screens/Play/RoomSubmittingPlayer.cs
 index 4e4d35bd308796e779a5f40bc7c6e86e69455ec9..df1317b06435fb21eb95498b5cb23edc295e6748 100644
 --- a/osu.Game/Screens/Play/RoomSubmittingPlayer.cs
@@ -1875,3 +2114,122 @@ index c930783f9980ca4cc522f2e367e6107462393b26..5549095929932cf1cd3c882fcd9a3338
                  scoreSubmissionSource.SetResult(true);
                  Logger.Log($"Score submission completed! (token:{token.Value} id:{s.ID})");
              };
+diff --git a/osu.Game/Users/Medal.cs b/osu.Game/Users/Medal.cs
+index 75718e714b285343ae72ad8d3e8faa3c8762cea6..028af0ad33da2c5ef7cd75472d05a9ab0609ad00 100644
+--- a/osu.Game/Users/Medal.cs
++++ b/osu.Game/Users/Medal.cs
+@@ -9,7 +9,8 @@ public class Medal
+     {
+         public string Name { get; set; }
+         public string InternalName { get; set; }
+-        public string ImageUrl => $@"https://s.ppy.sh/images/medals-client/{InternalName}@2x.png";
++        public string ImageUrlOverride { get; set; }
++        public string ImageUrl => string.IsNullOrEmpty(ImageUrlOverride) ? $@"https://s.ppy.sh/images/medals-client/{InternalName}@2x.png" : ImageUrlOverride;
+         public string Description { get; set; }
+     }
+ }
+diff --git a/osu.iOS/Info.plist b/osu.iOS/Info.plist
+index 8d9985d279951850093a0535a73c9749dd050e48..0b5ea20180253c1a104dd6923854df56c844b100 100644
+--- a/osu.iOS/Info.plist
++++ b/osu.iOS/Info.plist
+@@ -3,11 +3,11 @@
+ <plist version="1.0">
+ <dict>
+ 	<key>CFBundleIdentifier</key>
+-	<string>sh.ppy.osulazer</string>
++	<string>ovh.kai.zigcholazer</string>
+ 	<key>CFBundleName</key>
+-	<string>osu!</string>
++	<string>zigcho!lazer</string>
+ 	<key>CFBundleDisplayName</key>
+-	<string>osu!</string>
++	<string>zigcho!lazer</string>
+ 	<key>LSRequiresIPhoneOS</key>
+ 	<true/>
+ 	<key>MinimumOSVersion</key>
+@@ -82,19 +82,19 @@
+ 				<string>public.data</string>
+ 			</array>
+ 			<key>UTTypeIdentifier</key>
+-			<string>sh.ppy.osu.items</string>
++			<string>ovh.kai.zigcholazer.items</string>
+ 			<key>UTTypeTagSpecification</key>
+ 			<dict/>
+ 		</dict>
+ 		<dict>
+ 			<key>UTTypeConformsTo</key>
+ 			<array>
+-				<string>sh.ppy.osu.items</string>
++				<string>ovh.kai.zigcholazer.items</string>
+ 			</array>
+ 			<key>UTTypeDescription</key>
+ 			<string>osu! replay</string>
+ 			<key>UTTypeIdentifier</key>
+-			<string>sh.ppy.osu.osr</string>
++			<string>ovh.kai.zigcholazer.osr</string>
+ 			<key>UTTypeTagSpecification</key>
+ 			<dict>
+ 				<key>public.filename-extension</key>
+@@ -104,12 +104,12 @@
+ 		<dict>
+ 			<key>UTTypeConformsTo</key>
+ 			<array>
+-				<string>sh.ppy.osu.items</string>
++				<string>ovh.kai.zigcholazer.items</string>
+ 			</array>
+ 			<key>UTTypeDescription</key>
+ 			<string>osu! skin</string>
+ 			<key>UTTypeIdentifier</key>
+-			<string>sh.ppy.osu.osk</string>
++			<string>ovh.kai.zigcholazer.osk</string>
+ 			<key>UTTypeTagSpecification</key>
+ 			<dict>
+ 				<key>public.filename-extension</key>
+@@ -119,12 +119,12 @@
+ 		<dict>
+ 			<key>UTTypeConformsTo</key>
+ 			<array>
+-				<string>sh.ppy.osu.items</string>
++				<string>ovh.kai.zigcholazer.items</string>
+ 			</array>
+ 			<key>UTTypeDescription</key>
+ 			<string>osu! beatmap</string>
+ 			<key>UTTypeIdentifier</key>
+-			<string>sh.ppy.osu.osz</string>
++			<string>ovh.kai.zigcholazer.osz</string>
+ 			<key>UTTypeTagSpecification</key>
+ 			<dict>
+ 				<key>public.filename-extension</key>
+@@ -134,12 +134,12 @@
+ 		<dict>
+ 			<key>UTTypeConformsTo</key>
+ 			<array>
+-				<string>sh.ppy.osu.items</string>
++				<string>ovh.kai.zigcholazer.items</string>
+ 			</array>
+ 			<key>UTTypeDescription</key>
+ 			<string>osu! beatmap</string>
+ 			<key>UTTypeIdentifier</key>
+-			<string>sh.ppy.osu.olz</string>
++			<string>ovh.kai.zigcholazer.olz</string>
+ 			<key>UTTypeTagSpecification</key>
+ 			<dict>
+ 				<key>public.filename-extension</key>
+@@ -158,7 +158,7 @@
+ 			<string>Viewer</string>
+ 			<key>LSItemContentTypes</key>
+ 			<array>
+-				<string>sh.ppy.osu.items</string>
++				<string>ovh.kai.zigcholazer.items</string>
+ 			</array>
+ 		</dict>
+ 	</array>
+@@ -167,6 +167,8 @@
+ 		<dict>
+ 			<key>CFBundleURLSchemes</key>
+ 			<array>
++				<string>zigcho</string>
++				<string>zigchomp</string>
+ 				<string>osu</string>
+ 				<string>osump</string>
+ 			</array>

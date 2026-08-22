@@ -1,31 +1,25 @@
-# zigcho lazer client
+# zigcho!lazer
 
-This is the custom lazer part that belongs to zigcho. I am keeping one reviewable patch against a pinned official osu! revision instead of dumping the whole upstream source tree into this repository.
+i keep one patch against the pinned official osu commit instead of dumping the whole client into this repo.
 
-`upstream-commit.txt` pins the official client revision I have built and opened. `zigcho-client.patch` is the complete client delta and both apply scripts refuse to touch any other revision. Production uses the normal `kai.ovh` hosts. Development keeps the same website and resource hosts, but its API is deliberately loopback-only for the isolated SSH-tunnel QA lane instead of quietly falling back to `dev.ppy.sh`. The store accepts HTTPS resources from `kai.ovh`, `ppy.sh`, and their proper subdomains; it still rejects plaintext, unrelated hosts, suffix lookalikes, data URLs, and relative paths.
+the patch gives the client its own name, storage and IPC identity, points every player route at `kai.ovh`, keeps official updates away from it, and adds the compatibility work for chat, profiles, leaderboards, scores, rooms, spectating and medals.
 
-General realtime stays disabled. Login, profiles, beatmaps, leaderboards, solo score submission, and public chat use the REST API; chat uses a bounded one-second poll. Normal multiplayer and spectator streaming each have their exact hub enabled. Metadata and notification sockets stay off instead of coming along for the ride.
+## builds
+
+release builds happen on GitHub runners, not on somebody's laptop.
 
 ```sh
-client/lazer/apply-endpoints.sh work/osu-client
-work/dotnet/dotnet publish work/osu-client/osu.Desktop/osu.Desktop.csproj \
-  -c Debug -r osx-arm64 --self-contained true
+gh workflow run lazer-clients.yml
 ```
 
-The local Debug endpoint is deliberately loopback HTTP so it can sit in front of an SSH tunnel without changing production routing. Start that QA bundle through `client/lazer/run-local-debug.sh`; it enables insecure requests only after checking that the checked-in API host is exactly `127.0.0.1`. Production still uses HTTPS and the normal framework restriction.
+the workflow applies the patch from a clean checkout, runs the focused client tests once, then builds and verifies:
 
-The current macOS app is an ad-hoc signed QA build. It is enough for real compatibility work on this machine. It is not a public macOS release; distribution still needs a proper app identity, Developer ID signing, notarization, update metadata, and a clean player data path.
+- Windows x64
+- macOS arm64
+- Linux x64
+- Android arm64
+- iOS arm64
 
-## windows x64
+every artifact has a SHA-256 sidecar. desktop builds are portable folders with no installer or updater. the Android APK uses runner signing; the iOS IPA is intentionally unsigned and needs signing when it is installed.
 
-Windows has its own repeatable production build now. The PowerShell path applies the same pinned endpoint and resource patches, publishes a self-contained `win-x64` Release build, removes debug symbols, writes both project revisions into the package, includes both MIT licences, and checks every file before the zip is accepted.
-
-```powershell
-./client/lazer/build-windows.ps1 `
-  -Checkout work/osu-client `
-  -OutputDirectory artifacts/lazer
-```
-
-The result is `zigcho-lazer-0.1.0-alpha.9-windows-x64.zip` plus its SHA-256 file. It keeps its storage and IPC name separate from official lazer, and the official updater is disabled so it cannot replace the custom build. GitHub runs the same build on an actual Windows x64 runner whenever this client slice changes.
-
-This is a portable alpha. There is no installer. Open `app/osu!.exe` after extracting the whole folder; Windows may warn because the executable is unsigned. Public chat runs over the REST fallback. Leaderboard availability comes from zigcho for every map with an online ID instead of trusting stale local rank metadata. Normal rooms, Quick Play, two-player ranked matches and live spectating all use their real server paths now.
+`run-local-debug.sh` is only for the loopback QA lane. production builds always use HTTPS on the normal `kai.ovh` hosts.

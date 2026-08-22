@@ -6,6 +6,10 @@ pub fn build(b: *std.Build) void {
     const postgres_prefix = b.option([]const u8, "postgres-prefix", "PostgreSQL installation prefix (macOS defaults to Homebrew postgresql@17)");
     const postgres_runtime = b.option(bool, "postgres", "Build the server with PostgreSQL runtime storage") orelse false;
 
+    const database_sql_mod = b.createModule(.{
+        .root_source_file = b.path("database/sql.zig"),
+    });
+
     const cargo = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "pp/Cargo.toml", "--release", "--locked" });
     const pp_library = b.path(if (target.result.os.tag == .windows) "pp/target/release/zigcho_pp.lib" else "pp/target/release/libzigcho_pp.a");
 
@@ -15,6 +19,28 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const changelog_mod = b.createModule(.{
+        .root_source_file = b.path("changelog_module.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const build_io = b.graph.io;
+    const updates_dir = std.Io.Dir.cwd().openDir(build_io, "updates", .{ .iterate = true }) catch |err| std.debug.panic("cannot open updates/: {t}", .{err});
+    defer updates_dir.close(build_io);
+    var update_count: usize = 0;
+    var update_manifest: u64 = 0;
+    var update_iterator = updates_dir.iterate();
+    while (update_iterator.next(build_io) catch |err| std.debug.panic("cannot read updates/: {t}", .{err})) |entry| {
+        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, "2026-") or !std.mem.endsWith(u8, entry.name, ".md")) continue;
+        update_count += 1;
+        update_manifest ^= std.hash.Wyhash.hash(0, entry.name);
+    }
+    const changelog_options = b.addOptions();
+    changelog_options.addOption(usize, "update_count", update_count);
+    changelog_options.addOption(u64, "update_manifest", update_manifest);
+    changelog_mod.addOptions("changelog_options", changelog_options);
+    mod.addImport("changelog", changelog_mod);
+    mod.addImport("database_sql", database_sql_mod);
     const server_options = b.addOptions();
     server_options.addOption(bool, "postgres_runtime", postgres_runtime);
     mod.addOptions("build_options", server_options);
@@ -41,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     importer_mod.linkSystemLibrary("sqlite3", .{});
+    importer_mod.addImport("database_sql", database_sql_mod);
     if (target.result.os.tag == .linux) importer_mod.linkSystemLibrary("gcc_s", .{});
     importer_mod.addObjectFile(pp_library);
     const importer = b.addExecutable(.{ .name = "zigcho-import", .root_module = importer_mod });
@@ -54,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     archive_importer_mod.linkSystemLibrary("sqlite3", .{});
+    archive_importer_mod.addImport("database_sql", database_sql_mod);
     const archive_importer = b.addExecutable(.{ .name = "zigcho-import-archive", .root_module = archive_importer_mod });
     b.installArtifact(archive_importer);
 
@@ -64,6 +92,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     postgres_importer_mod.linkSystemLibrary("sqlite3", .{});
+    postgres_importer_mod.addImport("database_sql", database_sql_mod);
     postgres_importer_mod.linkSystemLibrary("pq", .{ .use_pkg_config = .no });
     if (target.result.os.tag == .macos) {
         const prefix = postgres_prefix orelse "/opt/homebrew/opt/postgresql@17";
@@ -86,6 +115,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addImport("changelog", changelog_mod);
+    test_mod.addImport("database_sql", database_sql_mod);
     const test_options = b.addOptions();
     test_options.addOption(bool, "postgres_runtime", false);
     test_mod.addOptions("build_options", test_options);

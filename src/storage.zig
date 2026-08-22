@@ -9,8 +9,10 @@ const media_contract = @import("media_contract.zig");
 const site_replay = @import("site_replay.zig");
 const user_json = @import("user_json.zig");
 const achievements = @import("achievements.zig");
+const bss = @import("bss.zig");
 const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
+const database_sql = @import("database_sql");
 pub const is_postgres = false;
 
 pub const LazerCommentable = enum {
@@ -255,100 +257,100 @@ pub const Store = struct {
         }
     }
     pub fn migrate(self: *Store) !void {
-        try self.exec(@embedFile("schema.sql"));
+        try self.exec(database_sql.sqlite_schema);
         var version: i32 = 0;
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "PRAGMA user_version", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         if (c.sqlite3_step(stmt) == c.SQLITE_ROW) version = c.sqlite3_column_int(stmt, 0);
         _ = c.sqlite3_finalize(stmt);
         const needs_score_rebuild = version < 28;
-        if (version < 2) try self.exec(@embedFile("migration_002.sql"));
-        if (version < 3) try self.exec(@embedFile("migration_003.sql"));
-        if (version < 4) try self.exec(@embedFile("migration_004.sql"));
-        if (version < 5) try self.exec(@embedFile("migration_005.sql"));
-        if (version < 6) try self.exec(@embedFile("migration_006.sql"));
-        if (version < 7) try self.exec(@embedFile("migration_007.sql"));
-        if (version < 8) try self.exec(@embedFile("migration_008.sql"));
-        if (version < 9) try self.exec(@embedFile("migration_009.sql"));
+        if (version < 2) try self.exec(database_sql.sqliteMigration(2));
+        if (version < 3) try self.exec(database_sql.sqliteMigration(3));
+        if (version < 4) try self.exec(database_sql.sqliteMigration(4));
+        if (version < 5) try self.exec(database_sql.sqliteMigration(5));
+        if (version < 6) try self.exec(database_sql.sqliteMigration(6));
+        if (version < 7) try self.exec(database_sql.sqliteMigration(7));
+        if (version < 8) try self.exec(database_sql.sqliteMigration(8));
+        if (version < 9) try self.exec(database_sql.sqliteMigration(9));
         if (version < 10) {
             if (try self.hasAvatarColumn())
                 try self.exec("PRAGMA user_version=10")
             else
-                try self.exec(@embedFile("migration_010.sql"));
+                try self.exec(database_sql.sqliteMigration(10));
         }
-        if (version < 11) try self.exec(@embedFile("migration_011.sql"));
-        if (version < 12) try self.exec(@embedFile("migration_012.sql"));
-        if (version < 13) try self.exec(@embedFile("migration_013.sql"));
+        if (version < 11) try self.exec(database_sql.sqliteMigration(11));
+        if (version < 12) try self.exec(database_sql.sqliteMigration(12));
+        if (version < 13) try self.exec(database_sql.sqliteMigration(13));
         if (version < 14) {
             if (try self.hasBeatmapStatusFrozenColumn())
                 try self.exec("PRAGMA user_version=14")
             else
-                try self.exec(@embedFile("migration_014.sql"));
+                try self.exec(database_sql.sqliteMigration(14));
         }
-        if (version < 15) try self.exec(@embedFile("migration_015.sql"));
-        if (version < 16) try self.exec(@embedFile("migration_016.sql"));
+        if (version < 15) try self.exec(database_sql.sqliteMigration(15));
+        if (version < 16) try self.exec(database_sql.sqliteMigration(16));
         if (version < 17) {
             if (try self.hasBeatmapArchiveAccessColumn())
                 try self.exec("PRAGMA user_version=17")
             else
-                try self.exec(@embedFile("migration_017.sql"));
+                try self.exec(database_sql.sqliteMigration(17));
         }
-        if (version < 18) try self.exec(@embedFile("migration_018.sql"));
-        if (version < 19) try self.exec(@embedFile("migration_019.sql"));
-        if (version < 20) try self.exec(@embedFile("migration_020.sql"));
+        if (version < 18) try self.exec(database_sql.sqliteMigration(18));
+        if (version < 19) try self.exec(database_sql.sqliteMigration(19));
+        if (version < 20) try self.exec(database_sql.sqliteMigration(20));
         if (version < 21) {
             if (try self.hasLazerLeaderboardColumns())
                 try self.exec("PRAGMA user_version=21")
             else
-                try self.exec(@embedFile("migration_021.sql"));
+                try self.exec(database_sql.sqliteMigration(21));
         }
         if (version < 22) {
             if (try self.hasLazerPerformanceColumns())
                 try self.exec("UPDATE lazer_scores SET best=1 WHERE id IN (SELECT id FROM (SELECT id,row_number() OVER (PARTITION BY user_id,beatmap_id,ruleset_id,rank_namespace ORDER BY pp DESC,total_score DESC,id ASC) place FROM lazer_scores WHERE passed=1) ranked WHERE place=1); PRAGMA user_version=22")
             else
-                try self.exec(@embedFile("migration_022.sql"));
+                try self.exec(database_sql.sqliteMigration(22));
         }
         if (version < 23) {
             if (try self.hasSiteProfileSchema())
                 try self.exec("PRAGMA user_version=23")
             else
-                try self.exec(@embedFile("migration_023.sql"));
+                try self.exec(database_sql.sqliteMigration(23));
         }
         if (version < 24) {
             if (try self.hasExpandedSiteProfileSchema())
                 try self.exec("PRAGMA user_version=24")
             else
-                try self.exec(@embedFile("migration_024.sql"));
+                try self.exec(database_sql.sqliteMigration(24));
         }
         if (version < 25) {
             if (try self.hasAnticheatReviewSchema())
                 try self.exec("PRAGMA user_version=25")
             else
-                try self.exec(@embedFile("migration_025.sql"));
+                try self.exec(database_sql.sqliteMigration(25));
         }
         if (version < 26) {
             if (try self.hasAnticheatGameplaySchema())
                 try self.exec("PRAGMA user_version=26")
             else
-                try self.exec(@embedFile("migration_026.sql"));
+                try self.exec(database_sql.sqliteMigration(26));
         }
         if (version < 27) {
             if (try self.hasLazerChatSchema())
                 try self.exec("PRAGMA user_version=27")
             else
-                try self.exec(@embedFile("migration_027.sql"));
+                try self.exec(database_sql.sqliteMigration(27));
         }
         if (version < 28) {
             if (try self.hasLazerDirectMessageColumns())
                 try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS direct_messages_sender_uuid ON direct_messages(from_id,client_uuid) WHERE client_uuid!=''; UPDATE custom_mods SET ranked=1; CREATE TABLE IF NOT EXISTS user_achievements(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,achievement_id INTEGER NOT NULL CHECK(achievement_id>0),score_source TEXT NOT NULL CHECK(score_source IN ('stable','lazer')),score_id INTEGER NOT NULL CHECK(score_id>0),achieved_at INTEGER NOT NULL DEFAULT (unixepoch()),PRIMARY KEY(user_id,achievement_id)); CREATE INDEX IF NOT EXISTS user_achievements_score ON user_achievements(score_source,score_id); PRAGMA user_version=28")
             else
-                try self.exec(@embedFile("migration_028.sql"));
+                try self.exec(database_sql.sqliteMigration(28));
         }
         if (version < 29) {
             if (try self.hasScoreStarRatingColumns())
                 try self.exec("UPDATE scores SET star_rating=coalesce(nullif(star_rating,0),(SELECT b.star_rating FROM beatmaps b WHERE b.md5=scores.map_md5),0); UPDATE lazer_scores SET star_rating=coalesce(nullif(star_rating,0),(SELECT b.star_rating FROM beatmaps b WHERE b.id=lazer_scores.beatmap_id),0); PRAGMA user_version=29")
             else
-                try self.exec(@embedFile("migration_029.sql"));
+                try self.exec(database_sql.sqliteMigration(29));
         }
         if (version < 31) {
             if (try self.hasBeatmapArchiveSizeColumn())
@@ -356,13 +358,14 @@ pub const Store = struct {
             else
                 try self.exec("ALTER TABLE beatmap_archives ADD COLUMN object_bytes INTEGER NOT NULL DEFAULT 0 CHECK(object_bytes>=0); UPDATE beatmap_archives SET object_bytes=length(osz_file); PRAGMA user_version=31");
         }
-        if (version < 32) try self.exec(@embedFile("migration_032.sql"));
+        if (version < 32) try self.exec(database_sql.sqliteMigration(32));
         if (version < 33) {
             if (try self.hasAccountTeamSchema())
                 try self.exec("PRAGMA user_version=33")
             else
-                try self.exec(@embedFile("migration_033.sql"));
+                try self.exec(database_sql.sqliteMigration(33));
         }
+        if (version < 34) try self.exec(database_sql.sqliteMigration(34));
         try self.exec(
             "BEGIN IMMEDIATE;" ++
                 "UPDATE lazer_scores SET best=0;" ++
@@ -1203,7 +1206,9 @@ pub const Store = struct {
                 try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 2)));
                 try output.writer.writeAll(",\"description\":");
                 try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 3)));
-                try output.writer.print(",\"is_open\":{},\"default_ruleset_id\":{d},\"leader_id\":{d},\"created_at\":{d},\"updated_at\":{d},\"member_count\":{d},\"flag_url\":\"https://assets.kai.ovh/teams/{d}/flag?v={d}\",\"member\":{},\"applied\":{}}}", .{ c.sqlite3_column_int(stmt, 4) != 0, c.sqlite3_column_int(stmt, 5), c.sqlite3_column_int(stmt, 6), c.sqlite3_column_int64(stmt, 7), c.sqlite3_column_int64(stmt, 8), c.sqlite3_column_int(stmt, 9), id, flag_version, c.sqlite3_column_int(stmt, 11) != 0, c.sqlite3_column_int(stmt, 12) != 0 });
+                try output.writer.print(",\"is_open\":{},\"default_ruleset_id\":{d},\"leader_id\":{d},\"created_at\":{d},\"updated_at\":{d},\"member_count\":{d},\"flag_url\":", .{ c.sqlite3_column_int(stmt, 4) != 0, c.sqlite3_column_int(stmt, 5), c.sqlite3_column_int(stmt, 6), c.sqlite3_column_int64(stmt, 7), c.sqlite3_column_int64(stmt, 8), c.sqlite3_column_int(stmt, 9) });
+                if (flag_version > 0) try output.writer.print("\"https://assets.kai.ovh/teams/{d}/flag?v={d}\"", .{ id, flag_version }) else try output.writer.writeAll("null");
+                try output.writer.print(",\"member\":{},\"applied\":{}}}", .{ c.sqlite3_column_int(stmt, 11) != 0, c.sqlite3_column_int(stmt, 12) != 0 });
             },
             c.SQLITE_DONE => break,
             else => return error.DatabaseQueryFailed,
@@ -1238,7 +1243,13 @@ pub const Store = struct {
         try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(team, 3)));
         try output.writer.writeAll(",\"description\":");
         try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(team, 4)));
-        try output.writer.print(",\"is_open\":{},\"default_ruleset_id\":{d},\"leader_id\":{d},\"created_at\":{d},\"updated_at\":{d},\"flag_url\":\"https://assets.kai.ovh/teams/{d}/flag?v={d}\",\"header_url\":\"https://assets.kai.ovh/teams/{d}/header?v={d}\",\"member\":{},\"applied\":{},\"can_manage\":{},\"members\":[", .{ c.sqlite3_column_int(team, 5) != 0, c.sqlite3_column_int(team, 6), leader_id, c.sqlite3_column_int64(team, 8), c.sqlite3_column_int64(team, 9), team_id, c.sqlite3_column_int64(team, 10), team_id, c.sqlite3_column_int64(team, 11), c.sqlite3_column_int(team, 12) != 0, c.sqlite3_column_int(team, 13) != 0, can_manage });
+        const flag_version = c.sqlite3_column_int64(team, 10);
+        const header_version = c.sqlite3_column_int64(team, 11);
+        try output.writer.print(",\"is_open\":{},\"default_ruleset_id\":{d},\"leader_id\":{d},\"created_at\":{d},\"updated_at\":{d},\"flag_url\":", .{ c.sqlite3_column_int(team, 5) != 0, c.sqlite3_column_int(team, 6), leader_id, c.sqlite3_column_int64(team, 8), c.sqlite3_column_int64(team, 9) });
+        if (flag_version > 0) try output.writer.print("\"https://assets.kai.ovh/teams/{d}/flag?v={d}\"", .{ team_id, flag_version }) else try output.writer.writeAll("null");
+        try output.writer.writeAll(",\"header_url\":");
+        if (header_version > 0) try output.writer.print("\"https://assets.kai.ovh/teams/{d}/header?v={d}\"", .{ team_id, header_version }) else try output.writer.writeAll("null");
+        try output.writer.print(",\"member\":{},\"applied\":{},\"can_manage\":{},\"members\":[", .{ c.sqlite3_column_int(team, 12) != 0, c.sqlite3_column_int(team, 13) != 0, can_manage });
         first: {
             var first = true;
             while (true) switch (c.sqlite3_step(members)) {
@@ -2190,9 +2201,28 @@ pub const Store = struct {
         }
     };
 
+    fn directMessageAllowedLocked(self: *Store, from_id: i32, to_id: i32) !bool {
+        if (from_id <= 0 or to_id <= 0 or from_id == to_id) return false;
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT EXISTS(SELECT 1 FROM users sender JOIN users recipient ON recipient.id=?2 WHERE sender.id=?1 AND sender.restricted=0 AND recipient.restricted=0 AND NOT EXISTS(SELECT 1 FROM user_blocks b WHERE (b.user_id=?1 AND b.blocked_id=?2) OR (b.user_id=?2 AND b.blocked_id=?1)))";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, from_id);
+        _ = c.sqlite3_bind_int(stmt, 2, to_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return c.sqlite3_column_int(stmt, 0) != 0;
+    }
+
+    pub fn directMessageAllowed(self: *Store, from_id: i32, to_id: i32) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.directMessageAllowedLocked(from_id, to_id);
+    }
+
     pub fn storeDirectMessage(self: *Store, from_id: i32, to_id: i32, message: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!try self.directMessageAllowedLocked(from_id, to_id)) return error.DirectMessageBlocked;
         var target_buffer: [64]u8 = undefined;
         const target = try lazer.directMessageTarget(&target_buffer, from_id, to_id);
         try self.exec("BEGIN IMMEDIATE");
@@ -2320,6 +2350,7 @@ pub const Store = struct {
         const target = try lazer.directMessageTarget(&target_buffer, sender_id, target_id);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!try self.directMessageAllowedLocked(sender_id, target_id)) return error.DirectMessageBlocked;
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
 
@@ -2411,6 +2442,39 @@ pub const Store = struct {
                 .uuid = std.mem.span(c.sqlite3_column_text(stmt, 6)),
                 .timestamp = std.mem.span(c.sqlite3_column_text(stmt, 7)),
             });
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
+    pub fn directMessageThreadsJson(self: *Store, allocator: std.mem.Allocator, viewer_id: i32, limit: u8) ![]u8 {
+        if (viewer_id <= 0 or limit == 0 or limit > 100) return error.InvalidChatQuery;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql =
+            "WITH participants AS (SELECT CASE WHEN from_id=?1 THEN to_id ELSE from_id END other_id,max(id) last_id FROM direct_messages WHERE from_id=?1 OR to_id=?1 GROUP BY other_id) " ++
+            "SELECT u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,d.message,d.is_action,strftime('%Y-%m-%dT%H:%M:%SZ',d.created_at,'unixepoch'),d.from_id,(SELECT count(*) FROM direct_messages unread WHERE unread.to_id=?1 AND unread.from_id=u.id AND unread.read=0) unread FROM participants p JOIN direct_messages d ON d.id=p.last_id JOIN users u ON u.id=p.other_id WHERE u.restricted=0 ORDER BY d.id DESC LIMIT ?2";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, viewer_id);
+        _ = c.sqlite3_bind_int(stmt, 2, limit);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{{\"id\":{d},\"name\":", .{c.sqlite3_column_int(stmt, 0)});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+            try output.writer.writeAll(",\"country\":");
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+            try output.writer.print(",\"privileges\":{d},\"last_message\":", .{c.sqlite3_column_int64(stmt, 3)});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 4)));
+            try output.writer.print(",\"is_action\":{},\"last_message_at\":", .{c.sqlite3_column_int(stmt, 5) != 0});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 6)));
+            try output.writer.print(",\"last_sender_id\":{d},\"unread\":{d}}}", .{ c.sqlite3_column_int(stmt, 7), c.sqlite3_column_int64(stmt, 8) });
         }
         try output.writer.writeByte(']');
         return output.toOwnedSlice();
@@ -3626,7 +3690,7 @@ pub const Store = struct {
         try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 13)));
         const banner_version = c.sqlite3_column_int64(user, 16);
         try output.writer.writeAll(",\"banner_url\":");
-        if (banner_version > 0) try output.writer.print("\"https://assets.kai.ovh/banners/{d}?v={d}\"", .{ user_id, banner_version }) else try output.writer.writeAll("null");
+        if (banner_version > 0) try output.writer.print("\"https://assets.kai.ovh/banners/{d}/cover.jpg?v={d}\"", .{ user_id, banner_version }) else try output.writer.writeAll("null");
         try output.writer.writeAll(",\"team\":");
         if (c.sqlite3_column_type(user, 17) == c.SQLITE_NULL) {
             try output.writer.writeAll("null");
@@ -3636,7 +3700,10 @@ pub const Store = struct {
             try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 18)));
             try output.writer.writeAll(",\"short_name\":");
             try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 19)));
-            try output.writer.print(",\"flag_url\":\"https://assets.kai.ovh/teams/{d}/flag?v={d}\"}}", .{ team_id, c.sqlite3_column_int64(user, 20) });
+            const flag_version = c.sqlite3_column_int64(user, 20);
+            try output.writer.writeAll(",\"flag_url\":");
+            if (flag_version > 0) try output.writer.print("\"https://assets.kai.ovh/teams/{d}/flag?v={d}\"", .{ team_id, flag_version }) else try output.writer.writeAll("null");
+            try output.writer.writeByte('}');
         }
         const show_profile_stats = c.sqlite3_column_int(user, 14) != 0;
         const show_recent_scores = c.sqlite3_column_int(user, 15) != 0;
@@ -3692,8 +3759,8 @@ pub const Store = struct {
         if (c.sqlite3_step(map) != c.SQLITE_ROW or c.sqlite3_column_int(map, 0) != score_mode) return null;
         const sql =
             "WITH candidates(id,user_id,name,country,privileges,total_score,pp,accuracy,max_combo,mods,mode,rank_namespace,submitted_at,client,mods_json,has_replay) AS (" ++
-            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.submitted_at,'stable',NULL,length(s.replay)>0 FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN users u ON u.id=s.user_id WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='stable' OR ?3='scorev2') UNION ALL " ++
-            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.submitted_at,'lazer',s.mods_json,length(s.replay)>0 FROM lazer_scores s JOIN users u ON u.id=s.user_id WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='lazer'))," ++
+            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.submitted_at,'stable',NULL,length(s.replay)>0 FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN users u ON u.id=s.user_id WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='stable' OR ?3='scorev2') AND NOT EXISTS(SELECT 1 FROM beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') UNION ALL " ++
+            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.submitted_at,'lazer',s.mods_json,length(s.replay)>0 FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN users u ON u.id=s.user_id WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?4 AND s.passed=1 AND u.restricted=0 AND u.id!=3 AND (?3='all' OR ?3='lazer') AND NOT EXISTS(SELECT 1 FROM beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto'))," ++
             "per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN ?5=1 THEN pp ELSE total_score END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN ?5=1 THEN pp ELSE total_score END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) position FROM per_user WHERE user_place=1) " ++
             "SELECT position,id,user_id,name,country,privileges,total_score,pp,accuracy,max_combo,mods,rank_namespace,submitted_at,client,mods_json,has_replay FROM board ORDER BY position LIMIT 100";
@@ -3904,6 +3971,24 @@ pub const Store = struct {
         return user;
     }
 
+    pub fn consumeGameRefreshToken(self: *Store, allocator: std.mem.Allocator, token: []const u8) !?domain.User {
+        if (token.len != 64) return null;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+        const user_id: i32 = consume: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var stmt: ?*c.sqlite3_stmt = null;
+            const sql = "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE token_hash=?1 AND scopes='game:refresh' AND revoked_at IS NULL AND expires_at>unixepoch() RETURNING user_id";
+            if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_blob(stmt, 1, &digest, digest.len, null);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            break :consume c.sqlite3_column_int(stmt, 0);
+        };
+        return self.userById(allocator, user_id);
+    }
+
     pub fn recentOauthUserIds(self: *Store, allocator: std.mem.Allocator, cutoff: i64) ![]i32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4032,7 +4117,7 @@ pub const Store = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE user_id=?1 AND revoked_at IS NULL AND expires_at>unixepoch() AND instr(' '||scopes||' ',' identify ')>0 AND instr(' '||scopes||' ',' scores:write ')>0";
+        const sql = "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE user_id=?1 AND revoked_at IS NULL AND expires_at>unixepoch() AND ((instr(' '||scopes||' ',' identify ')>0 AND instr(' '||scopes||' ',' scores:write ')>0) OR instr(' '||scopes||' ',' game:refresh ')>0)";
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
@@ -4314,21 +4399,23 @@ pub const Store = struct {
         return output.toOwnedSlice();
     }
 
-    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, filter_mods: bool, classic: bool, requested_stable_mods: ?i32, limit: u8) ![]u8 {
+    pub fn lazerLeaderboardJson(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, namespace: lazer.Namespace, exact_mods_json: []const u8, filter_mods: bool, classic: bool, requested_stable_mods: ?i32, scope: lazer.LeaderboardScope, limit: u8) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const sql =
             "WITH candidates AS (" ++
             "SELECT 'lazer' source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,s.passed=1 AND length(s.replay)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,0 perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
             "FROM lazer_scores s JOIN users u ON u.id=s.user_id LEFT JOIN team_members tm ON tm.user_id=u.id LEFT JOIN teams t ON t.id=tm.team_id JOIN beatmaps b ON b.id=s.beatmap_id " ++
-            "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?6=0 " ++
+            "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?6=0 AND NOT EXISTS(SELECT 1 FROM beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') " ++
+            "AND (?11='global' OR (?11='country' AND u.country=(SELECT country FROM users WHERE id=?10)) OR (?11='friend' AND (s.user_id=?10 OR EXISTS(SELECT 1 FROM friends f WHERE f.user_id=?10 AND f.friend_id=s.user_id))) OR (?11='team' AND tm.team_id IS NOT NULL AND tm.team_id=(SELECT team_id FROM team_members WHERE user_id=?10))) " ++
             "AND (?5=0 OR (" ++
             "NOT EXISTS(SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
             "AND NOT EXISTS(SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP')))) " ++
             "UNION ALL " ++
             "SELECT 'stable' source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{}' statistics_json,'{}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,s.passed=1 AND length(s.replay)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
             "FROM scores s JOIN users u ON u.id=s.user_id LEFT JOIN team_members tm ON tm.user_id=u.id LEFT JOIN teams t ON t.id=tm.team_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
-            "WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?3!='custom' AND ?7=1 AND (?5=0 OR s.mods=?8))," ++
+            "WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?3!='custom' AND ?7=1 AND (?5=0 OR (s.mods & ?12)=?8) AND NOT EXISTS(SELECT 1 FROM beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') " ++
+            "AND (?11='global' OR (?11='country' AND u.country=(SELECT country FROM users WHERE id=?10)) OR (?11='friend' AND (s.user_id=?10 OR EXISTS(SELECT 1 FROM friends f WHERE f.user_id=?10 AND f.friend_id=s.user_id))) OR (?11='team' AND tm.team_id IS NOT NULL AND tm.team_id=(SELECT team_id FROM team_members WHERE user_id=?10))))," ++
             "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('vanilla','relax','autopilot') THEN pp ELSE total_score END DESC,source_order,source_id) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
             "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace,team_id,team_name,team_short_name,team_flag_version " ++
@@ -4347,6 +4434,9 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 8, requested_stable_mods orelse 0);
         _ = c.sqlite3_bind_int(stmt, 9, limit);
         _ = c.sqlite3_bind_int(stmt, 10, requester_id);
+        const scope_name = @tagName(scope);
+        _ = c.sqlite3_bind_text(stmt, 11, scope_name.ptr, @intCast(scope_name.len), null);
+        _ = c.sqlite3_bind_int(stmt, 12, stable_mods.leaderboard_gameplay_mask);
 
         var scores: std.Io.Writer.Allocating = .init(allocator);
         defer scores.deinit();
@@ -4516,7 +4606,8 @@ pub const Store = struct {
 
     fn writeUserAchievementsLocked(self: *Store, writer: *std.Io.Writer, user_id: i32, include_metadata: bool) !void {
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT achievement_id,achieved_at FROM user_achievements WHERE user_id=?1 ORDER BY achieved_at,achievement_id", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        const sql = "SELECT ua.achievement_id,strftime('%Y-%m-%dT%H:%M:%SZ',ua.achieved_at,'unixepoch'),(SELECT count(*) FROM user_achievements all_ua JOIN users all_users ON all_users.id=all_ua.user_id WHERE all_ua.achievement_id=ua.achievement_id AND all_users.restricted=0),(SELECT count(*) FROM users WHERE restricted=0) FROM user_achievements ua WHERE ua.user_id=?1 ORDER BY ua.achieved_at DESC,ua.achievement_id DESC";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int(stmt, 1, user_id);
         try writer.writeByte('[');
@@ -4526,7 +4617,7 @@ pub const Store = struct {
             if (achievements.byId(id) == null) continue;
             if (!first) try writer.writeByte(',');
             first = false;
-            try achievements.writeJson(writer, id, c.sqlite3_column_int64(stmt, 1), include_metadata);
+            try achievements.writeJson(writer, id, std.mem.span(c.sqlite3_column_text(stmt, 1)), c.sqlite3_column_int64(stmt, 2), c.sqlite3_column_int64(stmt, 3), include_metadata);
         }
         try writer.writeByte(']');
     }
@@ -5181,6 +5272,286 @@ pub const Store = struct {
         try self.exec("COMMIT");
     }
 
+    fn allocateBssIdsLocked(self: *Store, kind: []const u8, count: u16) !i32 {
+        if (count == 0 or (!std.mem.eql(u8, kind, "set") and !std.mem.eql(u8, kind, "beatmap"))) return error.InvalidBssReservation;
+        var counter: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT next_id FROM bss_counters WHERE kind=?1", -1, &counter, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(counter);
+        _ = c.sqlite3_bind_text(counter, 1, kind.ptr, @intCast(kind.len), null);
+        if (c.sqlite3_step(counter) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        var start: i64 = @max(@as(i64, 100_000_000), c.sqlite3_column_int64(counter, 0));
+
+        var high: ?*c.sqlite3_stmt = null;
+        const high_sql = if (std.mem.eql(u8, kind, "set"))
+            "SELECT max(value) FROM (SELECT max(set_id) value FROM beatmaps UNION ALL SELECT max(set_id) value FROM beatmap_submissions)"
+        else
+            "SELECT max(value) FROM (SELECT max(id) value FROM beatmaps UNION ALL SELECT max(beatmap_id) value FROM beatmap_submission_maps)";
+        if (c.sqlite3_prepare_v2(self.db, high_sql, -1, &high, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(high);
+        if (c.sqlite3_step(high) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        if (c.sqlite3_column_type(high, 0) != c.SQLITE_NULL) start = @max(start, c.sqlite3_column_int64(high, 0) + 1);
+        const next = std.math.add(i64, start, count) catch return error.BssIdentifierExhausted;
+        if (start > std.math.maxInt(i32) or next > @as(i64, std.math.maxInt(i32)) + 1) return error.BssIdentifierExhausted;
+
+        var update: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE bss_counters SET next_id=?2 WHERE kind=?1", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(update);
+        _ = c.sqlite3_bind_text(update, 1, kind.ptr, @intCast(kind.len), null);
+        _ = c.sqlite3_bind_int64(update, 2, next);
+        if (c.sqlite3_step(update) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.DatabaseQueryFailed;
+        return @intCast(start);
+    }
+
+    pub fn reserveBssSubmission(self: *Store, allocator: std.mem.Allocator, user_id: i32, input: bss.ReserveInput) !bss.Reservation {
+        if (user_id <= 0) return error.InvalidUser;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+
+        const total = input.keep_ids.len + input.create_count;
+        if (total == 0 or total > bss.max_beatmaps) return error.InvalidBssReservation;
+        const ids = try allocator.alloc(i32, total);
+        errdefer allocator.free(ids);
+        var set_id: i32 = undefined;
+        var revision: u32 = 1;
+        if (input.set_id) |existing_set| {
+            var submission: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT owner_id,revision FROM beatmap_submissions WHERE set_id=?1", -1, &submission, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(submission);
+            _ = c.sqlite3_bind_int(submission, 1, existing_set);
+            if (c.sqlite3_step(submission) != c.SQLITE_ROW) return error.BssSubmissionNotFound;
+            if (c.sqlite3_column_int(submission, 0) != user_id) return error.BssNotOwner;
+            const old_revision = c.sqlite3_column_int64(submission, 1);
+            if (old_revision <= 0 or old_revision >= std.math.maxInt(u32)) return error.BssIdentifierExhausted;
+            revision = @intCast(old_revision + 1);
+            set_id = existing_set;
+
+            var owned: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM beatmap_submission_maps WHERE set_id=?1 AND beatmap_id=?2", -1, &owned, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(owned);
+            for (input.keep_ids, 0..) |id, index| {
+                _ = c.sqlite3_reset(owned);
+                _ = c.sqlite3_clear_bindings(owned);
+                _ = c.sqlite3_bind_int(owned, 1, set_id);
+                _ = c.sqlite3_bind_int(owned, 2, id);
+                if (c.sqlite3_step(owned) != c.SQLITE_ROW) return error.BssBeatmapNotOwned;
+                ids[index] = id;
+            }
+            var deactivate: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_submission_maps SET active=0 WHERE set_id=?1", -1, &deactivate, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(deactivate);
+            _ = c.sqlite3_bind_int(deactivate, 1, set_id);
+            if (c.sqlite3_step(deactivate) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+
+            var keep: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_submission_maps SET active=1,position=?3 WHERE set_id=?1 AND beatmap_id=?2", -1, &keep, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(keep);
+            for (input.keep_ids, 0..) |id, position| {
+                _ = c.sqlite3_reset(keep);
+                _ = c.sqlite3_clear_bindings(keep);
+                _ = c.sqlite3_bind_int(keep, 1, set_id);
+                _ = c.sqlite3_bind_int(keep, 2, id);
+                _ = c.sqlite3_bind_int64(keep, 3, @intCast(position));
+                if (c.sqlite3_step(keep) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.DatabaseQueryFailed;
+            }
+        } else {
+            set_id = try self.allocateBssIdsLocked("set", 1);
+            var create: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT INTO beatmap_submissions(set_id,owner_id,target,notify_replies) VALUES(?1,?2,?3,?4)", -1, &create, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(create);
+            _ = c.sqlite3_bind_int(create, 1, set_id);
+            _ = c.sqlite3_bind_int(create, 2, user_id);
+            _ = c.sqlite3_bind_text(create, 3, input.target.database().ptr, @intCast(input.target.database().len), null);
+            _ = c.sqlite3_bind_int(create, 4, @intFromBool(input.notify_replies));
+            if (c.sqlite3_step(create) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
+
+        if (input.create_count > 0) {
+            const first = try self.allocateBssIdsLocked("beatmap", input.create_count);
+            var insert: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT INTO beatmap_submission_maps(set_id,beatmap_id,position) VALUES(?1,?2,?3)", -1, &insert, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(insert);
+            for (0..input.create_count) |offset| {
+                const id: i32 = first + @as(i32, @intCast(offset));
+                const position = input.keep_ids.len + offset;
+                ids[position] = id;
+                _ = c.sqlite3_reset(insert);
+                _ = c.sqlite3_clear_bindings(insert);
+                _ = c.sqlite3_bind_int(insert, 1, set_id);
+                _ = c.sqlite3_bind_int(insert, 2, id);
+                _ = c.sqlite3_bind_int64(insert, 3, @intCast(position));
+                if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            }
+        }
+        if (input.set_id != null) {
+            var update: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_submissions SET target=?2,notify_replies=?3,state='reserved',revision=?4,last_error='',updated_at=unixepoch() WHERE set_id=?1 AND owner_id=?5", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(update);
+            _ = c.sqlite3_bind_int(update, 1, set_id);
+            _ = c.sqlite3_bind_text(update, 2, input.target.database().ptr, @intCast(input.target.database().len), null);
+            _ = c.sqlite3_bind_int(update, 3, @intFromBool(input.notify_replies));
+            _ = c.sqlite3_bind_int64(update, 4, revision);
+            _ = c.sqlite3_bind_int(update, 5, user_id);
+            if (c.sqlite3_step(update) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.DatabaseQueryFailed;
+        }
+        try self.exec("COMMIT");
+        return .{ .allocator = allocator, .set_id = set_id, .beatmap_ids = ids, .revision = revision };
+    }
+
+    pub fn bssReservedMapIds(self: *Store, allocator: std.mem.Allocator, user_id: i32, set_id: i32) ![]i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var owner: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT owner_id FROM beatmap_submissions WHERE set_id=?1", -1, &owner, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(owner);
+        _ = c.sqlite3_bind_int(owner, 1, set_id);
+        if (c.sqlite3_step(owner) != c.SQLITE_ROW) return error.BssSubmissionNotFound;
+        if (c.sqlite3_column_int(owner, 0) != user_id) return error.BssNotOwner;
+        var count_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*) FROM beatmap_submission_maps WHERE set_id=?1 AND active=1", -1, &count_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(count_stmt);
+        _ = c.sqlite3_bind_int(count_stmt, 1, set_id);
+        if (c.sqlite3_step(count_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        const count: usize = @intCast(c.sqlite3_column_int64(count_stmt, 0));
+        if (count == 0 or count > bss.max_beatmaps) return error.InvalidBssReservation;
+        const ids = try allocator.alloc(i32, count);
+        errdefer allocator.free(ids);
+        var rows: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT beatmap_id FROM beatmap_submission_maps WHERE set_id=?1 AND active=1 ORDER BY position,beatmap_id", -1, &rows, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(rows);
+        _ = c.sqlite3_bind_int(rows, 1, set_id);
+        var index: usize = 0;
+        while (c.sqlite3_step(rows) == c.SQLITE_ROW) : (index += 1) {
+            if (index >= ids.len) return error.DatabaseQueryFailed;
+            ids[index] = c.sqlite3_column_int(rows, 0);
+        }
+        if (index != ids.len) return error.DatabaseQueryFailed;
+        return ids;
+    }
+
+    pub fn failBssSubmission(self: *Store, user_id: i32, set_id: i32, reason: []const u8) !void {
+        const trimmed = std.mem.trim(u8, reason, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 500) return error.InvalidBssFailure;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_submissions SET state='failed',last_error=?3,updated_at=unixepoch() WHERE set_id=?1 AND owner_id=?2", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, set_id);
+        _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        _ = c.sqlite3_bind_text(stmt, 3, trimmed.ptr, @intCast(trimmed.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.BssNotOwner;
+    }
+
+    pub fn publishBssSubmission(self: *Store, user_id: i32, set_id: i32, package: *const bss.Package, archive: []const u8, sha256: []const u8) !void {
+        if (archive.len == 0 or archive.len > bss.max_upload_bytes or package.maps.len == 0 or package.maps.len > bss.max_beatmaps or !object_keys.validSha256(sha256)) return error.InvalidBssArchive;
+        if (self.object_store.enabled()) {
+            const object_key = try object_keys.archive(self.allocator, set_id, sha256);
+            defer self.allocator.free(object_key);
+            try self.object_store.put(self.allocator, self.io, object_key, "application/octet-stream", archive);
+        }
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+
+        var submission: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT owner_id,target FROM beatmap_submissions WHERE set_id=?1", -1, &submission, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(submission);
+        _ = c.sqlite3_bind_int(submission, 1, set_id);
+        if (c.sqlite3_step(submission) != c.SQLITE_ROW) return error.BssSubmissionNotFound;
+        if (c.sqlite3_column_int(submission, 0) != user_id) return error.BssNotOwner;
+        const target = bss.Target.parse(std.mem.span(c.sqlite3_column_text(submission, 1))) orelse return error.DatabaseQueryFailed;
+
+        var active_count: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*) FROM beatmap_submission_maps WHERE set_id=?1 AND active=1", -1, &active_count, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(active_count);
+        _ = c.sqlite3_bind_int(active_count, 1, set_id);
+        if (c.sqlite3_step(active_count) != c.SQLITE_ROW or c.sqlite3_column_int64(active_count, 0) != package.maps.len) return error.BssRevisionMismatch;
+
+        var active_map: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM beatmap_submission_maps WHERE set_id=?1 AND beatmap_id=?2 AND active=1", -1, &active_map, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(active_map);
+        const upsert_sql = "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,unixepoch(),?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) ON CONFLICT(id) DO UPDATE SET set_id=excluded.set_id,md5=excluded.md5,artist=excluded.artist,title=excluded.title,version=excluded.version,creator=excluded.creator,status=excluded.status,last_update=excluded.last_update,total_length=excluded.total_length,max_combo=excluded.max_combo,mode=excluded.mode,bpm=excluded.bpm,cs=excluded.cs,ar=excluded.ar,od=excluded.od,hp=excluded.hp,star_rating=excluded.star_rating,source=excluded.source,tags=excluded.tags,osu_file=excluded.osu_file,count_circles=excluded.count_circles,count_sliders=excluded.count_sliders,count_spinners=excluded.count_spinners";
+        var upsert: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, upsert_sql, -1, &upsert, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(upsert);
+        for (package.maps) |map| {
+            if (map.metadata.set_id != set_id) return error.BssRevisionMismatch;
+            _ = c.sqlite3_reset(active_map);
+            _ = c.sqlite3_clear_bindings(active_map);
+            _ = c.sqlite3_bind_int(active_map, 1, set_id);
+            _ = c.sqlite3_bind_int(active_map, 2, map.metadata.id);
+            if (c.sqlite3_step(active_map) != c.SQLITE_ROW) return error.BssRevisionMismatch;
+            _ = c.sqlite3_reset(upsert);
+            _ = c.sqlite3_clear_bindings(upsert);
+            _ = c.sqlite3_bind_int(upsert, 1, map.metadata.id);
+            _ = c.sqlite3_bind_int(upsert, 2, set_id);
+            _ = c.sqlite3_bind_text(upsert, 3, &map.md5, map.md5.len, null);
+            _ = c.sqlite3_bind_text(upsert, 4, map.metadata.artist.ptr, @intCast(map.metadata.artist.len), null);
+            _ = c.sqlite3_bind_text(upsert, 5, map.metadata.title.ptr, @intCast(map.metadata.title.len), null);
+            _ = c.sqlite3_bind_text(upsert, 6, map.metadata.version.ptr, @intCast(map.metadata.version.len), null);
+            _ = c.sqlite3_bind_text(upsert, 7, map.metadata.creator.ptr, @intCast(map.metadata.creator.len), null);
+            _ = c.sqlite3_bind_int(upsert, 8, target.status());
+            _ = c.sqlite3_bind_int(upsert, 9, map.metadata.total_length);
+            _ = c.sqlite3_bind_int64(upsert, 10, map.max_combo);
+            _ = c.sqlite3_bind_int(upsert, 11, map.metadata.mode);
+            _ = c.sqlite3_bind_double(upsert, 12, map.metadata.bpm);
+            _ = c.sqlite3_bind_double(upsert, 13, map.metadata.cs);
+            _ = c.sqlite3_bind_double(upsert, 14, map.metadata.ar);
+            _ = c.sqlite3_bind_double(upsert, 15, map.metadata.od);
+            _ = c.sqlite3_bind_double(upsert, 16, map.metadata.hp);
+            _ = c.sqlite3_bind_double(upsert, 17, map.stars);
+            _ = c.sqlite3_bind_text(upsert, 18, map.metadata.source.ptr, @intCast(map.metadata.source.len), null);
+            _ = c.sqlite3_bind_text(upsert, 19, map.metadata.tags.ptr, @intCast(map.metadata.tags.len), null);
+            _ = c.sqlite3_bind_blob(upsert, 20, map.contents.ptr, @intCast(map.contents.len), null);
+            _ = c.sqlite3_bind_int64(upsert, 21, map.metadata.count_circles);
+            _ = c.sqlite3_bind_int64(upsert, 22, map.metadata.count_sliders);
+            _ = c.sqlite3_bind_int64(upsert, 23, map.metadata.count_spinners);
+            if (c.sqlite3_step(upsert) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
+
+        var archive_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO beatmap_archives(set_id,sha256,osz_file,object_bytes,last_accessed_at) VALUES(?1,?2,?3,?4,unixepoch()) ON CONFLICT(set_id) DO UPDATE SET sha256=excluded.sha256,osz_file=excluded.osz_file,object_bytes=excluded.object_bytes,imported_at=unixepoch(),last_accessed_at=unixepoch()", -1, &archive_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(archive_stmt);
+        _ = c.sqlite3_bind_int(archive_stmt, 1, set_id);
+        _ = c.sqlite3_bind_text(archive_stmt, 2, sha256.ptr, @intCast(sha256.len), null);
+        _ = c.sqlite3_bind_blob(archive_stmt, 3, archive.ptr, @intCast(archive.len), null);
+        _ = c.sqlite3_bind_int64(archive_stmt, 4, @intCast(archive.len));
+        if (c.sqlite3_step(archive_stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+
+        if (target == .pending) {
+            var request: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(?1,?2,?3)", -1, &request, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_bind_int(request, 1, set_id);
+            _ = c.sqlite3_bind_int(request, 2, package.maps[0].metadata.id);
+            _ = c.sqlite3_bind_int(request, 3, user_id);
+            if (c.sqlite3_step(request) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            const inserted = c.sqlite3_changes(self.db) == 1;
+            _ = c.sqlite3_finalize(request);
+            if (inserted) try self.insertBeatmapRankEventLocked(set_id, user_id, "request", target.status(), target.status(), "lazer BSS pending submission");
+        } else {
+            var close_requests: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_rank_requests SET active=0,resolved_at=unixepoch() WHERE set_id=?1 AND active=1", -1, &close_requests, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_bind_int(close_requests, 1, set_id);
+            if (c.sqlite3_step(close_requests) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_finalize(close_requests);
+            var close_nominations: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_nominations SET active=0,updated_at=unixepoch() WHERE set_id=?1 AND active=1", -1, &close_nominations, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_bind_int(close_nominations, 1, set_id);
+            if (c.sqlite3_step(close_nominations) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            _ = c.sqlite3_finalize(close_nominations);
+        }
+        var complete: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_submissions SET state='published',last_error='',updated_at=unixepoch(),uploaded_at=unixepoch() WHERE set_id=?1 AND owner_id=?2", -1, &complete, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(complete);
+        _ = c.sqlite3_bind_int(complete, 1, set_id);
+        _ = c.sqlite3_bind_int(complete, 2, user_id);
+        if (c.sqlite3_step(complete) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.BssRevisionMismatch;
+        try self.exec("COMMIT");
+    }
+
     pub fn upsertBeatmapArchive(self: *Store, set_id: i32, sha256: []const u8, osz_file: []const u8) !void {
         if (!try self.beatmapSetExists(set_id)) return error.UnknownBeatmapSet;
         if (self.object_store.enabled() and object_keys.validSha256(sha256)) {
@@ -5701,7 +6072,7 @@ pub const Store = struct {
         return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4) };
     }
 
-    pub const BeatmapInfo = struct { id: i32, set_id: i32, max_combo: i32, artist: []const u8, title: []const u8, version: []const u8, star_rating: f64 };
+    pub const BeatmapInfo = struct { id: i32, set_id: i32, max_combo: i32, artist: []const u8, title: []const u8, version: []const u8, creator: []const u8, status: i8, star_rating: f64 };
 
     pub fn scoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
         self.mutex.lockUncancelable(self.io);
@@ -5738,7 +6109,7 @@ pub const Store = struct {
         defer self.allocator.free(context.mods_json);
         const filter = try lazer.scoreModFilter(self.allocator, context.mods_json);
         defer filter.deinit(self.allocator);
-        const board_json = try self.lazerLeaderboardJson(self.allocator, context.user_id, context.beatmap_id, context.ruleset_id, context.namespace, filter.exact_json, true, false, filter.stable_bits, 100);
+        const board_json = try self.lazerLeaderboardJson(self.allocator, context.user_id, context.beatmap_id, context.ruleset_id, context.namespace, filter.exact_json, true, false, filter.stable_bits, .global, 100);
         defer self.allocator.free(board_json);
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, board_json, .{});
         defer parsed.deinit();
@@ -5770,27 +6141,36 @@ pub const Store = struct {
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT id,set_id,max_combo,artist,title,version,star_rating FROM beatmaps WHERE md5=?1";
+        const sql = "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating FROM beatmaps WHERE md5=?1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const artist = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+        errdefer allocator.free(artist);
+        const title = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
+        errdefer allocator.free(title);
+        const version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5)));
+        errdefer allocator.free(version);
+        const creator = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 6)));
         return .{
             .id = c.sqlite3_column_int(stmt, 0),
             .set_id = c.sqlite3_column_int(stmt, 1),
             .max_combo = c.sqlite3_column_int(stmt, 2),
-            .artist = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3))),
-            .title = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4))),
-            .version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5))),
-            .star_rating = c.sqlite3_column_double(stmt, 6),
+            .artist = artist,
+            .title = title,
+            .version = version,
+            .creator = creator,
+            .status = @intCast(c.sqlite3_column_int(stmt, 7)),
+            .star_rating = c.sqlite3_column_double(stmt, 8),
         };
     }
 
     pub fn beatmapInfoById(self: *Store, allocator: std.mem.Allocator, map_id: i32) !?BeatmapInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT id,set_id,max_combo,artist,title,version,star_rating FROM beatmaps WHERE id=?1";
+        const sql = "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating FROM beatmaps WHERE id=?1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -5801,7 +6181,9 @@ pub const Store = struct {
         const title = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
         errdefer allocator.free(title);
         const version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5)));
-        return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .max_combo = c.sqlite3_column_int(stmt, 2), .artist = artist, .title = title, .version = version, .star_rating = c.sqlite3_column_double(stmt, 6) };
+        errdefer allocator.free(version);
+        const creator = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 6)));
+        return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .max_combo = c.sqlite3_column_int(stmt, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = @intCast(c.sqlite3_column_int(stmt, 7)), .star_rating = c.sqlite3_column_double(stmt, 8) };
     }
 
     pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {

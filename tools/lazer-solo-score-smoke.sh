@@ -52,14 +52,26 @@ for name in lazer-one lazer-two; do
   expect_status "$code" 201 "register_$name"
 done
 
-sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,total_length,star_rating,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,10,0,90,1.7931,readfile('$repo/src/testdata/synthetic-standard.osu'));"
+sqlite3 "$database" "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo,mode,total_length,star_rating,osu_file) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3,10,0,90,1.7931,readfile('$repo/src/testdata/synthetic-standard.osu')); INSERT INTO user_banners(user_id,object_key,content_type,etag,width,height,updated_at) VALUES(4,'banners/4/profile.jpg','image/jpeg','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',400,400,4242);"
 
 oauth() {
   curl --silent --show-error --request POST "$origin/oauth/token" \
-    --data-urlencode 'grant_type=password' --data-urlencode "username=$1" --data-urlencode 'password=LazerPass123!' | jq -er '.access_token'
+    --data-urlencode 'grant_type=password' --data-urlencode "username=$1" --data-urlencode 'password=LazerPass123!'
 }
-token_one=$(oauth lazer-one)
-token_two=$(oauth lazer-two)
+oauth_one=$(oauth lazer-one)
+oauth_two=$(oauth lazer-two)
+token_one=$(printf '%s' "$oauth_one" | jq -er '.access_token | select(length == 64)')
+refresh_one=$(printf '%s' "$oauth_one" | jq -er '.refresh_token | select(length == 64)')
+token_two=$(printf '%s' "$oauth_two" | jq -er '.access_token | select(length == 64)')
+printf '%s' "$oauth_two" | jq -e '.refresh_token | length == 64' >/dev/null || fail missing_second_refresh_token
+refreshed=$(curl --silent --show-error --request POST "$origin/oauth/token" \
+  --data-urlencode 'grant_type=refresh_token' --data-urlencode "refresh_token=$refresh_one" \
+  --data-urlencode 'client_id=5' --data-urlencode 'client_secret=zigcho-lazer')
+token_one=$(printf '%s' "$refreshed" | jq -er '.access_token | select(length == 64)')
+printf '%s' "$refreshed" | jq -e --arg old "$refresh_one" '.expires_in == 3600 and (.refresh_token | length == 64) and .refresh_token != $old' >/dev/null || fail invalid_refresh_contract
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/oauth/token" \
+  --data-urlencode 'grant_type=refresh_token' --data-urlencode "refresh_token=$refresh_one")
+expect_status "$code" 401 reused_refresh_token
 
 auth_get() {
   code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin$1" --header "Authorization: Bearer $token_one")
@@ -67,7 +79,7 @@ auth_get() {
 }
 
 auth_get /api/v2/me/ me
-jq -e '.statistics_rulesets.osu.play_count == 0 and .avatar_url == "https://a.kai.ovh/4" and .is_supporter == true and .support_level == 1' "$response" >/dev/null || fail invalid_me_contract
+jq -e '.statistics_rulesets.osu.play_count == 0 and .avatar_url == "https://a.kai.ovh/4" and .cover_url == "https://assets.kai.ovh/banners/4/cover.jpg?v=4242" and .cover.url == .cover_url and .is_supporter == true and .support_level == 1' "$response" >/dev/null || fail invalid_me_contract
 auth_get /api/v2/me/osu me_ruleset
 jq -e '.id == 4 and .statistics_rulesets.osu.play_count == 0' "$response" >/dev/null || fail invalid_me_ruleset_contract
 for route in session/verify session/verify/reissue session/verify/mail-fallback; do
@@ -90,7 +102,9 @@ jq -e '.ranking == [] and .spotlight.id == 1 and .spotlight.name == "zigcho!laze
 auth_get /api/v2/wiki/en/zigcho wiki
 jq -e '.layout == "wiki" and .locale == "en" and .path == "zigcho"' "$response" >/dev/null || fail invalid_wiki_contract
 auth_get /api/v2/changelog changelog
-jq -e '(.streams | length) > 0 and (.builds | length) > 0 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
+jq -e '(.streams | length) > 0 and (.builds | length) == 10 and ([.builds[].changelog_entries | length] | add) == 79 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
+auth_get /api/v2/changelog/lazer/2026.809.0 changelog_oldest
+jq -e '(.changelog_entries | length) == 18 and .versions.next.version == "2026.810.0" and .versions.previous == null' "$response" >/dev/null || fail invalid_changelog_navigation
 auth_get /api/v2/notifications notifications
 jq -e '.has_more == false and .notifications == [] and (.notification_endpoint | startswith("wss://"))' "$response" >/dev/null || fail invalid_notifications_contract
 auth_get /api/v2/friends friends
@@ -132,7 +146,7 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
   --header "Authorization: Bearer $token_one" --data-urlencode 'action=unfavourite')
 expect_status "$code" 204 delete_favourite
 auth_get '/api/v2/users/4/osu?key=id' profile_osu
-jq -e '.id == 4 and .statistics.play_count == 0 and .country_code == "XX"' "$response" >/dev/null || fail invalid_profile_contract
+jq -e '.id == 4 and .statistics.play_count == 0 and .country_code == "XX" and .cover_url == "https://assets.kai.ovh/banners/4/cover.jpg?v=4242" and .cover.custom_url == .cover_url' "$response" >/dev/null || fail invalid_profile_contract
 auth_get '/api/v2/users/4/?key=id' profile_default_ruleset
 jq -e '.id == 4 and .statistics.play_count == 0' "$response" >/dev/null || fail invalid_default_profile_contract
 auth_get '/api/v2/users/lazer-one/mania?key=username' profile_mania
@@ -306,6 +320,14 @@ jq -e --argjson id "$vanilla_score_id" '
   .scores[0].has_replay == true and
   .user_score.score.id == $id
 ' "$response" >/dev/null || fail invalid_vanilla_leaderboard_contract
+auth_get '/api/v2/beatmaps/75/scores?type=friend&mode=osu&limit=50' friend_leaderboard
+jq -e '.score_count == 1 and .scores[0].user_id == 4 and .user_score.position == 1' "$response" >/dev/null || fail invalid_friend_leaderboard_contract
+auth_get '/api/v2/beatmaps/75/scores?type=country&mode=osu&limit=50' country_leaderboard
+jq -e '.score_count == 1 and .scores[0].user_id == 4 and .user_score.position == 1' "$response" >/dev/null || fail invalid_country_leaderboard_contract
+auth_get '/api/v2/beatmaps/75/scores?type=team&mode=osu&limit=50' team_leaderboard_without_team
+jq -e '.score_count == 0 and .scores == [] and .user_score == null' "$response" >/dev/null || fail invalid_empty_team_leaderboard_contract
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v2/beatmaps/75/scores?type=local&mode=osu&limit=50" --header "Authorization: Bearer $token_one")
+expect_status "$code" 400 reject_local_leaderboard_scope
 
 auth_get "/api/v2/scores/$vanilla_score_id/download" authenticated_lazer_replay
 [ "$(base64 < "$response" | tr -d '\r\n')" = "$replay_base64" ] || fail authenticated_lazer_replay_mismatch

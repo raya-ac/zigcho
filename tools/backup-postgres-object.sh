@@ -4,8 +4,17 @@ set -eu
 backup_dir=${ZIGCHO_BACKUP_DIR:-/var/backups/zigcho}
 database_url=${ZIGCHO_POSTGRES_URL:-dbname=zigcho}
 admin_url=${ZIGCHO_POSTGRES_ADMIN_URL:-dbname=postgres}
-expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-32}
+expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-}
 current=/opt/zigcho/current
+
+if [ -z "$expected_schema" ]; then
+  expected_schema=$(runuser --user postgres -- \
+    psql --dbname="$database_url" --tuples-only --no-align \
+    --command="SELECT max(version) FROM zigcho.schema_migrations")
+fi
+case "$expected_schema" in
+  ''|*[!0-9]*) echo "could not resolve the live schema version" >&2; exit 1 ;;
+esac
 
 runuser --user postgres -- env \
   ZIGCHO_BACKUP_DIR="$backup_dir" \

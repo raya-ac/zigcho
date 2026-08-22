@@ -31,12 +31,18 @@ pub const key3: i32 = 1 << 27;
 pub const key2: i32 = 1 << 28;
 pub const score_v2: i32 = 1 << 29;
 pub const mirror: i32 = 1 << 30;
+pub const leaderboard_namespace_mask: i32 = relax | autopilot;
+pub const leaderboard_gameplay_mask: i32 = ~leaderboard_namespace_mask;
 
 pub fn canonical(mods: i32) i32 {
     var result = mods;
     if (result & nightcore != 0) result |= double_time;
     if (result & perfect != 0) result |= sudden_death;
     return result;
+}
+
+pub fn leaderboardGameplayBits(mods: i32) i32 {
+    return canonical(mods) & leaderboard_gameplay_mask;
 }
 
 pub fn namespace(mods: i32) []const u8 {
@@ -271,6 +277,12 @@ test "stable np words use the wire mod bits" {
     try std.testing.expectEqual(double_time | nightcore, parseNowPlayingTail(" +Nightcore").?);
     try std.testing.expectEqual(key7 | key_coop, parseNowPlayingTail(" |14K|").?);
     try std.testing.expect(parseNowPlayingTail("") == null);
+}
+
+test "leaderboard gameplay bits do not exact-match the namespace switch" {
+    try std.testing.expectEqual(@as(i32, 0), leaderboardGameplayBits(relax));
+    try std.testing.expectEqual(hidden | double_time, leaderboardGameplayBits(relax | hidden | double_time));
+    try std.testing.expectEqual(hard_rock, leaderboardGameplayBits(autopilot | hard_rock));
 }
 
 test "stable mod labels suppress implied bits" {

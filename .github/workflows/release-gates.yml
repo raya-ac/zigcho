@@ -1,0 +1,112 @@
+name: release gates
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - src/**
+      - database/**
+      - pp/**
+      - deploy/Dockerfile.build
+      - deploy/certbot/**
+      - deploy/stunnel/**
+      - deploy/systemd/**
+      - tools/activate-release.sh
+      - tools/backup-postgres.sh
+      - tools/backup-postgres-object.sh
+      - tools/restore-postgres-drill.sh
+      - build.zig
+      - build.zig.zon
+      - changelog_module.zig
+      - updates/**
+      - .github/workflows/release-gates.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x64:
+    name: pinned linux x64 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: zigcho
+          POSTGRES_USER: zigcho
+          POSTGRES_PASSWORD: zigcho-gate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zigcho -d zigcho"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: build with the pinned production container
+        run: docker build --file deploy/Dockerfile.build --tag zigcho-release-gate:${GITHUB_SHA} .
+
+      - name: extract and verify the release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/server
+          container=$(docker create "zigcho-release-gate:${GITHUB_SHA}")
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/out/." artifacts/server
+          test -x artifacts/server/zigcho
+          test -x artifacts/server/zigcho-import
+          test -x artifacts/server/zigcho-import-archive
+          test -x artifacts/server/zigcho-migrate-postgres
+          test -s artifacts/server/pp-engine-version
+          file artifacts/server/zigcho | grep -F 'ELF 64-bit LSB pie executable, x86-64' >/dev/null
+          if test -n "$(find artifacts/server -type f -name '*.pdb' -print -quit)"; then
+            exit 1
+          fi
+
+      - name: boot the exact binary on PostgreSQL
+        shell: bash
+        env:
+          ZIGCHO_POSTGRES_URL: host=127.0.0.1 port=5432 dbname=zigcho user=zigcho password=zigcho-gate connect_timeout=5
+          PGPASSWORD: zigcho-gate
+        run: |
+          set -euo pipefail
+          artifacts/server/zigcho check
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 34
+          artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' EXIT
+          ready=no
+          for attempt in $(seq 1 30); do
+            health=$(curl --fail --silent --show-error http://127.0.0.1:18099/health || true)
+            if [[ "$health" == *'"ok":true'* ]]; then
+              ready=yes
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = yes
+          bot=$(curl --fail --silent --show-error -H 'Host: kai.ovh' 'http://127.0.0.1:18099/api/v1/users/kai?source=all&mode=0')
+          [[ "$bot" == *'"is_bot":true'* ]]
+          kill "$server_pid"
+          wait "$server_pid" || true
+          trap - EXIT
+          sha256sum artifacts/server/zigcho > artifacts/server/zigcho.sha256
+
+      - name: upload the deployable release
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-linux-x64-${{ github.sha }}
+          path: artifacts/server
+          if-no-files-found: error
+          retention-days: 30

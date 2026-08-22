@@ -68,7 +68,7 @@ fn writeUserCore(writer: *std.Io.Writer, user: domain.User) !void {
     try writer.writeAll(",\"cover_url\":");
     if (user.banner_version > 0) {
         var cover_buf: [128]u8 = undefined;
-        const cover_url = try std.fmt.bufPrint(&cover_buf, "https://assets.kai.ovh/banners/{d}?v={d}", .{ user.id, user.banner_version });
+        const cover_url = try std.fmt.bufPrint(&cover_buf, "https://assets.kai.ovh/banners/{d}/cover.jpg?v={d}", .{ user.id, user.banner_version });
         try std.json.Stringify.value(cover_url, .{}, writer);
         try writer.writeAll(",\"cover\":{\"custom_url\":");
         try std.json.Stringify.value(cover_url, .{}, writer);
@@ -81,13 +81,17 @@ fn writeUserCore(writer: *std.Io.Writer, user: domain.User) !void {
     try writer.writeAll(",\"team\":");
     if (user.team) |team| {
         var flag_buf: [160]u8 = undefined;
-        const flag_url = try std.fmt.bufPrint(&flag_buf, "https://assets.kai.ovh/teams/{d}/flag?v={d}", .{ team.id, team.flag_version });
         try writer.print("{{\"id\":{d},\"name\":", .{team.id});
         try std.json.Stringify.value(team.name(), .{}, writer);
         try writer.writeAll(",\"short_name\":");
         try std.json.Stringify.value(team.shortName(), .{}, writer);
         try writer.writeAll(",\"flag_url\":");
-        try std.json.Stringify.value(flag_url, .{}, writer);
+        if (team.flag_version > 0) {
+            const flag_url = try std.fmt.bufPrint(&flag_buf, "https://assets.kai.ovh/teams/{d}/flag?v={d}", .{ team.id, team.flag_version });
+            try std.json.Stringify.value(flag_url, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
         try writer.writeByte('}');
     } else {
         try writer.writeAll("null");
@@ -252,6 +256,17 @@ pub fn profileOwned(allocator: std.mem.Allocator, user: domain.User, stats: ?dom
     return output.toOwnedSlice();
 }
 
+pub fn siteBotProfileOwned(allocator: std.mem.Allocator, user: domain.User) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.print("{{\"id\":{d},\"name\":", .{user.id});
+    try std.json.Stringify.value(user.name, .{}, &output.writer);
+    try output.writer.writeAll(",\"country\":\"XX\",\"privileges\":");
+    try output.writer.print("{d}", .{user.privileges});
+    try output.writer.writeAll(",\"created_at\":0,\"bio\":\"this is kai, the server bot.\",\"profile_source\":\"all\",\"preferred_mode\":0,\"avatar_version\":0,\"profile_title\":\"bot account\",\"profile_pronouns\":\"\",\"profile_location\":\"\",\"profile_website\":\"\",\"profile_accent\":\"bot\",\"banner_url\":null,\"team\":null,\"is_bot\":true,\"stats_public\":false,\"recent_scores_public\":false,\"selected_source\":\"all\",\"stats_source\":\"combined\",\"selected_mode\":0,\"selected_stats\":null,\"stats\":[],\"pinned_scores\":[],\"top_scores\":[],\"recent_scores\":[],\"first_place_count\":0,\"first_place_scores\":[],\"achievements\":[]}");
+    return output.toOwnedSlice();
+}
+
 test "user JSON escapes imported names" {
     var buffer: [512]u8 = undefined;
     const registration_json = try registration(&buffer, 4, "raya\"},\"admin\":true");
@@ -270,6 +285,28 @@ test "user JSON escapes imported names" {
     var parsed_country = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, imported_country_json, .{});
     defer parsed_country.deinit();
     try std.testing.expectEqualStrings("\"\\", parsed_country.value.object.get("country_code").?.string);
+}
+
+test "website bot profile contains identity without player data" {
+    const json = try siteBotProfileOwned(std.testing.allocator, .{
+        .id = 3,
+        .name = "kai",
+        .safe_name = "kai",
+        .privileges = 24579,
+    });
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 3), object.get("id").?.integer);
+    try std.testing.expectEqualStrings("kai", object.get("name").?.string);
+    try std.testing.expect(object.get("is_bot").?.bool);
+    try std.testing.expect(!object.get("stats_public").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), object.get("stats").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), object.get("pinned_scores").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), object.get("top_scores").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), object.get("recent_scores").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), object.get("achievements").?.array.items.len);
 }
 
 test "lazer profile JSON owns ruleset stats and role flags" {
@@ -299,7 +336,7 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqual(@as(i64, 1), object.get("support_level").?.integer);
     try std.testing.expect(object.get("is_bng").?.bool);
     try std.testing.expect(object.get("is_admin").?.bool);
-    try std.testing.expectEqualStrings("https://assets.kai.ovh/banners/4?v=42", object.get("cover_url").?.string);
+    try std.testing.expectEqualStrings("https://assets.kai.ovh/banners/4/cover.jpg?v=42", object.get("cover_url").?.string);
     try std.testing.expectEqual(@as(i64, 7), object.get("team").?.object.get("id").?.integer);
     try std.testing.expectEqualStrings("KAI", object.get("team").?.object.get("short_name").?.string);
     try std.testing.expectEqual(@as(i64, 424), object.get("statistics").?.object.get("pp").?.integer);

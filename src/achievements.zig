@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const legacy_count = 83;
 pub const official_count = 109;
-pub const count = 229;
+pub const count = official_count;
 
 pub const Achievement = struct {
     id: u16,
@@ -158,71 +158,43 @@ const official_extra_catalog = [_]Achievement{
     .{ .id = 229, .file = "osu-skill-cyclone", .name = "Cyclone", .description = "Clockwise or anticlockwise, that is the question." },
 };
 
-pub const catalog = blk: {
-    @setEvalBranchQuota(250_000);
-    var result: [count]Achievement = undefined;
-    for (legacy_catalog, 0..) |achievement, index| result[index] = achievement;
-    const modes = [_][]const u8{ "osu", "taiko", "catch", "mania" };
-    var id: u16 = legacy_count + 1;
-    for (modes) |mode| for (11..16) |level| {
-        result[id - 1] = .{
-            .id = id,
-            .file = std.fmt.comptimePrint("kai-{s}-pass-{d}", .{ mode, level }),
-            .name = std.fmt.comptimePrint("{s} {d} star clear", .{ mode, level }),
-            .description = std.fmt.comptimePrint("clear a ranked {s} map between {d} and {d} stars.", .{ mode, level, level + 1 }),
-        };
-        id += 1;
-    };
-    for (modes) |mode| for (9..16) |level| {
-        result[id - 1] = .{
-            .id = id,
-            .file = std.fmt.comptimePrint("kai-{s}-fc-{d}", .{ mode, level }),
-            .name = std.fmt.comptimePrint("{s} {d} star full combo", .{ mode, level }),
-            .description = std.fmt.comptimePrint("full combo a ranked {s} map between {d} and {d} stars.", .{ mode, level, level + 1 }),
-        };
-        id += 1;
-    };
-    const accuracy_names = [_][]const u8{ "90", "95", "97", "98", "99", "99.5", "100" };
-    for (modes) |mode| for (accuracy_names) |accuracy| {
-        result[id - 1] = .{
-            .id = id,
-            .file = std.fmt.comptimePrint("kai-{s}-accuracy-{s}", .{ mode, accuracy }),
-            .name = std.fmt.comptimePrint("{s} {s}%", .{ mode, accuracy }),
-            .description = std.fmt.comptimePrint("pass a ranked {s} map with at least {s}% accuracy.", .{ mode, accuracy }),
-        };
-        id += 1;
-    };
-    const pp_levels = [_]u16{ 25, 50, 100, 150, 200, 300, 400, 500, 750, 1000 };
-    for (modes) |mode| for (pp_levels) |pp| {
-        result[id - 1] = .{
-            .id = id,
-            .file = std.fmt.comptimePrint("kai-{s}-pp-{d}", .{ mode, pp }),
-            .name = std.fmt.comptimePrint("{s} {d}pp", .{ mode, pp }),
-            .description = std.fmt.comptimePrint("set a ranked {s} score worth at least {d}pp.", .{ mode, pp }),
-        };
-        id += 1;
-    };
-    const combo_levels = [_]u16{ 3000, 5000, 7500, 10_000 };
-    for (combo_levels) |combo| {
-        result[id - 1] = .{
-            .id = id,
-            .file = std.fmt.comptimePrint("kai-osu-combo-{d}", .{combo}),
-            .name = std.fmt.comptimePrint("{d} Combo", .{combo}),
-            .description = std.fmt.comptimePrint("hold a {d} combo on a ranked osu! map.", .{combo}),
-        };
-        id += 1;
-    }
-    for (official_extra_catalog) |achievement| {
-        result[id - 1] = achievement;
-        id += 1;
-    }
-    if (id != count + 1) @compileError("achievement catalogue count is stale");
-    break :blk result;
-};
+pub const catalog = legacy_catalog ++ official_extra_catalog;
 
 pub fn byId(id: u16) ?Achievement {
-    if (id == 0 or id > catalog.len) return null;
-    return catalog[id - 1];
+    for (catalog) |achievement| if (achievement.id == id) return achievement;
+    return null;
+}
+
+pub fn modeFor(achievement: Achievement) ?[]const u8 {
+    const slug = achievement.file;
+    if (std.mem.startsWith(u8, slug, "osu-")) return "osu";
+    if (std.mem.startsWith(u8, slug, "taiko-")) return "taiko";
+    if (std.mem.startsWith(u8, slug, "fruits-")) return "fruits";
+    if (std.mem.startsWith(u8, slug, "mania-")) return "mania";
+    return null;
+}
+
+pub fn groupingFor(achievement: Achievement) []const u8 {
+    if (std.mem.indexOf(u8, achievement.file, "-intro-") != null) return "Mod Introduction";
+    return "Skill & Dedication";
+}
+
+pub fn orderingFor(achievement: Achievement) u16 {
+    const slug = achievement.file;
+    if (std.mem.indexOf(u8, slug, "-skill-pass-") != null or std.mem.indexOf(u8, slug, "-pass-") != null) return 10;
+    if (std.mem.indexOf(u8, slug, "-skill-fc-") != null or std.mem.indexOf(u8, slug, "-fc-") != null) return 20;
+    if (std.mem.indexOf(u8, slug, "-accuracy-") != null) return 30;
+    if (std.mem.indexOf(u8, slug, "-pp-") != null) return 40;
+    if (std.mem.indexOf(u8, slug, "-combo-") != null) return 50;
+    if (std.mem.indexOf(u8, slug, "-plays-") != null or std.mem.indexOf(u8, slug, "-hits-") != null) return 60;
+    if (std.mem.indexOf(u8, slug, "-highranker-") != null) return 70;
+    if (std.mem.indexOf(u8, slug, "-dc-") != null) return 80;
+    if (std.mem.indexOf(u8, slug, "-intro-") != null) return 100;
+    return 90;
+}
+
+pub fn writeIconUrl(writer: *std.Io.Writer, achievement: Achievement) !void {
+    try writer.print("https://assets.ppy.sh/medals/web/{s}.png", .{achievement.file});
 }
 
 fn starLevel(input: Input, mode: u8, level: u8, requires_perfect: bool) bool {
@@ -261,28 +233,6 @@ pub fn matches(id: u16, input: Input) bool {
         83 => input.mode == 0 and input.mods == 4_096,
         else => false,
     };
-    if (id >= 84 and id <= 103) {
-        const offset = id - 84;
-        return starLevel(input, @intCast(offset / 5), @intCast(11 + offset % 5), false);
-    }
-    if (id >= 104 and id <= 131) {
-        const offset = id - 104;
-        return starLevel(input, @intCast(offset / 7), @intCast(9 + offset % 7), true);
-    }
-    if (id >= 132 and id <= 159) {
-        const thresholds = [_]f64{ 0.90, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0 };
-        const offset = id - 132;
-        return input.mode == @as(u8, @intCast(offset / 7)) and input.accuracy >= thresholds[offset % 7];
-    }
-    if (id >= 160 and id <= 199) {
-        const thresholds = [_]f64{ 25, 50, 100, 150, 200, 300, 400, 500, 750, 1000 };
-        const offset = id - 160;
-        return input.mode == @as(u8, @intCast(offset / 10)) and input.pp >= thresholds[offset % 10];
-    }
-    if (id >= 200 and id <= 203) {
-        const thresholds = [_]u32{ 3000, 5000, 7500, 10_000 };
-        return input.mode == 0 and input.max_combo >= thresholds[id - 200];
-    }
     if (id >= 204 and id <= 207) {
         const thresholds = [_]i64{ 50_000, 10_000, 5_000, 1_000 };
         return input.global_rank > 0 and input.global_rank <= thresholds[id - 204];
@@ -322,16 +272,27 @@ pub fn writeStable(writer: *std.Io.Writer, unlocks: Unlocks) !void {
     }
 }
 
-pub fn writeJson(writer: *std.Io.Writer, id: u16, achieved_at: i64, include_metadata: bool) !void {
+pub fn writeJson(writer: *std.Io.Writer, id: u16, achieved_at: []const u8, achieved_count: i64, user_count: i64, include_metadata: bool) !void {
     const achievement = byId(id) orelse return error.InvalidAchievement;
-    try writer.print("{{\"achievement_id\":{d},\"achieved_at\":{d}", .{ id, achieved_at });
+    try writer.print("{{\"achievement_id\":{d},\"achieved_at\":", .{id});
+    try std.json.Stringify.value(achieved_at, .{}, writer);
     if (include_metadata) {
         try writer.writeAll(",\"file\":");
+        try std.json.Stringify.value(achievement.file, .{}, writer);
+        try writer.writeAll(",\"slug\":");
         try std.json.Stringify.value(achievement.file, .{}, writer);
         try writer.writeAll(",\"name\":");
         try std.json.Stringify.value(achievement.name, .{}, writer);
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(achievement.description, .{}, writer);
+        try writer.writeAll(",\"grouping\":");
+        try std.json.Stringify.value(groupingFor(achievement), .{}, writer);
+        try writer.print(",\"ordering\":{d},\"mode\":", .{orderingFor(achievement)});
+        if (modeFor(achievement)) |mode| try std.json.Stringify.value(mode, .{}, writer) else try writer.writeAll("null");
+        try writer.writeAll(",\"instructions\":null,\"icon_url\":\"");
+        try writeIconUrl(writer, achievement);
+        try writer.print("\",\"achieved_count\":{d},\"achieved_percent\":", .{achieved_count});
+        if (user_count > 0) try writer.print("{d:.8}", .{@as(f64, @floatFromInt(achieved_count)) / @as(f64, @floatFromInt(user_count))}) else try writer.writeAll("null");
     }
     try writer.writeByte('}');
 }
@@ -343,7 +304,11 @@ pub fn writeLazerUnlocks(writer: *std.Io.Writer, unlocks: Unlocks, user_id: i32)
         const achievement = byId(id) orelse continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try writer.print("{{\"achievement_id\":{d},\"achievement_mode\":null,\"cover_url\":\"\",\"slug\":", .{id});
+        try writer.print("{{\"achievement_id\":{d},\"achievement_mode\":", .{id});
+        if (modeFor(achievement)) |mode| try std.json.Stringify.value(mode, .{}, writer) else try writer.writeAll("null");
+        try writer.writeAll(",\"cover_url\":\"");
+        try writeIconUrl(writer, achievement);
+        try writer.writeAll("\",\"slug\":");
         try std.json.Stringify.value(achievement.file, .{}, writer);
         try writer.writeAll(",\"title\":");
         try std.json.Stringify.value(achievement.name, .{}, writer);
@@ -354,11 +319,13 @@ pub fn writeLazerUnlocks(writer: *std.Io.Writer, unlocks: Unlocks, user_id: i32)
     try writer.writeByte(']');
 }
 
-test "catalog is dense and compatible conditions stay bounded" {
+test "catalog contains only official achievements and compatible conditions stay bounded" {
     try std.testing.expectEqual(@as(usize, count), catalog.len);
-    for (catalog, 1..) |achievement, id| try std.testing.expectEqual(@as(u16, @intCast(id)), achievement.id);
+    for (catalog) |achievement| try std.testing.expect(!std.mem.startsWith(u8, achievement.file, "kai-"));
+    try std.testing.expect(byId(84) == null);
+    try std.testing.expectEqualStrings("I Can See The Top", byId(204).?.name);
     const unlocks = candidates(.{ .eligible = true, .mode = 0, .mods = 8, .perfect = true, .max_combo = 750, .stars = 4.2, .accuracy = 0.99, .pp = 210 });
-    try std.testing.expectEqualSlices(u16, &.{ 4, 14, 21, 22, 74, 132, 133, 134, 135, 136, 160, 161, 162, 163, 164 }, unlocks.slice());
+    try std.testing.expectEqualSlices(u16, &.{ 4, 14, 21, 22, 74 }, unlocks.slice());
     try std.testing.expectEqual(@as(usize, 0), candidates(.{ .eligible = false, .mode = 0, .mods = 8, .perfect = true, .max_combo = 750, .stars = 4.2 }).slice().len);
 }
 
@@ -381,4 +348,19 @@ test "stable unlock text is exact and JSON escapes metadata" {
     unlocks.append(74);
     try writeStable(&stable_writer, unlocks);
     try std.testing.expectEqualStrings("osu-skill-pass-1+Rising Star+Can't go forward without the first steps./all-intro-hidden+Blindsight+I can see just perfectly", stable[0..stable_writer.end]);
+
+    var json_buffer: [1024]u8 = undefined;
+    var json_writer = std.Io.Writer.fixed(&json_buffer);
+    try writeJson(&json_writer, 1, "2026-08-23T01:02:03Z", 5, 20, true);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_buffer[0..json_writer.end], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("2026-08-23T01:02:03Z", parsed.value.object.get("achieved_at").?.string);
+    try std.testing.expectEqualStrings("Skill & Dedication", parsed.value.object.get("grouping").?.string);
+    try std.testing.expectEqualStrings("https://assets.ppy.sh/medals/web/osu-skill-pass-1.png", parsed.value.object.get("icon_url").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.value.object.get("achieved_percent").?.float, 0.000001);
+
+    var lazer_buffer: [1024]u8 = undefined;
+    var lazer_writer = std.Io.Writer.fixed(&lazer_buffer);
+    try writeLazerUnlocks(&lazer_writer, unlocks, 4);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_buffer[0..lazer_writer.end], "\"cover_url\":\"https://assets.ppy.sh/medals/web/osu-skill-pass-1.png\"") != null);
 }

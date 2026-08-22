@@ -572,6 +572,37 @@ CREATE TABLE beatmap_media (
 );
 CREATE INDEX beatmap_media_lru ON beatmap_media(last_accessed_at, fetched_at, set_id, kind);
 
+CREATE TABLE beatmap_submissions (
+    set_id integer PRIMARY KEY CHECK (set_id >= 100000000),
+    owner_id integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    target text NOT NULL CHECK (target IN ('WIP', 'Pending')),
+    notify_replies boolean NOT NULL DEFAULT false,
+    state text NOT NULL DEFAULT 'reserved' CHECK (state IN ('reserved', 'published', 'failed')),
+    revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
+    last_error text NOT NULL DEFAULT '' CHECK (length(last_error) <= 500),
+    created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    uploaded_at bigint
+);
+CREATE INDEX beatmap_submissions_owner_time ON beatmap_submissions(owner_id, updated_at DESC, set_id DESC);
+CREATE INDEX beatmap_submissions_state_time ON beatmap_submissions(state, updated_at, set_id);
+
+CREATE TABLE beatmap_submission_maps (
+    set_id integer NOT NULL REFERENCES beatmap_submissions(set_id) ON DELETE CASCADE,
+    beatmap_id integer NOT NULL UNIQUE CHECK (beatmap_id >= 100000000),
+    active boolean NOT NULL DEFAULT true,
+    position integer NOT NULL CHECK (position >= 0),
+    created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY (set_id, beatmap_id)
+);
+CREATE INDEX beatmap_submission_maps_active ON beatmap_submission_maps(set_id, active, position, beatmap_id);
+
+CREATE TABLE bss_counters (
+    kind text PRIMARY KEY CHECK (kind IN ('set', 'beatmap')),
+    next_id integer NOT NULL CHECK (next_id >= 100000000)
+);
+INSERT INTO bss_counters(kind, next_id) VALUES('set', 100000000), ('beatmap', 100000000);
+
 INSERT INTO custom_mods(acronym,name,description,ranked,score_multiplier,settings_schema)
 VALUES('RX','Relax','Server-side cursor relax; clicks are generated automatically.',true,0,'{"type":"object","additionalProperties":false}'::jsonb);
 
@@ -583,4 +614,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (33);
+INSERT INTO schema_migrations(version) VALUES (34);

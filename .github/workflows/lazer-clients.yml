@@ -1,0 +1,314 @@
+name: lazer clients
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - client/lazer/**
+      - .github/workflows/lazer-clients.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lazer-clients-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OSU_REVISION: 12df2e4ff254975f4b66ae9efda808837ee9beea
+  CLIENT_TEST_FILTER: FullyQualifiedName~TrustedDomainOnlineStoreTest|FullyQualifiedName~PollingChatClientTest|FullyQualifiedName~ZigchoLeaderboardAvailabilityTest|FullyQualifiedName~ZigchoLeaderboardModsTest|FullyQualifiedName~ZigchoRealtimeServicePolicyTest|FullyQualifiedName~ZigchoScoreResponseTest
+
+jobs:
+  client-tests:
+    name: patch and client tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: ${{ env.OSU_REVISION }}
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: apply and test the client changes
+        run: |
+          client/lazer/apply-endpoints.sh work/osu-client
+          git -C work/osu-client diff --check
+          dotnet test work/osu-client/osu.Game.Tests/osu.Game.Tests.csproj -c Release --filter "$CLIENT_TEST_FILTER"
+
+      - name: verify player-facing identity
+        run: |
+          grep -Fq 'zigcho!lazer' work/osu-client/osu.Game/Overlays/DevBuildBanner.cs
+          grep -Fq 'ovh.kai.zigcholazer' work/osu-client/osu.Android/AndroidManifest.xml
+          grep -Fq 'ovh.kai.zigcholazer' work/osu-client/osu.iOS/Info.plist
+          if grep -R -n -E 'DEVELOPER BUILD|osu! \(development\)' work/osu-client/osu.Game work/osu-client/osu.Desktop; then
+            exit 1
+          fi
+
+  windows-x64:
+    name: windows x64
+    needs: client-tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: ${{ env.OSU_REVISION }}
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: install python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: build and verify the portable client
+        shell: pwsh
+        run: ./client/lazer/build-windows.ps1 -Checkout work/osu-client -OutputDirectory artifacts/lazer
+
+      - name: upload the Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-lazer-windows-x64
+          path: artifacts/lazer/*windows-x64*
+          if-no-files-found: error
+          retention-days: 30
+
+  macos-arm64:
+    name: macos arm64
+    needs: client-tests
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: ${{ env.OSU_REVISION }}
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: build and verify the portable client
+        shell: bash
+        run: |
+          set -euo pipefail
+          client/lazer/apply-endpoints.sh work/osu-client
+          version=$(tr -d '\r\n' < client/lazer/client-version.txt)
+          numeric=${version%%-*}.0
+          publish="$RUNNER_TEMP/zigcho-lazer-macos-arm64"
+          dotnet publish work/osu-client/osu.Desktop/osu.Desktop.csproj \
+            -c Release -r osx-arm64 --self-contained true -o "$publish" \
+            -p:Version="$version" -p:FileVersion="$numeric" -p:AssemblyVersion="$numeric" \
+            -p:InformationalVersion="$version+zigcho.${GITHUB_SHA:0:8}.osu.${OSU_REVISION:0:8}" \
+            -p:DebugType=None -p:DebugSymbols=false
+          python3 client/lazer/package-desktop.py \
+            --publish-dir "$publish" --output-dir artifacts/lazer --runtime macos-arm64 \
+            --version "$version" --zigcho-revision "$GITHUB_SHA" --osu-revision "$OSU_REVISION" \
+            --zigcho-license LICENSE --osu-license work/osu-client/LICENCE
+
+      - name: upload the macOS package
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-lazer-macos-arm64
+          path: artifacts/lazer/*macos-arm64*
+          if-no-files-found: error
+          retention-days: 30
+
+  linux-x64:
+    name: linux x64
+    needs: client-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: ${{ env.OSU_REVISION }}
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: build and verify the portable client
+        run: |
+          set -euo pipefail
+          client/lazer/apply-endpoints.sh work/osu-client
+          version=$(tr -d '\r\n' < client/lazer/client-version.txt)
+          numeric=${version%%-*}.0
+          publish="$RUNNER_TEMP/zigcho-lazer-linux-x64"
+          dotnet publish work/osu-client/osu.Desktop/osu.Desktop.csproj \
+            -c Release -r linux-x64 --self-contained true -o "$publish" \
+            -p:Version="$version" -p:FileVersion="$numeric" -p:AssemblyVersion="$numeric" \
+            -p:InformationalVersion="$version+zigcho.${GITHUB_SHA:0:8}.osu.${OSU_REVISION:0:8}" \
+            -p:DebugType=None -p:DebugSymbols=false
+          python3 client/lazer/package-desktop.py \
+            --publish-dir "$publish" --output-dir artifacts/lazer --runtime linux-x64 \
+            --version "$version" --zigcho-revision "$GITHUB_SHA" --osu-revision "$OSU_REVISION" \
+            --zigcho-license LICENSE --osu-license work/osu-client/LICENCE
+
+      - name: upload the Linux package
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-lazer-linux-x64
+          path: artifacts/lazer/*linux-x64*
+          if-no-files-found: error
+          retention-days: 30
+
+  android-arm64:
+    name: android arm64
+    needs: client-tests
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: ${{ env.OSU_REVISION }}
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: microsoft
+          java-version: "17"
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: install python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: install the Android workload
+        run: dotnet workload install android
+
+      - name: build and verify the APK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./client/lazer/apply-endpoints.ps1 -Checkout work/osu-client
+          $Version = (Get-Content -Raw client/lazer/client-version.txt).Trim()
+          dotnet publish work/osu-client/osu.Android/osu.Android.csproj `
+            -c Release -f net8.0-android -r android-arm64 `
+            "-p:Version=$Version" "-p:ApplicationDisplayVersion=$Version" `
+            "-p:ApplicationVersion=$env:GITHUB_RUN_NUMBER" `
+            -p:AndroidPackageFormats=apk -p:AndroidKeyStore=false `
+            -p:DebugType=None -p:DebugSymbols=false
+          if ($LASTEXITCODE -ne 0) { throw "Android publish failed" }
+          $Apk = Get-ChildItem work/osu-client/osu.Android/bin/Release/net8.0-android -Recurse -File -Filter *-Signed.apk | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $Apk) {
+            $Apk = Get-ChildItem work/osu-client/osu.Android/bin/Release/net8.0-android -Recurse -File -Filter *.apk | Sort-Object Length -Descending | Select-Object -First 1
+          }
+          if (-not $Apk) { throw "Android APK missing" }
+          python client/lazer/package-mobile.py android-arm64 `
+            --input $Apk.FullName --output-dir artifacts/lazer --version $Version `
+            --zigcho-revision $env:GITHUB_SHA --osu-revision $env:OSU_REVISION
+          if ($LASTEXITCODE -ne 0) { throw "Android package verification failed" }
+
+      - name: upload the Android package
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-lazer-android-arm64
+          path: artifacts/lazer/*android-arm64*
+          if-no-files-found: error
+          retention-days: 30
+
+  ios-arm64:
+    name: ios arm64 unsigned
+    needs: client-tests
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: check out pinned osu client
+        uses: actions/checkout@v6
+        with:
+          repository: ppy/osu
+          ref: ${{ env.OSU_REVISION }}
+          path: work/osu-client
+          persist-credentials: false
+
+      - name: install dotnet 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: install the iOS workload
+        run: dotnet workload install ios
+
+      - name: use the Xcode version pinned by upstream osu
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      - name: build and verify the unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          client/lazer/apply-endpoints.sh work/osu-client
+          version=$(tr -d '\r\n' < client/lazer/client-version.txt)
+          dotnet publish work/osu-client/osu.iOS/osu.iOS.csproj \
+            -c Release -f net8.0-ios -r ios-arm64 \
+            -p:Version="$version" -p:ApplicationDisplayVersion="$version" \
+            -p:ApplicationVersion="$GITHUB_RUN_NUMBER" \
+            -p:EnableCodeSigning=false -p:EnableDefaultCodesignEntitlements=false \
+            -p:CodesignRequireProvisioningProfile=false -p:ArchiveOnBuild=false \
+            -p:DebugType=None -p:DebugSymbols=false
+          app=$(find work/osu-client/osu.iOS/bin/Release/net8.0-ios/ios-arm64 -type d -name '*.app' -print -quit)
+          test -n "$app"
+          python3 client/lazer/package-mobile.py ios-arm64 \
+            --input "$app" --output-dir artifacts/lazer --version "$version" \
+            --zigcho-revision "$GITHUB_SHA" --osu-revision "$OSU_REVISION"
+
+      - name: upload the iOS package
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigcho-lazer-ios-arm64
+          path: artifacts/lazer/*ios-arm64*
+          if-no-files-found: error
+          retention-days: 30

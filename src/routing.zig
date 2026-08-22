@@ -17,6 +17,7 @@ pub fn lazerBeatmapMetadata(path: []const u8) bool {
 pub fn websitePage(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/") or
         std.mem.eql(u8, path, "/rankings") or
+        std.mem.eql(u8, path, "/multiplayer") or
         std.mem.eql(u8, path, "/teams") or
         std.mem.eql(u8, path, "/changelog") or
         std.mem.eql(u8, path, "/login") or
@@ -27,6 +28,7 @@ pub fn websitePage(path: []const u8) bool {
     return playerPage(path, "/u/") or
         playerPage(path, "/users/") or
         numericPage(path, "/beatmapsets/") or
+        numericPage(path, "/multiplayer/") or
         numericPage(path, "/teams/");
 }
 
@@ -57,6 +59,8 @@ test "website pages stay limited to real browser routes" {
     try std.testing.expect(websitePage("/users"));
     try std.testing.expect(websitePage("/login"));
     try std.testing.expect(websitePage("/settings"));
+    try std.testing.expect(websitePage("/multiplayer"));
+    try std.testing.expect(websitePage("/multiplayer/42"));
     try std.testing.expect(websitePage("/users/4"));
     try std.testing.expect(websitePage("/u/4"));
     try std.testing.expect(websitePage("/users/raya"));

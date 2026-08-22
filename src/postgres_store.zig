@@ -2559,14 +2559,13 @@ pub const Store = struct {
     pub fn staffLazerReportsJson(self: *Store, allocator: std.mem.Allocator) ![]u8 {
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.query(lease.conn,
-            "SELECT r.id,r.reporter_id,reporter.name,reporter.country,r.reportable_type,r.reportable_id," ++
-                "CASE r.reportable_type WHEN 'user' THEN coalesce((SELECT name FROM zigcho.users WHERE id=r.reportable_id::integer),'missing user') " ++
-                "WHEN 'message' THEN left(coalesce((SELECT message FROM zigcho.chat_messages WHERE id=r.reportable_id),(SELECT message FROM zigcho.direct_messages WHERE id=r.reportable_id),'missing message'),180) " ++
-                "ELSE left(coalesce((SELECT message FROM zigcho.lazer_comments WHERE id=r.reportable_id),'missing comment'),180) END," ++
-                "r.reason,r.comments,r.status,r.created_at,coalesce(r.resolved_at,0),coalesce(resolver.name,'') " ++
-                "FROM zigcho.lazer_reports r JOIN zigcho.users reporter ON reporter.id=r.reporter_id LEFT JOIN zigcho.users resolver ON resolver.id=r.resolver_id " ++
-                "ORDER BY CASE r.status WHEN 'open' THEN 0 ELSE 1 END,r.created_at DESC,r.id DESC LIMIT 300");
+        var result = try postgres.query(lease.conn, "SELECT r.id,r.reporter_id,reporter.name,reporter.country,r.reportable_type,r.reportable_id," ++
+            "CASE r.reportable_type WHEN 'user' THEN coalesce((SELECT name FROM zigcho.users WHERE id=r.reportable_id::integer),'missing user') " ++
+            "WHEN 'message' THEN left(coalesce((SELECT message FROM zigcho.chat_messages WHERE id=r.reportable_id),(SELECT message FROM zigcho.direct_messages WHERE id=r.reportable_id),'missing message'),180) " ++
+            "ELSE left(coalesce((SELECT message FROM zigcho.lazer_comments WHERE id=r.reportable_id),'missing comment'),180) END," ++
+            "r.reason,r.comments,r.status,r.created_at,coalesce(r.resolved_at,0),coalesce(resolver.name,'') " ++
+            "FROM zigcho.lazer_reports r JOIN zigcho.users reporter ON reporter.id=r.reporter_id LEFT JOIN zigcho.users resolver ON resolver.id=r.resolver_id " ++
+            "ORDER BY CASE r.status WHEN 'open' THEN 0 ELSE 1 END,r.created_at DESC,r.id DESC LIMIT 300");
         defer result.deinit();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
@@ -4429,11 +4428,11 @@ pub const Store = struct {
         defer lease.release();
         const sql =
             "WITH ordered AS (" ++
-            "SELECT s.*,b.status,b.set_id,b.id beatmap_id,b.star_rating AS beatmap_star_rating,b.version,b.artist,b.title,b.creator,row_number() OVER(PARTITION BY s.user_id ORDER BY s.score DESC,s.id ASC) AS user_place " ++
-            "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
+            "SELECT s.*,b.status,b.set_id,b.id beatmap_id,b.star_rating AS beatmap_star_rating,b.version,b.artist,b.title,b.creator,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version,row_number() OVER(PARTITION BY s.user_id ORDER BY s.score DESC,s.id ASC) AS user_place " ++
+            "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=$1 AND s.mode=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND NOT u.restricted)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY score DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,id,user_id,(SELECT name FROM zigcho.users WHERE id=board.user_id),(SELECT country FROM zigcho.users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,to_char(to_timestamp(submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),status,set_id,map_md5,beatmap_star_rating,version,artist,title,creator " ++
+            "SELECT position,score_count,id,user_id,(SELECT name FROM zigcho.users WHERE id=board.user_id),(SELECT country FROM zigcho.users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,to_char(to_timestamp(submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),status,set_id,map_md5,beatmap_star_rating,version,artist,title,creator,team_id,team_name,team_short_name,team_flag_version " ++
             "FROM board WHERE position<=$3 OR user_id=$4 ORDER BY position";
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, limit_text, requester });
         defer result.deinit();
@@ -4484,6 +4483,7 @@ pub const Store = struct {
                 .ended_at = result.value(row, 20),
                 .ranked = status == 3 or status == 4,
                 .has_replay = false,
+                .team = if (result.isNull(row, 29)) null else try domain.TeamSummary.init(try result.int(i32, row, 29), result.value(row, 30), result.value(row, 31), try result.int(i64, row, 32)),
                 .beatmap = .{
                     .id = try result.int(i32, row, 6),
                     .set_id = try result.int(i32, row, 22),
@@ -4539,19 +4539,19 @@ pub const Store = struct {
         defer lease.release();
         const sql =
             "WITH candidates AS (" ++
-            "SELECT 'lazer'::text source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order " ++
-            "FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id " ++
+            "SELECT 'lazer'::text source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
+            "FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id " ++
             "WHERE s.beatmap_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND NOT $6::boolean " ++
             "AND (NOT $5::boolean OR (" ++
             "NOT EXISTS(SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE $3!='custom' OR upper(stored.value->>'acronym') NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE $3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
             "AND NOT EXISTS(SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE $3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE $3!='custom' OR upper(stored.value->>'acronym') NOT IN('RX','AP')))) " ++
             "UNION ALL " ++
-            "SELECT 'stable'::text source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{}'::text statistics_json,'{}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order " ++
-            "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
+            "SELECT 'stable'::text source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{}'::text statistics_json,'{}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
+            "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND $3!='custom' AND $7::boolean AND (NOT $5::boolean OR s.mods=$8))," ++
             "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('vanilla','relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace " ++
+            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace,team_id,team_name,team_short_name,team_flag_version " ++
             "FROM board WHERE position<=$9 OR user_id=$10 ORDER BY position";
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, namespace_name, exact_mods_json, filter, classic_only, stable_supported, stable_bits, limit_text, requester });
         defer result.deinit();
@@ -4597,6 +4597,7 @@ pub const Store = struct {
                 .ended_at = result.value(row, 20),
                 .ranked = (try result.int(i32, row, 21)) == 3 or (try result.int(i32, row, 21)) == 4,
                 .has_replay = try result.boolean(row, 22),
+                .team = if (result.isNull(row, 40)) null else try domain.TeamSummary.init(try result.int(i32, row, 40), result.value(row, 41), result.value(row, 42), try result.int(i64, row, 43)),
                 .beatmap = .{
                     .id = try result.int(i32, row, 7),
                     .set_id = try result.int(i32, row, 31),
@@ -5434,6 +5435,10 @@ test "postgres account auth stats and token slice" {
     defer store.close();
     try store.migrate();
     const user_id = try store.register("ari", "ari@example.test", "00000000000000000000000000000000");
+    const team_id = try store.createTeam(user_id, .{ .name = "uwu team", .short_name = "uwu", .url = "", .description = "postgres leaderboard flag", .is_open = true, .default_ruleset_id = 0 });
+    var team_etag: [64]u8 = undefined;
+    @memset(&team_etag, 'b');
+    try store.setTeamAsset(team_id, "flag", "teams/1/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png", "image/png", team_etag, 64, 32);
     const observation_id = try store.recordAnticheatObservation(user_id, .{
         .source = .stable_login,
         .module = "private",
@@ -5549,6 +5554,12 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, classic_lazer_board, "\"score_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, classic_lazer_board, "\"username\":\"ari\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, classic_lazer_board, "\"total_score\":1000000") != null);
+    var parsed_classic_lazer_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, classic_lazer_board, .{});
+    defer parsed_classic_lazer_board.deinit();
+    const classic_team = parsed_classic_lazer_board.value.object.get("scores").?.array.items[0].object.get("user").?.object.get("team").?.object;
+    try std.testing.expectEqual(@as(i64, team_id), classic_team.get("id").?.integer);
+    try std.testing.expectEqualStrings("uwu", classic_team.get("short_name").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, classic_team.get("flag_url").?.string, "https://assets.kai.ovh/teams/"));
     const after_pass = (try store.statsForUser(user_id, 0)).?;
     try std.testing.expectEqual(@as(i64, 1_000_000), after_pass.ranked_score);
     try std.testing.expectEqual(@as(i32, 27), after_pass.pp);
@@ -5800,6 +5811,7 @@ test "postgres account auth stats and token slice" {
     try std.testing.expectEqual(@as(usize, 1), mixed_scores.len);
     try std.testing.expect(mixed_scores[0].object.get("id").?.integer >= lazer.stable_score_id_offset);
     try std.testing.expect(std.mem.indexOf(u8, mixed_client_board, "\"pp\":120") != null);
+    try std.testing.expectEqual(@as(i64, team_id), mixed_scores[0].object.get("user").?.object.get("team").?.object.get("id").?.integer);
     try std.testing.expect(parsed_mixed_client_board.value.object.get("user_score").?.object.get("score").?.object.get("id").?.integer >= lazer.stable_score_id_offset);
     {
         var user_buf: [24]u8 = undefined;

@@ -4222,11 +4222,11 @@ pub const Store = struct {
     fn stableClassicLeaderboardJsonLocked(self: *Store, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, limit: u8) ![]u8 {
         const sql =
             "WITH ordered AS (" ++
-            "SELECT s.*,b.status,b.set_id,b.id beatmap_id,b.star_rating,b.version,b.artist,b.title,b.creator,row_number() OVER(PARTITION BY s.user_id ORDER BY s.score DESC,s.id ASC) AS user_place " ++
-            "FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
+            "SELECT s.*,b.status,b.set_id,b.id beatmap_id,b.star_rating,b.version,b.artist,b.title,b.creator,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version,row_number() OVER(PARTITION BY s.user_id ORDER BY s.score DESC,s.id ASC) AS user_place " ++
+            "FROM scores s JOIN users u ON u.id=s.user_id LEFT JOIN team_members tm ON tm.user_id=u.id LEFT JOIN teams t ON t.id=tm.team_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace='vanilla' AND s.passed=1 AND s.best=1 AND u.restricted=0)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY score DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,id,user_id,(SELECT name FROM users WHERE id=board.user_id),(SELECT country FROM users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,strftime('%Y-%m-%dT%H:%M:%SZ',submitted_at,'unixepoch'),status,set_id,map_md5,star_rating,version,artist,title,creator " ++
+            "SELECT position,score_count,id,user_id,(SELECT name FROM users WHERE id=board.user_id),(SELECT country FROM users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,strftime('%Y-%m-%dT%H:%M:%SZ',submitted_at,'unixepoch'),status,set_id,map_md5,star_rating,version,artist,title,creator,team_id,team_name,team_short_name,team_flag_version " ++
             "FROM board WHERE position<=?3 OR user_id=?4 ORDER BY position";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -4274,6 +4274,7 @@ pub const Store = struct {
                 .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 20)),
                 .ranked = c.sqlite3_column_int(stmt, 21) == 3 or c.sqlite3_column_int(stmt, 21) == 4,
                 .has_replay = false,
+                .team = if (c.sqlite3_column_type(stmt, 29) == c.SQLITE_NULL) null else try domain.TeamSummary.init(c.sqlite3_column_int(stmt, 29), std.mem.span(c.sqlite3_column_text(stmt, 30)), std.mem.span(c.sqlite3_column_text(stmt, 31)), c.sqlite3_column_int64(stmt, 32)),
                 .beatmap = .{
                     .id = c.sqlite3_column_int(stmt, 6),
                     .set_id = c.sqlite3_column_int(stmt, 22),
@@ -4318,19 +4319,19 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
         const sql =
             "WITH candidates AS (" ++
-            "SELECT 'lazer' source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,s.passed=1 AND length(s.replay)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,0 perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order " ++
-            "FROM lazer_scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id " ++
+            "SELECT 'lazer' source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json,s.statistics_json,s.maximum_statistics_json,s.pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,s.passed=1 AND length(s.replay)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,0 perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
+            "FROM lazer_scores s JOIN users u ON u.id=s.user_id LEFT JOIN team_members tm ON tm.user_id=u.id LEFT JOIN teams t ON t.id=tm.team_id JOIN beatmaps b ON b.id=s.beatmap_id " ++
             "WHERE s.beatmap_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?6=0 " ++
             "AND (?5=0 OR (" ++
             "NOT EXISTS(SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
             "AND NOT EXISTS(SELECT upper(value) FROM json_each(?4) WHERE ?3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(json_extract(stored.value,'$.acronym')) FROM json_each(s.mods_json) stored WHERE ?3!='custom' OR upper(json_extract(stored.value,'$.acronym')) NOT IN('RX','AP')))) " ++
             "UNION ALL " ++
-            "SELECT 'stable' source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{}' statistics_json,'{}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,s.passed=1 AND length(s.replay)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order " ++
-            "FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
+            "SELECT 'stable' source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,'' rank,'[]' mods_json,'{}' statistics_json,'{}' maximum_statistics_json,'[]' pauses_json,strftime('%Y-%m-%dT%H:%M:%SZ',s.submitted_at,'unixepoch') ended_at,b.status,s.passed=1 AND length(s.replay)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
+            "FROM scores s JOIN users u ON u.id=s.user_id LEFT JOIN team_members tm ON tm.user_id=u.id LEFT JOIN teams t ON t.id=tm.team_id JOIN beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND u.restricted=0 AND ?3!='custom' AND ?7=1 AND (?5=0 OR s.mods=?8))," ++
             "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('vanilla','relax','autopilot') THEN pp ELSE total_score END DESC,source_order,source_id) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace " ++
+            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace,team_id,team_name,team_short_name,team_flag_version " ++
             "FROM board WHERE position<=?9 OR user_id=?10 ORDER BY position";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -4388,6 +4389,7 @@ pub const Store = struct {
                 .ended_at = std.mem.span(c.sqlite3_column_text(stmt, 20)),
                 .ranked = c.sqlite3_column_int(stmt, 21) == 3 or c.sqlite3_column_int(stmt, 21) == 4,
                 .has_replay = c.sqlite3_column_int(stmt, 22) != 0,
+                .team = if (c.sqlite3_column_type(stmt, 40) == c.SQLITE_NULL) null else try domain.TeamSummary.init(c.sqlite3_column_int(stmt, 40), std.mem.span(c.sqlite3_column_text(stmt, 41)), std.mem.span(c.sqlite3_column_text(stmt, 42)), c.sqlite3_column_int64(stmt, 43)),
                 .beatmap = .{
                     .id = c.sqlite3_column_int(stmt, 7),
                     .set_id = c.sqlite3_column_int(stmt, 31),

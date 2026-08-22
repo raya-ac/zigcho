@@ -4613,7 +4613,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
-    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00'); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper')");
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00'); INSERT INTO teams(id,name,short_name,leader_id) VALUES(7,'uwu team','uwu',1); INSERT INTO team_members(user_id,team_id) VALUES(1,7); INSERT INTO team_assets(team_id,kind,object_key,content_type,etag,width,height,updated_at) VALUES(7,'flag','teams/7/flag.png','image/png','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',64,32,42); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper')");
 
     const raw = "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"mods\":[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\",\"settings\":{\"strength\":1.25}}],\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[]}";
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
@@ -4665,6 +4665,10 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
     try std.testing.expect(!listed.get("ranked").?.bool);
     try std.testing.expect(listed.get("has_replay").?.bool);
+    const leaderboard_team = listed.get("user").?.object.get("team").?.object;
+    try std.testing.expectEqual(@as(i64, 7), leaderboard_team.get("id").?.integer);
+    try std.testing.expectEqualStrings("uwu", leaderboard_team.get("short_name").?.string);
+    try std.testing.expectEqualStrings("https://assets.kai.ovh/teams/7/flag?v=42", leaderboard_team.get("flag_url").?.string);
     try std.testing.expectEqual(@as(i64, 1), parsed_leaderboard.value.object.get("user_score").?.object.get("position").?.integer);
 
     const counts = try store.lazerUserScoreCounts(1, 0, .all);
@@ -4735,6 +4739,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer parsed_classic.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_classic.value.object.get("score_count").?.integer);
     try std.testing.expectEqualStrings("CL", parsed_classic.value.object.get("scores").?.array.items[0].object.get("mods").?.array.items[0].object.get("acronym").?.string);
+    try std.testing.expectEqualStrings("https://assets.kai.ovh/teams/7/flag?v=42", parsed_classic.value.object.get("scores").?.array.items[0].object.get("user").?.object.get("team").?.object.get("flag_url").?.string);
 
     const expired = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
     var expire_buf: [160]u8 = undefined;

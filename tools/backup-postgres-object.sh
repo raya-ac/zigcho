@@ -4,7 +4,7 @@ set -eu
 backup_dir=${ZIGCHO_BACKUP_DIR:-/var/backups/zigcho}
 database_url=${ZIGCHO_POSTGRES_URL:-dbname=zigcho}
 admin_url=${ZIGCHO_POSTGRES_ADMIN_URL:-dbname=postgres}
-expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-31}
+expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-32}
 current=/opt/zigcho/current
 
 runuser --user postgres -- env \

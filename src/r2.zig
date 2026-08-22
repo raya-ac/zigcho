@@ -47,6 +47,16 @@ pub const Storage = struct {
         return allocator.realloc(buffer, writer.end);
     }
 
+    pub fn streamGet(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8, writer: *std.Io.Writer) !void {
+        if (!self.enabled()) return error.R2NotConfigured;
+        const result = try self.request(allocator, io, .GET, object_key, content_type, "", writer);
+        if (result == .not_found) return error.R2ObjectNotFound;
+        if (result != .ok) {
+            std.log.warn("event=r2_download_rejected status={d}", .{@intFromEnum(result)});
+            return error.R2DownloadFailed;
+        }
+    }
+
     pub fn delete(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8) !void {
         if (!self.enabled()) return error.R2NotConfigured;
         const result = try self.request(allocator, io, .DELETE, object_key, "application/octet-stream", "", null);

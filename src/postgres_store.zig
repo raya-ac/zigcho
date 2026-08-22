@@ -21,6 +21,9 @@ pub const AnticheatSource = sqlite_storage.AnticheatSource;
 pub const AnticheatReviewLabel = sqlite_storage.AnticheatReviewLabel;
 pub const AnticheatObservation = sqlite_storage.AnticheatObservation;
 pub const is_postgres = true;
+pub const LazerCommentable = sqlite_storage.LazerCommentable;
+pub const LazerCommentTarget = sqlite_storage.LazerCommentTarget;
+pub const LazerCommentSort = sqlite_storage.LazerCommentSort;
 const archive_object_limit: usize = 128 * 1024 * 1024;
 
 pub const Store = struct {
@@ -58,6 +61,7 @@ pub const Store = struct {
     pub const BeatmapCacheStats = struct { entries: i64, bytes: i64, hydration_failures: i64 };
     pub const BeatmapCachePrune = struct { entries: i64, bytes: i64 };
     pub const BeatmapMediaCacheStats = struct { entries: i64, bytes: i64 };
+    pub const BeatmapArchiveDownload = sqlite_storage.Store.BeatmapArchiveDownload;
     pub const ObjectMigrationStats = sqlite_storage.Store.ObjectMigrationStats;
     pub const ObjectPurgeStats = sqlite_storage.Store.ObjectPurgeStats;
     pub const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
@@ -129,7 +133,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -330,6 +334,7 @@ pub const Store = struct {
             );
         }
         if (version <= 30) try postgres.exec(lease.conn, @embedFile("migration_031.sql"));
+        if (version <= 31) try postgres.exec(lease.conn, @embedFile("migration_032_postgres.sql"));
         try self.refreshExternalOnly(lease.conn);
         try postgres.exec(
             lease.conn,
@@ -977,6 +982,46 @@ pub const Store = struct {
         return fallback;
     }
 
+    pub fn beatmapArchiveDownload(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?BeatmapArchiveDownload {
+        var set_buf: [24]u8 = undefined;
+        const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
+        const stored = blk: {
+            var lease = self.pool.acquire();
+            defer lease.release();
+            var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.beatmap_archives SET last_accessed_at=extract(epoch FROM clock_timestamp())::bigint WHERE set_id=$1 RETURNING sha256,osz_file,object_bytes", &.{set});
+            defer result.deinit();
+            if (result.rows() == 0) return null;
+            const sha256 = try allocator.dupe(u8, result.value(0, 0));
+            errdefer allocator.free(sha256);
+            const data: ?[]u8 = if (result.isNull(0, 1)) null else try postgres.decodeBytea(allocator, result.value(0, 1));
+            errdefer if (data) |value| allocator.free(value);
+            const bytes_i64 = try result.int(i64, 0, 2);
+            if (bytes_i64 <= 0 or bytes_i64 > archive_object_limit) return error.InvalidStoredBeatmapArchive;
+            break :blk .{ .sha256 = sha256, .data = data, .bytes = @as(usize, @intCast(bytes_i64)) };
+        };
+        defer allocator.free(stored.sha256);
+        if (stored.data) |data| {
+            if (data.len != stored.bytes or !object_keys.matchesSha256(data, stored.sha256)) {
+                allocator.free(data);
+                return error.InvalidStoredBeatmapArchive;
+            }
+        }
+        errdefer if (stored.data) |data| allocator.free(data);
+        const object_key = if (self.object_store.enabled() and object_keys.validSha256(stored.sha256))
+            try object_keys.archive(allocator, set_id, stored.sha256)
+        else
+            null;
+        if (object_key == null and stored.data == null) return null;
+        return .{ .allocator = allocator, .object_key = object_key, .data = stored.data, .bytes = stored.bytes };
+    }
+
+    pub fn streamBeatmapArchive(self: *Store, download: BeatmapArchiveDownload, writer: *std.Io.Writer) !void {
+        if (download.object_key) |object_key| {
+            return self.object_store.streamGet(self.allocator, self.io, object_key, "application/octet-stream", writer);
+        }
+        try writer.writeAll(download.data orelse return error.BeatmapArchiveUnavailable);
+    }
+
     pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
         var now_buf: [32]u8 = undefined;
         const now_text = try std.fmt.bufPrint(&now_buf, "{d}", .{now});
@@ -1345,7 +1390,7 @@ pub const Store = struct {
         try jsonString(writer, set_result.value(0, 8));
         try writer.writeAll(",\"last_updated\":");
         try jsonString(writer, set_result.value(0, 8));
-        try writer.print(",\"ranked_date\":null,\"ratings\":[],\"availability\":{{\"download_disabled\":{s},\"more_information\":\"\"}},\"genre\":{{\"id\":0,\"name\":\"Unspecified\"}},\"language\":{{\"id\":0,\"name\":\"Unspecified\"}},\"source\":", .{if (try set_result.boolean(0, 9)) "true" else "false"});
+        try writer.writeAll(",\"ranked_date\":null,\"ratings\":[],\"availability\":{\"download_disabled\":false,\"more_information\":\"\"},\"genre\":{\"id\":0,\"name\":\"Unspecified\"},\"language\":{\"id\":0,\"name\":\"Unspecified\"},\"source\":");
         try jsonString(writer, set_result.value(0, 6));
         try writer.writeAll(",\"tags\":");
         try jsonString(writer, set_result.value(0, 7));
@@ -1858,6 +1903,162 @@ pub const Store = struct {
             if (!result.isNull(row, 3)) try output.writer.print("|{s}", .{result.value(row, 3)});
             try output.writer.print("\t{s}", .{result.value(row, 4)});
         }
+        return output.toOwnedSlice();
+    }
+
+    pub fn addLazerComment(self: *Store, user_id: i32, target: LazerCommentTarget, parent_id: ?i64, message: []const u8) !i64 {
+        if (message.len == 0 or message.len > 1000 or !std.unicode.utf8ValidateSlice(message)) return error.InvalidComment;
+        var user_buf: [24]u8 = undefined;
+        var target_buf: [32]u8 = undefined;
+        var parent_buf: [32]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const target_id = try std.fmt.bufPrint(&target_buf, "{d}", .{target.id});
+        const parent = if (parent_id) |value| try std.fmt.bufPrint(&parent_buf, "{d}", .{value}) else null;
+        var lease = self.pool.acquire();
+        defer lease.release();
+        if (parent) |parent_text| {
+            var check = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.lazer_comments WHERE id=$1 AND commentable_type=$2 AND commentable_id=$3 AND deleted_at IS NULL", &.{ parent_text, target.commentable.text(), target_id });
+            defer check.deinit();
+            if (check.rows() == 0) return error.CommentParentNotFound;
+        }
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.lazer_comments(commentable_type,commentable_id,user_id,parent_id,message) VALUES($1,$2,$3,$4,$5) RETURNING id", &.{ target.commentable.text(), target_id, user, parent, message });
+        defer result.deinit();
+        return try result.int(i64, 0, 0);
+    }
+
+    pub fn lazerCommentTarget(self: *Store, comment_id: i64) !?LazerCommentTarget {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{comment_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT commentable_type,commentable_id FROM zigcho.lazer_comments WHERE id=$1", &.{id});
+        defer result.deinit();
+        if (result.rows() == 0) return null;
+        return .{ .commentable = LazerCommentable.parse(result.value(0, 0)) orelse return error.InvalidStoredComment, .id = try result.int(i64, 0, 1) };
+    }
+
+    pub fn deleteLazerComment(self: *Store, user_id: i32, comment_id: i64, staff: bool) !bool {
+        var user_buf: [24]u8 = undefined;
+        var id_buf: [32]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{comment_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, if (staff)
+            "UPDATE zigcho.lazer_comments SET message='',deleted_at=extract(epoch FROM clock_timestamp())::bigint,updated_at=extract(epoch FROM clock_timestamp())::bigint WHERE id=$1 AND deleted_at IS NULL RETURNING 1"
+        else
+            "UPDATE zigcho.lazer_comments SET message='',deleted_at=extract(epoch FROM clock_timestamp())::bigint,updated_at=extract(epoch FROM clock_timestamp())::bigint WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING 1", if (staff) &.{id} else &.{ id, user });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn setLazerCommentVote(self: *Store, user_id: i32, comment_id: i64, voted: bool) !bool {
+        var user_buf: [24]u8 = undefined;
+        var id_buf: [32]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{comment_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, if (voted)
+            "INSERT INTO zigcho.lazer_comment_votes(comment_id,user_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM zigcho.lazer_comments WHERE id=$1 AND deleted_at IS NULL) ON CONFLICT DO NOTHING RETURNING 1"
+        else
+            "DELETE FROM zigcho.lazer_comment_votes WHERE comment_id=$1 AND user_id=$2 RETURNING 1", &.{ id, user });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn reportLazerComment(self: *Store, user_id: i32, comment_id: i64, reason: []const u8, comments: []const u8) !bool {
+        var user_buf: [24]u8 = undefined;
+        var id_buf: [32]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{comment_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.lazer_comment_reports(comment_id,reporter_id,reason,comments) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM zigcho.lazer_comments WHERE id=$1) ON CONFLICT DO NOTHING RETURNING 1", &.{ id, user, reason, comments });
+        defer result.deinit();
+        return result.rows() != 0;
+    }
+
+    pub fn lazerCommentsJson(self: *Store, allocator: std.mem.Allocator, viewer_id: i32, target: LazerCommentTarget, sort: LazerCommentSort, page: u16, parent_id: i64, only_id: i64) ![]u8 {
+        if (page == 0 or page > 1000 or parent_id < 0 or only_id < 0) return error.InvalidCommentQuery;
+        var target_buf: [32]u8 = undefined;
+        var parent_buf: [32]u8 = undefined;
+        var only_buf: [32]u8 = undefined;
+        var viewer_buf: [24]u8 = undefined;
+        var offset_buf: [32]u8 = undefined;
+        const target_id = try std.fmt.bufPrint(&target_buf, "{d}", .{target.id});
+        const parent = try std.fmt.bufPrint(&parent_buf, "{d}", .{parent_id});
+        const only = try std.fmt.bufPrint(&only_buf, "{d}", .{only_id});
+        const viewer = try std.fmt.bufPrint(&viewer_buf, "{d}", .{viewer_id});
+        const offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{(@as(i64, page) - 1) * 50});
+        const base_sql = "SELECT c.id,c.parent_id,c.user_id,c.message,to_char(to_timestamp(c.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),to_char(to_timestamp(c.updated_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),CASE WHEN c.deleted_at IS NULL THEN NULL ELSE to_char(to_timestamp(c.deleted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,(SELECT count(*) FROM zigcho.lazer_comments r WHERE r.parent_id=c.id),(SELECT count(*) FROM zigcho.lazer_comment_votes v WHERE v.comment_id=c.id),EXISTS(SELECT 1 FROM zigcho.lazer_comment_votes v WHERE v.comment_id=c.id AND v.user_id=$5) FROM zigcho.lazer_comments c JOIN zigcho.users u ON u.id=c.user_id WHERE c.commentable_type=$1 AND c.commentable_id=$2 AND NOT u.restricted AND (($4::bigint>0 AND c.id=$4::bigint) OR ($4::bigint=0 AND (($3::bigint>0 AND c.parent_id=$3::bigint) OR ($3::bigint=0 AND c.parent_id IS NULL))))";
+        const sql = switch (sort) {
+            .new => base_sql ++ " ORDER BY c.created_at DESC,c.id DESC LIMIT 51 OFFSET $6::int",
+            .old => base_sql ++ " ORDER BY c.created_at ASC,c.id ASC LIMIT 51 OFFSET $6::int",
+            .top => base_sql ++ " ORDER BY (SELECT count(*) FROM zigcho.lazer_comment_votes v WHERE v.comment_id=c.id) DESC,c.created_at DESC,c.id DESC LIMIT 51 OFFSET $6::int",
+        };
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var rows = try postgres.queryParams(allocator, lease.conn, sql, &.{ target.commentable.text(), target_id, parent, only, viewer, offset });
+        defer rows.deinit();
+        var count = try postgres.queryParams(allocator, lease.conn, "SELECT count(*),count(*) FILTER(WHERE parent_id IS NULL) FROM zigcho.lazer_comments WHERE commentable_type=$1 AND commentable_id=$2", &.{ target.commentable.text(), target_id });
+        defer count.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"commentable_meta\":[{{\"id\":{d},\"owner_id\":null,\"owner_title\":null,\"title\":", .{target.id});
+        var title_buf: [96]u8 = undefined;
+        const title = try std.fmt.bufPrint(&title_buf, "{s} #{d}", .{ target.commentable.text(), target.id });
+        try jsonString(&output.writer, title);
+        try output.writer.writeAll(",\"type\":");
+        try jsonString(&output.writer, target.commentable.text());
+        try output.writer.writeAll(",\"url\":");
+        var url_buf: [128]u8 = undefined;
+        const url = if (target.commentable == .beatmapset) try std.fmt.bufPrint(&url_buf, "https://kai.ovh/beatmapsets/{d}", .{target.id}) else try std.fmt.bufPrint(&url_buf, "https://kai.ovh/", .{});
+        try jsonString(&output.writer, url);
+        try output.writer.writeAll(",\"current_user_attributes\":{\"can_new_comment_reason\":null}}],\"comments\":[");
+        const visible_rows = @min(rows.rows(), 50);
+        var user_ids: std.ArrayList(i32) = .empty;
+        defer user_ids.deinit(allocator);
+        var voted_ids: std.ArrayList(i64) = .empty;
+        defer voted_ids.deinit(allocator);
+        for (0..visible_rows) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            const comment_id = try rows.int(i64, row, 0);
+            const user_id = try rows.int(i32, row, 2);
+            if (std.mem.indexOfScalar(i32, user_ids.items, user_id) == null) try user_ids.append(allocator, user_id);
+            if (try rows.boolean(row, 9)) try voted_ids.append(allocator, comment_id);
+            try output.writer.print("{{\"id\":{d},\"parent_id\":", .{comment_id});
+            if (rows.isNull(row, 1)) try output.writer.writeAll("null") else try output.writer.print("{d}", .{try rows.int(i64, row, 1)});
+            try output.writer.print(",\"user_id\":{d},\"message\":", .{user_id});
+            try jsonString(&output.writer, rows.value(row, 3));
+            try output.writer.print(",\"message_html\":null,\"replies_count\":{d},\"votes_count\":{d},\"commentable_type\":", .{ try rows.int(i32, row, 7), try rows.int(i32, row, 8) });
+            try jsonString(&output.writer, target.commentable.text());
+            try output.writer.print(",\"commentable_id\":{d},\"legacy_name\":null,\"created_at\":", .{target.id});
+            try jsonString(&output.writer, rows.value(row, 4));
+            try output.writer.writeAll(",\"updated_at\":");
+            try jsonString(&output.writer, rows.value(row, 5));
+            try output.writer.writeAll(",\"deleted_at\":");
+            if (rows.isNull(row, 6)) try output.writer.writeAll("null") else try jsonString(&output.writer, rows.value(row, 6));
+            try output.writer.writeAll(",\"edited_at\":null,\"edited_by_id\":null,\"pinned\":false}");
+        }
+        try output.writer.print("],\"has_more\":{},\"has_more_id\":null,\"user_follow\":false,\"included_comments\":[],\"pinned_comments\":[],\"user_votes\":[", .{rows.rows() > 50});
+        for (voted_ids.items, 0..) |id, index| {
+            if (index != 0) try output.writer.writeByte(',');
+            try output.writer.print("{d}", .{id});
+        }
+        try output.writer.writeAll("],\"users\":[");
+        for (user_ids.items, 0..) |id, index| {
+            var id_buf: [24]u8 = undefined;
+            const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
+            var user_row = try postgres.queryParams(allocator, lease.conn, "SELECT id,name,CASE WHEN show_country THEN country ELSE 'XX' END,privileges,restricted FROM zigcho.users WHERE id=$1", &.{id_text});
+            defer user_row.deinit();
+            if (user_row.rows() == 0) continue;
+            if (index != 0) try output.writer.writeByte(',');
+            const country = user_row.value(0, 2);
+            const user_value: domain.User = .{ .id = id, .name = user_row.value(0, 1), .safe_name = "", .country = .{ country[0], country[1] }, .privileges = try user_row.int(u32, 0, 3), .restricted = try user_row.boolean(0, 4) };
+            try user_json.writeCompact(&output.writer, user_value);
+        }
+        try output.writer.print("],\"total\":{d},\"top_level_count\":{d}}}", .{ try count.int(i32, 0, 0), try count.int(i32, 0, 1) });
         return output.toOwnedSlice();
     }
 
@@ -3119,7 +3320,16 @@ pub const Store = struct {
         if (!show_profile_stats or selected_stats.rows() == 0) {
             try output.writer.writeAll("null");
         } else {
-            try output.writer.print("{{\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ try selected_stats.int(i64, 0, 0), try selected_stats.int(i64, 0, 1), try selected_stats.int(i32, 0, 2), try selected_stats.int(i32, 0, 3), try selected_stats.int(i32, 0, 4), try selected_stats.float(f64, 0, 5), try selected_stats.int(i32, 0, 6), try selected_stats.int(i32, 0, 7) });
+            const total_score = @max(@as(i64, 0), try selected_stats.int(i64, 0, 1));
+            const level_current = @min(@as(i64, 100), @divFloor(total_score, 1_000_000) + 1);
+            const level_progress = @divFloor(@mod(total_score, 1_000_000) * 100, 1_000_000);
+            const global_rank = try selected_stats.int(i32, 0, 7);
+            try output.writer.print("{{\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d},\"level_current\":{d},\"level_progress\":{d},\"rank_history\":[", .{ try selected_stats.int(i64, 0, 0), total_score, try selected_stats.int(i32, 0, 2), try selected_stats.int(i32, 0, 3), try selected_stats.int(i32, 0, 4), try selected_stats.float(f64, 0, 5), try selected_stats.int(i32, 0, 6), global_rank, level_current, level_progress });
+            for (0..90) |index| {
+                if (index != 0) try output.writer.writeByte(',');
+                try output.writer.print("{d}", .{if (global_rank > 0 and index >= 88) global_rank else 0});
+            }
+            try output.writer.writeAll("]}");
         }
         try output.writer.writeAll(",\"stats\":[");
         for (0..if (show_profile_stats) stats.rows() else 0) |row| {
@@ -3249,6 +3459,60 @@ pub const Store = struct {
             .recent = try result.int(i32, 0, 2),
             .pinned = try result.int(i32, 0, 3),
         };
+    }
+
+    pub fn lazerRecentActivityJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, offset: u16, limit: u8) ![]u8 {
+        if (limit == 0 or limit > 100) return error.InvalidScoreLimit;
+        var user_buf: [24]u8 = undefined;
+        var limit_buf: [8]u8 = undefined;
+        var offset_buf: [16]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        const limit_text = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
+        const offset_text = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+        const sql =
+            "WITH all_scores AS (" ++
+            "SELECT s.id,'lazer'::text source,s.user_id,s.ruleset_id mode,s.pp,s.rank,0 mods,s.accuracy,0 n300,0 n100,0 n50,0 nmiss,s.submitted_at,b.id map_id,b.set_id,b.artist,b.title,b.version FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.passed AND NOT u.restricted " ++
+            "UNION ALL SELECT s.id,'stable',s.user_id,s.mode,s.pp,''::text,s.mods,s.accuracy,s.n300,s.n100,s.n50,s.nmiss,s.submitted_at,b.id,b.set_id,b.artist,b.title,b.version FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.passed AND NOT u.restricted)," ++
+            "best AS (SELECT user_id,map_id,mode,max(pp) pp FROM all_scores GROUP BY user_id,map_id,mode) " ++
+            "SELECT a.id,a.source,a.mode,a.rank,a.mods,a.accuracy,a.n300,a.n100,a.n50,a.nmiss,to_char(to_timestamp(a.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),a.map_id,a.set_id,a.artist,a.title,a.version,u.name,1+(SELECT count(*) FROM best b WHERE b.map_id=a.map_id AND b.mode=a.mode AND b.pp>a.pp) placement FROM all_scores a JOIN zigcho.users u ON u.id=a.user_id WHERE a.user_id=$1 ORDER BY a.submitted_at DESC,a.source ASC,a.id DESC LIMIT $2 OFFSET $3";
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var rows = try postgres.queryParams(allocator, lease.conn, sql, &.{ user, limit_text, offset_text });
+        defer rows.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        for (0..rows.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            const stable = std.mem.eql(u8, rows.value(row, 1), "stable");
+            const mode = try rows.int(u8, row, 2);
+            const rank = if (stable) sqlite_storage.Store.stableGrade(mode, try rows.int(i32, row, 4), try rows.float(f64, row, 5), try rows.int(i32, row, 6), try rows.int(i32, row, 7), try rows.int(i32, row, 8), try rows.int(i32, row, 9)) else rows.value(row, 3);
+            try output.writer.print("{{\"id\":{d},\"createdAt\":", .{@as(i64, @intCast(row + 1 + offset))});
+            try jsonString(&output.writer, rows.value(row, 10));
+            try output.writer.writeAll(",\"type\":\"rank\",\"scoreRank\":");
+            try jsonString(&output.writer, rank);
+            try output.writer.print(",\"rank\":{d},\"mode\":", .{try rows.int(i32, row, 17)});
+            try jsonString(&output.writer, switch (mode) {
+                0 => "osu",
+                1 => "taiko",
+                2 => "fruits",
+                3 => "mania",
+                else => "osu",
+            });
+            var title_buf: [768]u8 = undefined;
+            const map_title = try std.fmt.bufPrint(&title_buf, "{s} - {s} [{s}]", .{ rows.value(row, 13), rows.value(row, 14), rows.value(row, 15) });
+            try output.writer.writeAll(",\"beatmap\":{\"title\":");
+            try jsonString(&output.writer, map_title);
+            try output.writer.print(",\"url\":\"/b/{d}\"}},\"beatmapset\":{{\"title\":", .{try rows.int(i32, row, 11)});
+            var set_title_buf: [512]u8 = undefined;
+            const set_title = try std.fmt.bufPrint(&set_title_buf, "{s} - {s}", .{ rows.value(row, 13), rows.value(row, 14) });
+            try jsonString(&output.writer, set_title);
+            try output.writer.print(",\"url\":\"/beatmapsets/{d}\"}},\"user\":{{\"username\":", .{try rows.int(i32, row, 12)});
+            try jsonString(&output.writer, rows.value(row, 16));
+            try output.writer.print(",\"url\":\"/users/{d}\",\"previousUsername\":null}}}}", .{user_id});
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
     }
 
     pub fn lazerUserScoresJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, ruleset_id: u8, kind: lazer.UserScoreKind, source: domain.SiteScoreSource, offset: u16, limit: u8) ![]u8 {
@@ -4494,6 +4758,7 @@ test "postgres account auth stats and token slice" {
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"AU\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"rank_history\":[0,0") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"artist\":\"artist\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);

@@ -789,6 +789,13 @@ test "beatmap mirror serves verified cache hits and tracks stored bytes" {
     defer std.testing.allocator.free(mirrored.data);
     try std.testing.expect(mirrored.cache_hit);
     try std.testing.expectEqualStrings(archive, mirrored.data);
+    var download = (try store.beatmapArchiveDownload(std.testing.allocator, 900000000)).?;
+    defer download.deinit();
+    try std.testing.expectEqual(archive.len, download.bytes);
+    var streamed: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer streamed.deinit();
+    try store.streamBeatmapArchive(download, &streamed.writer);
+    try std.testing.expectEqualStrings(archive, streamed.written());
     const metrics = sync.metrics();
     try std.testing.expectEqual(@as(u64, 1), metrics.mirror_hits);
     try std.testing.expectEqual(@as(u64, archive.len), metrics.mirror_bytes_served);
@@ -1247,7 +1254,9 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "https://assets.ppy.sh/medals/web/") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"achievement-icon\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "custom-achievement-icon") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "kind==='accuracy'?value+'%'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "<svg class=\"achievement-icon custom-achievement-icon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"rank-history-chart\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "tracking starts now") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "speed_change") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "toFixed(2)+'×'") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "recent.insertAdjacentHTML('afterend'") != null);
@@ -1444,6 +1453,44 @@ test "stable beatmap info comments and direct mail keep the real client contract
     try std.testing.expectEqual(@as(usize, 0), read.len);
 }
 
+test "lazer comments support listing replies votes deletion and reports" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-comments.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const author_id = try store.register("comment author", "comment-author@example.invalid", "00000000000000000000000000000000");
+    const voter_id = try store.register("comment voter", "comment-voter@example.invalid", "11111111111111111111111111111111");
+    const target: storage.LazerCommentTarget = .{ .commentable = .beatmapset, .id = 900000000 };
+    const parent_id = try store.addLazerComment(author_id, target, null, "first comment");
+    const reply_id = try store.addLazerComment(voter_id, target, parent_id, "reply comment");
+    try std.testing.expect(try store.setLazerCommentVote(voter_id, parent_id, true));
+    const root_json = try store.lazerCommentsJson(std.testing.allocator, voter_id, target, .top, 1, 0, 0);
+    defer std.testing.allocator.free(root_json);
+    var root = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, root_json, .{});
+    defer root.deinit();
+    const comment = root.value.object.get("comments").?.array.items[0].object;
+    try std.testing.expectEqual(parent_id, comment.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), comment.get("replies_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), comment.get("votes_count").?.integer);
+    try std.testing.expectEqual(parent_id, root.value.object.get("user_votes").?.array.items[0].integer);
+    const replies_json = try store.lazerCommentsJson(std.testing.allocator, author_id, target, .old, 1, parent_id, 0);
+    defer std.testing.allocator.free(replies_json);
+    var replies = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, replies_json, .{});
+    defer replies.deinit();
+    try std.testing.expectEqual(reply_id, replies.value.object.get("comments").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expect(try store.reportLazerComment(voter_id, parent_id, "Spam", "test report"));
+    try std.testing.expect(!try store.reportLazerComment(voter_id, parent_id, "Spam", "duplicate"));
+    try std.testing.expect(try store.deleteLazerComment(author_id, parent_id, false));
+    const deleted_json = try store.lazerCommentsJson(std.testing.allocator, author_id, target, .new, 1, 0, parent_id);
+    defer std.testing.allocator.free(deleted_json);
+    var deleted = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, deleted_json, .{});
+    defer deleted.deinit();
+    try std.testing.expect(deleted.value.object.get("comments").?.array.items[0].object.get("deleted_at").? != .null);
+}
+
 test "stable login replays unread private mail without marking it read" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1609,6 +1656,7 @@ test "beatmap ranking records nominations and lets BNs set every stable status" 
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"XX\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"rank_history\":[0,0") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "Zigcho Fixture") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_mode\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_source\":\"all\"") != null);
@@ -1618,6 +1666,16 @@ test "beatmap ranking records nominations and lets BNs set every stable status" 
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
+    const recent_activity = try store.lazerRecentActivityJson(std.testing.allocator, requester, 0, 50);
+    defer std.testing.allocator.free(recent_activity);
+    var parsed_activity = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, recent_activity, .{});
+    defer parsed_activity.deinit();
+    try std.testing.expect(parsed_activity.value.array.items.len >= 2);
+    const activity = parsed_activity.value.array.items[0].object;
+    try std.testing.expectEqualStrings("rank", activity.get("type").?.string);
+    try std.testing.expectEqualStrings("osu", activity.get("mode").?.string);
+    try std.testing.expectEqualStrings("requester", activity.get("user").?.object.get("username").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, activity.get("beatmap").?.object.get("url").?.string, "/b/"));
     const empty_autopilot_profile = (try store.siteProfile(std.testing.allocator, requester, .all, 8)).?;
     defer std.testing.allocator.free(empty_autopilot_profile);
     try std.testing.expect(std.mem.indexOf(u8, empty_autopilot_profile, "\"selected_mode\":8") != null);
@@ -4267,6 +4325,10 @@ test "lazer ruleset profile paths match the pinned client contract" {
     try std.testing.expectEqual(lazer.UserScoreKind.recent, lazer.parseUserScoresPath("/api/v2/users/4/scores/recent").?.kind);
     try std.testing.expect(lazer.parseUserScoresPath("/api/v2/users/4/scores/nope") == null);
     try std.testing.expect(lazer.parseUserScoresPath("/api/v2/users/name/scores/best") == null);
+    try std.testing.expectEqual(@as(i32, 4), lazer.parseUserRecentActivityPath("/api/v2/users/4/recent_activity").?);
+    try std.testing.expectEqual(@as(i64, 42), lazer.parseCommentPath("/api/v2/comments/42").?);
+    try std.testing.expectEqual(@as(i64, 42), lazer.parseCommentVotePath("/api/v2/comments/42/vote").?);
+    try std.testing.expect(lazer.parseCommentPath("/api/v2/comments/42/vote") == null);
 }
 
 test "official lazer score bodies allow omitted mods and reject hostile counters" {
@@ -4657,7 +4719,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 31), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 32), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {
@@ -5685,6 +5747,7 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i64, 2), parsed_ordered_sets.value.object.get("total").?.integer);
     try std.testing.expectEqual(@as(i64, other_metadata.set_id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, metadata.set_id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[1].object.get("id").?.integer);
+    try std.testing.expect(!parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("availability").?.object.get("download_disabled").?.bool);
     const search = try store.stableSearch(std.testing.allocator, "Fixture", -1, 4, 0);
     defer std.testing.allocator.free(search);
     try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|0|10.0|"));

@@ -20,9 +20,9 @@ if ($ActualCommit -ne $ExpectedCommit) {
 
 $Patch = Join-Path $ScriptDir "zigcho-client.patch"
 
-& git -C $Checkout apply --check $Patch 2>$null
+& git -C $Checkout apply --ignore-space-change --ignore-whitespace --check $Patch 2>$null
 if ($LASTEXITCODE -eq 0) {
-    & git -C $Checkout apply $Patch
+    & git -C $Checkout apply --ignore-space-change --ignore-whitespace $Patch
     if ($LASTEXITCODE -ne 0) {
         throw "zigcho client patching failed"
     }
@@ -31,7 +31,7 @@ if ($LASTEXITCODE -eq 0) {
     return
 }
 
-& git -C $Checkout apply --reverse --check $Patch 2>$null
+& git -C $Checkout apply --ignore-space-change --ignore-whitespace --reverse --check $Patch 2>$null
 if ($LASTEXITCODE -eq 0) {
     Write-Host "zigcho client patch already applied to $Checkout"
     return

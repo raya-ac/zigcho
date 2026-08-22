@@ -11,7 +11,7 @@ UMask=0077
 Environment="ZIGCHO_BACKUP_DIR=/var/backups/zigcho"
 Environment="ZIGCHO_POSTGRES_URL=dbname=zigcho"
 Environment="ZIGCHO_POSTGRES_ADMIN_URL=dbname=postgres"
-Environment="ZIGCHO_EXPECTED_SCHEMA=31"
+Environment="ZIGCHO_EXPECTED_SCHEMA=32"
 ExecStart=/opt/zigcho/current/tools/backup-postgres-object.sh
 Nice=10
 IOSchedulingClass=best-effort

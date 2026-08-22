@@ -180,12 +180,33 @@ fn writeScoreCounts(writer: *std.Io.Writer, counts: domain.UserScoreCounts) !voi
     try writer.print("{{\"best\":{d},\"firsts\":{d},\"recent\":{d},\"pinned\":{d}}}", .{ counts.best, counts.firsts, counts.recent, counts.pinned });
 }
 
+fn writeRankHistory(writer: *std.Io.Writer, maybe_stats: ?domain.Stats, restricted: bool) !void {
+    const stats = maybe_stats orelse domain.Stats{};
+    const mode = switch (stats.mode) {
+        .osu => "osu",
+        .taiko => "taiko",
+        .@"catch" => "fruits",
+        .mania => "mania",
+    };
+    try writer.writeAll("{\"mode\":");
+    try std.json.Stringify.value(mode, .{}, writer);
+    try writer.writeAll(",\"data\":[");
+    for (0..90) |index| {
+        if (index != 0) try writer.writeByte(',');
+        const rank = if (!restricted and stats.global_rank > 0 and index >= 88) stats.global_rank else 0;
+        try writer.print("{d}", .{rank});
+    }
+    try writer.writeAll("]}");
+}
+
 pub fn profileOwned(allocator: std.mem.Allocator, user: domain.User, stats: ?domain.Stats, score_counts: domain.UserScoreCounts, sources: ProfileSources, achievements_json: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try writeUserCore(&output.writer, user);
     try output.writer.writeAll(",\"statistics\":");
     try writeStatistics(&output.writer, stats, user.restricted);
+    try output.writer.writeAll(",\"rank_history\":");
+    try writeRankHistory(&output.writer, stats, user.restricted);
     try output.writer.writeAll(",\"zigcho_statistics\":{\"stable\":");
     try writeStatistics(&output.writer, sources.stable_stats, user.restricted);
     try output.writer.writeAll(",\"lazer\":");
@@ -250,6 +271,12 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expect(object.get("is_admin").?.bool);
     try std.testing.expectEqual(@as(i64, 424), object.get("statistics").?.object.get("pp").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 93.53), object.get("statistics").?.object.get("hit_accuracy").?.float, 0.0001);
+    const rank_history = object.get("rank_history").?.object;
+    try std.testing.expectEqualStrings("osu", rank_history.get("mode").?.string);
+    try std.testing.expectEqual(@as(usize, 90), rank_history.get("data").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 0), rank_history.get("data").?.array.items[87].integer);
+    try std.testing.expectEqual(@as(i64, 1), rank_history.get("data").?.array.items[88].integer);
+    try std.testing.expectEqual(@as(i64, 1), rank_history.get("data").?.array.items[89].integer);
     try std.testing.expectEqual(@as(i64, 300), object.get("zigcho_statistics").?.object.get("stable").?.object.get("pp").?.integer);
     try std.testing.expectEqual(@as(i64, 124), object.get("zigcho_statistics").?.object.get("lazer").?.object.get("pp").?.integer);
     try std.testing.expectEqual(@as(i64, 3), object.get("zigcho_score_counts").?.object.get("stable").?.object.get("recent").?.integer);

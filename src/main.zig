@@ -178,49 +178,6 @@ const App = struct {
     geo_client: std.http.Client,
     started_at: i64,
 
-    fn prefetchBeatmapMirror(self: *App) void {
-        std.log.info("event=beatmap_mirror_prefetch_started", .{});
-        std.Io.sleep(self.store.io, .fromSeconds(10), .awake) catch return;
-        while (true) {
-            const unknown_sizes = self.store.beatmapArchiveIdsMissingSize(self.allocator, 32) catch |err| {
-                std.log.warn("event=beatmap_mirror_inventory_list_failed error={t}", .{err});
-                std.Io.sleep(self.store.io, .fromSeconds(60), .awake) catch return;
-                continue;
-            };
-            for (unknown_sizes) |set_id| {
-                const archive = self.store.beatmapArchive(self.allocator, set_id) catch |err| {
-                    std.log.warn("event=beatmap_mirror_inventory_read_failed set_id={d} error={t}", .{ set_id, err });
-                    continue;
-                } orelse continue;
-                self.store.setBeatmapArchiveSize(set_id, archive.len) catch |err|
-                    std.log.warn("event=beatmap_mirror_inventory_write_failed set_id={d} error={t}", .{ set_id, err });
-                self.allocator.free(archive);
-                std.Io.sleep(self.store.io, .fromSeconds(1), .awake) catch return;
-            }
-            self.allocator.free(unknown_sizes);
-            const ids = self.store.beatmapSetIdsMissingArchives(self.allocator, 100) catch |err| {
-                std.log.warn("event=beatmap_mirror_prefetch_list_failed error={t}", .{err});
-                std.Io.sleep(self.store.io, .fromSeconds(60), .awake) catch return;
-                continue;
-            };
-            defer self.allocator.free(ids);
-            if (ids.len == 0) {
-                std.Io.sleep(self.store.io, .fromSeconds(900), .awake) catch return;
-                continue;
-            }
-            for (ids) |set_id| {
-                const mirrored = self.map_sync.prefetchMirrorArchive(&self.store, set_id) catch |err| {
-                    std.log.warn("event=beatmap_mirror_prefetch_failed set_id={d} error={t}", .{ set_id, err });
-                    std.Io.sleep(self.store.io, .fromSeconds(10), .awake) catch return;
-                    continue;
-                };
-                self.allocator.free(mirrored.data);
-                std.log.info("event=beatmap_mirror_prefetch_stored set_id={d}", .{set_id});
-                std.Io.sleep(self.store.io, .fromSeconds(3), .awake) catch return;
-            }
-        }
-    }
-
     fn anticheatNamespace(mods: i32) u32 {
         if (mods & stable_mods.autopilot != 0) return anticheat_abi.Namespace.autopilot;
         if (mods & stable_mods.relax != 0) return anticheat_abi.Namespace.relax;
@@ -392,6 +349,62 @@ const App = struct {
         if (headers.len > all.len - 1) return error.TooManyHeaders;
         @memcpy(all[1..][0..headers.len], headers);
         try req.respond(body, .{ .status = status, .extra_headers = all[0 .. headers.len + 1], .keep_alive = false });
+    }
+
+    fn serveBeatmapArchive(self: *App, req: *std.http.Server.Request, set_id: i32) !void {
+        const stored_download = self.store.beatmapArchiveDownload(self.allocator, set_id) catch |err| blk: {
+            std.log.warn("event=beatmap_archive_stream_metadata_failed set_id={d} error={t}", .{ set_id, err });
+            break :blk null;
+        };
+        if (stored_download) |download_value| {
+            var download = download_value;
+            defer download.deinit();
+            var disposition_buf: [96]u8 = undefined;
+            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
+            const headers = [_]std.http.Header{
+                .{ .name = "content-type", .value = "application/x-osu-beatmap-archive" },
+                .{ .name = "content-disposition", .value = disposition },
+                .{ .name = "cache-control", .value = "public, max-age=3600" },
+                .{ .name = "cdn-cache-control", .value = "public, max-age=86400" },
+                .{ .name = "x-zigcho-mirror-cache", .value = "hit" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            var stream_buffer: [64 * 1024]u8 = undefined;
+            var body_writer = try req.respondStreaming(&stream_buffer, .{
+                .content_length = download.bytes,
+                .respond_options = .{ .status = .ok, .extra_headers = &headers, .keep_alive = false },
+            });
+            try body_writer.flush();
+            self.store.streamBeatmapArchive(download, &body_writer.writer) catch |err| {
+                std.log.warn("event=beatmap_archive_stream_failed set_id={d} bytes={d} error={t}", .{ set_id, download.bytes, err });
+                return err;
+            };
+            try body_writer.end();
+            self.map_sync.recordMirrorCacheHit(download.bytes);
+            return;
+        }
+
+        const mirrored = self.map_sync.mirrorArchive(&self.store, set_id) catch |err| return switch (err) {
+            error.MirrorFillInProgress, error.MirrorAtCapacity => respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap mirror fill is already busy\"}", &.{.{ .name = "retry-after", .value = "5" }}),
+            error.InvalidBeatmapSet => respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{}),
+            else => blk: {
+                std.log.warn("event=beatmap_mirror_fill_failed set_id={d} error={t}", .{ set_id, err });
+                break :blk respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror upstream unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
+            },
+        };
+        defer self.allocator.free(mirrored.data);
+        if (mirrored.cache_hit) self.store.setBeatmapArchiveSize(set_id, mirrored.data.len) catch |err|
+            std.log.warn("event=beatmap_archive_size_write_failed set_id={d} error={t}", .{ set_id, err });
+        var disposition_buf: [96]u8 = undefined;
+        const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
+        const headers = [_]std.http.Header{
+            .{ .name = "content-disposition", .value = disposition },
+            .{ .name = "cache-control", .value = "public, max-age=3600" },
+            .{ .name = "cdn-cache-control", .value = "public, max-age=86400" },
+            .{ .name = "x-zigcho-mirror-cache", .value = if (mirrored.cache_hit) "hit" else "fill" },
+            .{ .name = "x-content-type-options", .value = "nosniff" },
+        };
+        return respond(req, .ok, "application/x-osu-beatmap-archive", mirrored.data, &headers);
     }
 
     const GeoResult = struct { lon: f32, lat: f32 };
@@ -798,7 +811,7 @@ const App = struct {
         if (req.head.method == .POST and std.mem.eql(u8, path, "/")) {
             return if (header(req, "osu-token") == null) rate_limit.login else rate_limit.authenticated;
         }
-        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/notifications") or std.mem.startsWith(u8, path, "/api/v2/friends") or std.mem.startsWith(u8, path, "/api/v2/blocks") or std.mem.eql(u8, path, "/api/v2/me/beatmapset-favourites") or lazer.parseFavouritePath(path) != null or std.mem.startsWith(u8, path, "/api/v2/chat/") or std.mem.eql(u8, path, "/api/v2/users") or std.mem.startsWith(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
+        if (std.mem.eql(u8, path, "/api/v2/me") or std.mem.eql(u8, path, "/api/v2/notifications") or std.mem.startsWith(u8, path, "/api/v2/friends") or std.mem.startsWith(u8, path, "/api/v2/blocks") or std.mem.eql(u8, path, "/api/v2/me/beatmapset-favourites") or lazer.parseFavouritePath(path) != null or std.mem.startsWith(u8, path, "/api/v2/chat/") or std.mem.startsWith(u8, path, "/api/v2/comments") or std.mem.eql(u8, path, "/api/v2/reports") or std.mem.eql(u8, path, "/api/v2/users") or std.mem.startsWith(u8, path, "/api/v2/users/") or std.mem.eql(u8, path, "/web/osu-osz2-getscores.php") or std.mem.eql(u8, path, "/web/osu-getreplay.php") or std.mem.eql(u8, path, "/web/osu-search.php") or std.mem.eql(u8, path, "/web/osu-search-set.php") or std.mem.eql(u8, path, "/web/osu-rate.php") or std.mem.eql(u8, path, "/web/lastfm.php") or std.mem.eql(u8, path, "/web/osu-getbeatmapinfo.php") or std.mem.eql(u8, path, "/web/osu-comment.php") or std.mem.eql(u8, path, "/web/osu-markasread.php")) return rate_limit.authenticated;
         return null;
     }
 
@@ -1662,29 +1675,7 @@ const App = struct {
             const set_id_text = if (std.mem.endsWith(u8, raw_set_id, "n")) raw_set_id[0 .. raw_set_id.len - 1] else raw_set_id;
             const set_id = std.fmt.parseInt(i32, set_id_text, 10) catch return respond(req, .bad_request, "text/plain", "", &.{});
             if (set_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{});
-            const mirrored = if (isBeatmapMirrorHost(host_owned))
-                self.map_sync.mirrorArchive(&self.store, set_id) catch |err| return switch (err) {
-                    error.MirrorFillInProgress, error.MirrorAtCapacity => respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap mirror fill is already busy\"}", &.{.{ .name = "retry-after", .value = "5" }}),
-                    error.InvalidBeatmapSet => respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set\"}", &.{}),
-                    else => blk: {
-                        std.log.warn("event=beatmap_mirror_fill_failed set_id={d} error={t}", .{ set_id, err });
-                        break :blk respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror upstream unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
-                    },
-                }
-            else blk: {
-                const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
-                break :blk beatmap_sync.Sync.MirrorArchive{ .data = archive, .cache_hit = true };
-            };
-            defer self.allocator.free(mirrored.data);
-            var disposition_buf: [96]u8 = undefined;
-            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
-            const headers = [_]std.http.Header{
-                .{ .name = "content-disposition", .value = disposition },
-                .{ .name = "cache-control", .value = "public, max-age=3600" },
-                .{ .name = "x-zigcho-mirror-cache", .value = if (mirrored.cache_hit) "hit" else "fill" },
-                .{ .name = "x-content-type-options", .value = "nosniff" },
-            };
-            return respond(req, .ok, "application/x-osu-beatmap-archive", mirrored.data, &headers);
+            return self.serveBeatmapArchive(req, set_id);
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/beatmapsets/") and std.mem.endsWith(u8, path, "/download")) {
             const id_text = path["/api/v2/beatmapsets/".len .. path.len - "/download".len];
@@ -1694,12 +1685,7 @@ const App = struct {
             const user = (try self.store.authenticateToken(self.allocator, auth[7..], "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            const archive = (try self.store.beatmapArchive(self.allocator, set_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap archive unavailable\"}", &.{});
-            defer self.allocator.free(archive);
-            var disposition_buf: [96]u8 = undefined;
-            const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
-            const headers = [_]std.http.Header{.{ .name = "content-disposition", .value = disposition }};
-            return respond(req, .ok, "application/x-osu-beatmap-archive", archive, &headers);
+            return self.serveBeatmapArchive(req, set_id);
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v2/beatmaps/") and std.mem.endsWith(u8, path, "/file")) {
             const id_text = path["/api/v2/beatmaps/".len .. path.len - "/file".len];
@@ -1783,6 +1769,92 @@ const App = struct {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
             return respond(req, .ok, "application/json", "{\"has_more\":false,\"notifications\":[],\"notification_endpoint\":\"wss://api.kai.ovh/notification-endpoint\"}", &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v2/comments")) {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            if (req.head.method == .GET) {
+                const commentable_text = queryField(target, "commentable_type") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"commentable_type required\"}", &.{});
+                const commentable = storage.LazerCommentable.parse(commentable_text) orelse return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid commentable_type\"}", &.{});
+                const commentable_id = std.fmt.parseInt(i64, queryField(target, "commentable_id") orelse "", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid commentable_id\"}", &.{});
+                const page = std.fmt.parseInt(u16, queryField(target, "page") orelse "1", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid page\"}", &.{});
+                const parent_id = std.fmt.parseInt(i64, queryField(target, "parent_id") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid parent_id\"}", &.{});
+                const sort = storage.LazerCommentSort.parse(queryField(target, "sort") orelse "new") orelse return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid sort\"}", &.{});
+                if (commentable_id <= 0 or page == 0 or parent_id < 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid comment query\"}", &.{});
+                if (commentable == .beatmapset and (commentable_id > std.math.maxInt(i32) or !try self.store.beatmapSetExists(@intCast(commentable_id)))) return respond(req, .not_found, "application/json", "{\"error\":\"beatmapset not found\"}", &.{});
+                const json = try self.store.lazerCommentsJson(self.allocator, user.id, .{ .commentable = commentable, .id = commentable_id }, sort, page, parent_id, 0);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &.{});
+            }
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            if (user.restricted) return respond(req, .forbidden, "application/json", "{\"error\":\"restricted\"}", &.{});
+            const now = std.Io.Clock.real.now(self.sessions.io).toSeconds();
+            if (user.silence_end > now) return respond(req, .forbidden, "application/json", "{\"error\":\"silenced\"}", &.{});
+            const commentable_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comment[commentable_type]"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"commentable_type required\"}", &.{});
+            defer self.allocator.free(commentable_owned);
+            const commentable = storage.LazerCommentable.parse(commentable_owned) orelse return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid commentable_type\"}", &.{});
+            const id_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comment[commentable_id]"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"commentable_id required\"}", &.{});
+            defer self.allocator.free(id_owned);
+            const commentable_id = std.fmt.parseInt(i64, id_owned, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid commentable_id\"}", &.{});
+            const message_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comment[message]"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"message required\"}", &.{});
+            defer self.allocator.free(message_owned);
+            const message = std.mem.trim(u8, message_owned, " \t\r\n");
+            const parent_owned = try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comment[parent_id]"});
+            defer if (parent_owned) |value| self.allocator.free(value);
+            const parent_id: ?i64 = if (parent_owned) |value| std.fmt.parseInt(i64, value, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid parent_id\"}", &.{}) else null;
+            if (commentable_id <= 0 or message.len == 0 or message.len > 1000 or !std.unicode.utf8ValidateSlice(message) or std.mem.indexOfScalar(u8, message, 0) != null) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid comment\"}", &.{});
+            if (commentable == .beatmapset and (commentable_id > std.math.maxInt(i32) or !try self.store.beatmapSetExists(@intCast(commentable_id)))) return respond(req, .not_found, "application/json", "{\"error\":\"beatmapset not found\"}", &.{});
+            const comment_target: storage.LazerCommentTarget = .{ .commentable = commentable, .id = commentable_id };
+            const comment_id = self.store.addLazerComment(user.id, comment_target, parent_id, message) catch |err| return switch (err) {
+                error.CommentParentNotFound => respond(req, .not_found, "application/json", "{\"error\":\"parent comment not found\"}", &.{}),
+                else => respond(req, .internal_server_error, "application/json", "{\"error\":\"comment unavailable\"}", &.{}),
+            };
+            const json = try self.store.lazerCommentsJson(self.allocator, user.id, comment_target, .new, 1, 0, comment_id);
+            defer self.allocator.free(json);
+            return respond(req, .created, "application/json", json, &.{});
+        }
+        if (lazer.parseCommentVotePath(path)) |comment_id| {
+            if (req.head.method != .POST and req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const comment_target = (try self.store.lazerCommentTarget(comment_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"comment not found\"}", &.{});
+            _ = try self.store.setLazerCommentVote(user.id, comment_id, req.head.method == .POST);
+            const json = try self.store.lazerCommentsJson(self.allocator, user.id, comment_target, .new, 1, 0, comment_id);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (lazer.parseCommentPath(path)) |comment_id| {
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const comment_target = (try self.store.lazerCommentTarget(comment_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"comment not found\"}", &.{});
+            if (req.head.method == .GET) {
+                const json = try self.store.lazerCommentsJson(self.allocator, user.id, comment_target, .new, 1, 0, comment_id);
+                defer self.allocator.free(json);
+                return respond(req, .ok, "application/json", json, &.{});
+            }
+            if (req.head.method != .DELETE) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            if (!try self.store.deleteLazerComment(user.id, comment_id, web_auth.canModerate(user))) return respond(req, .forbidden, "application/json", "{\"error\":\"comment cannot be deleted\"}", &.{});
+            const json = try self.store.lazerCommentsJson(self.allocator, user.id, comment_target, .new, 1, 0, comment_id);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{});
+        }
+        if (std.mem.eql(u8, path, "/api/v2/reports")) {
+            if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
+            const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, user);
+            const reportable_type = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reportable_type"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reportable_type required\"}", &.{});
+            defer self.allocator.free(reportable_type);
+            if (!std.mem.eql(u8, reportable_type, "comment")) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"unsupported report type\"}", &.{});
+            const id_owned = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reportable_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reportable_id required\"}", &.{});
+            defer self.allocator.free(id_owned);
+            const comment_id = std.fmt.parseInt(i64, id_owned, 10) catch return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid reportable_id\"}", &.{});
+            const reason = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &.{});
+            defer self.allocator.free(reason);
+            const comments = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"comments"})) orelse try self.allocator.dupe(u8, "");
+            defer self.allocator.free(comments);
+            if (reason.len == 0 or reason.len > 64 or comments.len > 1000 or !std.unicode.utf8ValidateSlice(comments)) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid report\"}", &.{});
+            if (!try self.store.reportLazerComment(user.id, comment_id, reason, comments)) return respond(req, .conflict, "application/json", "{\"error\":\"report already submitted or comment not found\"}", &.{});
+            return respond(req, .created, "application/json", "{}", &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/friends")) {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
@@ -2075,6 +2147,19 @@ const App = struct {
             try output.writer.writeAll("],\"cursor\":null}");
             return respond(req, .ok, "application/json", output.written(), &.{});
         }
+        if (req.head.method == .GET) if (lazer.parseUserRecentActivityPath(path)) |profile_user_id| {
+            const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
+            defer freeUser(self.allocator, requester);
+            const profile_user = (try self.store.userById(self.allocator, profile_user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            defer freeUser(self.allocator, profile_user);
+            if (profile_user.restricted and profile_user.id != requester.id) return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            const offset = std.fmt.parseInt(u16, queryField(target, "offset") orelse "0", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid offset\"}", &.{});
+            const limit = std.fmt.parseInt(u8, queryField(target, "limit") orelse "50", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid limit\"}", &.{});
+            if (limit == 0 or limit > 100 or offset > 10_000) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid pagination\"}", &.{});
+            const json = try self.store.lazerRecentActivityJson(self.allocator, profile_user.id, offset, limit);
+            defer self.allocator.free(json);
+            return respond(req, .ok, "application/json", json, &.{});
+        };
         if (req.head.method == .GET) if (lazer.parseUserScoresPath(path)) |score_path| {
             const requester = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, requester);
@@ -3274,11 +3359,79 @@ fn migrateAvatarObjects(allocator: std.mem.Allocator, store: *storage.Store, sou
     return stats;
 }
 
+fn mirrorWorkerCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !bool {
+    if (args.len == 0 or !std.mem.eql(u8, args[0], "mirror-worker")) return false;
+    if (args.len != 1) return error.InvalidMirrorWorkerArguments;
+    const database: [:0]const u8 = if (storage.is_postgres)
+        std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl)
+    else
+        "zigcho.db";
+    var store = try storage.Store.open(allocator, io, database);
+    defer store.close();
+    try store.migrate();
+    var config = try config_mod.load(allocator, io);
+    defer config.deinit();
+    const object_store = configuredObjectStore(config);
+    if (!object_store.enabled()) return error.ObjectStorageNotConfigured;
+    store.bindObjectStorage(object_store);
+    var sync = beatmap_sync.Sync.init(allocator, io, config.beatmap_cache_max_bytes);
+    defer sync.deinit();
+    std.log.info("event=beatmap_mirror_worker_started mode=continuous", .{});
+    while (true) {
+        const unknown_sizes = store.beatmapArchiveIdsMissingSize(allocator, 1) catch |err| {
+            std.log.warn("event=beatmap_mirror_worker_inventory_list_failed error={t}", .{err});
+            std.Io.sleep(io, .fromSeconds(30), .awake) catch return true;
+            continue;
+        };
+        if (unknown_sizes.len != 0) {
+            const set_id = unknown_sizes[0];
+            allocator.free(unknown_sizes);
+            const archive = store.beatmapArchive(allocator, set_id) catch |err| {
+                std.log.warn("event=beatmap_mirror_worker_inventory_read_failed set_id={d} error={t}", .{ set_id, err });
+                std.Io.sleep(io, .fromSeconds(30), .awake) catch return true;
+                continue;
+            } orelse {
+                std.Io.sleep(io, .fromSeconds(30), .awake) catch return true;
+                continue;
+            };
+            store.setBeatmapArchiveSize(set_id, archive.len) catch |err|
+                std.log.warn("event=beatmap_mirror_worker_inventory_write_failed set_id={d} error={t}", .{ set_id, err });
+            allocator.free(archive);
+            std.log.info("event=beatmap_mirror_worker_inventoried set_id={d}", .{set_id});
+            std.Io.sleep(io, .fromSeconds(1), .awake) catch return true;
+            continue;
+        }
+        allocator.free(unknown_sizes);
+        const ids = store.beatmapSetIdsMissingArchives(allocator, 1) catch |err| {
+            std.log.warn("event=beatmap_mirror_worker_list_failed error={t}", .{err});
+            std.Io.sleep(io, .fromSeconds(30), .awake) catch return true;
+            continue;
+        };
+        if (ids.len == 0) {
+            allocator.free(ids);
+            std.log.info("event=beatmap_mirror_worker_idle", .{});
+            std.Io.sleep(io, .fromSeconds(900), .awake) catch return true;
+            continue;
+        }
+        const set_id = ids[0];
+        allocator.free(ids);
+        const mirrored = sync.prefetchMirrorArchive(&store, set_id) catch |err| {
+            std.log.warn("event=beatmap_mirror_worker_failed set_id={d} error={t}", .{ set_id, err });
+            std.Io.sleep(io, .fromSeconds(30), .awake) catch return true;
+            continue;
+        };
+        allocator.free(mirrored.data);
+        std.log.info("event=beatmap_mirror_worker_stored set_id={d}", .{set_id});
+        std.Io.sleep(io, .fromSeconds(1), .awake) catch return true;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
     if (args.len > 1 and try objectTransferCommand(allocator, init.io, args[1..])) return;
+    if (args.len > 1 and try mirrorWorkerCommand(allocator, init.io, args[1..])) return;
     if (args.len > 1 and std.mem.eql(u8, args[1], "check")) {
         if (args.len > 2) return error.UnexpectedCheckArgument;
         const database: [:0]const u8 = if (storage.is_postgres)
@@ -3413,11 +3566,6 @@ pub fn main(init: std.process.Init) !void {
     kai_session.longitude = -21.9426; // reykjavik
     kai_session.latitude = 64.1466;
     if (app.anticheat) |*loaded| std.log.info("event=anticheat_module_loaded module={s} abi={d} mode=observe", .{ loaded.name(), anticheat_abi.version });
-    const mirror_thread: ?std.Thread = std.Thread.spawn(.{}, App.prefetchBeatmapMirror, .{&app}) catch |err| blk: {
-        std.log.warn("event=beatmap_mirror_prefetch_start_failed error={t}", .{err});
-        break :blk null;
-    };
-    if (mirror_thread) |thread| thread.detach();
     defer if (app.anticheat) |*loaded| loaded.close();
     defer app.score_webhook.deinit();
     defer app.avatar_cache.deinit();

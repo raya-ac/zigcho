@@ -154,6 +154,11 @@ pub const Sync = struct {
         return self.resolveMirrorArchive(store, set_id, false);
     }
 
+    pub fn recordMirrorCacheHit(self: *Sync, bytes: usize) void {
+        _ = self.mirror_hits.fetchAdd(1, .monotonic);
+        _ = self.mirror_bytes_served.fetchAdd(@intCast(bytes), .monotonic);
+    }
+
     fn resolveMirrorArchive(self: *Sync, store: *storage.Store, set_id: i32, count_served: bool) !MirrorArchive {
         if (set_id <= 0) return error.InvalidBeatmapSet;
         if (try store.beatmapArchive(self.allocator, set_id)) |archive| {

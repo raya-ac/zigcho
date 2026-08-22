@@ -12,6 +12,33 @@ const achievements = @import("achievements.zig");
 const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
 pub const is_postgres = false;
+
+pub const LazerCommentable = enum {
+    beatmapset,
+    build,
+    news_post,
+
+    pub fn parse(value: []const u8) ?LazerCommentable {
+        if (std.mem.eql(u8, value, "newspost")) return .news_post;
+        return std.meta.stringToEnum(LazerCommentable, value);
+    }
+
+    pub fn text(self: LazerCommentable) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const LazerCommentTarget = struct { commentable: LazerCommentable, id: i64 };
+
+pub const LazerCommentSort = enum {
+    new,
+    old,
+    top,
+
+    pub fn parse(value: []const u8) ?LazerCommentSort {
+        return std.meta.stringToEnum(LazerCommentSort, value);
+    }
+};
 pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -136,6 +163,19 @@ pub const Store = struct {
     pub const LazerChatWrite = struct {
         json: []u8,
         inserted: bool,
+    };
+
+    pub const BeatmapArchiveDownload = struct {
+        allocator: std.mem.Allocator,
+        object_key: ?[]u8,
+        data: ?[]u8,
+        bytes: usize,
+
+        pub fn deinit(self: *BeatmapArchiveDownload) void {
+            if (self.object_key) |value| self.allocator.free(value);
+            if (self.data) |value| self.allocator.free(value);
+            self.* = undefined;
+        }
     };
 
     const Credential = struct {
@@ -284,6 +324,7 @@ pub const Store = struct {
             else
                 try self.exec("ALTER TABLE beatmap_archives ADD COLUMN object_bytes INTEGER NOT NULL DEFAULT 0 CHECK(object_bytes>=0); UPDATE beatmap_archives SET object_bytes=length(osz_file); PRAGMA user_version=31");
         }
+        if (version < 32) try self.exec(@embedFile("migration_032.sql"));
         try self.exec(
             "BEGIN IMMEDIATE;" ++
                 "UPDATE lazer_scores SET best=0;" ++
@@ -1285,6 +1326,183 @@ pub const Store = struct {
             if (colour.len != 0) try output.writer.print("|{s}", .{colour});
             try output.writer.print("\t{s}", .{std.mem.span(c.sqlite3_column_text(stmt, 4))});
         }
+        return output.toOwnedSlice();
+    }
+
+    pub fn addLazerComment(self: *Store, user_id: i32, target: LazerCommentTarget, parent_id: ?i64, message: []const u8) !i64 {
+        if (message.len == 0 or message.len > 1000 or !std.unicode.utf8ValidateSlice(message)) return error.InvalidComment;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (parent_id) |parent| {
+            var check: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM lazer_comments WHERE id=?1 AND commentable_type=?2 AND commentable_id=?3 AND deleted_at IS NULL", -1, &check, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(check);
+            _ = c.sqlite3_bind_int64(check, 1, parent);
+            _ = c.sqlite3_bind_text(check, 2, target.commentable.text().ptr, @intCast(target.commentable.text().len), null);
+            _ = c.sqlite3_bind_int64(check, 3, target.id);
+            if (c.sqlite3_step(check) != c.SQLITE_ROW) return error.CommentParentNotFound;
+        }
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO lazer_comments(commentable_type,commentable_id,user_id,parent_id,message) VALUES(?1,?2,?3,?4,?5)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, target.commentable.text().ptr, @intCast(target.commentable.text().len), null);
+        _ = c.sqlite3_bind_int64(stmt, 2, target.id);
+        _ = c.sqlite3_bind_int(stmt, 3, user_id);
+        if (parent_id) |parent| _ = c.sqlite3_bind_int64(stmt, 4, parent) else _ = c.sqlite3_bind_null(stmt, 4);
+        _ = c.sqlite3_bind_text(stmt, 5, message.ptr, @intCast(message.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_last_insert_rowid(self.db);
+    }
+
+    pub fn lazerCommentTarget(self: *Store, comment_id: i64) !?LazerCommentTarget {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT commentable_type,commentable_id FROM lazer_comments WHERE id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, comment_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{ .commentable = LazerCommentable.parse(std.mem.span(c.sqlite3_column_text(stmt, 0))) orelse return error.InvalidStoredComment, .id = c.sqlite3_column_int64(stmt, 1) };
+    }
+
+    pub fn deleteLazerComment(self: *Store, user_id: i32, comment_id: i64, staff: bool) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = if (staff)
+            "UPDATE lazer_comments SET message='',deleted_at=unixepoch(),updated_at=unixepoch() WHERE id=?1 AND deleted_at IS NULL"
+        else
+            "UPDATE lazer_comments SET message='',deleted_at=unixepoch(),updated_at=unixepoch() WHERE id=?1 AND user_id=?2 AND deleted_at IS NULL";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, comment_id);
+        if (!staff) _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
+    pub fn setLazerCommentVote(self: *Store, user_id: i32, comment_id: i64, voted: bool) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = if (voted)
+            "INSERT OR IGNORE INTO lazer_comment_votes(comment_id,user_id) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM lazer_comments WHERE id=?1 AND deleted_at IS NULL)"
+        else
+            "DELETE FROM lazer_comment_votes WHERE comment_id=?1 AND user_id=?2";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, comment_id);
+        _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
+    pub fn reportLazerComment(self: *Store, user_id: i32, comment_id: i64, reason: []const u8, comments: []const u8) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO lazer_comment_reports(comment_id,reporter_id,reason,comments) SELECT ?1,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM lazer_comments WHERE id=?1)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, comment_id);
+        _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        _ = c.sqlite3_bind_text(stmt, 3, reason.ptr, @intCast(reason.len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, comments.ptr, @intCast(comments.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) != 0;
+    }
+
+    pub fn lazerCommentsJson(self: *Store, allocator: std.mem.Allocator, viewer_id: i32, target: LazerCommentTarget, sort: LazerCommentSort, page: u16, parent_id: i64, only_id: i64) ![]u8 {
+        if (page == 0 or page > 1000 or parent_id < 0 or only_id < 0) return error.InvalidCommentQuery;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const base_sql = "SELECT c.id,c.parent_id,c.user_id,c.message,strftime('%Y-%m-%dT%H:%M:%SZ',c.created_at,'unixepoch'),strftime('%Y-%m-%dT%H:%M:%SZ',c.updated_at,'unixepoch'),CASE WHEN c.deleted_at IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%SZ',c.deleted_at,'unixepoch') END,(SELECT count(*) FROM lazer_comments r WHERE r.parent_id=c.id),(SELECT count(*) FROM lazer_comment_votes v WHERE v.comment_id=c.id),EXISTS(SELECT 1 FROM lazer_comment_votes v WHERE v.comment_id=c.id AND v.user_id=?5) FROM lazer_comments c JOIN users u ON u.id=c.user_id WHERE c.commentable_type=?1 AND c.commentable_id=?2 AND u.restricted=0 AND ((?4>0 AND c.id=?4) OR (?4=0 AND ((?3>0 AND c.parent_id=?3) OR (?3=0 AND c.parent_id IS NULL))))";
+        const sql = switch (sort) {
+            .new => base_sql ++ " ORDER BY c.created_at DESC,c.id DESC LIMIT 51 OFFSET ?6",
+            .old => base_sql ++ " ORDER BY c.created_at ASC,c.id ASC LIMIT 51 OFFSET ?6",
+            .top => base_sql ++ " ORDER BY (SELECT count(*) FROM lazer_comment_votes v WHERE v.comment_id=c.id) DESC,c.created_at DESC,c.id DESC LIMIT 51 OFFSET ?6",
+        };
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, target.commentable.text().ptr, @intCast(target.commentable.text().len), null);
+        _ = c.sqlite3_bind_int64(stmt, 2, target.id);
+        _ = c.sqlite3_bind_int64(stmt, 3, parent_id);
+        _ = c.sqlite3_bind_int64(stmt, 4, only_id);
+        _ = c.sqlite3_bind_int(stmt, 5, viewer_id);
+        _ = c.sqlite3_bind_int64(stmt, 6, (@as(i64, page) - 1) * 50);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        var user_ids: std.ArrayList(i32) = .empty;
+        defer user_ids.deinit(allocator);
+        var voted_ids: std.ArrayList(i64) = .empty;
+        defer voted_ids.deinit(allocator);
+        try output.writer.writeAll("{\"commentable_meta\":[{\"id\":");
+        try output.writer.print("{d},\"owner_id\":null,\"owner_title\":null,\"title\":", .{target.id});
+        var title_buf: [96]u8 = undefined;
+        const title = try std.fmt.bufPrint(&title_buf, "{s} #{d}", .{ target.commentable.text(), target.id });
+        try jsonString(&output.writer, title);
+        try output.writer.writeAll(",\"type\":");
+        try jsonString(&output.writer, target.commentable.text());
+        try output.writer.writeAll(",\"url\":");
+        var url_buf: [128]u8 = undefined;
+        const url = if (target.commentable == .beatmapset) try std.fmt.bufPrint(&url_buf, "https://kai.ovh/beatmapsets/{d}", .{target.id}) else try std.fmt.bufPrint(&url_buf, "https://kai.ovh/", .{});
+        try jsonString(&output.writer, url);
+        try output.writer.writeAll(",\"current_user_attributes\":{\"can_new_comment_reason\":null}}],\"comments\":[");
+        var written: usize = 0;
+        var has_more = false;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (written == 50) {
+                has_more = true;
+                break;
+            }
+            if (written != 0) try output.writer.writeByte(',');
+            written += 1;
+            const comment_id = c.sqlite3_column_int64(stmt, 0);
+            const user_id = c.sqlite3_column_int(stmt, 2);
+            if (std.mem.indexOfScalar(i32, user_ids.items, user_id) == null) try user_ids.append(allocator, user_id);
+            const voted = c.sqlite3_column_int(stmt, 9) != 0;
+            if (voted) try voted_ids.append(allocator, comment_id);
+            try output.writer.print("{{\"id\":{d},\"parent_id\":", .{comment_id});
+            if (c.sqlite3_column_type(stmt, 1) == c.SQLITE_NULL) try output.writer.writeAll("null") else try output.writer.print("{d}", .{c.sqlite3_column_int64(stmt, 1)});
+            try output.writer.print(",\"user_id\":{d},\"message\":", .{user_id});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+            try output.writer.writeAll(",\"message_html\":null,\"replies_count\":");
+            try output.writer.print("{d},\"votes_count\":{d},\"commentable_type\":", .{ c.sqlite3_column_int(stmt, 7), c.sqlite3_column_int(stmt, 8) });
+            try jsonString(&output.writer, target.commentable.text());
+            try output.writer.print(",\"commentable_id\":{d},\"legacy_name\":null,\"created_at\":", .{target.id});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 4)));
+            try output.writer.writeAll(",\"updated_at\":");
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 5)));
+            try output.writer.writeAll(",\"deleted_at\":");
+            if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) try output.writer.writeAll("null") else try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 6)));
+            try output.writer.writeAll(",\"edited_at\":null,\"edited_by_id\":null,\"pinned\":false}");
+        }
+        var count_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT count(*),sum(CASE WHEN parent_id IS NULL THEN 1 ELSE 0 END) FROM lazer_comments WHERE commentable_type=?1 AND commentable_id=?2", -1, &count_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(count_stmt);
+        _ = c.sqlite3_bind_text(count_stmt, 1, target.commentable.text().ptr, @intCast(target.commentable.text().len), null);
+        _ = c.sqlite3_bind_int64(count_stmt, 2, target.id);
+        if (c.sqlite3_step(count_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        const total = c.sqlite3_column_int(count_stmt, 0);
+        const top_level = c.sqlite3_column_int(count_stmt, 1);
+        try output.writer.print("],\"has_more\":{},\"has_more_id\":null,\"user_follow\":false,\"included_comments\":[],\"pinned_comments\":[],\"user_votes\":[", .{has_more});
+        for (voted_ids.items, 0..) |id, index| {
+            if (index != 0) try output.writer.writeByte(',');
+            try output.writer.print("{d}", .{id});
+        }
+        try output.writer.writeAll("],\"users\":[");
+        for (user_ids.items, 0..) |id, index| {
+            var user_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT id,name,CASE WHEN show_country=1 THEN country ELSE 'XX' END,privileges,restricted FROM users WHERE id=?1", -1, &user_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(user_stmt);
+            _ = c.sqlite3_bind_int(user_stmt, 1, id);
+            if (c.sqlite3_step(user_stmt) != c.SQLITE_ROW) continue;
+            if (index != 0) try output.writer.writeByte(',');
+            const country = std.mem.span(c.sqlite3_column_text(user_stmt, 2));
+            const user: domain.User = .{ .id = id, .name = std.mem.span(c.sqlite3_column_text(user_stmt, 1)), .safe_name = "", .country = .{ country[0], country[1] }, .privileges = @intCast(c.sqlite3_column_int64(user_stmt, 3)), .restricted = c.sqlite3_column_int(user_stmt, 4) != 0 };
+            try user_json.writeCompact(&output.writer, user);
+        }
+        try output.writer.print("],\"total\":{d},\"top_level_count\":{d}}}", .{ total, top_level });
         return output.toOwnedSlice();
     }
 
@@ -2667,7 +2885,16 @@ pub const Store = struct {
         const show_recent_scores = c.sqlite3_column_int(user, 15) != 0;
         try output.writer.print(",\"stats_public\":{},\"recent_scores_public\":{},\"selected_source\":\"{s}\",\"stats_source\":\"{s}\",\"selected_mode\":{d},\"selected_stats\":", .{ show_profile_stats, show_recent_scores, @tagName(source), if (source == .all) "combined" else @tagName(source), stats_mode });
         if (show_profile_stats and c.sqlite3_step(selected_stats) == c.SQLITE_ROW) {
-            try output.writer.print("{{\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ c.sqlite3_column_int64(selected_stats, 0), c.sqlite3_column_int64(selected_stats, 1), c.sqlite3_column_int(selected_stats, 2), c.sqlite3_column_int(selected_stats, 3), c.sqlite3_column_int(selected_stats, 4), c.sqlite3_column_double(selected_stats, 5), c.sqlite3_column_int(selected_stats, 6), c.sqlite3_column_int(selected_stats, 7) });
+            const total_score = @max(@as(i64, 0), c.sqlite3_column_int64(selected_stats, 1));
+            const level_current = @min(@as(i64, 100), @divFloor(total_score, 1_000_000) + 1);
+            const level_progress = @divFloor(@mod(total_score, 1_000_000) * 100, 1_000_000);
+            const global_rank = c.sqlite3_column_int(selected_stats, 7);
+            try output.writer.print("{{\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d},\"level_current\":{d},\"level_progress\":{d},\"rank_history\":[", .{ c.sqlite3_column_int64(selected_stats, 0), total_score, c.sqlite3_column_int(selected_stats, 2), c.sqlite3_column_int(selected_stats, 3), c.sqlite3_column_int(selected_stats, 4), c.sqlite3_column_double(selected_stats, 5), c.sqlite3_column_int(selected_stats, 6), global_rank, level_current, level_progress });
+            for (0..90) |index| {
+                if (index != 0) try output.writer.writeByte(',');
+                try output.writer.print("{d}", .{if (global_rank > 0 and index >= 88) global_rank else 0});
+            }
+            try output.writer.writeAll("]}");
         } else {
             try output.writer.writeAll("null");
         }
@@ -3029,6 +3256,60 @@ pub const Store = struct {
             .recent = c.sqlite3_column_int(stmt, 2),
             .pinned = c.sqlite3_column_int(stmt, 3),
         };
+    }
+
+    pub fn lazerRecentActivityJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, offset: u16, limit: u8) ![]u8 {
+        if (limit == 0 or limit > 100) return error.InvalidScoreLimit;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const sql =
+            "WITH all_scores AS (" ++
+            "SELECT s.id,'lazer' source,s.user_id,s.ruleset_id mode,s.pp,s.rank,0 mods,s.accuracy,0 n300,0 n100,0 n50,0 nmiss,s.submitted_at,b.id map_id,b.set_id,b.artist,b.title,b.version FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN users u ON u.id=s.user_id WHERE s.passed=1 AND u.restricted=0 " ++
+            "UNION ALL SELECT s.id,'stable',s.user_id,s.mode,s.pp,'',s.mods,s.accuracy,s.n300,s.n100,s.n50,s.nmiss,s.submitted_at,b.id,b.set_id,b.artist,b.title,b.version FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 JOIN users u ON u.id=s.user_id WHERE s.passed=1 AND u.restricted=0)," ++
+            "best AS (SELECT user_id,map_id,mode,max(pp) pp FROM all_scores GROUP BY user_id,map_id,mode) " ++
+            "SELECT a.id,a.source,a.mode,a.rank,a.mods,a.accuracy,a.n300,a.n100,a.n50,a.nmiss,strftime('%Y-%m-%dT%H:%M:%SZ',a.submitted_at,'unixepoch'),a.map_id,a.set_id,a.artist,a.title,a.version,u.name,1+(SELECT count(*) FROM best b WHERE b.map_id=a.map_id AND b.mode=a.mode AND b.pp>a.pp) placement FROM all_scores a JOIN users u ON u.id=a.user_id WHERE a.user_id=?1 ORDER BY a.submitted_at DESC,a.source ASC,a.id DESC LIMIT ?2 OFFSET ?3";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, user_id);
+        _ = c.sqlite3_bind_int(stmt, 2, limit);
+        _ = c.sqlite3_bind_int(stmt, 3, offset);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        var index: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (index != 0) try output.writer.writeByte(',');
+            const stable = std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)), "stable");
+            const mode: u8 = @intCast(c.sqlite3_column_int(stmt, 2));
+            const rank = if (stable) stableGrade(mode, c.sqlite3_column_int(stmt, 4), c.sqlite3_column_double(stmt, 5), c.sqlite3_column_int(stmt, 6), c.sqlite3_column_int(stmt, 7), c.sqlite3_column_int(stmt, 8), c.sqlite3_column_int(stmt, 9)) else std.mem.span(c.sqlite3_column_text(stmt, 3));
+            try output.writer.print("{{\"id\":{d},\"createdAt\":", .{@as(i64, @intCast(index + 1 + offset))});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 10)));
+            try output.writer.writeAll(",\"type\":\"rank\",\"scoreRank\":");
+            try jsonString(&output.writer, rank);
+            try output.writer.print(",\"rank\":{d},\"mode\":", .{c.sqlite3_column_int(stmt, 17)});
+            try jsonString(&output.writer, switch (mode) {
+                0 => "osu",
+                1 => "taiko",
+                2 => "fruits",
+                3 => "mania",
+                else => "osu",
+            });
+            var title_buf: [768]u8 = undefined;
+            const map_title = try std.fmt.bufPrint(&title_buf, "{s} - {s} [{s}]", .{ std.mem.span(c.sqlite3_column_text(stmt, 13)), std.mem.span(c.sqlite3_column_text(stmt, 14)), std.mem.span(c.sqlite3_column_text(stmt, 15)) });
+            try output.writer.writeAll(",\"beatmap\":{\"title\":");
+            try jsonString(&output.writer, map_title);
+            try output.writer.print(",\"url\":\"/b/{d}\"}},\"beatmapset\":{{\"title\":", .{c.sqlite3_column_int(stmt, 11)});
+            var set_title_buf: [512]u8 = undefined;
+            const set_title = try std.fmt.bufPrint(&set_title_buf, "{s} - {s}", .{ std.mem.span(c.sqlite3_column_text(stmt, 13)), std.mem.span(c.sqlite3_column_text(stmt, 14)) });
+            try jsonString(&output.writer, set_title);
+            try output.writer.print(",\"url\":\"/beatmapsets/{d}\"}},\"user\":{{\"username\":", .{c.sqlite3_column_int(stmt, 12)});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(stmt, 16)));
+            try output.writer.print(",\"url\":\"/users/{d}\",\"previousUsername\":null}}}}", .{user_id});
+            index += 1;
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
     }
 
     pub fn lazerUserScoresJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, ruleset_id: u8, kind: lazer.UserScoreKind, source: domain.SiteScoreSource, offset: u16, limit: u8) ![]u8 {
@@ -4208,6 +4489,49 @@ pub const Store = struct {
         return stored.data;
     }
 
+    pub fn beatmapArchiveDownload(self: *Store, allocator: std.mem.Allocator, set_id: i32) !?BeatmapArchiveDownload {
+        const stored = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT sha256,osz_file,object_bytes FROM beatmap_archives WHERE set_id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_int(stmt, 1, set_id);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            const sha256 = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+            errdefer allocator.free(sha256);
+            const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const data = try allocator.dupe(u8, ptr[0..len]);
+            errdefer allocator.free(data);
+            const bytes: usize = @intCast(c.sqlite3_column_int64(stmt, 2));
+            var touch: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmap_archives SET last_accessed_at=unixepoch() WHERE set_id=?1", -1, &touch, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(touch);
+            _ = c.sqlite3_bind_int(touch, 1, set_id);
+            if (c.sqlite3_step(touch) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            break :blk .{ .sha256 = sha256, .data = data, .bytes = bytes };
+        };
+        defer allocator.free(stored.sha256);
+        if (stored.bytes == 0 or stored.bytes != stored.data.len or !object_keys.matchesSha256(stored.data, stored.sha256)) {
+            allocator.free(stored.data);
+            return error.InvalidStoredBeatmapArchive;
+        }
+        errdefer allocator.free(stored.data);
+        const object_key = if (self.object_store.enabled() and object_keys.validSha256(stored.sha256))
+            try object_keys.archive(allocator, set_id, stored.sha256)
+        else
+            null;
+        return .{ .allocator = allocator, .object_key = object_key, .data = stored.data, .bytes = stored.bytes };
+    }
+
+    pub fn streamBeatmapArchive(self: *Store, download: BeatmapArchiveDownload, writer: *std.Io.Writer) !void {
+        if (download.object_key) |object_key| {
+            return self.object_store.streamGet(self.allocator, self.io, object_key, "application/octet-stream", writer);
+        }
+        try writer.writeAll(download.data orelse return error.BeatmapArchiveUnavailable);
+    }
+
     pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -4810,7 +5134,7 @@ pub const Store = struct {
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 8)));
         try writer.writeAll(",\"last_updated\":");
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 8)));
-        try writer.print(",\"ranked_date\":null,\"ratings\":[],\"availability\":{{\"download_disabled\":{s},\"more_information\":\"\"}},\"genre\":{{\"id\":0,\"name\":\"Unspecified\"}},\"language\":{{\"id\":0,\"name\":\"Unspecified\"}},\"source\":", .{if (c.sqlite3_column_int(set_stmt, 9) != 0) "true" else "false"});
+        try writer.writeAll(",\"ranked_date\":null,\"ratings\":[],\"availability\":{\"download_disabled\":false,\"more_information\":\"\"},\"genre\":{\"id\":0,\"name\":\"Unspecified\"},\"language\":{\"id\":0,\"name\":\"Unspecified\"},\"source\":");
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 6)));
         try writer.writeAll(",\"tags\":");
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 7)));

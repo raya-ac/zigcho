@@ -638,6 +638,35 @@ pub fn parseUserScoresPath(path: []const u8) ?UserScoresPath {
     return .{ .user_id = user_id, .kind = kind };
 }
 
+pub fn parseUserRecentActivityPath(path: []const u8) ?i32 {
+    const prefix = "/api/v2/users/";
+    const suffix = "/recent_activity";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const id_text = path[prefix.len .. path.len - suffix.len];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const id = std.fmt.parseInt(i32, id_text, 10) catch return null;
+    return if (id > 0) id else null;
+}
+
+pub fn parseCommentPath(path: []const u8) ?i64 {
+    const prefix = "/api/v2/comments/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const id_text = path[prefix.len..];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    return if (id > 0) id else null;
+}
+
+pub fn parseCommentVotePath(path: []const u8) ?i64 {
+    const prefix = "/api/v2/comments/";
+    const suffix = "/vote";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const id_text = path[prefix.len .. path.len - suffix.len];
+    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
+    const id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    return if (id > 0) id else null;
+}
+
 pub fn parseUserPath(path: []const u8) ?UserPath {
     const prefix = "/api/v2/users/";
     if (!std.mem.startsWith(u8, path, prefix)) return null;

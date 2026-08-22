@@ -31,7 +31,7 @@ ZIGCHO_POSTGRES_URL='host=/var/run/postgresql dbname=zigcho user=zigcho connect_
   ./zig-out/bin/zigcho 127.0.0.1 8080
 ```
 
-copy `config.example.ini` to `config.ini` for private runtime settings. the real file is ignored by git and Docker. object storage stays private and only needs read/write access to its one bucket. `zigcho object-migrate` copies and verifies the existing map cache and avatars without deleting anything. once an object-aware build is the rollback, `zigcho object-purge` verifies every object again before removing the duplicate PostgreSQL blobs. `beatmaps.kai.ovh` fills missing sets into that same store and the backup timer only removes its local dump after the uploaded copy has been read back and checked.
+copy `config.example.ini` to `config.ini` for private runtime settings. the real file is ignored by git and Docker. object storage stays private and only needs read/write access to its one bucket. `zigcho object-migrate` copies and verifies the existing map cache and avatars without deleting anything. once an object-aware build is the rollback, `zigcho object-purge` verifies every object again before removing the duplicate PostgreSQL blobs. `beatmaps.kai.ovh` streams stored sets instead of buffering the whole file first. the separate low-priority mirror worker fills missing sets without sitting inside the player server, and the backup timer only removes its local dump after the uploaded copy has been read back and checked.
 
 the full public hostname contract is in `deploy/hosts.txt`. production releases are built from an exact commit, placed under `/opt/zigcho/releases/<commit>`, then activated with `tools/activate-release.sh`. activation makes and restore-tests a PostgreSQL backup before changing the live symlink.
 

@@ -1474,27 +1474,32 @@ index 6b7ffbd1db410ec1fe384d72af85aae1c3c45a7c..0e45f6e02c3c56efc2b6ad6452a5f2fe
              description.Colour = colours.BlueLight;
          }
 diff --git a/osu.Game/Overlays/Profile/Sections/MedalsSection.cs b/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
-index 42f241d66275993f7d15ccff7c9a54a909cd6123..3a36e8fc1db24b594f00c36cbd2dad77c6597225 100644
+index 42f241d66275993f7d15ccff7c9a54a909cd6123..780325af4d 100644
 --- a/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
 +++ b/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
-@@ -1,8 +1,16 @@
+@@ -1,8 +1,21 @@
  ﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
  // See the LICENCE file in the repository root for full licence text.
  
++using System;
 +using osu.Framework.Bindables;
 +using osu.Framework.Graphics;
 +using osu.Framework.Graphics.Containers;
++using osu.Framework.Graphics.Cursor;
 +using osu.Framework.Graphics.Shapes;
++using osu.Framework.Graphics.Sprites;
  using osu.Framework.Localisation;
 +using osu.Game.Graphics;
++using osu.Game.Graphics.Containers;
 +using osu.Game.Graphics.Sprites;
 +using osu.Game.Online.API.Requests.Responses;
++using osu.Game.Overlays.Profile.Sections.Recent;
  using osu.Game.Resources.Localisation.Web;
 +using osuTK;
  
  namespace osu.Game.Overlays.Profile.Sections
  {
-@@ -11,5 +19,76 @@ public partial class MedalsSection : ProfileSection
+@@ -11,5 +24,112 @@ public partial class MedalsSection : ProfileSection
          public override LocalisableString Title => UsersStrings.ShowExtraMedalsTitle;
  
          public override string Identifier => @"medals";
@@ -1507,8 +1512,8 @@ index 42f241d66275993f7d15ccff7c9a54a909cd6123..3a36e8fc1db24b594f00c36cbd2dad77
 +            {
 +                RelativeSizeAxes = Axes.X,
 +                AutoSizeAxes = Axes.Y,
-+                Direction = FillDirection.Vertical,
-+                Spacing = new Vector2(0, 8),
++                Direction = FillDirection.Full,
++                Spacing = new Vector2(12, 18),
 +            };
 +
 +            User.BindValueChanged(userChanged, true);
@@ -1522,52 +1527,88 @@ index 42f241d66275993f7d15ccff7c9a54a909cd6123..3a36e8fc1db24b594f00c36cbd2dad77
 +                medalList.Add(new MedalEntry(achievement));
 +        }
 +
-+        private partial class MedalEntry : CompositeDrawable
++        private partial class MedalEntry : CompositeDrawable, IHasTooltip
 +        {
++            public LocalisableString TooltipText { get; }
++
 +            public MedalEntry(APIUserAchievement achievement)
 +            {
-+                RelativeSizeAxes = Axes.X;
-+                Height = 58;
-+                Masking = true;
-+                CornerRadius = 6;
++                Width = 142;
++                Height = 104;
++                TooltipText = $"{achievement.Name}\n{achievement.Description}";
++
++                Drawable icon = createIcon(achievement);
++                icon.Anchor = Anchor.TopCentre;
++                icon.Origin = Anchor.TopCentre;
++                icon.Size = new Vector2(66);
 +
 +                InternalChildren = new Drawable[]
++                {
++                    icon,
++                    new OsuTextFlowContainer(text => text.Font = OsuFont.GetFont(size: 12, weight: FontWeight.SemiBold))
++                    {
++                        Anchor = Anchor.BottomCentre,
++                        Origin = Anchor.BottomCentre,
++                        RelativeSizeAxes = Axes.X,
++                        AutoSizeAxes = Axes.Y,
++                        TextAnchor = Anchor.TopCentre,
++                        Text = string.IsNullOrEmpty(achievement.Name) ? $"achievement #{achievement.ID}" : achievement.Name,
++                    },
++                };
++            }
++
++            private static Drawable createIcon(APIUserAchievement achievement)
++            {
++                if (achievement.Slug.StartsWith("kai-", StringComparison.Ordinal))
++                    return new CustomMedalIcon(achievement.Slug);
++
++                return new DelayedLoadWrapper(new MedalIcon(achievement.Slug)
++                {
++                    RelativeSizeAxes = Axes.Both,
++                    FillMode = FillMode.Fit,
++                })
++                {
++                    RelativeSizeAxes = Axes.Both,
++                };
++            }
++        }
++
++        private partial class CustomMedalIcon : CircularContainer
++        {
++            public CustomMedalIcon(string slug)
++            {
++                Masking = true;
++                BorderThickness = 2;
++                BorderColour = accentFor(slug);
++
++                IconUsage icon = slug.Contains("-fc-", StringComparison.Ordinal) ? FontAwesome.Solid.Check
++                    : slug.Contains("-accuracy-", StringComparison.Ordinal) ? FontAwesome.Solid.Crosshairs
++                    : slug.Contains("-pp-", StringComparison.Ordinal) ? FontAwesome.Solid.Bolt
++                    : slug.Contains("-combo-", StringComparison.Ordinal) ? FontAwesome.Solid.Link
++                    : FontAwesome.Solid.Star;
++
++                Children = new Drawable[]
 +                {
 +                    new Box
 +                    {
 +                        RelativeSizeAxes = Axes.Both,
-+                        Colour = Colour4.Black.Opacity(0.18f),
++                        Colour = accentFor(slug).Opacity(0.16f),
 +                    },
-+                    new Box
++                    new SpriteIcon
 +                    {
-+                        RelativeSizeAxes = Axes.Y,
-+                        Width = 3,
-+                        Colour = OsuColour.Gray(0.8f),
-+                    },
-+                    new FillFlowContainer
-+                    {
-+                        RelativeSizeAxes = Axes.X,
-+                        AutoSizeAxes = Axes.Y,
-+                        Padding = new MarginPadding { Horizontal = 14, Vertical = 9 },
-+                        Direction = FillDirection.Vertical,
-+                        Spacing = new Vector2(0, 2),
-+                        Children = new Drawable[]
-+                        {
-+                            new OsuSpriteText
-+                            {
-+                                Text = string.IsNullOrEmpty(achievement.Name) ? $"achievement #{achievement.ID}" : achievement.Name,
-+                                Font = OsuFont.GetFont(size: 15, weight: FontWeight.SemiBold),
-+                            },
-+                            new OsuSpriteText
-+                            {
-+                                Text = achievement.Description,
-+                                Font = OsuFont.GetFont(size: 12),
-+                                Colour = OsuColour.Gray(0.75f),
-+                            },
-+                        },
++                        Anchor = Anchor.Centre,
++                        Origin = Anchor.Centre,
++                        Size = new Vector2(25),
++                        Icon = icon,
++                        Colour = accentFor(slug),
 +                    },
 +                };
 +            }
++
++            private static Colour4 accentFor(string slug) => slug.Contains("-taiko-", StringComparison.Ordinal) ? new Colour4(230, 109, 114, 255)
++                : slug.Contains("-catch-", StringComparison.Ordinal) ? new Colour4(130, 213, 187, 255)
++                : slug.Contains("-mania-", StringComparison.Ordinal) ? new Colour4(171, 148, 255, 255)
++                : new Colour4(239, 134, 186, 255);
 +        }
      }
  }

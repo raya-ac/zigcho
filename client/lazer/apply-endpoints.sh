@@ -11,13 +11,13 @@ if [ "$actual_commit" != "$expected_commit" ]; then
     exit 1
 fi
 
-if git -C "$checkout" apply --check "$script_dir/zigcho-client.patch" 2>/dev/null; then
-    git -C "$checkout" apply "$script_dir/zigcho-client.patch"
+if git -C "$checkout" apply --ignore-space-change --ignore-whitespace --check "$script_dir/zigcho-client.patch" 2>/dev/null; then
+    git -C "$checkout" apply --ignore-space-change --ignore-whitespace "$script_dir/zigcho-client.patch"
     echo "zigcho client patch applied to $checkout"
     exit 0
 fi
 
-if git -C "$checkout" apply --reverse --check "$script_dir/zigcho-client.patch" 2>/dev/null; then
+if git -C "$checkout" apply --ignore-space-change --ignore-whitespace --reverse --check "$script_dir/zigcho-client.patch" 2>/dev/null; then
     echo "zigcho client patch already applied to $checkout"
     exit 0
 fi

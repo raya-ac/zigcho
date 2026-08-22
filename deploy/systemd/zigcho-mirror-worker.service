@@ -1,0 +1,46 @@
+[Unit]
+Description=zigcho beatmap mirror fill worker
+After=network-online.target postgresql.service zigcho.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=zigcho
+Group=zigcho
+WorkingDirectory=/var/lib/zigcho
+StateDirectory=zigcho
+StateDirectoryMode=0700
+Environment="ZIGCHO_POSTGRES_URL=dbname=zigcho user=zigcho host=/var/run/postgresql connect_timeout=5"
+ExecStart=/opt/zigcho/current/zigcho mirror-worker
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=15s
+UMask=0077
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=768M
+MemoryMax=1G
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zigcho
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

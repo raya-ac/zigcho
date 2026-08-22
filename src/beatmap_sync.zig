@@ -75,6 +75,38 @@ const OsuV1User = struct {
     count_rank_a: []const u8 = "0",
 };
 
+const OsuV1Beatmap = struct {
+    beatmapset_id: []const u8,
+    beatmap_id: []const u8,
+    approved: []const u8,
+    total_length: []const u8 = "0",
+    hit_length: []const u8 = "0",
+    version: []const u8,
+    file_md5: []const u8,
+    diff_size: []const u8 = "0",
+    diff_overall: []const u8 = "0",
+    diff_approach: []const u8 = "0",
+    diff_drain: []const u8 = "0",
+    mode: []const u8 = "0",
+    bpm: []const u8 = "0",
+    max_combo: ?[]const u8 = null,
+    difficultyrating: []const u8 = "0",
+    playcount: []const u8 = "0",
+    passcount: []const u8 = "0",
+    artist: []const u8,
+    title: []const u8,
+    creator: []const u8,
+    source: []const u8 = "",
+    tags: []const u8 = "",
+    approved_date: ?[]const u8 = null,
+    submit_date: ?[]const u8 = null,
+    last_update: ?[]const u8 = null,
+    favourite_count: []const u8 = "0",
+    genre_id: []const u8 = "0",
+    language_id: []const u8 = "0",
+    video: []const u8 = "0",
+};
+
 fn profileFromV1(user: OsuV1User, mode: u8, expected_id: ?i32, join_date: *[20]u8) !upstream_user.Profile {
     const id = try parseBoundedInteger(i32, user.user_id, 1, std.math.maxInt(i32));
     if (expected_id) |wanted| if (id != wanted) return error.InvalidUpstreamUser;
@@ -110,6 +142,19 @@ fn profileFromV1(user: OsuV1User, mode: u8, expected_id: ?i32, join_date: *[20]u
         .grade_s = try parseBoundedInteger(i32, user.count_rank_s, 0, std.math.maxInt(i32)),
         .grade_a = try parseBoundedInteger(i32, user.count_rank_a, 0, std.math.maxInt(i32)),
     };
+}
+
+fn timestampFromV1(value: []const u8, output: *[20]u8) ?[]const u8 {
+    if (value.len != 19 or value[4] != '-' or value[7] != '-' or value[10] != ' ' or value[13] != ':' or value[16] != ':') return null;
+    for (value, 0..) |char, index| switch (index) {
+        4, 7, 10, 13, 16 => {},
+        else => if (!std.ascii.isDigit(char)) return null,
+    };
+    @memcpy(output[0..10], value[0..10]);
+    output[10] = 'T';
+    @memcpy(output[11..19], value[11..19]);
+    output[19] = 'Z';
+    return output;
 }
 
 const BeatmapIdentity = struct {
@@ -739,7 +784,108 @@ pub const Sync = struct {
         }
     }
 
+    fn storeOfficialSetMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32, rows: []const OsuV1Beatmap) !RemoteSet {
+        if (set_id <= 0 or rows.len == 0 or rows.len > mapset_map_limit) return error.InvalidUpstreamBeatmap;
+        const approved = try parseBoundedInteger(i32, rows[0].approved, -2, 4);
+        const first_set_id = try parseBoundedInteger(i32, rows[0].beatmapset_id, 1, std.math.maxInt(i32));
+        if (first_set_id != set_id or rows[0].artist.len == 0 or rows[0].title.len == 0 or rows[0].creator.len == 0) return error.InvalidUpstreamBeatmap;
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        var submitted_buffer: [20]u8 = undefined;
+        var updated_buffer: [20]u8 = undefined;
+        var ranked_buffer: [20]u8 = undefined;
+        const submitted = if (rows[0].submit_date) |value| timestampFromV1(value, &submitted_buffer) orelse "1970-01-01T00:00:00Z" else "1970-01-01T00:00:00Z";
+        const updated = if (rows[0].last_update) |value| timestampFromV1(value, &updated_buffer) orelse submitted else submitted;
+        const ranked = if (rows[0].approved_date) |value| timestampFromV1(value, &ranked_buffer) else null;
+        const favourites = try parseBoundedInteger(i32, rows[0].favourite_count, 0, std.math.maxInt(i32));
+        const genre = try parseBoundedInteger(i16, rows[0].genre_id, 0, std.math.maxInt(i16));
+        const language = try parseBoundedInteger(i16, rows[0].language_id, 0, std.math.maxInt(i16));
+        const video = try parseBoundedInteger(u8, rows[0].video, 0, 1);
+        try store.upsertBeatmapSetMetadata(.{
+            .set_id = set_id,
+            .favourites = favourites,
+            .submitted_date = submitted,
+            .last_updated = updated,
+            .ranked_date = ranked,
+            .has_video = video == 1,
+            .genre_id = genre,
+            .language_id = language,
+        }, now);
+
+        const maps = try self.allocator.alloc(RemoteMap, rows.len);
+        errdefer self.allocator.free(maps);
+        var requested_index: ?usize = if (wanted_md5 == null) 0 else null;
+        for (rows, 0..) |row, index| {
+            const row_set_id = try parseBoundedInteger(i32, row.beatmapset_id, 1, std.math.maxInt(i32));
+            const map_id = try parseBoundedInteger(i32, row.beatmap_id, 1, std.math.maxInt(i32));
+            const row_approved = try parseBoundedInteger(i32, row.approved, -2, 4);
+            const mode = try parseBoundedInteger(u8, row.mode, 0, 3);
+            if (row_set_id != set_id or row_approved != approved or !validMd5(row.file_md5) or row.version.len == 0 or !std.mem.eql(u8, row.artist, rows[0].artist) or !std.mem.eql(u8, row.title, rows[0].title) or !std.mem.eql(u8, row.creator, rows[0].creator)) return error.InvalidUpstreamBeatmap;
+            for (maps[0..index]) |previous| if (previous.beatmap_id == map_id or std.ascii.eqlIgnoreCase(&previous.md5, row.file_md5)) return error.InvalidUpstreamBeatmap;
+            const playcount = try parseBoundedInteger(i32, row.playcount, 0, std.math.maxInt(i32));
+            const passcount = try parseBoundedInteger(i32, row.passcount, 0, playcount);
+            const total_length = try parseBoundedInteger(i32, row.total_length, 0, std.math.maxInt(i32));
+            const hit_length = try parseBoundedInteger(i32, row.hit_length, 0, total_length);
+            const max_combo = try parseBoundedInteger(u32, row.max_combo orelse "0", 0, std.math.maxInt(u32));
+            const metadata = beatmap.Metadata{
+                .id = map_id,
+                .set_id = set_id,
+                .mode = mode,
+                .artist = row.artist,
+                .title = row.title,
+                .version = row.version,
+                .creator = row.creator,
+                .source = row.source,
+                .tags = row.tags,
+                .hp = try parseBoundedFloat(row.diff_drain, 0, 20),
+                .cs = try parseBoundedFloat(row.diff_size, 0, 20),
+                .od = try parseBoundedFloat(row.diff_overall, 0, 20),
+                .ar = try parseBoundedFloat(row.diff_approach, 0, 20),
+                .bpm = try parseBoundedFloat(row.bpm, 0, 10_000),
+                .total_length = total_length,
+                .object_count = 0,
+            };
+            try store.upsertBeatmapMeta(metadata, row.file_md5, localStatus(approved), try parseBoundedFloat(row.difficultyrating, 0, 100), max_combo);
+            try store.updateBeatmapUpstreamStats(map_id, playcount, passcount, hit_length);
+            maps[index] = .{ .md5 = undefined, .beatmap_id = map_id };
+            @memcpy(&maps[index].md5, row.file_md5);
+            if (wanted_md5) |md5| if (std.ascii.eqlIgnoreCase(md5, row.file_md5)) requested_index = index;
+        }
+        const requested = requested_index orelse return error.Md5NotFound;
+        return .{
+            .allocator = self.allocator,
+            .approved = approved,
+            .requested_beatmap_id = maps[requested].beatmap_id,
+            .maps = maps,
+        };
+    }
+
+    fn fetchAndStoreOfficialMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteSet {
+        if (self.osu_api_key.len == 0) return error.OsuApiNotConfigured;
+        var url: std.Io.Writer.Allocating = .init(self.allocator);
+        defer url.deinit();
+        try url.writer.print("https://osu.ppy.sh/api/get_beatmaps?k={f}&s={d}", .{
+            std.fmt.alt(@as(std.Uri.Component, .{ .raw = self.osu_api_key }), .formatEscaped),
+            set_id,
+        });
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        const body = try fetchSensitive(&client, self.allocator, url.written(), metadata_limit);
+        defer self.allocator.free(body);
+        const parsed = std.json.parseFromSlice([]OsuV1Beatmap, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidUpstreamBeatmap;
+        defer parsed.deinit();
+        return self.storeOfficialSetMetadata(store, wanted_md5, set_id, parsed.value);
+    }
+
     fn fetchAndStoreMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteSet {
+        return self.fetchAndStoreOsuDirectMetadata(store, wanted_md5, set_id) catch |direct_error| {
+            if (self.osu_api_key.len == 0) return direct_error;
+            std.log.warn("event=beatmap_metadata_official_fallback set_id={d} direct_error={t}", .{ set_id, direct_error });
+            return self.fetchAndStoreOfficialMetadata(store, wanted_md5, set_id);
+        };
+    }
+
+    fn fetchAndStoreOsuDirectMetadata(self: *Sync, store: *storage.Store, wanted_md5: ?[]const u8, set_id: i32) !RemoteSet {
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -1067,6 +1213,38 @@ test "official osu api mapper fixture becomes a real lazer profile" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"avatar_url\":\"https://a.ppy.sh/4452992\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"global_rank\":50128") != null);
     try std.testing.expectError(error.InvalidUpstreamUser, profileFromV1(parsed.value[0], 0, 99, &join_date));
+}
+
+test "official osu api beatmapset fallback stores every real difficulty" {
+    const body =
+        \\[{"beatmapset_id":"900000000","beatmap_id":"900000001","approved":"1","total_length":"60","hit_length":"55","version":"Normal","file_md5":"11111111111111111111111111111111","diff_size":"4","diff_overall":"6","diff_approach":"7","diff_drain":"5","mode":"0","bpm":"180","max_combo":"300","difficultyrating":"2.5","playcount":"100","passcount":"80","artist":"Zigcho","title":"Fallback Set","creator":"Ari","source":"test","tags":"one two","approved_date":"2026-08-22 10:11:12","submit_date":"2026-08-20 08:09:10","last_update":"2026-08-21 09:10:11","favourite_count":"42","genre_id":"3","language_id":"2","video":"1"},{"beatmapset_id":"900000000","beatmap_id":"900000002","approved":"1","total_length":"65","hit_length":"58","version":"Hard","file_md5":"22222222222222222222222222222222","diff_size":"4","diff_overall":"8","diff_approach":"9","diff_drain":"6","mode":"0","bpm":"180","max_combo":"500","difficultyrating":"4.25","playcount":"90","passcount":"40","artist":"Zigcho","title":"Fallback Set","creator":"Ari","source":"test","tags":"one two","approved_date":"2026-08-22 10:11:12","submit_date":"2026-08-20 08:09:10","last_update":"2026-08-21 09:10:11","favourite_count":"42","genre_id":"3","language_id":"2","video":"1"}]
+    ;
+    const parsed = try std.json.parseFromSlice([]OsuV1Beatmap, std.testing.allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, ".zig-cache/tmp/{s}/official-set.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var sync = Sync.init(std.testing.allocator, std.testing.io, 32 * 1024 * 1024);
+    defer sync.deinit();
+    const remote = try sync.storeOfficialSetMetadata(&store, null, 900_000_000, parsed.value);
+    defer remote.deinit();
+    try std.testing.expectEqual(@as(i32, 1), remote.approved);
+    try std.testing.expectEqual(@as(usize, 2), remote.maps.len);
+    try std.testing.expectEqual(@as(i32, 900_000_001), remote.requested_beatmap_id);
+    const first = (try store.beatmapSelectionById(900_000_001)).?;
+    const second = (try store.beatmapSelectionById(900_000_002)).?;
+    try std.testing.expectEqual(@as(i32, 900_000_000), first.set_id);
+    try std.testing.expectEqual(@as(i8, 3), first.status);
+    try std.testing.expectEqual(@as(i8, 3), second.status);
+    const set_json = (try store.lazerBeatmapSet(std.testing.allocator, 900_000_000, null)).?;
+    defer std.testing.allocator.free(set_json);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"favourite_count\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"video\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "2026-08-22T10:11:12Z") != null);
 }
 
 pub fn needsHydration(store: *storage.Store, wanted_md5: []const u8) !bool {

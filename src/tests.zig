@@ -1290,6 +1290,13 @@ test "website profile settings and private avatar metadata stay account scoped" 
 test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".accent-bot #pinned-plays") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".accent-bot #recent-plays") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-head-tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "aria-label','score filters") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "combined or client-specific") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "grid-template-columns:repeat(20,minmax(0,1fr))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "grid-template-columns:repeat(4,minmax(0,1fr))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".profile-stats .stat:nth-child(n){grid-column:auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "<dialog class=\"score-dialog\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "aria-labelledby=\"score-dialog-title\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-score-detail") != null);

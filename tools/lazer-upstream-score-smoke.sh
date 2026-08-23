@@ -42,6 +42,11 @@ token=$(curl --silent --show-error --request POST "$origin/oauth/token" \
   --data-urlencode 'grant_type=password' --data-urlencode 'username=upstream-score' --data-urlencode 'password=LazerPass123!' | jq -er '.access_token')
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/api/v2/beatmapsets/search" \
+  --header "Authorization: Bearer $token")
+[ "$code" = 200 ] || fail "upstream_listing status=$code"
+jq -e '(.beatmapsets | length) > 0 and all(.beatmapsets[]; .id > 0 and (.beatmaps | length) > 0 and (.video | type) == "boolean") and .total > 0' "$response" >/dev/null || fail invalid_upstream_listing_contract
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/api/v2/beatmapsets/search" \
   --header "Authorization: Bearer $token" --data-urlencode 'q=Thaehan Never Give Up' --data 'm=0' --data 'offset=0')
 [ "$code" = 200 ] || fail "upstream_search status=$code"
 jq -e '.beatmapsets[] | select(.id == 1048705) | .beatmaps | length == 6' "$response" >/dev/null || fail upstream_search_missing_full_set

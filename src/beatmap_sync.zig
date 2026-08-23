@@ -48,7 +48,7 @@ const CheesegullSet = struct {
     Favourites: i64 = 0,
     Genre: i16 = 0,
     Language: i16 = 0,
-    HasVideo: bool = false,
+    HasVideo: u8 = 0,
 };
 
 const OsuV1User = struct {
@@ -743,14 +743,14 @@ pub const Sync = struct {
         const submitted_date = validIsoTimestamp(set.SubmittedDate orelse "") orelse "1970-01-01T00:00:00Z";
         const last_updated = validIsoTimestamp(set.LastUpdate orelse "") orelse submitted_date;
         const ranked_date = validIsoTimestamp(set.ApprovedDate orelse "");
-        if (set.Favourites < 0 or set.Favourites > std.math.maxInt(i32) or set.Genre < 0 or set.Language < 0) return error.IdMismatch;
+        if (set.Favourites < 0 or set.Favourites > std.math.maxInt(i32) or set.Genre < 0 or set.Language < 0 or set.HasVideo > 1) return error.IdMismatch;
         try store.upsertBeatmapSetMetadata(.{
             .set_id = set.SetID,
             .favourites = @intCast(set.Favourites),
             .submitted_date = submitted_date,
             .last_updated = last_updated,
             .ranked_date = ranked_date,
-            .has_video = set.HasVideo,
+            .has_video = set.HasVideo != 0,
             .genre_id = set.Genre,
             .language_id = set.Language,
         }, now);
@@ -1190,11 +1190,12 @@ test "osu direct metadata keeps cheese gull map and set fields" {
     try std.testing.expectEqualStrings("e74aaf07ca2a2f48b9fcb75892d2387c", parsed_map.value.FileMD5);
 
     const set_json =
-        \\{"SetID":1593278,"Title":"test title","Artist":"test artist","Creator":"mapper","Source":"","Tags":"tag one","RankedStatus":1,"ChildrenBeatmaps":[{"ParentSetID":1593278,"BeatmapID":3314160,"TotalLength":245,"DiffName":"normal","FileMD5":"e74aaf07ca2a2f48b9fcb75892d2387c","CS":3.2,"AR":6,"HP":4,"OD":4,"Mode":0,"BPM":168,"MaxCombo":827,"DifficultyRating":2.20658}]}
+        \\{"SetID":1593278,"Title":"test title","Artist":"test artist","Creator":"mapper","Source":"","Tags":"tag one","RankedStatus":1,"HasVideo":1,"ChildrenBeatmaps":[{"ParentSetID":1593278,"BeatmapID":3314160,"TotalLength":245,"DiffName":"normal","FileMD5":"e74aaf07ca2a2f48b9fcb75892d2387c","CS":3.2,"AR":6,"HP":4,"OD":4,"Mode":0,"BPM":168,"MaxCombo":827,"DifficultyRating":2.20658}]}
     ;
     const parsed_set = try std.json.parseFromSlice(CheesegullSet, std.testing.allocator, set_json, .{ .ignore_unknown_fields = true });
     defer parsed_set.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_set.value.ChildrenBeatmaps.len);
+    try std.testing.expectEqual(@as(u8, 1), parsed_set.value.HasVideo);
     try std.testing.expectEqual(@as(i8, 3), localStatus(parsed_set.value.RankedStatus));
     try std.testing.expectEqualStrings("normal", parsed_set.value.ChildrenBeatmaps[0].DiffName);
 }

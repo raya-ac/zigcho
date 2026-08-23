@@ -3295,8 +3295,11 @@ const App = struct {
                         written += 1;
                         try output.writer.writeAll(set);
                     };
-                } else if (!std.mem.eql(u8, beatmapset_path.kind, "ranked") and !std.mem.eql(u8, beatmapset_path.kind, "loved") and !std.mem.eql(u8, beatmapset_path.kind, "pending") and !std.mem.eql(u8, beatmapset_path.kind, "guest") and !std.mem.eql(u8, beatmapset_path.kind, "graveyard") and !std.mem.eql(u8, beatmapset_path.kind, "nominated")) {
-                    return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set type\"}", &.{});
+                } else {
+                    if (!std.mem.eql(u8, beatmapset_path.kind, "ranked") and !std.mem.eql(u8, beatmapset_path.kind, "loved") and !std.mem.eql(u8, beatmapset_path.kind, "pending") and !std.mem.eql(u8, beatmapset_path.kind, "guest") and !std.mem.eql(u8, beatmapset_path.kind, "graveyard") and !std.mem.eql(u8, beatmapset_path.kind, "nominated")) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap set type\"}", &.{});
+                    const sets = try self.store.lazerUserBeatmapSetsJson(self.allocator, beatmapset_path.user_id, beatmapset_path.kind, offset, limit, requester.id);
+                    defer self.allocator.free(sets);
+                    try output.writer.writeAll(sets[1 .. sets.len - 1]);
                 }
                 try output.writer.writeByte(']');
                 return respond(req, .ok, "application/json", output.written(), &.{});

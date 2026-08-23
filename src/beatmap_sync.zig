@@ -720,6 +720,7 @@ pub const Sync = struct {
     pub fn ensureMapperProfile(self: *Sync, store: *storage.Store, set_id: i32) !bool {
         var creator = (try store.beatmapSetCreator(self.allocator, set_id)) orelse return false;
         defer creator.deinit();
+        if (creator.is_local) return false;
         const user_id = (try self.ensureUpstreamProfile(store, creator.name, false, creator.mode)) orelse return false;
         try store.linkBeatmapSetCreator(set_id, user_id);
         return true;

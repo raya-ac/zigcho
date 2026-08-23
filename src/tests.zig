@@ -1398,6 +1398,8 @@ test "lazer BSS reserves owned ids publishes pending and returns WIP through one
     try std.testing.expect(std.mem.indexOf(u8, server_source, "user.privileges & bss.premium_privilege == 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, server_source, "{\\\"error\\\":\\\"premium required\\\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "premium mapper uploads, package validation and BN review handoff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "mappedBeatmapRows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "id=\"mapped-beatmaps\"") != null);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1446,6 +1448,51 @@ test "lazer BSS reserves owned ids publishes pending and returns WIP through one
     defer std.testing.allocator.free(stored_map.version);
     defer std.testing.allocator.free(stored_map.creator);
     try std.testing.expectEqual(@as(i8, 2), stored_map.status);
+    var collision_sql_buf: [512]u8 = undefined;
+    const collision_sql = try std.fmt.bufPrintZ(&collision_sql_buf, "INSERT INTO upstream_users(id,username,country,join_date) VALUES(35712887,'Raya_old_6','AU','2020-01-01T00:00:00Z'); UPDATE beatmaps SET creator_id=35712887 WHERE set_id={d};", .{reservation.set_id});
+    try store.exec(collision_sql);
+    var local_creator = (try store.beatmapSetCreator(std.testing.allocator, reservation.set_id)).?;
+    defer local_creator.deinit();
+    try std.testing.expect(local_creator.is_local);
+    try std.testing.expectEqual(owner_id, local_creator.user_id.?);
+    try std.testing.expectEqualStrings("bss owner", local_creator.name);
+
+    const lookup = (try store.lazerBeatmapLookup(std.testing.allocator, reservation.beatmap_ids[0], null, owner_id)).?;
+    defer std.testing.allocator.free(lookup);
+    var parsed_lookup = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lookup, .{});
+    defer parsed_lookup.deinit();
+    try std.testing.expectEqual(@as(i64, owner_id), parsed_lookup.value.object.get("user_id").?.integer);
+    try std.testing.expectEqualStrings("bss owner", parsed_lookup.value.object.get("owners").?.array.items[0].object.get("username").?.string);
+    const lookup_set = parsed_lookup.value.object.get("beatmapset").?.object;
+    try std.testing.expectEqual(@as(i64, owner_id), lookup_set.get("user_id").?.integer);
+    try std.testing.expectEqualStrings("bss owner", lookup_set.get("creator").?.string);
+    try std.testing.expectEqualStrings("bss owner", lookup_set.get("user").?.object.get("username").?.string);
+
+    const pending_sets = try store.lazerUserBeatmapSetsJson(std.testing.allocator, owner_id, "pending", 0, 50, owner_id);
+    defer std.testing.allocator.free(pending_sets);
+    var parsed_pending_sets = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pending_sets, .{});
+    defer parsed_pending_sets.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_pending_sets.value.array.items.len);
+    try std.testing.expectEqual(@as(i64, reservation.set_id), parsed_pending_sets.value.array.items[0].object.get("id").?.integer);
+
+    const score_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"beatmap_id\":{d},\"ruleset_id\":0,\"total_score\":987654,\"legacy_total_score\":900000,\"accuracy\":0.985,\"max_combo\":321,\"passed\":true,\"mods\":[],\"statistics\":{{}},\"client_version\":\"2026.823.0\"}}", .{reservation.beatmap_ids[0]});
+    defer std.testing.allocator.free(score_body);
+    var parsed_score = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, score_body, .{});
+    defer parsed_score.deinit();
+    _ = try store.insertLazerScore(owner_id, try lazer.parseScore(parsed_score.value), 100, "[]", "{}", "{}", "[]", &.{});
+    const pending_board = try store.lazerLeaderboardJson(std.testing.allocator, owner_id, reservation.beatmap_ids[0], 0, .vanilla, "[]", false, false, 0, .global, 50);
+    defer std.testing.allocator.free(pending_board);
+    var parsed_pending_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pending_board, .{});
+    defer parsed_pending_board.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_pending_board.value.object.get("score_count").?.integer);
+    try std.testing.expect(parsed_pending_board.value.object.get("user_score").? == .null);
+
+    const site_profile = (try store.siteProfile(std.testing.allocator, owner_id, .all, 0)).?;
+    defer std.testing.allocator.free(site_profile);
+    var parsed_site_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, site_profile, .{});
+    defer parsed_site_profile.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_site_profile.value.object.get("beatmapsets").?.array.items.len);
+    try std.testing.expectEqualStrings("bss owner", parsed_site_profile.value.object.get("beatmapsets").?.array.items[0].object.get("creator").?.string);
     const ranking = try store.staffRankingJson(std.testing.allocator);
     defer std.testing.allocator.free(ranking);
     const set_marker = try std.fmt.allocPrint(std.testing.allocator, "\"set_id\":{d}", .{reservation.set_id});

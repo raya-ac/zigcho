@@ -1331,6 +1331,22 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "['reports','reports']") != null);
 }
 
+test "website routes share the dense page sheet layout" {
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "function structurePageView()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "pageLayoutObserver.observe(app,{childList:true})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "className='page-mode-bar'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "auth.classList.add('auth-sheet')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "tabs.classList.add('workspace-tabs')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view.error-page") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .changelog-build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .chat-layout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .team-page-header") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .map-head") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .service-row{grid-template-columns:minmax(0,1fr) auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .stats .stat:last-child:nth-child(odd)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "'/rankings':'rankings','/appeal':'appeal','/staff':'staff'") != null);
+}
+
 test "team JSON does not publish dead asset URLs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

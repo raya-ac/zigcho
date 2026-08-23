@@ -1068,15 +1068,16 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
  
          public override UserPresence LocalUserPresence => localUserPresence;
          private UserPresence localUserPresence;
-@@ -39,6 +43,7 @@ public partial class OnlineMetadataClient : MetadataClient
+@@ -39,6 +43,8 @@ public partial class OnlineMetadataClient : MetadataClient
          private IAPIProvider api { get; set; } = null!;
  
          private IHubClientConnector? connector;
 +        private readonly CancellationTokenSource presencePollingCancellation = new CancellationTokenSource();
++        private readonly IBindableList<APIRelation> localFriends = new BindableList<APIRelation>();
          private Bindable<int> lastQueueId = null!;
          private IBindable<APIUser> localUser = null!;
          private IBindable<UserStatus> userStatus = null!;
-@@ -73,7 +78,7 @@ private void load(OsuConfigManager config, SessionStatics session)
+@@ -73,7 +79,7 @@ private void load(OsuConfigManager config, SessionStatics session)
                      connection.On(nameof(IStatefulUserHubClient.ServerShuttingDown), ((IStatefulUserHubClient)this).ServerShuttingDown);
                  };
  
@@ -1085,17 +1086,19 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
                  IsConnected.BindValueChanged(isConnectedChanged, true);
              }
  
-@@ -81,6 +86,9 @@ private void load(OsuConfigManager config, SessionStatics session)
+@@ -81,6 +87,11 @@ private void load(OsuConfigManager config, SessionStatics session)
              lastQueueId = config.GetBindable<int>(OsuSetting.LastProcessedMetadataId);
              userStatus = config.GetBindable<UserStatus>(OsuSetting.UserOnlineStatus);
              userActivity = session.GetBindable<UserActivity?>(Static.UserOnlineActivity);
 +
 +            if (connector == null)
 +                _ = Task.Run(pollPresence, presencePollingCancellation.Token);
++
++            localFriends.BindTo(api.LocalUserState.Friends);
          }
  
          protected override void LoadComplete()
-@@ -102,6 +110,102 @@ protected override void LoadComplete()
+@@ -102,6 +113,113 @@ protected override void LoadComplete()
  
          private bool catchingUp;
  
@@ -1161,9 +1164,12 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
 +        private void applyPollingPresence(IReadOnlyCollection<PresenceEntry> entries)
 +        {
 +            var onlineIds = entries.Select(entry => entry.UserId).ToHashSet();
++            var onlineFriendIds = GetOnlineFriendIds(onlineIds, localFriends.Select(friend => friend.TargetID));
 +
 +            foreach (int userId in userPresences.Keys.Where(id => !onlineIds.Contains(id)).ToArray())
 +                userPresences.Remove(userId);
++            foreach (int userId in friendPresences.Keys.Where(id => !onlineFriendIds.Contains(id)).ToArray())
++                friendPresences.Remove(userId);
 +
 +            foreach (int userId in onlineIds)
 +            {
@@ -1174,6 +1180,8 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
 +                    Status = isLocal ? userStatus.Value : UserStatus.Online,
 +                };
 +                userPresences[userId] = presence;
++                if (onlineFriendIds.Contains(userId))
++                    friendPresences[userId] = presence;
 +                if (isLocal)
 +                    localUserPresence = presence;
 +            }
@@ -1182,6 +1190,12 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
 +                localUserPresence = default;
 +
 +            isConnected.Value = true;
++        }
++
++        internal static HashSet<int> GetOnlineFriendIds(IEnumerable<int> onlineIds, IEnumerable<int> friendIds)
++        {
++            var online = onlineIds.ToHashSet();
++            return friendIds.Where(online.Contains).ToHashSet();
 +        }
 +
 +        private void clearPollingPresence()
@@ -1198,7 +1212,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
          private void isConnectedChanged(ValueChangedEvent<bool> connected)
          {
              if (!connected.NewValue)
-@@ -188,6 +292,17 @@ public override Task<BeatmapUpdates> GetChangesSince(int queueId)
+@@ -188,6 +306,17 @@ public override Task<BeatmapUpdates> GetChangesSince(int queueId)
  
          public override Task UpdateActivity(UserActivity? activity)
          {
@@ -1216,7 +1230,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
              if (connector?.IsConnected.Value != true)
                  return Task.FromCanceled(new CancellationToken(true));
  
-@@ -197,6 +312,17 @@ public override Task UpdateActivity(UserActivity? activity)
+@@ -197,6 +326,17 @@ public override Task UpdateActivity(UserActivity? activity)
  
          public override Task UpdateStatus(UserStatus? status)
          {
@@ -1234,7 +1248,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
              if (connector?.IsConnected.Value != true)
                  return Task.FromCanceled(new CancellationToken(true));
  
-@@ -271,6 +397,12 @@ public override Task DailyChallengeUpdated(DailyChallengeInfo? info)
+@@ -271,6 +411,12 @@ public override Task DailyChallengeUpdated(DailyChallengeInfo? info)
  
          public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultiplayerRoom(long id)
          {
@@ -1247,7 +1261,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
              if (connector?.IsConnected.Value != true)
                  throw new OperationCanceledException();
  
-@@ -284,6 +416,12 @@ public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultipla
+@@ -284,6 +430,12 @@ public override async Task<MultiplayerPlaylistItemStats[]> BeginWatchingMultipla
  
          public override async Task EndWatchingMultiplayerRoom(long id)
          {
@@ -1260,7 +1274,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
              if (connector?.IsConnected.Value != true)
                  throw new OperationCanceledException();
  
-@@ -296,6 +434,9 @@ public override async Task EndWatchingMultiplayerRoom(long id)
+@@ -296,6 +448,9 @@ public override async Task EndWatchingMultiplayerRoom(long id)
  
          public override async Task RefreshFriends()
          {
@@ -1270,7 +1284,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
              if (connector?.IsConnected.Value != true)
                  throw new OperationCanceledException();
  
-@@ -305,6 +446,8 @@ public override async Task RefreshFriends()
+@@ -305,6 +460,8 @@ public override async Task RefreshFriends()
  
          protected override void Dispose(bool isDisposing)
          {
@@ -1279,7 +1293,7 @@ index 6e4f7e4d6d422896120cce7430ab4629e507a517..0ff45df84b315bde09f0ab91eb8610ae
              base.Dispose(isDisposing);
              connector?.Dispose();
          }
-@@ -320,5 +463,16 @@ protected override async Task DisconnectInternal()
+@@ -320,5 +477,16 @@ protected override async Task DisconnectInternal()
              if (connector != null)
                  await connector.Disconnect().ConfigureAwait(false);
          }
@@ -2247,3 +2261,33 @@ index 8d9985d279951850093a0535a73c9749dd050e48..0b5ea20180253c1a104dd6923854df56
  				<string>osu</string>
  				<string>osump</string>
  			</array>
+
+diff --git a/osu.Game.Tests/ZigchoPollingPresenceTest.cs b/osu.Game.Tests/ZigchoPollingPresenceTest.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..60378b3c2f1b3df846f3dbb202105af7cb4f9c6f
+--- /dev/null
++++ b/osu.Game.Tests/ZigchoPollingPresenceTest.cs
+@@ -0,0 +1,23 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the official osu! source tree for full licence text.
++
++using NUnit.Framework;
++using osu.Game.Online.Metadata;
++
++namespace osu.Game.Online.Tests
++{
++    [TestFixture]
++    public class ZigchoPollingPresenceTest
++    {
++        [Test]
++        public void TestOnlineFriendsAreCopiedIntoFriendPresence()
++        {
++            var onlineFriends = OnlineMetadataClient.GetOnlineFriendIds(
++                new[] { 3, 4, 35 },
++                new[] { 4, 11 });
++
++            Assert.That(onlineFriends, Is.EquivalentTo(new[] { 4 }));
++            Assert.That(onlineFriends, Does.Not.Contain(11));
++        }
++    }
++}

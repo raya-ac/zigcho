@@ -5272,6 +5272,17 @@ fn mirrorWorkerCommand(allocator: std.mem.Allocator, io: std.Io, args: []const [
     }
 }
 
+fn multiplayerMaintenance(app: *App, io: std.Io) std.Io.Cancelable!void {
+    while (true) {
+        try std.Io.sleep(io, .fromMilliseconds(200), .awake);
+        const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+        _ = app.lazer_multiplayer.advanceExpiredRankedPicks(now_ms) catch |err| {
+            std.log.warn("event=lazer_multiplayer_maintenance_failed error={t}", .{err});
+            continue;
+        };
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
@@ -5429,6 +5440,7 @@ pub fn main(init: std.process.Init) !void {
     defer listener.deinit(init.io);
     var connections: std.Io.Group = .init;
     defer connections.cancel(init.io);
+    try connections.concurrent(init.io, multiplayerMaintenance, .{ &app, init.io });
     if (config.irc_port != 0) try connections.concurrent(init.io, serveIrcListener, .{ &app, config.irc_bind, config.irc_port, init.io });
     std.log.info("event=server_started bind={s} port={d} storage={s}", .{ bind, port, if (storage.is_postgres) "postgres" else "sqlite" });
     while (true) {

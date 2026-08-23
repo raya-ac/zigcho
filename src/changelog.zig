@@ -18,6 +18,7 @@ const Build = struct {
 
 const builds = [_]Build{
     .{ .id = 34, .version = "2026.823.0", .created_at = "2026-08-23T02:15:00+09:30", .updates = &.{
+        .{ .name = "2026-08-23-maps-rooms-and-presence.md", .created_at = "2026-08-23T18:09:51+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-23-maps-rooms-and-presence.md") },
         .{ .name = "2026-08-23-bss-local-mappers.md", .created_at = "2026-08-23T15:03:08+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-23-bss-local-mappers.md") },
         .{ .name = "2026-08-23-lazer-profiles-and-sessions.md", .created_at = "2026-08-23T02:15:00+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-23-lazer-profiles-and-sessions.md") },
     } },

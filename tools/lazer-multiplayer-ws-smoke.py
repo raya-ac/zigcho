@@ -256,6 +256,23 @@ class WebSocket:
                 stages.append(arguments[0][1][0])
         return stages
 
+    def ranked_countdowns_started(self):
+        countdowns = []
+        for arguments in self.event_arguments("MatchEvent"):
+            if not arguments or arguments[0][0] != 0:
+                continue
+            countdown = arguments[0][1][0]
+            if countdown[0] == 4:
+                countdowns.append(countdown[1])
+        return countdowns
+
+    def countdowns_stopped(self):
+        stopped = []
+        for arguments in self.event_arguments("MatchEvent"):
+            if arguments and arguments[0][0] == 1:
+                stopped.append(arguments[0][1][0])
+        return stopped
+
 
 def api_request(origin, token, method, path, body=None, content_type=None):
     request = urllib.request.Request(origin + path, data=body, method=method)
@@ -447,6 +464,9 @@ def main():
         two.invoke(105, "DiscardCards", [[]])
         if 4 not in two.ranked_stages():
             raise RuntimeError(f"ranked match did not enter card play: {two.ranked_stages()}")
+        initial_countdowns = two.ranked_countdowns_started()
+        if not initial_countdowns or initial_countdowns[-1][1] <= 0 or initial_countdowns[-1][2] != 4:
+            raise RuntimeError(f"ranked pick countdown was not started: {initial_countdowns}")
 
         for round_number in (1, 2):
             state_events = two.event_arguments("MatchRoomStateChanged")
@@ -455,7 +475,10 @@ def main():
             active_card = ranked_state[3][active_user_id][2][0]
             active = one if active_user_id == one_user_id else two
             passive = two if active is one else one
+            active_countdown = active.ranked_countdowns_started()[-1][0]
             active.invoke(110 + round_number * 20, "PlayCard", [active_card])
+            if active_countdown not in active.countdowns_stopped():
+                raise RuntimeError(f"ranked pick countdown {active_countdown} was not stopped")
             passive.invoke(111 + round_number * 20, "ChangeState", [1])
             active.invoke(112 + round_number * 20, "ChangeState", [1])
             ranked_stages = one.ranked_stages() + two.ranked_stages()

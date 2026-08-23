@@ -16,6 +16,8 @@ const ranked_player_count = 2;
 const ranked_hand_size = 5;
 const max_ranked_cards = max_playlist * ranked_player_count;
 const max_hub_message = 60 * 1024;
+const ranked_pick_seconds: i64 = 30;
+const timespan_ticks_per_millisecond: i64 = 10_000;
 
 const matchmaking_stage = struct {
     const waiting_for_clients_join: u8 = 0;
@@ -529,10 +531,21 @@ const RankedPlayState = struct {
     played_card: ?RankedCard = null,
     gameplay_item: i64 = 0,
     round_winner_id: ?i32 = null,
+    pick_countdown: ?RankedStageCountdown = null,
 
     fn userIndex(self: *const RankedPlayState, user_id: i32) ?usize {
         for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
         return null;
+    }
+};
+
+const RankedStageCountdown = struct {
+    id: i32,
+    deadline_ms: i64,
+    stage: u8,
+
+    fn remainingTicks(self: RankedStageCountdown, now_ms: i64) i64 {
+        return @max(0, self.deadline_ms - now_ms) * timespan_ticks_per_millisecond;
     }
 };
 
@@ -682,6 +695,7 @@ pub const Manager = struct {
     pending_matches: [max_rooms]?PendingMatch = [_]?PendingMatch{null} ** max_rooms,
     next_room_id: i64 = 1,
     next_pending_match_id: u32 = 1,
+    next_countdown_id: i32 = 1,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
         return .{ .allocator = allocator, .io = io };
@@ -756,6 +770,21 @@ pub const Manager = struct {
         for (&self.rooms) |*entry| if (entry.*) |room| self.allocator.destroy(room);
         for (self.connections.items) |connection| connection.release();
         self.connections.deinit(self.allocator);
+    }
+
+    fn nowMs(self: *const Manager) i64 {
+        return std.Io.Clock.awake.now(self.io).toMilliseconds();
+    }
+
+    fn startRankedPickCountdownLocked(self: *Manager, ranked: *RankedPlayState, now_ms: i64) RankedStageCountdown {
+        const countdown: RankedStageCountdown = .{
+            .id = self.next_countdown_id,
+            .deadline_ms = now_ms + ranked_pick_seconds * std.time.ms_per_s,
+            .stage = ranked_stage.card_play,
+        };
+        self.next_countdown_id = if (self.next_countdown_id == std.math.maxInt(i32)) 1 else self.next_countdown_id + 1;
+        ranked.pick_countdown = countdown;
+        return countdown;
     }
 
     fn archiveRoom(self: *Manager, room: *Room) void {
@@ -1044,6 +1073,7 @@ pub const Manager = struct {
                 ranked_user.rating_after = ranked_user.rating + rating_delta;
             };
             ranked.stage = ranked_stage.ended;
+            ranked.pick_countdown = null;
             ranked_ended.* = true;
         };
         room.users[user_index] = null;
@@ -1506,7 +1536,7 @@ pub const Manager = struct {
         room.channel_id = 4;
         connection.room_id = room.id;
         self.rooms[slot] = room;
-        response = completionRoomOwned(self.allocator, id, room) catch |err| {
+        response = completionRoomOwned(self.allocator, id, room, self.nowMs()) catch |err| {
             self.rooms[slot] = null;
             connection.room_id = null;
             self.mutex.unlock(self.io);
@@ -1620,7 +1650,7 @@ pub const Manager = struct {
         }
         const count = self.recipientsLocked(room_id, connection, &recipients);
         defer releaseRecipients(recipients[0..count]);
-        response = completionRoomOwned(self.allocator, id, room) catch |err| {
+        response = completionRoomOwned(self.allocator, id, room, self.nowMs()) catch |err| {
             if (advanced_match) {
                 room.matchmaking.?.current_round = 0;
                 room.matchmaking.?.stage = matchmaking_stage.waiting_for_clients_join;
@@ -1798,6 +1828,8 @@ pub const Manager = struct {
         var ranked_added_card: ?RankedCard = null;
         var ranked_added_item: ?PlaylistItem = null;
         var ranked_added_user: ?i32 = null;
+        var ranked_countdown_event: ?[]u8 = null;
+        defer if (ranked_countdown_event) |event| self.allocator.free(event);
         var changed_room_state: ?i32 = null;
         var emitted_user_state: u8 = new_state;
         self.mutex.lockUncancelable(self.io);
@@ -1981,6 +2013,7 @@ pub const Manager = struct {
                     match_snapshots[match_snapshot_count] = room.*;
                     match_snapshot_count += 1;
                     ranked.stage = ranked_stage.card_play;
+                    _ = self.startRankedPickCountdownLocked(ranked, self.nowMs());
                     match_snapshots[match_snapshot_count] = room.*;
                     match_snapshot_count += 1;
                 }
@@ -1997,11 +2030,21 @@ pub const Manager = struct {
                 return err;
             };
         }
+        if (room.ranked_play) |ranked| if (ranked.pick_countdown) |countdown| {
+            if (room_before.ranked_play == null or room_before.ranked_play.?.pick_countdown == null or room_before.ranked_play.?.pick_countdown.?.id != countdown.id) {
+                ranked_countdown_event = eventRankedCountdownStartedOwned(self.allocator, countdown, self.nowMs()) catch |err| {
+                    room.* = room_before;
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+            }
+        };
         self.mutex.unlock(self.io);
         const user_state_event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ connection.user_id, emitted_user_state });
         defer self.allocator.free(user_state_event);
         sendRecipients(recipients[0..count], user_state_event);
         for (match_events[0..match_snapshot_count]) |state_event| sendRecipients(recipients[0..count], state_event.?);
+        if (ranked_countdown_event) |event| sendRecipients(recipients[0..count], event);
         for (server_user_updates[0..server_user_update_count]) |update| {
             const event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ update.id, update.state });
             defer self.allocator.free(event);
@@ -2977,12 +3020,16 @@ pub const Manager = struct {
         var snapshots: [3]Room = undefined;
         var snapshot_count: usize = 0;
         var recipients: [max_connections]*Connection = undefined;
+        var countdown_started: ?RankedStageCountdown = null;
+        var countdown_event: ?[]u8 = null;
+        defer if (countdown_event) |event| self.allocator.free(event);
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
             self.mutex.unlock(self.io);
             return error.NotInMultiplayerRoom;
         };
         const room = self.roomByIdLocked(room_id).?;
+        const room_before = room.*;
         if (room.ranked_play == null) {
             self.mutex.unlock(self.io);
             return error.InvalidRankedPlayStage;
@@ -3024,11 +3071,17 @@ pub const Manager = struct {
             snapshots[snapshot_count] = room.*;
             snapshot_count += 1;
             ranked.stage = ranked_stage.card_play;
+            countdown_started = self.startRankedPickCountdownLocked(ranked, self.nowMs());
             snapshots[snapshot_count] = room.*;
             snapshot_count += 1;
         }
         const recipient_count = self.recipientsLocked(room_id, null, &recipients);
         defer releaseRecipients(recipients[0..recipient_count]);
+        if (countdown_started) |countdown| countdown_event = eventRankedCountdownStartedOwned(self.allocator, countdown, self.nowMs()) catch |err| {
+            room.* = room_before;
+            self.mutex.unlock(self.io);
+            return err;
+        };
         self.mutex.unlock(self.io);
         for (removed[0..requested_count]) |entry| if (entry) |card| {
             const event = try eventRankedCardUserOwned(self.allocator, "RankedPlayCardRemoved", connection.user_id, card);
@@ -3048,6 +3101,7 @@ pub const Manager = struct {
             defer self.allocator.free(state_event);
             sendRecipients(recipients[0..recipient_count], state_event);
         }
+        if (countdown_event) |event| sendRecipients(recipients[0..recipient_count], event);
         try self.finishVoid(connection, invocation_id);
     }
 
@@ -3058,12 +3112,15 @@ pub const Manager = struct {
         var item: PlaylistItem = undefined;
         var settings: Settings = undefined;
         var snapshot: Room = undefined;
+        var countdown_stopped_event: ?[]u8 = null;
+        defer if (countdown_stopped_event) |event| self.allocator.free(event);
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
             self.mutex.unlock(self.io);
             return error.NotInMultiplayerRoom;
         };
         const room = self.roomByIdLocked(room_id).?;
+        const room_before = room.*;
         if (room.ranked_play == null) {
             self.mutex.unlock(self.io);
             return error.InvalidRankedPlayStage;
@@ -3088,11 +3145,19 @@ pub const Manager = struct {
         ranked.gameplay_item = card.playlist_item_id;
         room.settings.playlist_item_id = card.playlist_item_id;
         ranked.stage = ranked_stage.finish_card_play;
+        const countdown_id = if (ranked.pick_countdown) |countdown| countdown.id else null;
+        ranked.pick_countdown = null;
         settings = room.settings;
         snapshot = room.*;
         const recipient_count = self.recipientsLocked(room_id, null, &recipients);
         defer releaseRecipients(recipients[0..recipient_count]);
+        if (countdown_id) |id| countdown_stopped_event = eventRankedCountdownStoppedOwned(self.allocator, id) catch |err| {
+            room.* = room_before;
+            self.mutex.unlock(self.io);
+            return err;
+        };
         self.mutex.unlock(self.io);
+        if (countdown_stopped_event) |event| sendRecipients(recipients[0..recipient_count], event);
         const reveal_event = try eventRankedCardRevealedOwned(self.allocator, card, item);
         defer self.allocator.free(reveal_event);
         sendRecipients(recipients[0..recipient_count], reveal_event);
@@ -3106,6 +3171,122 @@ pub const Manager = struct {
         defer self.allocator.free(state_event);
         sendRecipients(recipients[0..recipient_count], state_event);
         try self.finishVoid(connection, invocation_id);
+    }
+
+    pub fn advanceExpiredRankedPicks(self: *Manager, now_ms: i64) !usize {
+        var advanced: usize = 0;
+        while (true) {
+            var recipients: [max_connections]*Connection = undefined;
+            var recipient_count: usize = 0;
+            var frames: [5]?[]u8 = [_]?[]u8{null} ** 5;
+            defer for (frames) |frame| if (frame) |owned| self.allocator.free(owned);
+            var room_id: i64 = 0;
+            var active_user_id: i32 = 0;
+
+            self.mutex.lockUncancelable(self.io);
+            const room = expired: {
+                for (self.rooms) |entry| if (entry) |candidate| {
+                    if (candidate.ranked_play) |ranked| {
+                        const countdown = ranked.pick_countdown orelse continue;
+                        if (ranked.stage == ranked_stage.card_play and ranked.played_card == null and countdown.deadline_ms <= now_ms) break :expired candidate;
+                    }
+                };
+                self.mutex.unlock(self.io);
+                return advanced;
+            };
+            const room_before = room.*;
+            const ranked = &room.ranked_play.?;
+            const countdown = ranked.pick_countdown.?;
+            var user_index = if (ranked.active_user_id) |id| ranked.userIndex(id) else null;
+            if (user_index == null or ranked.users[user_index.?].?.hand_count == 0) {
+                user_index = null;
+                for (ranked.users, 0..) |entry, index| if (entry) |user| if (user.life > 0 and user.hand_count != 0) {
+                    user_index = index;
+                    ranked.active_user_id = user.id;
+                    break;
+                };
+            }
+            const selected_user_index = user_index orelse {
+                ranked.pick_countdown = null;
+                ranked.winning_user_id = rankedWinner(ranked);
+                ranked.stage = ranked_stage.ended;
+                room_id = room.id;
+                recipient_count = self.recipientsLocked(room.id, null, &recipients);
+                frames[0] = eventRankedCountdownStoppedOwned(self.allocator, countdown.id) catch |err| {
+                    room.* = room_before;
+                    self.mutex.unlock(self.io);
+                    releaseRecipients(recipients[0..recipient_count]);
+                    return err;
+                };
+                frames[1] = eventMatchStateOwned(self.allocator, room) catch |err| {
+                    room.* = room_before;
+                    self.mutex.unlock(self.io);
+                    releaseRecipients(recipients[0..recipient_count]);
+                    return err;
+                };
+                self.mutex.unlock(self.io);
+                defer releaseRecipients(recipients[0..recipient_count]);
+                sendRecipients(recipients[0..recipient_count], frames[0].?);
+                sendRecipients(recipients[0..recipient_count], frames[1].?);
+                std.log.warn("event=lazer_ranked_pick_ended room_id={d} error=no_playable_card", .{room_id});
+                advanced += 1;
+                continue;
+            };
+            const card = for (ranked.users[selected_user_index].?.hand) |entry| {
+                if (entry) |value| break value;
+            } else unreachable;
+            const item_index = room.itemIndex(card.playlist_item_id) orelse {
+                self.mutex.unlock(self.io);
+                return error.MultiplayerPlaylistItemNotFound;
+            };
+            const item = room.playlist[item_index].?;
+            active_user_id = ranked.users[selected_user_index].?.id;
+            room_id = room.id;
+            ranked.played_card = card;
+            ranked.gameplay_item = card.playlist_item_id;
+            ranked.pick_countdown = null;
+            ranked.stage = ranked_stage.finish_card_play;
+            room.settings.playlist_item_id = card.playlist_item_id;
+            const settings = room.settings;
+            const snapshot = room.*;
+            recipient_count = self.recipientsLocked(room.id, null, &recipients);
+
+            frames[0] = eventRankedCountdownStoppedOwned(self.allocator, countdown.id) catch |err| {
+                room.* = room_before;
+                self.mutex.unlock(self.io);
+                releaseRecipients(recipients[0..recipient_count]);
+                return err;
+            };
+            frames[1] = eventRankedCardRevealedOwned(self.allocator, card, item) catch |err| {
+                room.* = room_before;
+                self.mutex.unlock(self.io);
+                releaseRecipients(recipients[0..recipient_count]);
+                return err;
+            };
+            frames[2] = eventRankedCardPlayedOwned(self.allocator, card) catch |err| {
+                room.* = room_before;
+                self.mutex.unlock(self.io);
+                releaseRecipients(recipients[0..recipient_count]);
+                return err;
+            };
+            frames[3] = eventSettingsOwned(self.allocator, "SettingsChanged", settings) catch |err| {
+                room.* = room_before;
+                self.mutex.unlock(self.io);
+                releaseRecipients(recipients[0..recipient_count]);
+                return err;
+            };
+            frames[4] = eventMatchStateOwned(self.allocator, &snapshot) catch |err| {
+                room.* = room_before;
+                self.mutex.unlock(self.io);
+                releaseRecipients(recipients[0..recipient_count]);
+                return err;
+            };
+            self.mutex.unlock(self.io);
+            defer releaseRecipients(recipients[0..recipient_count]);
+            for (frames) |frame| sendRecipients(recipients[0..recipient_count], frame.?);
+            std.log.info("event=lazer_ranked_pick_timed_out room_id={d} user_id={d} card_id={s}", .{ room_id, active_user_id, card.id.slice() });
+            advanced += 1;
+        }
     }
 
     pub fn recordRoomScore(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, score: RoomScoreResult) !void {
@@ -3364,12 +3545,13 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
         if (item_id_raw <= 0) return error.InvalidMultiplayerRoom;
         for (room.playlist[0..index]) |previous| if (previous) |item| if (item.id == item_id_raw) return error.InvalidMultiplayerRoom;
         const owner_id_raw = (try jsonOptionalInteger(item_object, "owner_id")) orelse user.id;
-        if (owner_id_raw <= 0 or owner_id_raw > std.math.maxInt(i32)) return error.InvalidMultiplayerRoom;
+        if (owner_id_raw < 0 or owner_id_raw > std.math.maxInt(i32)) return error.InvalidMultiplayerRoom;
+        const owner_id: i32 = if (owner_id_raw == 0) user.id else @intCast(owner_id_raw);
         const order_raw = (try jsonOptionalInteger(item_object, "playlist_order")) orelse @as(i64, @intCast(index));
         if (order_raw < 0 or order_raw > std.math.maxInt(u16)) return error.InvalidMultiplayerRoom;
         var item: PlaylistItem = .{
             .id = item_id_raw,
-            .owner_id = @intCast(owner_id_raw),
+            .owner_id = owner_id,
             .beatmap_id = @intCast(beatmap_id_raw),
             .ruleset_id = @intCast(ruleset_id_raw),
             .order = @intCast(order_raw),
@@ -3827,7 +4009,18 @@ fn writeMatchState(pack: MessagePackWriter, room: *const Room) !void {
     } else try pack.nil();
 }
 
-fn writeRoom(pack: MessagePackWriter, room: *const Room) !void {
+fn writeRankedStageCountdown(pack: MessagePackWriter, countdown: RankedStageCountdown, now_ms: i64) !void {
+    // MultiplayerCountdown union key 4 is RankedPlayStageCountdown. MessagePack-CSharp
+    // represents TimeSpan as signed 100ns ticks.
+    try pack.array(2);
+    try pack.integer(4);
+    try pack.array(3);
+    try pack.integer(countdown.id);
+    try pack.integer(countdown.remainingTicks(now_ms));
+    try pack.integer(countdown.stage);
+}
+
+fn writeRoom(pack: MessagePackWriter, room: *const Room, now_ms: i64) !void {
     try pack.array(9);
     try pack.integer(room.id);
     try pack.integer(room.state);
@@ -3843,7 +4036,14 @@ fn writeRoom(pack: MessagePackWriter, room: *const Room) !void {
     try writeMatchState(pack, room);
     try pack.array(room.playlist_count);
     for (room.playlist) |entry| if (entry) |item| try writePlaylistItem(pack, item);
-    try pack.array(0);
+    if (room.ranked_play) |ranked| if (ranked.pick_countdown) |countdown| {
+        try pack.array(1);
+        try writeRankedStageCountdown(pack, countdown, now_ms);
+    } else {
+        try pack.array(0);
+    } else {
+        try pack.array(0);
+    }
     try pack.integer(room.channel_id);
 }
 
@@ -4135,7 +4335,7 @@ pub fn completionErrorOwned(allocator: std.mem.Allocator, invocation_id: []const
     return allocatingFrame(allocator, &output);
 }
 
-fn completionRoomOwned(allocator: std.mem.Allocator, invocation_id: []const u8, room: *const Room) ![]u8 {
+fn completionRoomOwned(allocator: std.mem.Allocator, invocation_id: []const u8, room: *const Room, now_ms: i64) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const pack: MessagePackWriter = .{ .writer = &output.writer };
@@ -4144,7 +4344,7 @@ fn completionRoomOwned(allocator: std.mem.Allocator, invocation_id: []const u8, 
     try pack.map(0);
     try pack.string(invocation_id);
     try pack.integer(3);
-    try writeRoom(pack, room);
+    try writeRoom(pack, room, now_ms);
     return allocatingFrame(allocator, &output);
 }
 
@@ -4295,6 +4495,34 @@ fn eventMatchStateOwned(allocator: std.mem.Allocator, room: *const Room) ![]u8 {
     const pack: MessagePackWriter = .{ .writer = &output.writer };
     try beginEvent(pack, "MatchRoomStateChanged", 1);
     try writeMatchState(pack, room);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventRankedCountdownStartedOwned(allocator: std.mem.Allocator, countdown: RankedStageCountdown, now_ms: i64) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchEvent", 1);
+    // MatchServerEvent union key 0 is CountdownStartedEvent.
+    try pack.array(2);
+    try pack.integer(0);
+    try pack.array(1);
+    try writeRankedStageCountdown(pack, countdown, now_ms);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventRankedCountdownStoppedOwned(allocator: std.mem.Allocator, countdown_id: i32) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchEvent", 1);
+    // MatchServerEvent union key 1 is CountdownStoppedEvent.
+    try pack.array(2);
+    try pack.integer(1);
+    try pack.array(1);
+    try pack.integer(countdown_id);
     try endEvent(pack);
     return allocatingFrame(allocator, &output);
 }
@@ -4528,6 +4756,24 @@ test "lazer multiplayer REST room paths cover leaderboard and user scores" {
     try std.testing.expectError(error.InvalidRoomListFilter, roomListFilter(4, "open", null, "made_up"));
 }
 
+test "lazer playlist creation assigns zero owner ids to the authenticated user" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
+    const client_body =
+        \\{"id":null,"name":"raya's awesome playlist","description":null,"password":null,"host":null,"category":"normal","duration":30,"starts_at":null,"ends_at":null,"max_participants":null,"participant_count":0,"recent_participants":[],"max_attempts":null,"playlist":[{"owner_id":0,"ruleset_id":0,"expired":false,"playlist_order":null,"played_at":null,"allowed_mods":[],"required_mods":[],"beatmap_id":1000000003,"freestyle":false}],"playlist_item_stats":null,"difficulty_range":null,"type":"playlists","queue_mode":"host_only","auto_skip":false,"auto_start_duration":0,"current_user_score":null,"current_playlist_item":null,"channel_id":0,"status":"idle","pinned":false}
+    ;
+    const created = try manager.restCreateRoom(std.testing.allocator, host, client_body);
+    defer std.testing.allocator.free(created);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+    try std.testing.expectEqualStrings("playlists", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("normal", parsed.value.object.get("category").?.string);
+    try std.testing.expectEqual(@as(i64, host.id), parsed.value.object.get("playlist").?.array.items[0].object.get("owner_id").?.integer);
+    try std.testing.expectEqual(@as(i64, host.id), parsed.value.object.get("current_playlist_item").?.object.get("owner_id").?.integer);
+}
+
 test "lazer multiplayer REST lifecycle owns room state and score boards" {
     var manager = Manager.init(std.testing.allocator, std.testing.io);
     defer manager.deinit();
@@ -4701,7 +4947,7 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     client_room.playlist_count = 1;
     var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer encoded.deinit();
-    try writeRoom(.{ .writer = &encoded.writer }, &client_room);
+    try writeRoom(.{ .writer = &encoded.writer }, &client_room, 0);
     var connection: Connection = .{ .allocator = std.testing.allocator, .user_id = host.id, .user_country = host.country, .io = std.testing.io };
     try connection.user_name.set(host.name);
     const decoded = try parseRoom(std.testing.allocator, encoded.written(), &connection);
@@ -4823,6 +5069,85 @@ test "ranked play state uses the official union and damage contract" {
     try std.testing.expectEqual(@as(usize, 7), try reader.arrayLen());
     try std.testing.expectEqual(@as(i64, ranked_stage.results), try reader.integer());
     try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+}
+
+test "ranked pick countdown uses the pinned client union and timespan ticks" {
+    const countdown: RankedStageCountdown = .{ .id = 17, .deadline_ms = 35_000, .stage = ranked_stage.card_play };
+    const frame = try eventRankedCountdownStartedOwned(std.testing.allocator, countdown, 5_000);
+    defer std.testing.allocator.free(frame);
+    var prefix_len: usize = 0;
+    while (frame[prefix_len] & 0x80 != 0) prefix_len += 1;
+    prefix_len += 1;
+    var reader: MessagePackReader = .{ .data = frame[prefix_len..] };
+    try std.testing.expectEqual(@as(usize, 6), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try reader.mapLen());
+    try reader.skip(0);
+    try std.testing.expectEqualStrings("MatchEvent", try reader.string());
+    try std.testing.expectEqual(@as(usize, 1), try reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 2), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 0), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 1), try reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 2), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 4), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 3), try reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 17), try reader.integer());
+    try std.testing.expectEqual(@as(i64, 300_000_000), try reader.integer());
+    try std.testing.expectEqual(@as(i64, ranked_stage.card_play), try reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try reader.arrayLen());
+
+    var room: Room = .{ .id = 9, .settings = .{}, .host_id = 4, .ranked_play = .{} };
+    try room.settings.name.set("rejoining pick");
+    try room.settings.auto_start.set(&.{0xc0});
+    room.ranked_play.?.pick_countdown = .{ .id = 18, .deadline_ms = 20_000, .stage = ranked_stage.card_play };
+    var snapshot: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer snapshot.deinit();
+    try writeRoom(.{ .writer = &snapshot.writer }, &room, 5_000);
+    var snapshot_reader: MessagePackReader = .{ .data = snapshot.written() };
+    try std.testing.expectEqual(@as(usize, 9), try snapshot_reader.arrayLen());
+    for (0..7) |_| try snapshot_reader.skip(0);
+    try std.testing.expectEqual(@as(usize, 1), try snapshot_reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 2), try snapshot_reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 4), try snapshot_reader.integer());
+    try std.testing.expectEqual(@as(usize, 3), try snapshot_reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 18), try snapshot_reader.integer());
+    try std.testing.expectEqual(@as(i64, 150_000_000), try snapshot_reader.integer());
+    try std.testing.expectEqual(@as(i64, ranked_stage.card_play), try snapshot_reader.integer());
+}
+
+test "expired ranked pick advances once with a deterministic card" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const room = try std.testing.allocator.create(Room);
+    room.* = .{ .id = 9, .settings = .{}, .host_id = 4, .ranked_play = .{} };
+    try room.settings.name.set("ranked timeout");
+    try room.settings.auto_start.set(&.{0xc0});
+    var item: PlaylistItem = .{ .id = 51, .owner_id = 4, .beatmap_id = 75 };
+    try item.required_mods.set(&.{0x90});
+    try item.allowed_mods.set(&.{0x90});
+    try item.played_at.set(&.{0xc0});
+    room.playlist[0] = item;
+    room.playlist_count = 1;
+    const ranked = &room.ranked_play.?;
+    ranked.stage = ranked_stage.card_play;
+    ranked.current_round = 1;
+    ranked.active_user_id = 4;
+    ranked.user_count = 1;
+    ranked.users[0] = .{ .id = 4 };
+    var card: RankedCard = .{ .playlist_item_id = 51 };
+    card.id.setText("00112233-4455-6677-8899-aabbccddeeff");
+    ranked.users[0].?.hand[0] = card;
+    ranked.users[0].?.hand_count = 1;
+    ranked.pick_countdown = .{ .id = 3, .deadline_ms = 1_000, .stage = ranked_stage.card_play };
+    manager.rooms[0] = room;
+
+    try std.testing.expectEqual(@as(usize, 0), try manager.advanceExpiredRankedPicks(999));
+    try std.testing.expectEqual(@as(usize, 1), try manager.advanceExpiredRankedPicks(1_000));
+    try std.testing.expectEqual(@as(u8, ranked_stage.finish_card_play), room.ranked_play.?.stage);
+    try std.testing.expectEqual(@as(i64, 51), room.settings.playlist_item_id);
+    try std.testing.expectEqualStrings(card.id.slice(), room.ranked_play.?.played_card.?.id.slice());
+    try std.testing.expect(room.ranked_play.?.pick_countdown == null);
+    try std.testing.expectEqual(@as(usize, 0), try manager.advanceExpiredRankedPicks(2_000));
 }
 
 test "ranked card parser accepts canonical guids and rejects duplicates" {

@@ -1331,7 +1331,7 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "['reports','reports']") != null);
 }
 
-test "website routes share the dense page sheet layout" {
+test "website routes keep shared language without sharing one layout" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "function structurePageView()") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "pageLayoutObserver.observe(app,{childList:true})") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "className='page-mode-bar'") != null);
@@ -1345,6 +1345,20 @@ test "website routes share the dense page sheet layout" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .service-row{grid-template-columns:minmax(0,1fr) auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".page-view .stats .stat:last-child:nth-child(odd)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "'/rankings':'rankings','/appeal':'appeal','/staff':'staff'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "view.classList.add(type+'-view')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "type=siteSession?'chat-workspace':'chat-gate'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "type=staffSession?'staff-workspace':'staff-login'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "className='chat-gate-rail'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "className='changelog-feed'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".home-view{display:grid;grid-template-columns:minmax(0,1fr) 250px}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".rankings-view>.page-mode-bar{position:sticky") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".multiplayer-index-view>#multiplayer-groups{grid-column:1/-1;display:grid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".changelog-view{display:grid;grid-template-columns:220px minmax(0,1fr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".login-view{display:grid;grid-template-columns:minmax(0,.85fr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".appeal-view{display:grid;grid-template-columns:280px minmax(0,1fr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".staff-login-view>.auth-sheet{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".settings-view{display:grid;grid-template-columns:250px minmax(0,1fr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".staff-workspace-view{display:grid;grid-template-columns:180px minmax(0,1fr)") != null);
 }
 
 test "team JSON does not publish dead asset URLs" {

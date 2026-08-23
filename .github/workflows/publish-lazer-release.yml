@@ -84,4 +84,4 @@ jobs:
             --target "$SOURCE_REVISION" \
             --title "zigcho!lazer ${CLIENT_VERSION}" \
             --prerelease \
-            --notes "${CLIENT_VERSION} is the current pinned zigcho!lazer build. it carries the production map, multiplayer and failed BSS reservation fixes from ${SOURCE_REVISION}. every package below was built and checksum-verified on GitHub; nothing was built on a player machine."
+            --notes "${CLIENT_VERSION} fixes the in-game beatmap listing getting stuck before it ever sent a search. opening the listing now forces a fresh request instead of waiting for startup or login state to change. every package below was built and checksum-verified on GitHub; nothing was built on a player machine. source: ${SOURCE_REVISION}."

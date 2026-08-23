@@ -4360,7 +4360,7 @@ const App = struct {
         return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
     }
 
-    fn bssPathForRequest(method: std.http.Method, host: []const u8, path: []const u8) ?bss.Path {
+    fn bssPathForRequest(method: std.http.Method, host: ?[]const u8, path: []const u8) ?bss.Path {
         if (method == .GET and web_auth.websiteHost(host) and routing.websitePage(path)) return null;
         return bss.parsePath(path);
     }

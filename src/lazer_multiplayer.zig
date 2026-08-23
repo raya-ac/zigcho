@@ -426,6 +426,8 @@ const PlaylistItem = struct {
     order: u16 = 0,
     played_at: Raw64 = .{},
     star_rating: f64 = 0,
+    total_length: i32 = 0,
+    hit_length: i32 = 0,
     freestyle: bool = false,
 };
 
@@ -730,6 +732,8 @@ pub const Manager = struct {
         item.creator.setText(info.creator);
         item.status = info.status;
         item.star_rating = info.star_rating;
+        item.total_length = info.total_length;
+        item.hit_length = info.hit_length;
     }
 
     fn hydrateRoom(self: *Manager, room: *Room) !void {
@@ -3576,6 +3580,14 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
                     item.star_rating = try jsonNumber(rating);
                     if (item.star_rating < 0 or item.star_rating > 100) return error.InvalidMultiplayerRoom;
                 }
+                if (try jsonOptionalInteger(beatmap, "total_length")) |total_length| {
+                    if (total_length < 0 or total_length > std.math.maxInt(i32)) return error.InvalidMultiplayerRoom;
+                    item.total_length = @intCast(total_length);
+                }
+                if (try jsonOptionalInteger(beatmap, "hit_length")) |hit_length| {
+                    if (hit_length < 0 or hit_length > std.math.maxInt(i32)) return error.InvalidMultiplayerRoom;
+                    item.hit_length = @intCast(hit_length);
+                }
                 if (try jsonOptionalInteger(beatmap, "beatmapset_id")) |set_id| {
                     if (set_id <= 0 or set_id > std.math.maxInt(i32)) return error.InvalidMultiplayerRoom;
                     item.beatmapset_id = @intCast(set_id);
@@ -4154,7 +4166,7 @@ fn writePlaylistItemJson(writer: *std.Io.Writer, item: PlaylistItem) !void {
     try writer.writeAll(",\"version\":");
     try std.json.Stringify.value(version, .{}, writer);
     try writer.writeAll(",\"difficulty_rating\":");
-    try writer.print("{d},\"checksum\":", .{item.star_rating});
+    try writer.print("{d},\"total_length\":{d},\"hit_length\":{d},\"checksum\":", .{ item.star_rating, item.total_length, item.hit_length });
     try std.json.Stringify.value(item.checksum.slice(), .{}, writer);
     try writer.print(",\"beatmapset\":{{\"id\":{d},\"status\":", .{set_id});
     try std.json.Stringify.value(status, .{}, writer);
@@ -4914,7 +4926,7 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
-    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,star_rating) VALUES(75,900,'0123456789abcdef0123456789abcdef','stored artist','stored song','stored diff','stored mapper',3,6.25)");
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,star_rating,total_length,hit_length) VALUES(75,900,'0123456789abcdef0123456789abcdef','stored artist','stored song','stored diff','stored mapper',3,6.25,143,119)");
     var manager = Manager.init(std.testing.allocator, std.testing.io);
     defer manager.deinit();
     try manager.bindStore(&store);
@@ -4931,6 +4943,8 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     try std.testing.expectEqualStrings("stored diff", beatmap.get("version").?.string);
     try std.testing.expectEqualStrings("ranked", beatmap.get("status").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 6.25), beatmap.get("difficulty_rating").?.float, 0.0001);
+    try std.testing.expectEqual(@as(i64, 143), beatmap.get("total_length").?.integer);
+    try std.testing.expectEqual(@as(i64, 119), beatmap.get("hit_length").?.integer);
     const set = beatmap.get("beatmapset").?.object;
     try std.testing.expectEqualStrings("stored artist", set.get("artist").?.string);
     try std.testing.expectEqualStrings("stored song", set.get("title").?.string);
@@ -4965,6 +4979,8 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     try std.testing.expectEqual(@as(i64, 900), client_beatmap.get("beatmapset_id").?.integer);
     try std.testing.expectEqualStrings("stored song", client_beatmap.get("beatmapset").?.object.get("title").?.string);
     try std.testing.expectEqualStrings("stored diff", client_beatmap.get("version").?.string);
+    try std.testing.expectEqual(@as(i64, 143), client_beatmap.get("total_length").?.integer);
+    try std.testing.expectEqual(@as(i64, 119), client_beatmap.get("hit_length").?.integer);
 }
 
 test "signalr accepts messagepack handshake bytes independent of websocket opcode" {

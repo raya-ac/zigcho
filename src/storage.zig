@@ -425,6 +425,12 @@ pub const Store = struct {
         }
         if (version < 36) try self.exec(database_sql.sqliteMigration(36));
         if (version < 37) try self.exec(database_sql.sqliteMigration(37));
+        if (version < 38) {
+            if (try self.hasDirectMessageChatLink())
+                try self.exec("BEGIN IMMEDIATE; CREATE UNIQUE INDEX IF NOT EXISTS direct_messages_chat_message ON direct_messages(chat_message_id) WHERE chat_message_id IS NOT NULL; PRAGMA user_version=38; COMMIT")
+            else
+                try self.exec(database_sql.sqliteMigration(38));
+        }
         try self.exec(
             "BEGIN IMMEDIATE;" ++
                 "UPDATE lazer_scores SET best=0;" ++
@@ -501,6 +507,16 @@ pub const Store = struct {
             if (std.mem.eql(u8, name, "client_uuid")) have_uuid = true;
         }
         return have_action and have_uuid;
+    }
+
+    fn hasDirectMessageChatLink(self: *Store) !bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "PRAGMA table_info(direct_messages)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)), "chat_message_id")) return true;
+        }
+        return false;
     }
 
     fn hasSiteProfileSchema(self: *Store) !bool {
@@ -2318,20 +2334,24 @@ pub const Store = struct {
         const target = try lazer.directMessageTarget(&target_buffer, from_id, to_id);
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        _ = c.sqlite3_bind_int(stmt, 1, from_id);
-        _ = c.sqlite3_bind_int(stmt, 2, to_id);
-        _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        _ = c.sqlite3_finalize(stmt);
-        stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO chat_messages(sender_id,target,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int(stmt, 1, from_id);
-        _ = c.sqlite3_bind_text(stmt, 2, target.ptr, @intCast(target.len), null);
-        _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        const chat_message_id: i64 = chat: {
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT INTO chat_messages(sender_id,target,message) VALUES(?1,?2,?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_int(stmt, 1, from_id);
+            _ = c.sqlite3_bind_text(stmt, 2, target.ptr, @intCast(target.len), null);
+            _ = c.sqlite3_bind_text(stmt, 3, message.ptr, @intCast(message.len), null);
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            break :chat c.sqlite3_last_insert_rowid(self.db);
+        };
+        var direct: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message,chat_message_id) VALUES(?1,?2,?3,?4)", -1, &direct, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(direct);
+        _ = c.sqlite3_bind_int(direct, 1, from_id);
+        _ = c.sqlite3_bind_int(direct, 2, to_id);
+        _ = c.sqlite3_bind_text(direct, 3, message.ptr, @intCast(message.len), null);
+        _ = c.sqlite3_bind_int64(direct, 4, chat_message_id);
+        if (c.sqlite3_step(direct) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         try self.exec("COMMIT");
     }
 
@@ -2469,13 +2489,14 @@ pub const Store = struct {
 
         if (inserted) {
             var direct: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message,is_action,client_uuid) VALUES(?1,?2,?3,?4,?5)", -1, &direct, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT INTO direct_messages(from_id,to_id,message,is_action,client_uuid,chat_message_id) VALUES(?1,?2,?3,?4,?5,?6)", -1, &direct, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
             defer _ = c.sqlite3_finalize(direct);
             _ = c.sqlite3_bind_int(direct, 1, sender_id);
             _ = c.sqlite3_bind_int(direct, 2, target_id);
             _ = c.sqlite3_bind_text(direct, 3, message.ptr, @intCast(message.len), null);
             _ = c.sqlite3_bind_int(direct, 4, @intFromBool(is_action));
             _ = c.sqlite3_bind_text(direct, 5, uuid.ptr, @intCast(uuid.len), null);
+            _ = c.sqlite3_bind_int64(direct, 6, c.sqlite3_column_int64(row, 0));
             if (c.sqlite3_step(direct) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         }
 
@@ -2580,8 +2601,9 @@ pub const Store = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const filter = "target IN('#osu','#announce','#lobby','#lazer') OR target LIKE ?1 OR target LIKE ?2";
+        const unread_filter = "(m.target IN('#osu','#announce','#lobby','#lazer') AND m.id>coalesce((SELECT r.last_read_id FROM lazer_channel_reads r WHERE r.user_id=?3 AND r.channel_id=CASE m.target WHEN '#osu' THEN 1 WHEN '#announce' THEN 2 WHEN '#lobby' THEN 3 WHEN '#lazer' THEN 4 END),0)) OR ((m.target LIKE ?1 OR m.target LIKE ?2) AND EXISTS(SELECT 1 FROM direct_messages d WHERE d.chat_message_id=m.id AND d.to_id=?3 AND d.read=0))";
         const sql = if (since == 0)
-            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM (SELECT * FROM chat_messages WHERE " ++ filter ++ " ORDER BY id DESC LIMIT ?3) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM (SELECT m.* FROM chat_messages m WHERE " ++ unread_filter ++ " ORDER BY m.id DESC LIMIT ?4) m JOIN users u ON u.id=m.sender_id WHERE u.restricted=0 ORDER BY m.id"
         else
             "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,strftime('%Y-%m-%dT%H:%M:%SZ',m.created_at,'unixepoch'),u.privileges FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE (" ++ filter ++ ") AND m.id>?3 AND u.restricted=0 ORDER BY m.id LIMIT ?4";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -2589,8 +2611,8 @@ pub const Store = struct {
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_text(stmt, 1, low_pattern.ptr, @intCast(low_pattern.len), null);
         _ = c.sqlite3_bind_text(stmt, 2, high_pattern.ptr, @intCast(high_pattern.len), null);
-        _ = c.sqlite3_bind_int64(stmt, 3, if (since == 0) limit else since);
-        if (since != 0) _ = c.sqlite3_bind_int(stmt, 4, limit);
+        _ = c.sqlite3_bind_int64(stmt, 3, if (since == 0) viewer_id else since);
+        _ = c.sqlite3_bind_int(stmt, 4, limit);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         try output.writer.writeByte('[');
@@ -2733,7 +2755,7 @@ pub const Store = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "SELECT max(m.id),CASE WHEN NOT EXISTS(SELECT 1 FROM direct_messages d WHERE d.to_id=?2 AND d.from_id=?3 AND d.read=0) THEN max(m.id) ELSE NULL END FROM chat_messages m WHERE m.target=?1";
+        const sql = "SELECT max(m.id),CASE WHEN (SELECT min(d.chat_message_id) FROM direct_messages d WHERE d.to_id=?2 AND d.from_id=?3 AND d.read=0 AND d.chat_message_id IS NOT NULL) IS NULL THEN max(m.id) ELSE (SELECT max(previous.id) FROM chat_messages previous WHERE previous.target=?1 AND previous.id<(SELECT min(d.chat_message_id) FROM direct_messages d WHERE d.to_id=?2 AND d.from_id=?3 AND d.read=0 AND d.chat_message_id IS NOT NULL)) END FROM chat_messages m WHERE m.target=?1";
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_text(stmt, 1, target.ptr, @intCast(target.len), null);
@@ -2762,6 +2784,31 @@ pub const Store = struct {
         _ = c.sqlite3_bind_text(stmt, 4, target.ptr, @intCast(target.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         if (c.sqlite3_changes(self.db) == 0) return error.ChatMessageNotFound;
+    }
+
+    pub fn markLazerDirectMessageRead(self: *Store, viewer_id: i32, other_id: i32, message_id: i64) !void {
+        if (viewer_id <= 0 or other_id <= 0 or viewer_id == other_id or message_id <= 0) return error.InvalidChatQuery;
+        var target_buffer: [64]u8 = undefined;
+        const target = try lazer.directMessageTarget(&target_buffer, viewer_id, other_id);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var message: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM chat_messages WHERE id=?1 AND target=?2", -1, &message, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        _ = c.sqlite3_bind_int64(message, 1, message_id);
+        _ = c.sqlite3_bind_text(message, 2, target.ptr, @intCast(target.len), null);
+        const found = c.sqlite3_step(message) == c.SQLITE_ROW;
+        _ = c.sqlite3_finalize(message);
+        if (!found) return error.ChatMessageNotFound;
+        var update: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE direct_messages SET read=1 WHERE to_id=?1 AND from_id=?2 AND read=0 AND (chat_message_id IS NULL OR chat_message_id<=?3)", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(update);
+        _ = c.sqlite3_bind_int(update, 1, viewer_id);
+        _ = c.sqlite3_bind_int(update, 2, other_id);
+        _ = c.sqlite3_bind_int64(update, 3, message_id);
+        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        try self.exec("COMMIT");
     }
 
     pub fn beatmapRankContext(self: *Store, map_md5: []const u8) !?domain.BeatmapRankContext {
@@ -6496,7 +6543,7 @@ pub const Store = struct {
         return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4) };
     }
 
-    pub const BeatmapInfo = struct { id: i32, set_id: i32, max_combo: i32, artist: []const u8, title: []const u8, version: []const u8, creator: []const u8, status: i8, star_rating: f64 };
+    pub const BeatmapInfo = struct { id: i32, set_id: i32, max_combo: i32, artist: []const u8, title: []const u8, version: []const u8, creator: []const u8, status: i8, star_rating: f64, total_length: i32, hit_length: i32 };
 
     pub fn scoreLeaderboardPlacement(self: *Store, score_id: i64) !?domain.ScorePlacement {
         self.mutex.lockUncancelable(self.io);
@@ -6565,7 +6612,7 @@ pub const Store = struct {
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating FROM beatmaps WHERE md5=?1";
+        const sql = "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating,max(total_length,0),max(CASE WHEN hit_length>0 THEN hit_length ELSE total_length END,0) FROM beatmaps WHERE md5=?1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -6588,13 +6635,15 @@ pub const Store = struct {
             .creator = creator,
             .status = @intCast(c.sqlite3_column_int(stmt, 7)),
             .star_rating = c.sqlite3_column_double(stmt, 8),
+            .total_length = c.sqlite3_column_int(stmt, 9),
+            .hit_length = c.sqlite3_column_int(stmt, 10),
         };
     }
 
     pub fn beatmapInfoById(self: *Store, allocator: std.mem.Allocator, map_id: i32) !?BeatmapInfo {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const sql = "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating FROM beatmaps WHERE id=?1";
+        const sql = "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating,max(total_length,0),max(CASE WHEN hit_length>0 THEN hit_length ELSE total_length END,0) FROM beatmaps WHERE id=?1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -6607,7 +6656,7 @@ pub const Store = struct {
         const version = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5)));
         errdefer allocator.free(version);
         const creator = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 6)));
-        return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .max_combo = c.sqlite3_column_int(stmt, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = @intCast(c.sqlite3_column_int(stmt, 7)), .star_rating = c.sqlite3_column_double(stmt, 8) };
+        return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .max_combo = c.sqlite3_column_int(stmt, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = @intCast(c.sqlite3_column_int(stmt, 7)), .star_rating = c.sqlite3_column_double(stmt, 8), .total_length = c.sqlite3_column_int(stmt, 9), .hit_length = c.sqlite3_column_int(stmt, 10) };
     }
 
     pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {

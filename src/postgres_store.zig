@@ -142,7 +142,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36 and version != 37) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36 and version != 37 and version != 38) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -349,6 +349,7 @@ pub const Store = struct {
         if (version <= 34) try postgres.exec(lease.conn, database_sql.postgresMigration(35));
         if (version <= 35) try postgres.exec(lease.conn, database_sql.postgresMigration(36));
         if (version <= 36) try postgres.exec(lease.conn, database_sql.postgresMigration(37));
+        if (version <= 37) try postgres.exec(lease.conn, database_sql.postgresMigration(38));
         try self.refreshExternalOnly(lease.conn);
         try postgres.exec(
             lease.conn,
@@ -3355,10 +3356,13 @@ pub const Store = struct {
         try postgres.exec(lease.conn, "BEGIN");
         errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
         if (!try self.directMessageAllowedWithConnection(lease.conn, from_id, to_id)) return error.DirectMessageBlocked;
-        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.direct_messages(from_id,to_id,message) VALUES($1,$2,$3)", &.{ from, to, message });
+        var mirror = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.chat_messages(sender_id,target,message) VALUES($1,$2,$3) RETURNING id", &.{ from, target, message });
+        defer mirror.deinit();
+        const chat_message_id = try mirror.int(i64, 0, 0);
+        var chat_buf: [24]u8 = undefined;
+        const chat = try std.fmt.bufPrint(&chat_buf, "{d}", .{chat_message_id});
+        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.direct_messages(from_id,to_id,message,chat_message_id) VALUES($1,$2,$3,$4)", &.{ from, to, message, chat });
         result.deinit();
-        var mirror = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.chat_messages(sender_id,target,message) VALUES($1,$2,$3)", &.{ from, target, message });
-        mirror.deinit();
         try postgres.exec(lease.conn, "COMMIT");
     }
 
@@ -3463,7 +3467,9 @@ pub const Store = struct {
         if (row.rows() != 1) return error.DatabaseQueryFailed;
         if (!std.mem.eql(u8, row.value(0, 1), target) or !std.mem.eql(u8, row.value(0, 2), message) or (try row.boolean(0, 3)) != is_action) return error.ChatUuidConflict;
         if (inserted) {
-            var direct = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.direct_messages(from_id,to_id,message,is_action,client_uuid) VALUES($1,$2,$3,$4,$5)", &.{ sender, receiver, message, if (is_action) "true" else "false", uuid });
+            var chat_buf: [24]u8 = undefined;
+            const chat = try std.fmt.bufPrint(&chat_buf, "{d}", .{try row.int(i64, 0, 0)});
+            var direct = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.direct_messages(from_id,to_id,message,is_action,client_uuid,chat_message_id) VALUES($1,$2,$3,$4,$5,$6)", &.{ sender, receiver, message, if (is_action) "true" else "false", uuid, chat });
             direct.deinit();
         }
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -3562,21 +3568,24 @@ pub const Store = struct {
         if (viewer_id <= 0 or since < 0 or limit == 0 or limit > 100) return error.InvalidChatQuery;
         var low_pattern_buf: [64]u8 = undefined;
         var high_pattern_buf: [64]u8 = undefined;
+        var viewer_buf: [24]u8 = undefined;
         var since_buf: [24]u8 = undefined;
         var limit_buf: [8]u8 = undefined;
         const low_pattern = try std.fmt.bufPrint(&low_pattern_buf, "@dm:{d}:%", .{viewer_id});
         const high_pattern = try std.fmt.bufPrint(&high_pattern_buf, "@dm:%:{d}", .{viewer_id});
+        const viewer = try std.fmt.bufPrint(&viewer_buf, "{d}", .{viewer_id});
         const since_text = try std.fmt.bufPrint(&since_buf, "{d}", .{since});
         const limit_text = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
         var lease = self.pool.acquire();
         defer lease.release();
         const filter = "target IN('#osu','#announce','#lobby','#lazer') OR target LIKE $1 OR target LIKE $2";
+        const unread_filter = "(m.target IN('#osu','#announce','#lobby','#lazer') AND m.id>coalesce((SELECT r.last_read_id FROM zigcho.lazer_channel_reads r WHERE r.user_id=$3::int AND r.channel_id=CASE m.target WHEN '#osu' THEN 1 WHEN '#announce' THEN 2 WHEN '#lobby' THEN 3 WHEN '#lazer' THEN 4 END),0)) OR ((m.target LIKE $1 OR m.target LIKE $2) AND EXISTS(SELECT 1 FROM zigcho.direct_messages d WHERE d.chat_message_id=m.id AND d.to_id=$3::int AND NOT d.read))";
         const sql = if (since == 0)
-            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),u.privileges FROM (SELECT * FROM zigcho.chat_messages WHERE " ++ filter ++ " ORDER BY id DESC LIMIT $3::int) m JOIN zigcho.users u ON u.id=m.sender_id WHERE NOT u.restricted ORDER BY m.id"
+            "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),u.privileges FROM (SELECT m.* FROM zigcho.chat_messages m WHERE " ++ unread_filter ++ " ORDER BY m.id DESC LIMIT $4::int) m JOIN zigcho.users u ON u.id=m.sender_id WHERE NOT u.restricted ORDER BY m.id"
         else
             "SELECT m.id,m.target,m.sender_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,m.message,m.is_action,m.client_uuid,to_char(to_timestamp(m.created_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),u.privileges FROM zigcho.chat_messages m JOIN zigcho.users u ON u.id=m.sender_id WHERE (" ++ filter ++ ") AND m.id>$3::bigint AND NOT u.restricted ORDER BY m.id LIMIT $4::int";
         var result = if (since == 0)
-            try postgres.queryParams(allocator, lease.conn, sql, &.{ low_pattern, high_pattern, limit_text })
+            try postgres.queryParams(allocator, lease.conn, sql, &.{ low_pattern, high_pattern, viewer, limit_text })
         else
             try postgres.queryParams(allocator, lease.conn, sql, &.{ low_pattern, high_pattern, since_text, limit_text });
         defer result.deinit();
@@ -3716,7 +3725,7 @@ pub const Store = struct {
         const target = try lazer.directMessageTarget(&target_buf, viewer_id, other_id);
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT max(m.id),CASE WHEN NOT EXISTS(SELECT 1 FROM zigcho.direct_messages d WHERE d.to_id=$2::int AND d.from_id=$3::int AND NOT d.read) THEN max(m.id) ELSE NULL END FROM zigcho.chat_messages m WHERE m.target=$1", &.{ target, viewer, other });
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT max(m.id),CASE WHEN (SELECT min(d.chat_message_id) FROM zigcho.direct_messages d WHERE d.to_id=$2::int AND d.from_id=$3::int AND NOT d.read AND d.chat_message_id IS NOT NULL) IS NULL THEN max(m.id) ELSE (SELECT max(previous.id) FROM zigcho.chat_messages previous WHERE previous.target=$1 AND previous.id<(SELECT min(d.chat_message_id) FROM zigcho.direct_messages d WHERE d.to_id=$2::int AND d.from_id=$3::int AND NOT d.read AND d.chat_message_id IS NOT NULL)) END FROM zigcho.chat_messages m WHERE m.target=$1", &.{ target, viewer, other });
         defer result.deinit();
         if (result.rows() != 1) return error.DatabaseQueryFailed;
         return .{
@@ -3739,6 +3748,28 @@ pub const Store = struct {
         var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.lazer_channel_reads(user_id,channel_id,last_read_id) SELECT $1::int,$2::smallint,$3::bigint WHERE EXISTS(SELECT 1 FROM zigcho.chat_messages WHERE id=$3::bigint AND target=$4) ON CONFLICT(user_id,channel_id) DO UPDATE SET last_read_id=greatest(zigcho.lazer_channel_reads.last_read_id,excluded.last_read_id),updated_at=extract(epoch FROM clock_timestamp())::bigint RETURNING 1", &.{ user, channel, message, target });
         defer result.deinit();
         if (result.rows() == 0) return error.ChatMessageNotFound;
+    }
+
+    pub fn markLazerDirectMessageRead(self: *Store, viewer_id: i32, other_id: i32, message_id: i64) !void {
+        if (viewer_id <= 0 or other_id <= 0 or viewer_id == other_id or message_id <= 0) return error.InvalidChatQuery;
+        var viewer_buf: [24]u8 = undefined;
+        var other_buf: [24]u8 = undefined;
+        var message_buf: [24]u8 = undefined;
+        var target_buf: [64]u8 = undefined;
+        const viewer = try std.fmt.bufPrint(&viewer_buf, "{d}", .{viewer_id});
+        const other = try std.fmt.bufPrint(&other_buf, "{d}", .{other_id});
+        const message = try std.fmt.bufPrint(&message_buf, "{d}", .{message_id});
+        const target = try lazer.directMessageTarget(&target_buf, viewer_id, other_id);
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var found = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.chat_messages WHERE id=$1::bigint AND target=$2", &.{ message, target });
+        defer found.deinit();
+        if (found.rows() == 0) return error.ChatMessageNotFound;
+        var update = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.direct_messages SET read=true WHERE to_id=$1::int AND from_id=$2::int AND NOT read AND (chat_message_id IS NULL OR chat_message_id<=$3::bigint)", &.{ viewer, other, message });
+        update.deinit();
+        try postgres.exec(lease.conn, "COMMIT");
     }
 
     pub fn beatmapRankContext(self: *Store, map_md5: []const u8) !?domain.BeatmapRankContext {
@@ -5748,7 +5779,7 @@ pub const Store = struct {
     pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating FROM zigcho.beatmaps WHERE md5=$1", &.{md5});
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating,greatest(total_length,0),greatest(CASE WHEN hit_length>0 THEN hit_length ELSE total_length END,0) FROM zigcho.beatmaps WHERE md5=$1", &.{md5});
         defer result.deinit();
         if (result.rows() == 0) return null;
         const artist = try allocator.dupe(u8, result.value(0, 3));
@@ -5758,7 +5789,7 @@ pub const Store = struct {
         const version = try allocator.dupe(u8, result.value(0, 5));
         errdefer allocator.free(version);
         const creator = try allocator.dupe(u8, result.value(0, 6));
-        return .{ .id = try result.int(i32, 0, 0), .set_id = try result.int(i32, 0, 1), .max_combo = try result.int(i32, 0, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = try result.int(i8, 0, 7), .star_rating = try result.float(f64, 0, 8) };
+        return .{ .id = try result.int(i32, 0, 0), .set_id = try result.int(i32, 0, 1), .max_combo = try result.int(i32, 0, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = try result.int(i8, 0, 7), .star_rating = try result.float(f64, 0, 8), .total_length = try result.int(i32, 0, 9), .hit_length = try result.int(i32, 0, 10) };
     }
 
     pub fn beatmapInfoById(self: *Store, allocator: std.mem.Allocator, map_id: i32) !?BeatmapInfo {
@@ -5766,7 +5797,7 @@ pub const Store = struct {
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{map_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating FROM zigcho.beatmaps WHERE id=$1", &.{id});
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,max_combo,artist,title,version,creator,status,star_rating,greatest(total_length,0),greatest(CASE WHEN hit_length>0 THEN hit_length ELSE total_length END,0) FROM zigcho.beatmaps WHERE id=$1", &.{id});
         defer result.deinit();
         if (result.rows() == 0) return null;
         const artist = try allocator.dupe(u8, result.value(0, 3));
@@ -5776,7 +5807,7 @@ pub const Store = struct {
         const version = try allocator.dupe(u8, result.value(0, 5));
         errdefer allocator.free(version);
         const creator = try allocator.dupe(u8, result.value(0, 6));
-        return .{ .id = try result.int(i32, 0, 0), .set_id = try result.int(i32, 0, 1), .max_combo = try result.int(i32, 0, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = try result.int(i8, 0, 7), .star_rating = try result.float(f64, 0, 8) };
+        return .{ .id = try result.int(i32, 0, 0), .set_id = try result.int(i32, 0, 1), .max_combo = try result.int(i32, 0, 2), .artist = artist, .title = title, .version = version, .creator = creator, .status = try result.int(i8, 0, 7), .star_rating = try result.float(f64, 0, 8), .total_length = try result.int(i32, 0, 9), .hit_length = try result.int(i32, 0, 10) };
     }
 
     pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {
@@ -6070,7 +6101,7 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates through BSS media schema thirty seven" {
+test "postgres runtime migrates through chat cursor schema thirty eight" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -6079,7 +6110,7 @@ test "postgres runtime migrates through BSS media schema thirty seven" {
         var previous = old_store.pool.acquire();
         defer previous.release();
         try postgres.exec(previous.conn, "DROP TABLE zigcho.lazer_multiplayer_room_history; DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
-        try postgres.exec(previous.conn, "ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
+        try postgres.exec(previous.conn, "ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; ALTER TABLE zigcho.direct_messages DROP COLUMN chat_message_id; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
         try postgres.exec(previous.conn, "ALTER TABLE zigcho.beatmap_archives ALTER COLUMN osz_file SET NOT NULL; ALTER TABLE zigcho.beatmap_media ALTER COLUMN data SET NOT NULL");
     }
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -6088,9 +6119,9 @@ test "postgres runtime migrates through BSS media schema thirty seven" {
     try std.testing.expect(!store.external_only);
     var lease = store.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')) FROM zigcho.schema_migrations");
+    var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name='chat_message_id'),(to_regclass('zigcho.direct_messages_chat_message') IS NOT NULL)::int,(SELECT count(*) FROM pg_constraint WHERE connamespace='zigcho'::regnamespace AND conname='direct_messages_chat_message_id_fkey' AND convalidated) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 37), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 38), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -6118,6 +6149,9 @@ test "postgres runtime migrates through BSS media schema thirty seven" {
     try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 25));
     try std.testing.expectEqual(@as(i32, 12), try result.int(i32, 0, 26));
     try std.testing.expectEqual(@as(i32, 2), try result.int(i32, 0, 27));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 28));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 29));
+    try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 30));
     var bss_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.beatmap_submissions') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_submission_maps') IS NOT NULL)::int,(to_regclass('zigcho.bss_counters') IS NOT NULL)::int,(SELECT count(*) FROM zigcho.bss_counters),(SELECT min(next_id) FROM zigcho.bss_counters),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='beatmap_submissions' AND column_name='replacement_set_id'),(to_regclass('zigcho.beatmap_submissions_replacement') IS NOT NULL)::int");
     defer bss_schema.deinit();
     try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 0));
@@ -6800,6 +6834,12 @@ test "postgres account auth stats and token slice" {
     defer std.testing.allocator.free(comments);
     try std.testing.expect(std.mem.indexOf(u8, comments, "12.5\tmap\t\tpostgres map comment") != null);
     try store.storeDirectMessage(second_id, user_id, "postgres offline hello");
+    const initial_dm_feed = try store.lazerAllMessagesJson(std.testing.allocator, user_id, 0, 100);
+    defer std.testing.allocator.free(initial_dm_feed);
+    const parsed_dm_feed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, initial_dm_feed, .{});
+    defer parsed_dm_feed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_dm_feed.value.array.items.len);
+    const dm_message_id = parsed_dm_feed.value.array.items[0].object.get("message_id").?.integer;
     const unread = try store.unreadDirectMessages(std.testing.allocator, user_id);
     defer {
         for (unread) |*message| message.deinit(std.testing.allocator);
@@ -6807,7 +6847,10 @@ test "postgres account auth stats and token slice" {
     }
     try std.testing.expectEqual(@as(usize, 1), unread.len);
     try std.testing.expectEqualStrings("raya", unread[0].from_name);
-    try store.markDirectMessagesRead(user_id, second_id);
+    try store.markLazerDirectMessageRead(user_id, second_id, dm_message_id);
+    const cleared_dm_feed = try store.lazerAllMessagesJson(std.testing.allocator, user_id, 0, 100);
+    defer std.testing.allocator.free(cleared_dm_feed);
+    try std.testing.expectEqualStrings("[]", cleared_dm_feed);
     const dm_threads = try store.directMessageThreadsJson(std.testing.allocator, user_id, 50);
     defer std.testing.allocator.free(dm_threads);
     try std.testing.expect(std.mem.indexOf(u8, dm_threads, "\"name\":\"raya\"") != null);

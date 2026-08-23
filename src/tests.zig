@@ -3340,6 +3340,25 @@ test "lazer public chat persists actions and deduplicates client uuids" {
     const action_id = action_parsed.value.object.get("message_id").?.integer;
     try std.testing.expectError(error.ChatMessageNotFound, store.markLazerChannelRead(user_id, 1, action_id));
     try std.testing.expectError(error.ChatMessageNotFound, store.markLazerChannelRead(user_id, 1, 999_999));
+
+    const second = try store.recordLazerPublicMessage(std.testing.allocator, user_id, "#osu", "new after read", false, "22222222-3333-4444-5555-666666666666");
+    defer std.testing.allocator.free(second.json);
+    const second_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, second.json, .{});
+    defer second_parsed.deinit();
+    const second_id = second_parsed.value.object.get("message_id").?.integer;
+    const reconnect_unread = try store.lazerAllMessagesJson(std.testing.allocator, user_id, 0, 100);
+    defer std.testing.allocator.free(reconnect_unread);
+    try std.testing.expect(std.mem.indexOf(u8, reconnect_unread, "new after read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reconnect_unread, "hello from lazer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reconnect_unread, "waves") != null);
+    try store.markLazerChannelRead(user_id, 1, second_id);
+    try store.markLazerChannelRead(user_id, 1, first_id);
+    try store.markLazerChannelRead(user_id, 4, action_id);
+    const monotonic = try store.lazerChannelCursor(user_id, 1);
+    try std.testing.expectEqual(second_id, monotonic.last_read_id.?);
+    const reconnect_clear = try store.lazerAllMessagesJson(std.testing.allocator, user_id, 0, 100);
+    defer std.testing.allocator.free(reconnect_clear);
+    try std.testing.expectEqualStrings("[]", reconnect_clear);
 }
 
 test "lazer private messages share one cursor with stable offline mail" {
@@ -3370,6 +3389,7 @@ test "lazer private messages share one cursor with stable offline mail" {
     try std.testing.expectEqual(@as(usize, 1), parsed_history.value.array.items.len);
     try std.testing.expectEqual(lazer.privateChannelId(first_id).?, parsed_history.value.array.items[0].object.get("channel_id").?.integer);
     try std.testing.expectEqualStrings("private hello", parsed_history.value.array.items[0].object.get("content").?.string);
+    const first_message_id = parsed_history.value.array.items[0].object.get("message_id").?.integer;
 
     const updates = try store.lazerAllMessagesJson(std.testing.allocator, second_id, 0, 100);
     defer std.testing.allocator.free(updates);
@@ -3388,15 +3408,33 @@ test "lazer private messages share one cursor with stable offline mail" {
     const cursor_before = try store.lazerDirectMessageCursor(second_id, first_id);
     try std.testing.expect(cursor_before.last_message_id != null);
     try std.testing.expectEqual(@as(?i64, null), cursor_before.last_read_id);
-    try store.markDirectMessagesRead(second_id, first_id);
+    try store.markLazerDirectMessageRead(second_id, first_id, first_message_id);
     const cursor_after = try store.lazerDirectMessageCursor(second_id, first_id);
     try std.testing.expectEqual(cursor_after.last_message_id, cursor_after.last_read_id);
+    const reconnect_clear = try store.lazerAllMessagesJson(std.testing.allocator, second_id, 0, 100);
+    defer std.testing.allocator.free(reconnect_clear);
+    try std.testing.expectEqualStrings("[]", reconnect_clear);
+
+    const second = try store.recordLazerDirectMessage(std.testing.allocator, first_id, second_id, "new private hello", false, "cccccccc-dddd-eeee-ffff-000000000000");
+    defer std.testing.allocator.free(second.json);
+    const second_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, second.json, .{});
+    defer second_parsed.deinit();
+    const second_message_id = second_parsed.value.object.get("message_id").?.integer;
+    const reconnect_unread = try store.lazerAllMessagesJson(std.testing.allocator, second_id, 0, 100);
+    defer std.testing.allocator.free(reconnect_unread);
+    try std.testing.expect(std.mem.indexOf(u8, reconnect_unread, "new private hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reconnect_unread, "\"content\":\"private hello\"") == null);
+    try store.markLazerDirectMessageRead(second_id, first_id, second_message_id);
+    try store.markLazerDirectMessageRead(second_id, first_id, first_message_id);
+    const reconnect_cleared_again = try store.lazerAllMessagesJson(std.testing.allocator, second_id, 0, 100);
+    defer std.testing.allocator.free(reconnect_cleared_again);
+    try std.testing.expectEqualStrings("[]", reconnect_cleared_again);
 
     try store.storeDirectMessage(second_id, first_id, "stable hello");
     const stable_update = try store.lazerAllMessagesJson(std.testing.allocator, first_id, 0, 100);
     defer std.testing.allocator.free(stable_update);
     try std.testing.expect(std.mem.indexOf(u8, stable_update, "stable hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stable_update, "private hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable_update, "private hello") == null);
 
     const first_threads = try store.directMessageThreadsJson(std.testing.allocator, first_id, 50);
     defer std.testing.allocator.free(first_threads);
@@ -5180,7 +5218,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 37), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 38), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {

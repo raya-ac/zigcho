@@ -3138,7 +3138,10 @@ const App = struct {
             const user = (try self.lazerUser(auth_owned, "identify")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
             if (lazer.privateChannelUser(channel_path.channel_id)) |other_id|
-                self.store.markDirectMessagesRead(user.id, other_id) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"read state unavailable\"}", &.{})
+                self.store.markLazerDirectMessageRead(user.id, other_id, channel_path.message_id) catch |err| return switch (err) {
+                    error.ChatMessageNotFound => respond(req, .not_found, "application/json", "{\"error\":\"chat message not found\"}", &.{}),
+                    else => respond(req, .internal_server_error, "application/json", "{\"error\":\"read state unavailable\"}", &.{}),
+                }
             else
                 self.store.markLazerChannelRead(user.id, channel_path.channel_id, channel_path.message_id) catch |err| return switch (err) {
                     error.ChatMessageNotFound => respond(req, .not_found, "application/json", "{\"error\":\"chat message not found\"}", &.{}),

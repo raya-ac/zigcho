@@ -10,6 +10,9 @@ pub const Metadata = struct {
     creator: []const u8 = "",
     source: []const u8 = "",
     tags: []const u8 = "",
+    audio_filename: []const u8 = "",
+    background_filename: []const u8 = "",
+    preview_time: i32 = -1,
     hp: f64 = 0,
     cs: f64 = 0,
     od: f64 = 0,
@@ -30,6 +33,23 @@ fn value(line: []const u8, key: []const u8) ?[]const u8 {
 
 fn parseFloat(text: []const u8) !f64 {
     return std.fmt.parseFloat(f64, text);
+}
+
+fn backgroundFilename(line: []const u8) ?[]const u8 {
+    const first_comma = std.mem.findScalar(u8, line, ',') orelse return null;
+    if (!std.mem.eql(u8, std.mem.trim(u8, line[0..first_comma], " \t"), "0")) return null;
+    const after_first = line[first_comma + 1 ..];
+    const second_relative = std.mem.findScalar(u8, after_first, ',') orelse return null;
+    if (!std.mem.eql(u8, std.mem.trim(u8, after_first[0..second_relative], " \t"), "0")) return null;
+    const raw = std.mem.trimStart(u8, after_first[second_relative + 1 ..], " \t");
+    if (raw.len == 0) return null;
+    if (raw[0] == '"') {
+        const end = (std.mem.findScalar(u8, raw[1..], '"') orelse return null) + 1;
+        return if (end > 1) raw[1..end] else null;
+    }
+    const end = std.mem.findScalar(u8, raw, ',') orelse raw.len;
+    const filename = std.mem.trim(u8, raw[0..end], " \t");
+    return if (filename.len == 0) null else filename;
 }
 
 pub fn parse(bytes: []const u8) !Metadata {
@@ -58,6 +78,8 @@ pub fn parseWithIds(bytes: []const u8, fallback_id: i32, fallback_set_id: i32) !
         }
         if (std.mem.eql(u8, section, "General")) {
             if (value(line, "Mode")) |v| result.mode = try std.fmt.parseInt(u8, v, 10);
+            if (value(line, "AudioFilename")) |v| result.audio_filename = v;
+            if (value(line, "PreviewTime")) |v| result.preview_time = try std.fmt.parseInt(i32, v, 10);
         } else if (std.mem.eql(u8, section, "Metadata")) {
             if (value(line, "BeatmapID")) |v| result.id = try std.fmt.parseInt(i32, v, 10);
             if (value(line, "BeatmapSetID")) |v| result.set_id = try std.fmt.parseInt(i32, v, 10);
@@ -67,6 +89,8 @@ pub fn parseWithIds(bytes: []const u8, fallback_id: i32, fallback_set_id: i32) !
             if (value(line, "Creator")) |v| result.creator = v;
             if (value(line, "Source")) |v| result.source = v;
             if (value(line, "Tags")) |v| result.tags = v;
+        } else if (std.mem.eql(u8, section, "Events") and result.background_filename.len == 0) {
+            if (backgroundFilename(line)) |filename| result.background_filename = filename;
         } else if (std.mem.eql(u8, section, "Difficulty")) {
             if (value(line, "HPDrainRate")) |v| result.hp = try parseFloat(v);
             if (value(line, "CircleSize")) |v| result.cs = try parseFloat(v);

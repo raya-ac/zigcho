@@ -1400,6 +1400,11 @@ test "lazer BSS reserves owned ids publishes pending and returns WIP through one
     try std.testing.expect(std.mem.indexOf(u8, index_page, "premium mapper uploads, package validation and BN review handoff") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "mappedBeatmapRows") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "id=\"mapped-beatmaps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-map-preview=\"/preview/${set.id}.mp3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "recent.after(mapped)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "bindMappedSetPreviews()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "storeBssMedia") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "package.media()") != null);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1607,23 +1612,35 @@ test "beatmap covers and previews survive the bounded media cache" {
     const metadata = try beatmap.parse(map);
     const hash = beatmap.md5(map);
     try store.upsertBeatmap(metadata, &hash, 3, 1.7931, 10, map);
-    const jpeg = "\xff\xd8\xffcover bytes\xff\xd9";
-    const ogg = "OggSpreview bytes";
-    try store.putBeatmapMedia(metadata.set_id, .cover, .jpeg, jpeg);
-    try store.putBeatmapMedia(metadata.set_id, .preview, .ogg, ogg);
-    try std.testing.expectError(error.InvalidBeatmapMedia, store.putBeatmapMedia(metadata.set_id, .cover, .ogg, ogg));
-    try std.testing.expectError(error.UnknownBeatmapSet, store.putBeatmapMedia(metadata.set_id + 1, .cover, .jpeg, jpeg));
-    var cover = (try store.beatmapMedia(std.testing.allocator, metadata.set_id, .cover)).?;
-    defer cover.deinit(std.testing.allocator);
-    try std.testing.expectEqual(media_contract.ContentType.jpeg, cover.content_type);
-    try std.testing.expectEqualSlices(u8, jpeg, cover.data);
-    var preview = (try store.beatmapMedia(std.testing.allocator, metadata.set_id, .preview)).?;
+    const png = "\x89PNG\r\n\x1a\ncover bytes";
+    const wav = "RIFFxxxxWAVEpreview bytes";
+    var source: bss.Archive = .{ .allocator = std.testing.allocator };
+    defer source.deinit();
+    for ([_][]const u8{ "Zigcho [Tests].osu", "background.png", "synthetic.mp3" }, [_][]const u8{ map, png, wav }) |name, data| {
+        try source.entries.append(std.testing.allocator, .{
+            .allocator = std.testing.allocator,
+            .name = try std.testing.allocator.dupe(u8, name),
+            .data = try std.testing.allocator.dupe(u8, data),
+        });
+    }
+    const archive = try bss.buildArchive(std.testing.allocator, &source);
+    defer std.testing.allocator.free(archive);
+    const digest = bss.archiveSha256(archive);
+    try store.upsertBeatmapArchive(metadata.set_id, &digest, archive);
+    var sync = beatmap_media.Sync.init(std.testing.allocator, std.testing.io, 64 * 1024 * 1024);
+    var list_cover = (try sync.get(&store, .{ .set_id = metadata.set_id, .kind = .list })).?;
+    defer list_cover.deinit(std.testing.allocator);
+    try std.testing.expectEqual(media_contract.ContentType.png, list_cover.content_type);
+    try std.testing.expectEqualSlices(u8, png, list_cover.data);
+    var preview = (try sync.get(&store, .{ .set_id = metadata.set_id, .kind = .preview })).?;
     defer preview.deinit(std.testing.allocator);
-    try std.testing.expectEqual(media_contract.ContentType.ogg, preview.content_type);
-    try std.testing.expectEqualSlices(u8, ogg, preview.data);
+    try std.testing.expectEqual(media_contract.ContentType.wav, preview.content_type);
+    try std.testing.expectEqualSlices(u8, wav, preview.data);
+    try std.testing.expectError(error.InvalidBeatmapMedia, store.putBeatmapMedia(metadata.set_id, .cover, .wav, wav));
+    try std.testing.expectError(error.UnknownBeatmapSet, store.putBeatmapMedia(metadata.set_id + 1, .cover, .png, png));
     const before = try store.beatmapMediaCacheStats();
     try std.testing.expectEqual(@as(i64, 2), before.entries);
-    try std.testing.expectEqual(@as(i64, jpeg.len + ogg.len), before.bytes);
+    try std.testing.expectEqual(@as(i64, png.len + wav.len), before.bytes);
     const pruned = try store.pruneBeatmapMedia(0);
     try std.testing.expectEqual(@as(i64, 2), pruned.entries);
     try std.testing.expectEqual(@as(i64, 0), (try store.beatmapMediaCacheStats()).entries);
@@ -5161,7 +5178,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 36), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 37), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {
@@ -6159,6 +6176,8 @@ test "beatmap metadata parser owns the import contract" {
     try std.testing.expectEqual(@as(i32, 900000000), metadata.set_id);
     try std.testing.expectEqualStrings("Zigcho", metadata.artist);
     try std.testing.expectEqualStrings("Zigcho Fixture", metadata.title);
+    try std.testing.expectEqualStrings("synthetic.mp3", metadata.audio_filename);
+    try std.testing.expectEqual(@as(i32, -1), metadata.preview_time);
     try std.testing.expectEqual(@as(u32, 10), metadata.object_count);
     try std.testing.expectEqual(@as(u32, 10), metadata.count_circles);
     try std.testing.expectEqual(@as(u32, 0), metadata.count_sliders);

@@ -637,6 +637,10 @@ const App = struct {
             std.mem.eql(u8, name, "BssObjectStorageRequired");
     }
 
+    fn storeBssMedia(self: *App, set_id: i32, media: bss.PreparedMedia) !void {
+        try beatmap_media.storeLocalMedia(&self.store, set_id, media);
+    }
+
     fn isLocalMetricsHost(value: ?[]const u8) bool {
         const raw = value orelse return false;
         const host = if (raw.len > 0 and raw[0] == '[') raw else if (std.mem.findScalar(u8, raw, ':')) |colon| raw[0..colon] else raw;
@@ -1319,6 +1323,7 @@ const App = struct {
                     return respond(req, .unprocessable_entity, "application/json", bss.packageErrorJson(err), &.{});
                 };
                 defer package.deinit();
+                const package_media = package.media();
                 const digest = bss.archiveSha256(archive);
                 self.store.publishBssSubmission(bss_user.?.id, set_id, &package, archive, &digest) catch |err| {
                     if (bssStorageFailure(err)) return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap storage unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
@@ -1329,7 +1334,12 @@ const App = struct {
                         else => return err,
                     };
                 };
-                std.log.info("event=bss_published user_id={d} set_id={d} maps={d} bytes={d} sha256={s}", .{ bss_user.?.id, set_id, package.maps.len, archive.len, &digest });
+                self.storeBssMedia(set_id, package_media) catch |err| {
+                    self.store.failBssSubmission(bss_user.?.id, set_id, @errorName(err)) catch {};
+                    std.log.warn("event=bss_media_store_failed user_id={d} set_id={d} error={t}", .{ bss_user.?.id, set_id, err });
+                    return respond(req, .service_unavailable, "application/json", "{\"error\":\"beatmap media storage unavailable\"}", &.{.{ .name = "retry-after", .value = "30" }});
+                };
+                std.log.info("event=bss_published user_id={d} set_id={d} maps={d} bytes={d} cover={s} preview={s} sha256={s}", .{ bss_user.?.id, set_id, package.maps.len, archive.len, if (package_media.cover != null) "uploaded" else "default", if (package_media.preview != null) "true" else "false", &digest });
                 return respond(req, .no_content, "application/json", "", &.{.{ .name = "cache-control", .value = "no-store" }});
             },
         };

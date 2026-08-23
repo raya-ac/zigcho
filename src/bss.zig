@@ -2,6 +2,7 @@ const std = @import("std");
 const beatmap = @import("beatmap.zig");
 const pp = @import("exact_pp.zig");
 const multipart = @import("multipart.zig");
+const media_contract = @import("media_contract.zig");
 
 pub const premium_privilege: u32 = 1 << 5;
 pub const max_upload_bytes: usize = 128 * 1024 * 1024;
@@ -375,7 +376,103 @@ pub const Package = struct {
         self.archive.deinit();
         self.* = undefined;
     }
+
+    pub fn media(self: *const Package) PreparedMedia {
+        var result: PreparedMedia = .{};
+        for (self.maps) |map| {
+            if (result.cover == null) result.cover = referencedMedia(&self.archive, map.metadata.background_filename, .cover);
+            if (result.preview == null) result.preview = referencedMedia(&self.archive, map.metadata.audio_filename, .preview);
+            if (result.cover != null and result.preview != null) return result;
+        }
+        fillMediaFallbacks(&result, &self.archive);
+        return result;
+    }
 };
+
+pub fn mediaFromArchive(archive: *const Archive) PreparedMedia {
+    var result: PreparedMedia = .{};
+    for (archive.entries.items) |entry| {
+        if (!std.ascii.endsWithIgnoreCase(entry.name, ".osu")) continue;
+        const metadata = beatmap.parse(entry.data) catch continue;
+        if (result.cover == null) result.cover = referencedMedia(archive, metadata.background_filename, .cover);
+        if (result.preview == null) result.preview = referencedMedia(archive, metadata.audio_filename, .preview);
+        if (result.cover != null and result.preview != null) return result;
+    }
+    fillMediaFallbacks(&result, archive);
+    return result;
+}
+
+fn fillMediaFallbacks(result: *PreparedMedia, archive: *const Archive) void {
+    for (archive.entries.items) |entry| {
+        if (result.cover == null) if (media_contract.detect(.cover, entry.data)) |content_type| {
+            result.cover = .{ .data = entry.data, .content_type = content_type };
+        };
+        if (result.preview == null) if (media_contract.detect(.preview, entry.data)) |content_type| {
+            result.preview = .{ .data = entry.data, .content_type = content_type };
+        };
+        if (result.cover != null and result.preview != null) break;
+    }
+}
+
+pub const PreparedMediaAsset = struct {
+    data: []const u8,
+    content_type: media_contract.ContentType,
+};
+
+pub const PreparedMedia = struct {
+    cover: ?PreparedMediaAsset = null,
+    preview: ?PreparedMediaAsset = null,
+};
+
+fn normalizedPathByte(byte: u8) u8 {
+    return std.ascii.toLower(if (byte == '\\') '/' else byte);
+}
+
+fn sameAssetPath(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| if (normalizedPathByte(a) != normalizedPathByte(b)) return false;
+    return true;
+}
+
+fn basename(path: []const u8) []const u8 {
+    var start: usize = 0;
+    for (path, 0..) |byte, index| if (byte == '/' or byte == '\\') {
+        start = index + 1;
+    };
+    return path[start..];
+}
+
+fn validAssetReference(path: []const u8) bool {
+    if (path.len == 0 or path.len > 1024 or path[0] == '/' or path[0] == '\\') return false;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index <= path.len) : (index += 1) {
+        if (index != path.len and path[index] != '/' and path[index] != '\\') continue;
+        const part = path[start..index];
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+        start = index + 1;
+    }
+    return true;
+}
+
+fn referencedEntry(archive: *const Archive, path: []const u8) ?*const Entry {
+    if (!validAssetReference(path)) return null;
+    for (archive.entries.items) |*entry| if (sameAssetPath(entry.name, path)) return entry;
+    const wanted = basename(path);
+    var found: ?*const Entry = null;
+    for (archive.entries.items) |*entry| {
+        if (!sameAssetPath(basename(entry.name), wanted)) continue;
+        if (found != null) return null;
+        found = entry;
+    }
+    return found;
+}
+
+fn referencedMedia(archive: *const Archive, path: []const u8, kind: media_contract.Kind) ?PreparedMediaAsset {
+    const entry = referencedEntry(archive, path) orelse return null;
+    const content_type = media_contract.detect(kind, entry.data) orelse return null;
+    return .{ .data = entry.data, .content_type = content_type };
+}
 
 fn metadataBounded(metadata: beatmap.Metadata) bool {
     return metadata.artist.len <= 256 and metadata.title.len <= 256 and metadata.version.len <= 256 and metadata.creator.len <= 256 and metadata.source.len <= 1000 and metadata.tags.len <= 4000;
@@ -481,4 +578,33 @@ test "BSS paths and reservation payload stay lazer-specific and bounded" {
     try std.testing.expectEqual(@as(u16, 2), input.create_count);
     try std.testing.expectEqual(Target.pending, input.target);
     try std.testing.expect(input.notify_replies);
+}
+
+test "BSS packages keep their referenced background and preview audio" {
+    const source_map = @embedFile("testdata/synthetic-standard.osu");
+    const map = try std.mem.replaceOwned(u8, std.testing.allocator, source_map, "[Events]\n//Background and Video events", "[Events]\n0,0,\"folder\\background.png\",0,0");
+    defer std.testing.allocator.free(map);
+
+    const names = [_][]const u8{ "Zigcho [Tests].osu", "folder/background.png", "synthetic.mp3" };
+    const values = [_][]const u8{ map, "\x89PNG\r\n\x1a\nbackground", "ID3preview audio" };
+    var source: Archive = .{ .allocator = std.testing.allocator };
+    defer source.deinit();
+    for (names, values) |name, data| {
+        try source.entries.append(std.testing.allocator, .{
+            .allocator = std.testing.allocator,
+            .name = try std.testing.allocator.dupe(u8, name),
+            .data = try std.testing.allocator.dupe(u8, data),
+        });
+    }
+    const archive = try buildArchive(std.testing.allocator, &source);
+    defer std.testing.allocator.free(archive);
+    var package = try preparePackage(std.testing.allocator, archive, 900_000_000, &.{900_000_001});
+    defer package.deinit();
+    const media = package.media();
+    try std.testing.expectEqual(media_contract.ContentType.png, media.cover.?.content_type);
+    try std.testing.expectEqualSlices(u8, values[1], media.cover.?.data);
+    try std.testing.expectEqual(media_contract.ContentType.mp3, media.preview.?.content_type);
+    try std.testing.expectEqualSlices(u8, values[2], media.preview.?.data);
+    try std.testing.expectEqualStrings("folder\\background.png", package.maps[0].metadata.background_filename);
+    try std.testing.expectEqualStrings("synthetic.mp3", package.maps[0].metadata.audio_filename);
 }

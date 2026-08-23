@@ -1,25 +1,35 @@
 const std = @import("std");
 
-pub const max_image_bytes: usize = 2 * 1024 * 1024;
-pub const max_preview_bytes: usize = 4 * 1024 * 1024;
+pub const max_image_bytes: usize = 16 * 1024 * 1024;
+pub const max_preview_bytes: usize = 32 * 1024 * 1024;
+pub const local_cover_fallback = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0b\x49\x44\x41\x54\x78\xda\x63\x64\xf8\x0f\x00\x01\x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
 
 pub const ContentType = enum {
     jpeg,
+    png,
+    gif,
     ogg,
     mp3,
+    wav,
 
     pub fn value(self: ContentType) []const u8 {
         return switch (self) {
             .jpeg => "image/jpeg",
+            .png => "image/png",
+            .gif => "image/gif",
             .ogg => "audio/ogg",
             .mp3 => "audio/mpeg",
+            .wav => "audio/wav",
         };
     }
 
     pub fn parse(raw: []const u8) ?ContentType {
         if (std.mem.eql(u8, raw, "image/jpeg")) return .jpeg;
+        if (std.mem.eql(u8, raw, "image/png")) return .png;
+        if (std.mem.eql(u8, raw, "image/gif")) return .gif;
         if (std.mem.eql(u8, raw, "audio/ogg")) return .ogg;
         if (std.mem.eql(u8, raw, "audio/mpeg")) return .mp3;
+        if (std.mem.eql(u8, raw, "audio/wav")) return .wav;
         return null;
     }
 };
@@ -154,19 +164,37 @@ fn validMp3(bytes: []const u8) bool {
     return bytes[0] == 0xff and (bytes[1] & 0xe0) == 0xe0;
 }
 
+fn validPng(bytes: []const u8) bool {
+    return bytes.len >= 12 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n");
+}
+
+fn validGif(bytes: []const u8) bool {
+    return bytes.len >= 10 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"));
+}
+
+fn validWav(bytes: []const u8) bool {
+    return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WAVE");
+}
+
 pub fn detect(kind: Kind, bytes: []const u8) ?ContentType {
     if (bytes.len == 0 or bytes.len > kind.maxBytes()) return null;
-    if (kind != .preview) return if (validJpeg(bytes)) .jpeg else null;
+    if (kind != .preview) {
+        if (validJpeg(bytes)) return .jpeg;
+        if (validPng(bytes)) return .png;
+        if (validGif(bytes)) return .gif;
+        return null;
+    }
     if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "OggS")) return .ogg;
     if (validMp3(bytes)) return .mp3;
+    if (validWav(bytes)) return .wav;
     return null;
 }
 
 pub fn compatible(kind: Kind, content_type: ContentType) bool {
     return if (kind == .preview)
-        content_type == .ogg or content_type == .mp3
+        content_type == .ogg or content_type == .mp3 or content_type == .wav
     else
-        content_type == .jpeg;
+        content_type == .jpeg or content_type == .png or content_type == .gif;
 }
 
 test "stable and modern beatmap media paths stay exact" {
@@ -185,9 +213,14 @@ test "beatmap media validates bytes instead of extensions" {
     const jpeg = "\xff\xd8\xffbody\xff\xd9";
     const ogg = "OggSpreview";
     const mp3 = "ID3preview";
+    const png = "\x89PNG\r\n\x1a\nbody";
+    const wav = "RIFFxxxxWAVEpreview";
     try std.testing.expectEqual(ContentType.jpeg, detect(.cover, jpeg).?);
+    try std.testing.expectEqual(ContentType.png, detect(.cover, png).?);
     try std.testing.expectEqual(ContentType.ogg, detect(.preview, ogg).?);
     try std.testing.expectEqual(ContentType.mp3, detect(.preview, mp3).?);
+    try std.testing.expectEqual(ContentType.wav, detect(.preview, wav).?);
+    try std.testing.expectEqual(ContentType.png, detect(.cover, local_cover_fallback).?);
     try std.testing.expect(detect(.preview, jpeg) == null);
     try std.testing.expect(detect(.cover, ogg) == null);
     try std.testing.expect(ContentType.parse("audio/ogg").? == .ogg);

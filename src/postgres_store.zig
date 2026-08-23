@@ -142,7 +142,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36 and version != 37) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -348,6 +348,7 @@ pub const Store = struct {
         if (version <= 33) try postgres.exec(lease.conn, database_sql.postgresMigration(34));
         if (version <= 34) try postgres.exec(lease.conn, database_sql.postgresMigration(35));
         if (version <= 35) try postgres.exec(lease.conn, database_sql.postgresMigration(36));
+        if (version <= 36) try postgres.exec(lease.conn, database_sql.postgresMigration(37));
         try self.refreshExternalOnly(lease.conn);
         try postgres.exec(
             lease.conn,
@@ -6069,7 +6070,7 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates through durable lazer multiplayer schema thirty six" {
+test "postgres runtime migrates through BSS media schema thirty seven" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -6089,7 +6090,7 @@ test "postgres runtime migrates through durable lazer multiplayer schema thirty 
     defer lease.release();
     var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 36), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 37), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -6197,6 +6198,18 @@ test "postgres BSS publishes an owned pending package into the BN queue" {
     defer package.deinit();
     const digest = bss.archiveSha256(archive);
     try store.publishBssSubmission(owner_id, reservation.set_id, &package, archive, &digest);
+    const cover_bytes = "\x89PNG\r\n\x1a\npostgres BSS cover";
+    const preview_bytes = "RIFFxxxxWAVEpostgres BSS preview";
+    try store.putBeatmapMedia(reservation.set_id, .cover, .png, cover_bytes);
+    try store.putBeatmapMedia(reservation.set_id, .preview, .wav, preview_bytes);
+    var stored_cover = (try store.beatmapMedia(std.testing.allocator, reservation.set_id, .cover)).?;
+    defer stored_cover.deinit(std.testing.allocator);
+    try std.testing.expectEqual(media_contract.ContentType.png, stored_cover.content_type);
+    try std.testing.expectEqualSlices(u8, cover_bytes, stored_cover.data);
+    var stored_preview = (try store.beatmapMedia(std.testing.allocator, reservation.set_id, .preview)).?;
+    defer stored_preview.deinit(std.testing.allocator);
+    try std.testing.expectEqual(media_contract.ContentType.wav, stored_preview.content_type);
+    try std.testing.expectEqualSlices(u8, preview_bytes, stored_preview.data);
     const info = (try store.beatmapInfoById(std.testing.allocator, reservation.beatmap_ids[0])).?;
     defer std.testing.allocator.free(info.artist);
     defer std.testing.allocator.free(info.title);

@@ -424,6 +424,7 @@ pub const Store = struct {
                 try self.exec(database_sql.sqliteMigration(35));
         }
         if (version < 36) try self.exec(database_sql.sqliteMigration(36));
+        if (version < 37) try self.exec(database_sql.sqliteMigration(37));
         try self.exec(
             "BEGIN IMMEDIATE;" ++
                 "UPDATE lazer_scores SET best=0;" ++

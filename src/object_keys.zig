@@ -24,8 +24,11 @@ pub fn media(allocator: std.mem.Allocator, set_id: i32, kind: media_contract.Kin
     if (set_id <= 0 or !validSha256(sha256) or !media_contract.compatible(kind, content_type)) return error.InvalidObjectIdentity;
     const extension: []const u8 = switch (content_type) {
         .jpeg => "jpg",
+        .png => "png",
+        .gif => "gif",
         .ogg => "ogg",
         .mp3 => "mp3",
+        .wav => "wav",
     };
     return std.fmt.allocPrint(allocator, "beatmaps/media/{d}/{s}/{s}.{s}", .{ set_id, kind.dbName(), sha256, extension });
 }

@@ -4895,6 +4895,9 @@ test "completed lazer rooms and score boards survive manager restart" {
     var parsed_ended = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ended, .{});
     defer parsed_ended.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_ended.value.array.items.len);
+    const open = (try reopened.roomsJson(std.testing.allocator, null, .{ .requester_id = 0, .mode = .open })).?;
+    defer std.testing.allocator.free(open);
+    try std.testing.expectEqualStrings("[]", open);
 
     const next = try reopened.restCreateRoom(std.testing.allocator, host, room_body);
     defer std.testing.allocator.free(next);

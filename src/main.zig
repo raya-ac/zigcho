@@ -1219,7 +1219,7 @@ const App = struct {
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
-        const bss_path = bss.parsePath(path);
+        const bss_path = bssPathForRequest(req.head.method, host_owned, path);
         var bss_user: ?domain.User = null;
         defer if (bss_user) |user| freeUser(self.allocator, user);
         if (bss_path) |route| {
@@ -1580,7 +1580,7 @@ const App = struct {
                 try output.writer.writeByte('}');
                 return respond(req, .ok, "application/json", output.written(), &no_store);
             }
-            const rooms_value = try self.lazer_multiplayer.roomsJson(self.allocator, null, null);
+            const rooms_value = try self.lazer_multiplayer.roomsJson(self.allocator, null, .{ .requester_id = 0, .mode = .open });
             const rooms = rooms_value orelse "[]";
             defer if (rooms_value != null) self.allocator.free(rooms);
             return respond(req, .ok, "application/json", rooms, &no_store);
@@ -4359,7 +4359,18 @@ const App = struct {
         }
         return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
     }
+
+    fn bssPathForRequest(method: std.http.Method, host: []const u8, path: []const u8) ?bss.Path {
+        if (method == .GET and web_auth.websiteHost(host) and routing.websitePage(path)) return null;
+        return bss.parsePath(path);
+    }
 };
+
+test "public beatmapset pages bypass BSS upload routing" {
+    try std.testing.expect(App.bssPathForRequest(.GET, "kai.ovh", "/beatmapsets/1000000001") == null);
+    try std.testing.expect(App.bssPathForRequest(.PUT, "bss.kai.ovh", "/beatmapsets/1000000001") != null);
+    try std.testing.expect(App.bssPathForRequest(.PATCH, "bss.kai.ovh", "/beatmapsets/1000000001") != null);
+}
 
 const PosixAddress = extern union {
     any: std.posix.sockaddr,

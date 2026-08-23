@@ -5039,7 +5039,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(score_id, listed.get("id").?.integer);
     try std.testing.expectEqualStrings("A", listed.get("rank").?.string);
     try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
-    try std.testing.expect(!listed.get("ranked").?.bool);
+    try std.testing.expect(listed.get("ranked").?.bool);
     try std.testing.expect(listed.get("has_replay").?.bool);
     const leaderboard_team = listed.get("user").?.object.get("team").?.object;
     try std.testing.expectEqual(@as(i64, 7), leaderboard_team.get("id").?.integer);

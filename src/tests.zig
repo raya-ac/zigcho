@@ -1313,7 +1313,9 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "tracking starts now") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "speed_change") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "toFixed(2)+'×'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "recent.insertAdjacentHTML('afterend'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "if(mapped)recent.after(mapped)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "achievementAnchor=mapped||recent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "achievementAnchor.insertAdjacentHTML('afterend'") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "online · '+esc(presence.client_label)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "beatmaps.kai.ovh") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "stored sets") != null);

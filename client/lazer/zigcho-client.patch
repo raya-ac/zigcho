@@ -2356,14 +2356,14 @@ diff --git a/osu.Game.Tests/Visual/Online/TestSceneBeatmapListingOverlay.cs b/os
 +        public void TestShowRefreshesSearch()
 +        {
 +            AddUntilStep("initial search finishes", () => searchRequestCount > 0);
-+            AddStep("hide", overlay.Hide);
++            AddStep("hide", () => overlay.Hide());
 +            AddUntilStep("is hidden", () => overlay.State.Value == Visibility.Hidden);
 +            AddStep("prepare one result", () =>
 +            {
 +                setSearchResponse(new[] { CreateAPIBeatmapSet(Ruleset.Value) }, false);
 +                searchRequestCount = 0;
 +            });
-+            AddStep("show", overlay.Show);
++            AddStep("show", () => overlay.Show());
 +            AddUntilStep("search requested after opening", () => searchRequestCount == 1);
 +            assertAllCardsOfType<BeatmapCardNormal>(1);
 +        }

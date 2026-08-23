@@ -1,8 +1,9 @@
 BEGIN;
 
 ALTER TABLE zigcho.beatmap_media
-    DROP CONSTRAINT beatmap_media_content_type_check,
-    DROP CONSTRAINT beatmap_media_data_check;
+    DROP CONSTRAINT IF EXISTS beatmap_media_content_type_check,
+    DROP CONSTRAINT IF EXISTS beatmap_media_data_check,
+    DROP CONSTRAINT IF EXISTS beatmap_media_check;
 ALTER TABLE zigcho.beatmap_media
     ADD CONSTRAINT beatmap_media_content_type_check CHECK(content_type IN (
         'image/jpeg','image/png','image/gif',

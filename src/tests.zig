@@ -1431,7 +1431,9 @@ test "lazer BSS reserves owned ids publishes pending and returns WIP through one
     defer std.testing.allocator.free(with_map_id);
     const map = try std.mem.replaceOwned(u8, std.testing.allocator, with_map_id, "BeatmapSetID:900000000", set_id_text);
     defer std.testing.allocator.free(map);
-    const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
+    const exported_map = try std.mem.concat(std.testing.allocator, u8, &.{ "\xef\xbb\xbf", map });
+    defer std.testing.allocator.free(exported_map);
+    const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", exported_map);
     defer std.testing.allocator.free(archive);
     var package = try bss.preparePackage(std.testing.allocator, archive, reservation.set_id, reservation.beatmap_ids);
     defer package.deinit();
@@ -2256,6 +2258,27 @@ test "old beatmaps without embedded ids use trusted API ids" {
     const current = try beatmap.parseWithIds(@embedFile("testdata/synthetic-standard.osu"), 1, 2);
     try std.testing.expectEqual(@as(i32, 900000001), current.id);
     try std.testing.expectEqual(@as(i32, 900000000), current.set_id);
+}
+
+test "lazer exported beatmaps accept a utf8 bom across metadata and native pp" {
+    const plain = @embedFile("testdata/synthetic-standard.osu");
+    const exported = "\xef\xbb\xbf" ++ plain;
+    const parsed = try beatmap.parse(exported);
+    try std.testing.expectEqual(@as(i32, 900000001), parsed.id);
+    const calculated = try native_pp.calculate(exported, .{
+        .mode = 0,
+        .lazer = 0,
+        .mods = 0,
+        .max_combo = 1,
+        .n_geki = 0,
+        .n_katu = 0,
+        .n300 = 1,
+        .n100 = 0,
+        .n50 = 0,
+        .misses = 0,
+        .legacy_total_score = 1_000_000,
+    });
+    try std.testing.expect(calculated.stars > 0);
 }
 
 test "metadata-only beatmaps stay eligible for hydration retry" {
@@ -3234,6 +3257,9 @@ test "lazer public chat persists actions and deduplicates client uuids" {
     defer parsed_before.deinit();
     try std.testing.expectEqual(first_id, parsed_before.value.array.items[0].object.get("last_message_id").?.integer);
     try std.testing.expect(parsed_before.value.array.items[0].object.get("last_read_id").? == .null);
+    const detail_before = try store.lazerChannelCursor(user_id, 1);
+    try std.testing.expectEqual(first_id, detail_before.last_message_id.?);
+    try std.testing.expectEqual(@as(?i64, null), detail_before.last_read_id);
 
     try store.markLazerChannelRead(user_id, 1, first_id);
     const channels_after = try store.lazerChannelListJson(std.testing.allocator, user_id);
@@ -3241,6 +3267,8 @@ test "lazer public chat persists actions and deduplicates client uuids" {
     const parsed_after = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, channels_after, .{});
     defer parsed_after.deinit();
     try std.testing.expectEqual(first_id, parsed_after.value.array.items[0].object.get("last_read_id").?.integer);
+    const detail_after = try store.lazerChannelCursor(user_id, 1);
+    try std.testing.expectEqual(first_id, detail_after.last_read_id.?);
     const action_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, action.json, .{});
     defer action_parsed.deinit();
     const action_id = action_parsed.value.object.get("message_id").?.integer;
@@ -3291,7 +3319,12 @@ test "lazer private messages share one cursor with stable offline mail" {
     }
     try std.testing.expectEqual(@as(usize, 1), unread.len);
     try std.testing.expectEqualStrings("private hello", unread[0].message);
+    const cursor_before = try store.lazerDirectMessageCursor(second_id, first_id);
+    try std.testing.expect(cursor_before.last_message_id != null);
+    try std.testing.expectEqual(@as(?i64, null), cursor_before.last_read_id);
     try store.markDirectMessagesRead(second_id, first_id);
+    const cursor_after = try store.lazerDirectMessageCursor(second_id, first_id);
+    try std.testing.expectEqual(cursor_after.last_message_id, cursor_after.last_read_id);
 
     try store.storeDirectMessage(second_id, first_id, "stable hello");
     const stable_update = try store.lazerAllMessagesJson(std.testing.allocator, first_id, 0, 100);
@@ -5081,7 +5114,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 35), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 36), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {

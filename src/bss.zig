@@ -392,13 +392,16 @@ pub fn preparePackage(allocator: std.mem.Allocator, bytes: []const u8, set_id: i
         if (!std.ascii.endsWithIgnoreCase(entry.name, ".osu")) continue;
         if (entry.data.len > max_osu_bytes) return error.BssBeatmapTooLarge;
         if (count >= maps.len) return error.BssBeatmapCountMismatch;
-        const metadata = beatmap.parse(entry.data) catch return error.BssBeatmapParseFailed;
+        const metadata = beatmap.parse(entry.data) catch |err| {
+            std.log.warn("event=bss_beatmap_parse_failed filename={s} error={t}", .{ entry.name, err });
+            return error.BssBeatmapParseFailed;
+        };
         if (!metadataBounded(metadata)) return error.BssBeatmapMetadataTooLarge;
         if (metadata.set_id != set_id) return error.BssBeatmapSetIdMismatch;
         if (std.mem.indexOfScalar(i32, expected_ids, metadata.id) == null) return error.BssBeatmapIdMismatch;
         for (maps[0..count]) |existing| if (existing.metadata.id == metadata.id or std.ascii.eqlIgnoreCase(&existing.md5, &beatmap.md5(entry.data))) return error.DuplicateBssBeatmap;
         const digest = beatmap.md5(entry.data);
-        const attributes = pp.calculate(entry.data, .{
+        const attributes = pp.calculate(beatmap.withoutUtf8Bom(entry.data), .{
             .mode = metadata.mode,
             .lazer = 0,
             .mods = 0,

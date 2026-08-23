@@ -217,6 +217,11 @@ pub const Store = struct {
         inserted: bool,
     };
 
+    pub const ChatCursor = struct {
+        last_message_id: ?i64,
+        last_read_id: ?i64,
+    };
+
     pub const BeatmapArchiveDownload = struct {
         allocator: std.mem.Allocator,
         object_key: ?[]u8,
@@ -226,6 +231,25 @@ pub const Store = struct {
         pub fn deinit(self: *BeatmapArchiveDownload) void {
             if (self.object_key) |value| self.allocator.free(value);
             if (self.data) |value| self.allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    pub const MultiplayerRoomArchive = struct {
+        allocator: std.mem.Allocator,
+        room_id: i64,
+        owner_id: i32,
+        category: []u8,
+        room_json: []u8,
+        leaderboard_json: []u8,
+        participant_ids_json: []u8,
+        ended_at: i64,
+
+        pub fn deinit(self: *MultiplayerRoomArchive) void {
+            self.allocator.free(self.category);
+            self.allocator.free(self.room_json);
+            self.allocator.free(self.leaderboard_json);
+            self.allocator.free(self.participant_ids_json);
             self.* = undefined;
         }
     };
@@ -398,6 +422,7 @@ pub const Store = struct {
             else
                 try self.exec(database_sql.sqliteMigration(35));
         }
+        if (version < 36) try self.exec(database_sql.sqliteMigration(36));
         try self.exec(
             "BEGIN IMMEDIATE;" ++
                 "UPDATE lazer_scores SET best=0;" ++
@@ -2679,6 +2704,44 @@ pub const Store = struct {
         }
         try output.writer.writeByte(']');
         return output.toOwnedSlice();
+    }
+
+    pub fn lazerChannelCursor(self: *Store, user_id: i32, channel_id: i64) !ChatCursor {
+        const target = lazer.channelName(channel_id) orelse return error.UnknownChannel;
+        if (user_id <= 0) return error.InvalidUser;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT (SELECT max(id) FROM chat_messages WHERE target=?1),(SELECT last_read_id FROM lazer_channel_reads WHERE user_id=?2 AND channel_id=?3)", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        _ = c.sqlite3_bind_int64(stmt, 3, channel_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return .{
+            .last_message_id = if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 0),
+            .last_read_id = if (c.sqlite3_column_type(stmt, 1) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 1),
+        };
+    }
+
+    pub fn lazerDirectMessageCursor(self: *Store, viewer_id: i32, other_id: i32) !ChatCursor {
+        if (viewer_id <= 0 or other_id <= 0 or viewer_id == other_id) return error.InvalidDirectMessage;
+        var target_buffer: [64]u8 = undefined;
+        const target = try lazer.directMessageTarget(&target_buffer, viewer_id, other_id);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT max(m.id),CASE WHEN NOT EXISTS(SELECT 1 FROM direct_messages d WHERE d.to_id=?2 AND d.from_id=?3 AND d.read=0) THEN max(m.id) ELSE NULL END FROM chat_messages m WHERE m.target=?1";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, target.ptr, @intCast(target.len), null);
+        _ = c.sqlite3_bind_int(stmt, 2, viewer_id);
+        _ = c.sqlite3_bind_int(stmt, 3, other_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return .{
+            .last_message_id = if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 0),
+            .last_read_id = if (c.sqlite3_column_type(stmt, 1) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 1),
+        };
     }
 
     pub fn markLazerChannelRead(self: *Store, user_id: i32, channel_id: i64, message_id: i64) !void {
@@ -5126,6 +5189,83 @@ pub const Store = struct {
         mode: u8,
         stars: f64,
     };
+
+    fn multiplayerRoomArchiveFromStatement(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !MultiplayerRoomArchive {
+        const category = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+        errdefer allocator.free(category);
+        const room_json = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+        errdefer allocator.free(room_json);
+        const leaderboard_json = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
+        errdefer allocator.free(leaderboard_json);
+        const participant_ids_json = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5)));
+        return .{
+            .allocator = allocator,
+            .room_id = c.sqlite3_column_int64(stmt, 0),
+            .owner_id = c.sqlite3_column_int(stmt, 1),
+            .category = category,
+            .room_json = room_json,
+            .leaderboard_json = leaderboard_json,
+            .participant_ids_json = participant_ids_json,
+            .ended_at = c.sqlite3_column_int64(stmt, 6),
+        };
+    }
+
+    pub fn nextLazerMultiplayerRoomId(self: *Store) !i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT coalesce(max(room_id),0)+1 FROM lazer_multiplayer_room_history", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
+    pub fn saveLazerMultiplayerRoomArchive(self: *Store, room_id: i64, owner_id: i32, category: []const u8, room_json: []const u8, leaderboard_json: []const u8, participant_ids_json: []const u8) !void {
+        if (room_id <= 0 or owner_id <= 0 or room_json.len == 0 or room_json.len > 512 * 1024 or leaderboard_json.len == 0 or leaderboard_json.len > 512 * 1024 or participant_ids_json.len == 0 or participant_ids_json.len > 4096) return error.InvalidMultiplayerArchive;
+        if (!std.mem.eql(u8, category, "normal") and !std.mem.eql(u8, category, "realtime") and !std.mem.eql(u8, category, "spotlight") and !std.mem.eql(u8, category, "featured_artist")) return error.InvalidMultiplayerArchive;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "INSERT INTO lazer_multiplayer_room_history(room_id,owner_id,category,room_json,leaderboard_json,participant_ids_json,ended_at) VALUES(?1,?2,?3,?4,?5,?6,unixepoch()) ON CONFLICT(room_id) DO UPDATE SET owner_id=excluded.owner_id,category=excluded.category,room_json=excluded.room_json,leaderboard_json=excluded.leaderboard_json,participant_ids_json=excluded.participant_ids_json,ended_at=excluded.ended_at";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, room_id);
+        _ = c.sqlite3_bind_int(stmt, 2, owner_id);
+        _ = c.sqlite3_bind_text(stmt, 3, category.ptr, @intCast(category.len), null);
+        _ = c.sqlite3_bind_text(stmt, 4, room_json.ptr, @intCast(room_json.len), null);
+        _ = c.sqlite3_bind_text(stmt, 5, leaderboard_json.ptr, @intCast(leaderboard_json.len), null);
+        _ = c.sqlite3_bind_text(stmt, 6, participant_ids_json.ptr, @intCast(participant_ids_json.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+    }
+
+    pub fn lazerMultiplayerRoomArchive(self: *Store, allocator: std.mem.Allocator, room_id: i64) !?MultiplayerRoomArchive {
+        if (room_id <= 0) return null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT room_id,owner_id,category,room_json,leaderboard_json,participant_ids_json,ended_at FROM lazer_multiplayer_room_history WHERE room_id=?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, room_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try multiplayerRoomArchiveFromStatement(allocator, stmt.?);
+    }
+
+    pub fn lazerMultiplayerRoomArchives(self: *Store, allocator: std.mem.Allocator, limit: u8) ![]MultiplayerRoomArchive {
+        if (limit == 0) return allocator.alloc(MultiplayerRoomArchive, 0);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT room_id,owner_id,category,room_json,leaderboard_json,participant_ids_json,ended_at FROM lazer_multiplayer_room_history ORDER BY ended_at DESC,room_id DESC LIMIT ?1", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int(stmt, 1, limit);
+        var archives: std.ArrayList(MultiplayerRoomArchive) = .empty;
+        errdefer {
+            for (archives.items) |*archive| archive.deinit();
+            archives.deinit(allocator);
+        }
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) try archives.append(allocator, try multiplayerRoomArchiveFromStatement(allocator, stmt.?));
+        return archives.toOwnedSlice(allocator);
+    }
 
     pub fn matchmakingBeatmaps(self: *Store, allocator: std.mem.Allocator, mode: u8, limit: u8) ![]MatchmakingBeatmap {
         if (mode > 3 or limit == 0 or limit > 32) return error.InvalidMatchmakingPool;

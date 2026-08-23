@@ -10,6 +10,7 @@ pub const max_users = 16;
 pub const max_playlist = 32;
 pub const max_matchmaking_maps = 16;
 pub const max_room_scores = 128;
+pub const max_room_participants = 128;
 pub const matchmaking_rounds = 3;
 const ranked_player_count = 2;
 const ranked_hand_size = 5;
@@ -64,6 +65,12 @@ pub fn roomListFilter(requester_id: i32, mode: []const u8, status: ?[]const u8, 
     const parsed_status: ?RoomListStatus = if (status) |value| std.meta.stringToEnum(RoomListStatus, value) orelse return error.InvalidRoomListFilter else null;
     if (category.len != 0 and !std.mem.eql(u8, category, "normal") and !std.mem.eql(u8, category, "realtime") and !std.mem.eql(u8, category, "spotlight") and !std.mem.eql(u8, category, "featured_artist")) return error.InvalidRoomListFilter;
     return .{ .requester_id = requester_id, .mode = parsed_mode, .status = parsed_status, .category = category };
+}
+
+fn archiveIncludesUser(allocator: std.mem.Allocator, participant_ids_json: []const u8, user_id: i32) bool {
+    const parsed = std.json.parseFromSlice([]i32, allocator, participant_ids_json, .{}) catch return false;
+    defer parsed.deinit();
+    return std.mem.indexOfScalar(i32, parsed.value, user_id) != null;
 }
 
 pub fn parseRoomUserPath(path: []const u8) ?RoomUserPath {
@@ -433,6 +440,12 @@ const RoomUser = struct {
     role: u8 = 0,
 };
 
+const RoomParticipant = struct {
+    id: i32,
+    name: Text64 = .{},
+    country: [2]u8 = .{ 'X', 'X' },
+};
+
 const MatchmakingRound = struct {
     round: u8,
     placement: u8 = 0,
@@ -553,6 +566,9 @@ const Room = struct {
     scores: [max_room_scores]?RoomScoreRecord = [_]?RoomScoreRecord{null} ** max_room_scores,
     score_count: usize = 0,
     score_cursor: usize = 0,
+    participants: [max_room_participants]?RoomParticipant = [_]?RoomParticipant{null} ** max_room_participants,
+    participant_count: usize = 0,
+    ended: bool = false,
 
     fn userIndex(self: *const Room, user_id: i32) ?usize {
         for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
@@ -564,11 +580,33 @@ const Room = struct {
         return null;
     }
 
+    fn participantIndex(self: *const Room, user_id: i32) ?usize {
+        for (self.participants[0..self.participant_count], 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
+        return null;
+    }
+
+    fn rememberParticipant(self: *Room, user: RoomUser) void {
+        if (self.participantIndex(user.id)) |index| {
+            self.participants[index] = .{ .id = user.id, .name = user.name, .country = user.country };
+            return;
+        }
+        if (self.participant_count == self.participants.len) {
+            for (1..self.participant_count) |index| self.participants[index - 1] = self.participants[index];
+            self.participant_count -= 1;
+        }
+        self.participants[self.participant_count] = .{ .id = user.id, .name = user.name, .country = user.country };
+        self.participant_count += 1;
+    }
+
     fn userAllowed(self: *const Room, user_id: i32) bool {
         if (self.allowed_user_count == 0) return true;
         return std.mem.indexOfScalar(i32, self.allowed_users[0..self.allowed_user_count], user_id) != null;
     }
 };
+
+fn roomCategory(room: *const Room) []const u8 {
+    return if (room.settings.match_type == 0) "normal" else "realtime";
+}
 
 const PendingMatch = struct {
     id: u32,
@@ -649,8 +687,9 @@ pub const Manager = struct {
         return .{ .allocator = allocator, .io = io };
     }
 
-    pub fn bindStore(self: *Manager, store: *storage.Store) void {
+    pub fn bindStore(self: *Manager, store: *storage.Store) !void {
         self.store = store;
+        self.next_room_id = @max(self.next_room_id, try store.nextLazerMultiplayerRoomId());
     }
 
     pub fn bindBeatmapSync(self: *Manager, sync: *beatmap_sync.Sync) void {
@@ -717,6 +756,41 @@ pub const Manager = struct {
         for (&self.rooms) |*entry| if (entry.*) |room| self.allocator.destroy(room);
         for (self.connections.items) |connection| connection.release();
         self.connections.deinit(self.allocator);
+    }
+
+    fn archiveRoom(self: *Manager, room: *Room) void {
+        defer self.allocator.destroy(room);
+        room.ended = true;
+        const store = self.store orelse {
+            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error=store_unavailable", .{room.id});
+            return;
+        };
+        var room_output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer room_output.deinit();
+        writeRoomJson(&room_output.writer, room) catch |err| {
+            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
+            return;
+        };
+        var leaderboard_output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer leaderboard_output.deinit();
+        writeRoomLeaderboardJson(&leaderboard_output.writer, room, 0) catch |err| {
+            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
+            return;
+        };
+        var participants_output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer participants_output.deinit();
+        participants_output.writer.writeByte('[') catch return;
+        for (room.participants[0..room.participant_count], 0..) |entry, index| if (entry) |participant| {
+            if (index != 0) participants_output.writer.writeByte(',') catch return;
+            participants_output.writer.print("{d}", .{participant.id}) catch return;
+        };
+        participants_output.writer.writeByte(']') catch return;
+        const owner_id = if (room.participant_count != 0) room.participants[0].?.id else room.host_id;
+        store.saveLazerMultiplayerRoomArchive(room.id, owner_id, roomCategory(room), room_output.written(), leaderboard_output.written(), participants_output.written()) catch |err| {
+            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
+            return;
+        };
+        std.log.info("event=lazer_multiplayer_room_archived room_id={d} participants={d} scores={d}", .{ room.id, room.participant_count, room.score_count });
     }
 
     fn roomByIdLocked(self: *Manager, room_id: i64) ?*Room {
@@ -803,6 +877,7 @@ pub const Manager = struct {
             } else return error.MultiplayerRoomFull;
             room.users[slot] = try defaultRoomUser(user.id, user.name, user.country);
             room.user_count += 1;
+            room.rememberParticipant(room.users[slot].?);
         }
         if (self.connectionByUserLocked(user.id)) |connection| connection.room_id = room_id;
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -814,20 +889,26 @@ pub const Manager = struct {
 
     pub fn restPartRoom(self: *Manager, user_id: i32, room_id: i64) !void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const room = self.roomByIdLocked(room_id) orelse return error.MultiplayerRoomNotFound;
-        const index = room.userIndex(user_id) orelse return error.NotInMultiplayerRoom;
+        const room = self.roomByIdLocked(room_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerRoomNotFound;
+        };
+        const index = room.userIndex(user_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
         room.users[index] = null;
         room.user_count -= 1;
         if (self.connectionByUserLocked(user_id)) |connection| if (connection.room_id == room_id) {
             connection.room_id = null;
         };
+        var ended_room: ?*Room = null;
         if (room.user_count == 0) {
             for (&self.rooms) |*entry| if (entry.* == room) {
                 entry.* = null;
                 break;
             };
-            self.allocator.destroy(room);
+            ended_room = room;
         } else if (room.host_id == user_id) {
             for (room.users) |entry| if (entry) |next| {
                 room.host_id = next.id;
@@ -836,14 +917,21 @@ pub const Manager = struct {
                 break;
             };
         }
+        self.mutex.unlock(self.io);
+        if (ended_room) |ended| self.archiveRoom(ended);
         std.log.info("event=lazer_multiplayer_rest_room_left room_id={d} user_id={d}", .{ room_id, user_id });
     }
 
     pub fn restCloseRoom(self: *Manager, user_id: i32, room_id: i64) !void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const room = self.roomByIdLocked(room_id) orelse return error.MultiplayerRoomNotFound;
-        if (room.host_id != user_id) return error.MultiplayerPermissionDenied;
+        const room = self.roomByIdLocked(room_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerRoomNotFound;
+        };
+        if (room.host_id != user_id) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
         for (self.connections.items) |connection| {
             if (connection.room_id == room_id) connection.room_id = null;
         }
@@ -851,7 +939,8 @@ pub const Manager = struct {
             entry.* = null;
             break;
         };
-        self.allocator.destroy(room);
+        self.mutex.unlock(self.io);
+        self.archiveRoom(room);
         std.log.info("event=lazer_multiplayer_rest_room_closed room_id={d} user_id={d}", .{ room_id, user_id });
     }
 
@@ -936,7 +1025,7 @@ pub const Manager = struct {
         _ = self.connections.swapRemove(index);
     }
 
-    fn leaveLocked(self: *Manager, connection: *Connection, recipients: *[max_connections]*Connection, left_user: *?RoomUser, new_host: *?i32, ranked_ended: *bool) usize {
+    fn leaveLocked(self: *Manager, connection: *Connection, recipients: *[max_connections]*Connection, left_user: *?RoomUser, new_host: *?i32, ranked_ended: *bool, ended_room: *?*Room) usize {
         const room_id = connection.room_id orelse return 0;
         const room = self.roomByIdLocked(room_id) orelse {
             connection.room_id = null;
@@ -965,12 +1054,14 @@ pub const Manager = struct {
                 entry.* = null;
                 break;
             };
-            self.allocator.destroy(room);
+            ended_room.* = room;
             return 0;
         }
         if (room.host_id == connection.user_id) {
             for (room.users) |entry| if (entry) |user| {
                 room.host_id = user.id;
+                room.host_name = user.name;
+                room.host_country = user.country;
                 new_host.* = user.id;
                 break;
             };
@@ -984,6 +1075,7 @@ pub const Manager = struct {
         var left_user: ?RoomUser = null;
         var new_host: ?i32 = null;
         var ranked_ended = false;
+        var ended_room: ?*Room = null;
         var ranked_event: ?[]u8 = null;
         defer if (ranked_event) |event| self.allocator.free(event);
         var queue_peer: ?*Connection = null;
@@ -1012,7 +1104,7 @@ pub const Manager = struct {
         connection.queue_pool_id = null;
         connection.lobby_pool_id = null;
         const room_id = connection.room_id;
-        const count = self.leaveLocked(connection, &recipients, &left_user, &new_host, &ranked_ended);
+        const count = self.leaveLocked(connection, &recipients, &left_user, &new_host, &ranked_ended, &ended_room);
         if (ranked_ended) if (room_id) |id| if (self.roomByIdLocked(id)) |room| {
             ranked_event = eventMatchStateOwned(self.allocator, room) catch null;
         };
@@ -1020,6 +1112,7 @@ pub const Manager = struct {
         defer if (queue_peer) |peer| peer.release();
         self.removeConnectionLocked(connection);
         self.mutex.unlock(self.io);
+        if (ended_room) |ended| self.archiveRoom(ended);
         std.log.info("event=lazer_multiplayer_disconnected user_id={d}", .{connection.user_id});
         if (queue_peer) |peer| {
             const frame_result = if (queue_peer_left)
@@ -1052,26 +1145,64 @@ pub const Manager = struct {
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         if (only_room_id) |room_id| {
-            const room = self.roomByIdLocked(room_id) orelse return null;
-            try writeRoomJson(&output.writer, room);
+            if (self.roomByIdLocked(room_id)) |room| {
+                writeRoomJson(&output.writer, room) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.mutex.unlock(self.io);
+                return try output.toOwnedSlice();
+            }
+            self.mutex.unlock(self.io);
+            const store = self.store orelse return null;
+            var archive = (try store.lazerMultiplayerRoomArchive(allocator, room_id)) orelse return null;
+            defer archive.deinit();
+            try output.writer.writeAll(archive.room_json);
             return try output.toOwnedSlice();
         }
-        try output.writer.writeByte('[');
+        output.writer.writeByte('[') catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
         var written: usize = 0;
         for (self.rooms) |entry| if (entry) |room| {
             if (filter) |value| {
                 if (value.mode == .ended) continue;
                 if (value.mode == .owned and room.host_id != value.requester_id) continue;
-                if (value.mode == .participated and room.userIndex(value.requester_id) == null) continue;
+                if (value.mode == .participated and room.participantIndex(value.requester_id) == null) continue;
                 if (value.status) |wanted| if ((wanted == .idle) != (room.state == 0)) continue;
-                const category = if (room.settings.match_type == 0) "normal" else "realtime";
-                if (value.category.len != 0 and !std.mem.eql(u8, value.category, category)) continue;
+                if (value.category.len != 0 and !std.mem.eql(u8, value.category, roomCategory(room))) continue;
             }
-            if (written != 0) try output.writer.writeByte(',');
-            try writeRoomJson(&output.writer, room);
+            if (written != 0) output.writer.writeByte(',') catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            writeRoomJson(&output.writer, room) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
             written += 1;
+        };
+        self.mutex.unlock(self.io);
+        const include_archives = filter == null or filter.?.mode == .ended or filter.?.mode == .participated or filter.?.mode == .owned;
+        if (include_archives) if (self.store) |store| {
+            const archives = try store.lazerMultiplayerRoomArchives(allocator, 100);
+            defer {
+                for (archives) |*archive| archive.deinit();
+                allocator.free(archives);
+            }
+            for (archives) |archive| {
+                if (filter) |value| {
+                    if (value.status != null) continue;
+                    if (value.category.len != 0 and !std.mem.eql(u8, value.category, archive.category)) continue;
+                    if (value.mode == .owned and archive.owner_id != value.requester_id) continue;
+                    if (value.mode == .participated and !archiveIncludesUser(allocator, archive.participant_ids_json, value.requester_id)) continue;
+                }
+                if (written != 0) try output.writer.writeByte(',');
+                try output.writer.writeAll(archive.room_json);
+                written += 1;
+            }
         };
         try output.writer.writeByte(']');
         return try output.toOwnedSlice();
@@ -1120,66 +1251,22 @@ pub const Manager = struct {
     }
 
     pub fn roomLeaderboardJson(self: *Manager, allocator: std.mem.Allocator, requester_id: i32, room_id: i64) !?[]u8 {
-        const Aggregate = struct {
-            user: RoomUser,
-            attempts: i32 = 0,
-            completed: i32 = 0,
-            total_score: i64 = 0,
-            accuracy_total: f64 = 0,
-        };
-        var aggregates: [max_users]?Aggregate = [_]?Aggregate{null} ** max_users;
-        var aggregate_count: usize = 0;
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const room = self.roomByIdLocked(room_id) orelse return null;
-        for (room.scores) |entry| if (entry) |score| {
-            const user_index = room.userIndex(score.user_id) orelse continue;
-            var aggregate_index: ?usize = null;
-            for (aggregates[0..aggregate_count], 0..) |candidate, index| if (candidate.?.user.id == score.user_id) {
-                aggregate_index = index;
-                break;
+        if (self.roomByIdLocked(room_id)) |room| {
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            errdefer output.deinit();
+            writeRoomLeaderboardJson(&output.writer, room, requester_id) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
             };
-            if (aggregate_index == null) {
-                aggregate_index = aggregate_count;
-                aggregates[aggregate_count] = .{ .user = room.users[user_index].? };
-                aggregate_count += 1;
-            }
-            const aggregate = &aggregates[aggregate_index.?].?;
-            aggregate.attempts += 1;
-            aggregate.completed += @intFromBool(score.passed);
-            aggregate.total_score += score.total_score;
-            aggregate.accuracy_total += score.accuracy;
-        };
-        std.mem.sort(?Aggregate, aggregates[0..aggregate_count], {}, struct {
-            fn lessThan(_: void, left: ?Aggregate, right: ?Aggregate) bool {
-                if (left.?.total_score != right.?.total_score) return left.?.total_score > right.?.total_score;
-                return left.?.user.id < right.?.user.id;
-            }
-        }.lessThan);
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        errdefer output.deinit();
-        try output.writer.writeAll("{\"leaderboard\":[");
-        for (aggregates[0..aggregate_count], 0..) |entry, index| {
-            const aggregate = entry.?;
-            if (index != 0) try output.writer.writeByte(',');
-            try output.writer.print("{{\"attempts\":{d},\"completed\":{d},\"accuracy\":{d},\"pp\":null,\"room_id\":{d},\"total_score\":{d},\"user_id\":{d},\"user\":", .{ aggregate.attempts, aggregate.completed, aggregate.accuracy_total / @as(f64, @floatFromInt(aggregate.attempts)), room.id, aggregate.total_score, aggregate.user.id });
-            try writeApiUserJson(&output.writer, aggregate.user.id, aggregate.user.name.slice(), aggregate.user.country);
-            try output.writer.print(",\"position\":{d}}}", .{index + 1});
+            self.mutex.unlock(self.io);
+            return @as(?[]u8, try output.toOwnedSlice());
         }
-        try output.writer.writeAll("],\"user_score\":");
-        var own_index: ?usize = null;
-        for (aggregates[0..aggregate_count], 0..) |entry, index| if (entry.?.user.id == requester_id) {
-            own_index = index;
-            break;
-        };
-        if (own_index) |index| {
-            const aggregate = aggregates[index].?;
-            try output.writer.print("{{\"attempts\":{d},\"completed\":{d},\"accuracy\":{d},\"pp\":null,\"room_id\":{d},\"total_score\":{d},\"user_id\":{d},\"user\":", .{ aggregate.attempts, aggregate.completed, aggregate.accuracy_total / @as(f64, @floatFromInt(aggregate.attempts)), room.id, aggregate.total_score, aggregate.user.id });
-            try writeApiUserJson(&output.writer, aggregate.user.id, aggregate.user.name.slice(), aggregate.user.country);
-            try output.writer.print(",\"position\":{d}}}", .{index + 1});
-        } else try output.writer.writeAll("null");
-        try output.writer.writeByte('}');
-        return @as(?[]u8, try output.toOwnedSlice());
+        self.mutex.unlock(self.io);
+        const store = self.store orelse return null;
+        var archive = (try store.lazerMultiplayerRoomArchive(allocator, room_id)) orelse return null;
+        defer archive.deinit();
+        return @as(?[]u8, try allocator.dupe(u8, archive.leaderboard_json));
     }
 
     pub fn serve(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !void {
@@ -1548,6 +1635,7 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return err;
         };
+        room.rememberParticipant(joined);
         self.mutex.unlock(self.io);
         defer self.allocator.free(response);
         connection.send(response);
@@ -1568,16 +1656,18 @@ pub const Manager = struct {
         var left_user: ?RoomUser = null;
         var new_host: ?i32 = null;
         var ranked_ended = false;
+        var ended_room: ?*Room = null;
         var ranked_event: ?[]u8 = null;
         defer if (ranked_event) |event| self.allocator.free(event);
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id;
-        const count = self.leaveLocked(connection, &recipients, &left_user, &new_host, &ranked_ended);
+        const count = self.leaveLocked(connection, &recipients, &left_user, &new_host, &ranked_ended, &ended_room);
         if (ranked_ended) if (room_id) |id| if (self.roomByIdLocked(id)) |room| {
             ranked_event = try eventMatchStateOwned(self.allocator, room);
         };
         defer releaseRecipients(recipients[0..count]);
         self.mutex.unlock(self.io);
+        if (ended_room) |ended| self.archiveRoom(ended);
         if (left_user) |user| {
             const event = try eventUserOwned(self.allocator, "UserLeft", user);
             defer self.allocator.free(event);
@@ -3260,6 +3350,7 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
     try room.host_name.set(user.name);
     room.users[0] = try defaultRoomUser(user.id, user.name, user.country);
     room.user_count = 1;
+    room.rememberParticipant(room.users[0].?);
 
     for (playlist.items, 0..) |entry, index| {
         const item_object = switch (entry) {
@@ -3570,6 +3661,7 @@ fn parseRoom(allocator: std.mem.Allocator, encoded: []const u8, connection: *Con
     try room.host_name.set(connection.user_name.slice());
     room.users[0] = try defaultRoomUser(connection.user_id, connection.user_name.slice(), connection.user_country);
     room.user_count = 1;
+    room.rememberParticipant(room.users[0].?);
     for (0..playlist_len) |index| {
         const raw_item = try reader.raw();
         var item = try parsePlaylistItem(raw_item);
@@ -3888,13 +3980,21 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     try std.json.Stringify.value(if (room.settings.match_type == 0) "normal" else "realtime", .{}, writer);
     try writer.writeAll(",\"duration\":null,\"starts_at\":null,\"ends_at\":null,\"max_participants\":");
     if (room.settings.max_participants) |limit| try writer.print("{d}", .{limit}) else try writer.writeAll("null");
-    try writer.print(",\"participant_count\":{d},\"recent_participants\":[", .{room.user_count});
+    try writer.print(",\"participant_count\":{d},\"recent_participants\":[", .{if (room.ended) room.participant_count else room.user_count});
     var users_written: usize = 0;
-    for (room.users) |entry| if (entry) |user| {
-        if (users_written != 0) try writer.writeByte(',');
-        try writeApiUserJson(writer, user.id, user.name.slice(), user.country);
-        users_written += 1;
-    };
+    if (room.ended) {
+        for (room.participants[0..room.participant_count]) |entry| if (entry) |user| {
+            if (users_written != 0) try writer.writeByte(',');
+            try writeApiUserJson(writer, user.id, user.name.slice(), user.country);
+            users_written += 1;
+        };
+    } else {
+        for (room.users) |entry| if (entry) |user| {
+            if (users_written != 0) try writer.writeByte(',');
+            try writeApiUserJson(writer, user.id, user.name.slice(), user.country);
+            users_written += 1;
+        };
+    }
     const match_type: []const u8 = switch (room.settings.match_type) {
         0 => "playlists",
         2 => "team_versus",
@@ -3923,8 +4023,66 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     try writer.print(",\"auto_skip\":{s},\"auto_start_duration\":0,\"current_user_score\":null,\"current_playlist_item\":", .{if (room.settings.auto_skip) "true" else "false"});
     const current = room.playlist[room.itemIndex(room.settings.playlist_item_id) orelse 0] orelse return error.MultiplayerPlaylistItemNotFound;
     try writePlaylistItemJson(writer, current);
-    try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false", .{ room.channel_id, if (room.state == 0) "idle" else "playing" });
+    try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false", .{ room.channel_id, if (room.ended) "ended" else if (room.state == 0) "idle" else "playing" });
     try writeRoomModeJson(writer, room);
+    try writer.writeByte('}');
+}
+
+fn writeRoomLeaderboardJson(writer: *std.Io.Writer, room: *const Room, requester_id: i32) !void {
+    const Aggregate = struct {
+        user: RoomParticipant,
+        attempts: i32 = 0,
+        completed: i32 = 0,
+        total_score: i64 = 0,
+        accuracy_total: f64 = 0,
+    };
+    var aggregates: [max_room_participants]?Aggregate = [_]?Aggregate{null} ** max_room_participants;
+    var aggregate_count: usize = 0;
+    for (room.scores) |entry| if (entry) |score| {
+        const participant_index = room.participantIndex(score.user_id) orelse continue;
+        var aggregate_index: ?usize = null;
+        for (aggregates[0..aggregate_count], 0..) |candidate, index| if (candidate.?.user.id == score.user_id) {
+            aggregate_index = index;
+            break;
+        };
+        if (aggregate_index == null) {
+            if (aggregate_count == aggregates.len) continue;
+            aggregate_index = aggregate_count;
+            aggregates[aggregate_count] = .{ .user = room.participants[participant_index].? };
+            aggregate_count += 1;
+        }
+        const aggregate = &aggregates[aggregate_index.?].?;
+        aggregate.attempts += 1;
+        aggregate.completed += @intFromBool(score.passed);
+        aggregate.total_score += score.total_score;
+        aggregate.accuracy_total += score.accuracy;
+    };
+    std.mem.sort(?Aggregate, aggregates[0..aggregate_count], {}, struct {
+        fn lessThan(_: void, left: ?Aggregate, right: ?Aggregate) bool {
+            if (left.?.total_score != right.?.total_score) return left.?.total_score > right.?.total_score;
+            return left.?.user.id < right.?.user.id;
+        }
+    }.lessThan);
+    try writer.writeAll("{\"leaderboard\":[");
+    for (aggregates[0..aggregate_count], 0..) |entry, index| {
+        const aggregate = entry.?;
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{{\"attempts\":{d},\"completed\":{d},\"accuracy\":{d},\"pp\":null,\"room_id\":{d},\"total_score\":{d},\"user_id\":{d},\"user\":", .{ aggregate.attempts, aggregate.completed, aggregate.accuracy_total / @as(f64, @floatFromInt(aggregate.attempts)), room.id, aggregate.total_score, aggregate.user.id });
+        try writeApiUserJson(writer, aggregate.user.id, aggregate.user.name.slice(), aggregate.user.country);
+        try writer.print(",\"position\":{d}}}", .{index + 1});
+    }
+    try writer.writeAll("],\"user_score\":");
+    var own_index: ?usize = null;
+    for (aggregates[0..aggregate_count], 0..) |entry, index| if (entry.?.user.id == requester_id) {
+        own_index = index;
+        break;
+    };
+    if (own_index) |index| {
+        const aggregate = aggregates[index].?;
+        try writer.print("{{\"attempts\":{d},\"completed\":{d},\"accuracy\":{d},\"pp\":null,\"room_id\":{d},\"total_score\":{d},\"user_id\":{d},\"user\":", .{ aggregate.attempts, aggregate.completed, aggregate.accuracy_total / @as(f64, @floatFromInt(aggregate.attempts)), room.id, aggregate.total_score, aggregate.user.id });
+        try writeApiUserJson(writer, aggregate.user.id, aggregate.user.name.slice(), aggregate.user.country);
+        try writer.print(",\"position\":{d}}}", .{index + 1});
+    } else try writer.writeAll("null");
     try writer.writeByte('}');
 }
 
@@ -4442,6 +4600,63 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     try std.testing.expect((try manager.roomsJson(std.testing.allocator, 1, null)) == null);
 }
 
+test "completed lazer rooms and score boards survive manager restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/multiplayer-history.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const host_id = try store.register("room host", "room-host@example.invalid", "00000000000000000000000000000000");
+    const guest_id = try store.register("room guest", "room-guest@example.invalid", "00000000000000000000000000000000");
+    const host: domain.User = .{ .id = host_id, .name = "room host", .safe_name = "room_host", .country = .{ 'A', 'U' } };
+    const guest: domain.User = .{ .id = guest_id, .name = "room guest", .safe_name = "room_guest", .country = .{ 'G', 'B' } };
+    const room_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"name\":\"kept room\",\"type\":\"head_to_head\",\"queue_mode\":\"host_only\",\"playlist\":[{{\"id\":8,\"owner_id\":{d},\"beatmap_id\":75,\"ruleset_id\":0,\"beatmap\":{{\"checksum\":\"0123456789abcdef0123456789abcdef\",\"difficulty_rating\":5.25,\"beatmapset_id\":750,\"status\":\"ranked\",\"version\":\"history\",\"beatmapset\":{{\"artist\":\"fixture\",\"title\":\"kept\",\"creator\":\"mapper\"}}}}}}]}}", .{host_id});
+    defer std.testing.allocator.free(room_body);
+
+    {
+        var manager = Manager.init(std.testing.allocator, std.testing.io);
+        defer manager.deinit();
+        try manager.bindStore(&store);
+        const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
+        std.testing.allocator.free(created);
+        const joined = try manager.restJoinRoom(std.testing.allocator, guest, 1, "");
+        std.testing.allocator.free(joined);
+        try manager.recordRoomScore(host_id, 1, 8, .{ .score_id = 201, .total_score = 700_000, .accuracy = 0.97, .max_combo = 400, .passed = true });
+        try manager.recordRoomScore(guest_id, 1, 8, .{ .score_id = 202, .total_score = 900_000, .accuracy = 0.99, .max_combo = 500, .passed = true });
+        try manager.restPartRoom(guest_id, 1);
+        try manager.restCloseRoom(host_id, 1);
+    }
+
+    var reopened = Manager.init(std.testing.allocator, std.testing.io);
+    defer reopened.deinit();
+    try reopened.bindStore(&store);
+    const archived = (try reopened.roomsJson(std.testing.allocator, 1, null)).?;
+    defer std.testing.allocator.free(archived);
+    var parsed_room = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, archived, .{});
+    defer parsed_room.deinit();
+    try std.testing.expectEqualStrings("ended", parsed_room.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 2), parsed_room.value.object.get("recent_participants").?.array.items.len);
+    const leaderboard = (try reopened.roomLeaderboardJson(std.testing.allocator, 0, 1)).?;
+    defer std.testing.allocator.free(leaderboard);
+    var parsed_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, leaderboard, .{});
+    defer parsed_board.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_board.value.object.get("leaderboard").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, guest_id), parsed_board.value.object.get("leaderboard").?.array.items[0].object.get("user_id").?.integer);
+    const ended = (try reopened.roomsJson(std.testing.allocator, null, try roomListFilter(host_id, "ended", null, "realtime"))).?;
+    defer std.testing.allocator.free(ended);
+    var parsed_ended = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ended, .{});
+    defer parsed_ended.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_ended.value.array.items.len);
+
+    const next = try reopened.restCreateRoom(std.testing.allocator, host, room_body);
+    defer std.testing.allocator.free(next);
+    var parsed_next = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, next, .{});
+    defer parsed_next.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_next.value.object.get("id").?.integer);
+}
+
 test "multiplayer room cards use stored beatmap metadata and cover ids" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4453,7 +4668,7 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,star_rating) VALUES(75,900,'0123456789abcdef0123456789abcdef','stored artist','stored song','stored diff','stored mapper',3,6.25)");
     var manager = Manager.init(std.testing.allocator, std.testing.io);
     defer manager.deinit();
-    manager.bindStore(&store);
+    try manager.bindStore(&store);
     const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
     const room_body =
         \\{"name":"metadata","type":"head_to_head","queue_mode":"host_only","playlist":[{"id":1,"owner_id":4,"beatmap_id":75,"ruleset_id":0,"beatmap":{"checksum":"0123456789abcdef0123456789abcdef","difficulty_rating":1,"beatmapset_id":75,"status":"pending","version":"stale","beatmapset":{"artist":"stale","title":"stale","creator":"stale"}}}]}

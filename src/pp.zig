@@ -1,4 +1,5 @@
 const std = @import("std");
+const beatmap = @import("beatmap.zig");
 
 // Bump this whenever the native Stable model or its calibration changes. The
 // operations recalc records the value so staff can tell which engine rewrote
@@ -203,20 +204,22 @@ fn combineStars(primary: f64, secondary: f64, mode: u8, mods: u32) f64 {
 }
 
 fn parseMap(allocator: std.mem.Allocator, bytes: []const u8, input: Input) !MapAttributes {
-    if (bytes.len == 0 or bytes.len > 32 * 1024 * 1024 or !std.mem.startsWith(u8, bytes, "osu file format v") or input.mode > 3) return error.InvalidBeatmap;
+    if (bytes.len == 0 or bytes.len > 32 * 1024 * 1024 or input.mode > 3) return error.InvalidBeatmap;
+    const contents = beatmap.withoutUtf8Bom(bytes);
+    if (!std.mem.startsWith(u8, contents, "osu file format v")) return error.InvalidBeatmap;
     var attrs: MapAttributes = .{};
-    if (std.mem.indexOf(u8, bytes[0..@min(bytes.len, 64)], "osu file format v")) |offset| {
+    if (std.mem.indexOf(u8, contents[0..@min(contents.len, 64)], "osu file format v")) |offset| {
         const version_start = offset + "osu file format v".len;
         var version_end = version_start;
-        while (version_end < bytes.len and bytes[version_end] >= '0' and bytes[version_end] <= '9') version_end += 1;
-        attrs.version = number(u8, bytes[version_start..version_end]) catch 14;
+        while (version_end < contents.len and contents[version_end] >= '0' and contents[version_end] <= '9') version_end += 1;
+        attrs.version = number(u8, contents[version_start..version_end]) catch 14;
     }
     var section: Section = .none;
     var points: std.ArrayList(TimingPoint) = .empty;
     defer points.deinit(allocator);
     var beat_length: f64 = 500;
     var slider_velocity: f64 = 1;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;

@@ -457,7 +457,7 @@ pub const Manager = struct {
     }
 
     fn startWatching(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, user_id: i32) !void {
-        if (user_id == connection.user_id) return error.SpectatorCannotWatchSelf;
+        const self_watch = user_id == connection.user_id;
         const store = self.store orelse return error.SpectatorStoreUnavailable;
         const target_user = (try store.userById(self.allocator, user_id)) orelse return error.SpectatorUserNotFound;
         defer self.allocator.free(target_user.name);
@@ -487,12 +487,12 @@ pub const Manager = struct {
                 defer self.allocator.free(began);
                 connection.send(began);
             }
-            if (host) |current| {
+            if (host) |current| if (!self_watch) {
                 const watcher = SpectatorUser{ .id = connection.user_id, .name = connection.user_name };
                 const watching = try eventWatchersOwned(self.allocator, &.{watcher});
                 defer self.allocator.free(watching);
                 current.send(watching);
-            }
+            };
         }
         try self.finishVoid(connection, invocation_id);
         if (added) std.log.info("event=lazer_spectator_watch_started user_id={d} target_id={d}", .{ connection.user_id, user_id });

@@ -479,6 +479,18 @@ CREATE TABLE lazer_score_tokens (
 );
 CREATE INDEX lazer_score_tokens_user_expiry ON lazer_score_tokens(user_id, expires_at DESC);
 
+CREATE TABLE lazer_multiplayer_room_history (
+    room_id bigint PRIMARY KEY CHECK(room_id>0),
+    owner_id integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    category text NOT NULL CHECK(category IN('normal','realtime','spotlight','featured_artist')),
+    room_json jsonb NOT NULL CHECK(jsonb_typeof(room_json)='object'),
+    leaderboard_json jsonb NOT NULL CHECK(jsonb_typeof(leaderboard_json)='object'),
+    participant_ids_json jsonb NOT NULL CHECK(jsonb_typeof(participant_ids_json)='array'),
+    ended_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint)
+);
+CREATE INDEX lazer_multiplayer_room_history_owner ON lazer_multiplayer_room_history(owner_id,ended_at DESC,room_id DESC);
+CREATE INDEX lazer_multiplayer_room_history_time ON lazer_multiplayer_room_history(ended_at DESC,room_id DESC);
+
 CREATE TABLE user_achievements (
     user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     achievement_id smallint NOT NULL CHECK(achievement_id > 0),
@@ -652,4 +664,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (35);
+INSERT INTO schema_migrations(version) VALUES (36);

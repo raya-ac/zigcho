@@ -1,4 +1,5 @@
 const std = @import("std");
+const beatmap = @import("beatmap.zig");
 const abi = @import("anticheat_abi.zig");
 
 const max_decompressed_bytes = 32 * 1024 * 1024;
@@ -119,7 +120,9 @@ pub fn parseFrames(allocator: std.mem.Allocator, decoded: []const u8) ![]abi.Rep
 }
 
 fn parseMap(allocator: std.mem.Allocator, map: []const u8, mods: u64, played_to_ms: i64) !ParsedMap {
-    if (map.len == 0 or map.len > 32 * 1024 * 1024 or !std.mem.startsWith(u8, map, "osu file format v")) return error.InvalidBeatmap;
+    if (map.len == 0 or map.len > 32 * 1024 * 1024) return error.InvalidBeatmap;
+    const contents = beatmap.withoutUtf8Bom(map);
+    if (!std.mem.startsWith(u8, contents, "osu file format v")) return error.InvalidBeatmap;
     const Section = enum { none, general, difficulty, hit_objects };
     var section: Section = .none;
     var overall_difficulty: f64 = 5;
@@ -130,7 +133,7 @@ fn parseMap(allocator: std.mem.Allocator, map: []const u8, mods: u64, played_to_
     var last_object_time: i64 = -1;
     var map_duration_ms: u32 = 0;
 
-    var lines = std.mem.splitScalar(u8, map, '\n');
+    var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;

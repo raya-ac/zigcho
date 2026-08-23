@@ -36,13 +36,19 @@ pub fn parse(bytes: []const u8) !Metadata {
     return parseWithIds(bytes, 0, 0);
 }
 
+pub fn withoutUtf8Bom(bytes: []const u8) []const u8 {
+    const utf8_bom = "\xef\xbb\xbf";
+    return if (std.mem.startsWith(u8, bytes, utf8_bom)) bytes[utf8_bom.len..] else bytes;
+}
+
 pub fn parseWithIds(bytes: []const u8, fallback_id: i32, fallback_set_id: i32) !Metadata {
-    if (!std.mem.startsWith(u8, bytes, "osu file format v")) return error.InvalidBeatmap;
+    const contents = withoutUtf8Bom(bytes);
+    if (!std.mem.startsWith(u8, contents, "osu file format v")) return error.InvalidBeatmap;
     var result: Metadata = .{};
     var section: []const u8 = "";
     var first_beat_length: ?f64 = null;
     var last_object_time: i64 = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;

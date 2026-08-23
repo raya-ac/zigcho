@@ -3087,10 +3087,11 @@ const App = struct {
                 defer freeUser(self.allocator, other);
                 if (other.restricted) return respond(req, .not_found, "application/json", "{\"error\":\"channel not found\"}", &.{});
                 try self.markOnline(&other);
+                const cursor = try self.store.lazerDirectMessageCursor(user.id, other.id);
                 var output: std.Io.Writer.Allocating = .init(self.allocator);
                 defer output.deinit();
                 try output.writer.writeAll("{\"channel\":");
-                try lazer.writePrivateChatChannel(&output.writer, channel_id, other.name, null, null);
+                try lazer.writePrivateChatChannel(&output.writer, channel_id, other.name, cursor.last_message_id, cursor.last_read_id);
                 try output.writer.writeAll(",\"users\":[");
                 try user_json.writeCompact(&output.writer, user);
                 try output.writer.writeByte(',');
@@ -3101,10 +3102,11 @@ const App = struct {
             var kai = (try self.store.userById(self.allocator, 3)) orelse return respond(req, .service_unavailable, "application/json", "{\"error\":\"channel presence unavailable\"}", &.{});
             defer freeUser(self.allocator, kai);
             try self.markOnline(&kai);
+            const cursor = try self.store.lazerChannelCursor(user.id, channel_id);
             var output: std.Io.Writer.Allocating = .init(self.allocator);
             defer output.deinit();
             try output.writer.writeAll("{\"channel\":");
-            try lazer.writeChatChannel(&output.writer, channel_id, null, null);
+            try lazer.writeChatChannel(&output.writer, channel_id, cursor.last_message_id, cursor.last_read_id);
             try output.writer.writeAll(",\"users\":[");
             try user_json.writeCompact(&output.writer, user);
             try output.writer.writeByte(',');
@@ -5390,7 +5392,7 @@ pub fn main(init: std.process.Init) !void {
     };
     app.map_sync.bindOsuApiKey(config.osu_api_key);
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
-    app.lazer_multiplayer.bindStore(&app.store);
+    try app.lazer_multiplayer.bindStore(&app.store);
     app.lazer_multiplayer.bindBeatmapSync(&app.map_sync);
     app.lazer_multiplayer.refreshMatchmakingMaps() catch |err| std.log.warn("event=lazer_matchmaking_pool_startup_failed error={t}", .{err});
     app.lazer_spectator.bindStore(&app.store);

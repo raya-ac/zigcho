@@ -740,6 +740,46 @@ pub const Manager = struct {
         for (&room.playlist) |*entry| if (entry.*) |*item| try self.hydratePlaylistItem(item);
     }
 
+    fn hydrateArchivedPlaylistItem(self: *Manager, arena: std.mem.Allocator, value: *std.json.Value) !void {
+        const store = self.store orelse return;
+        const item = switch (value.*) {
+            .object => |*object| object,
+            else => return,
+        };
+        const beatmap_value = item.getPtr("beatmap") orelse return;
+        const beatmap = switch (beatmap_value.*) {
+            .object => |*object| object,
+            else => return,
+        };
+        const id_value = beatmap.get("id") orelse item.get("beatmap_id") orelse return;
+        const beatmap_id: i32 = switch (id_value) {
+            .integer => |id| if (id > 0 and id <= std.math.maxInt(i32)) @intCast(id) else return,
+            else => return,
+        };
+        const info = (try store.beatmapInfoById(self.allocator, beatmap_id)) orelse return;
+        defer self.allocator.free(info.artist);
+        defer self.allocator.free(info.title);
+        defer self.allocator.free(info.version);
+        defer self.allocator.free(info.creator);
+        try beatmap.put(arena, "total_length", .{ .integer = info.total_length });
+        try beatmap.put(arena, "hit_length", .{ .integer = info.hit_length });
+    }
+
+    fn writeHydratedArchiveJson(self: *Manager, writer: *std.Io.Writer, room_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, room_json, .{});
+        defer parsed.deinit();
+        const room = switch (parsed.value) {
+            .object => |*object| object,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        if (room.getPtr("playlist")) |playlist_value| switch (playlist_value.*) {
+            .array => |*playlist| for (playlist.items) |*item| try self.hydrateArchivedPlaylistItem(parsed.arena.allocator(), item),
+            else => {},
+        };
+        if (room.getPtr("current_playlist_item")) |item| try self.hydrateArchivedPlaylistItem(parsed.arena.allocator(), item);
+        try std.json.Stringify.value(parsed.value, .{}, writer);
+    }
+
     pub fn refreshMatchmakingMaps(self: *Manager) !void {
         const store = self.store orelse return error.MatchmakingStoreUnavailable;
         var loaded: [4][]storage.Store.MatchmakingBeatmap = undefined;
@@ -1192,7 +1232,7 @@ pub const Manager = struct {
             const store = self.store orelse return null;
             var archive = (try store.lazerMultiplayerRoomArchive(allocator, room_id)) orelse return null;
             defer archive.deinit();
-            try output.writer.writeAll(archive.room_json);
+            try self.writeHydratedArchiveJson(&output.writer, archive.room_json);
             return try output.toOwnedSlice();
         }
         output.writer.writeByte('[') catch |err| {
@@ -1234,7 +1274,7 @@ pub const Manager = struct {
                     if (value.mode == .participated and !archiveIncludesUser(allocator, archive.participant_ids_json, value.requester_id)) continue;
                 }
                 if (written != 0) try output.writer.writeByte(',');
-                try output.writer.writeAll(archive.room_json);
+                try self.writeHydratedArchiveJson(&output.writer, archive.room_json);
                 written += 1;
             }
         };
@@ -4866,6 +4906,7 @@ test "completed lazer rooms and score boards survive manager restart" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,star_rating,total_length,hit_length) VALUES(75,750,'0123456789abcdef0123456789abcdef','fixture','kept','history','mapper',3,5.25,143,119)");
     const host_id = try store.register("room host", "room-host@example.invalid", "00000000000000000000000000000000");
     const guest_id = try store.register("room guest", "room-guest@example.invalid", "00000000000000000000000000000000");
     const host: domain.User = .{ .id = host_id, .name = "room host", .safe_name = "room_host", .country = .{ 'A', 'U' } };
@@ -4896,6 +4937,12 @@ test "completed lazer rooms and score boards survive manager restart" {
     defer parsed_room.deinit();
     try std.testing.expectEqualStrings("ended", parsed_room.value.object.get("status").?.string);
     try std.testing.expectEqual(@as(usize, 2), parsed_room.value.object.get("recent_participants").?.array.items.len);
+    const archived_beatmap = parsed_room.value.object.get("playlist").?.array.items[0].object.get("beatmap").?.object;
+    try std.testing.expectEqual(@as(i64, 143), archived_beatmap.get("total_length").?.integer);
+    try std.testing.expectEqual(@as(i64, 119), archived_beatmap.get("hit_length").?.integer);
+    const archived_current = parsed_room.value.object.get("current_playlist_item").?.object.get("beatmap").?.object;
+    try std.testing.expectEqual(@as(i64, 143), archived_current.get("total_length").?.integer);
+    try std.testing.expectEqual(@as(i64, 119), archived_current.get("hit_length").?.integer);
     const leaderboard = (try reopened.roomLeaderboardJson(std.testing.allocator, 0, 1)).?;
     defer std.testing.allocator.free(leaderboard);
     var parsed_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, leaderboard, .{});

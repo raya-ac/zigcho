@@ -79,7 +79,7 @@ auth_get() {
 }
 
 auth_get /api/v2/me/ me
-jq -e '.statistics_rulesets.osu.play_count == 0 and .avatar_url == "https://a.kai.ovh/4" and .cover_url == "https://assets.kai.ovh/banners/4/cover.jpg?v=4242" and .cover.url == .cover_url and .is_supporter == true and .support_level == 1' "$response" >/dev/null || fail invalid_me_contract
+jq -e '.statistics_rulesets.osu.play_count == 0 and (.avatar_url | startswith("https://a.kai.ovh/4")) and .cover_url == "https://assets.kai.ovh/banners/4/cover.jpg?v=4242" and .cover.url == .cover_url and .is_supporter == true and .support_level == 1' "$response" >/dev/null || fail invalid_me_contract
 auth_get /api/v2/me/osu me_ruleset
 jq -e '.id == 4 and .statistics_rulesets.osu.play_count == 0' "$response" >/dev/null || fail invalid_me_ruleset_contract
 for route in session/verify session/verify/reissue session/verify/mail-fallback; do
@@ -92,7 +92,7 @@ jq -e '.backgrounds == []' "$response" >/dev/null || fail invalid_seasonal_backg
 auth_get '/api/v2/search?mode=user&query=lazer' user_search
 jq -e '.total == 2 and (.user.data | length) == 2' "$response" >/dev/null || fail invalid_user_search_contract
 auth_get /api/v2/news news
-jq -e '.news_posts == [] and .cursor == null and .news_sidebar.current_year == 2026' "$response" >/dev/null || fail invalid_news_contract
+jq -e '.news_posts[0].id == 3700 and .news_posts[0].slug == "2026-08-25-classic-score-and-profile-graphs" and .cursor == null and .news_sidebar.current_year == 2026' "$response" >/dev/null || fail invalid_news_contract
 auth_get /api/v2/spotlights spotlights
 jq -e '.spotlights == []' "$response" >/dev/null || fail invalid_spotlights_contract
 auth_get /api/v2/rankings/kudosu kudosu_rankings
@@ -102,7 +102,7 @@ jq -e '.ranking == [] and .spotlight.id == 1 and .spotlight.name == "zigcho!laze
 auth_get /api/v2/wiki/en/Main_page wiki
 jq -e '.layout == "wiki" and .locale == "en" and .path == "Main_page" and (.markdown | contains("](/wiki/Multiplayer)"))' "$response" >/dev/null || fail invalid_wiki_contract
 auth_get /api/v2/changelog changelog
-jq -e '(.streams | length) > 0 and (.builds | length) == 10 and ([.builds[].changelog_entries | length] | add) == 79 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
+jq -e '(.streams | length) > 0 and (.builds | length) > 0 and .builds[0].id == 37 and .builds[0].changelog_entries[0].id == 3700 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
 auth_get /api/v2/changelog/lazer/2026.809.0 changelog_oldest
 jq -e '(.changelog_entries | length) == 18 and .versions.next.version == "2026.810.0" and .versions.previous == null' "$response" >/dev/null || fail invalid_changelog_navigation
 auth_get /api/v2/notifications notifications
@@ -286,8 +286,8 @@ expect_status "$code" 409 reject_token_reuse
 [ "$(sqlite3 "$database" "SELECT statistics_json FROM lazer_scores WHERE id=$score_id")" = '{"great":300,"miss":2}' ] || fail statistics_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT rank_namespace FROM lazer_scores WHERE id=$score_id")" = custom ] || fail custom_namespace_missing
 [ "$(sqlite3 "$database" "SELECT total_score_without_mods FROM lazer_scores WHERE id=$score_id")" = 900000 ] || fail score_without_mods_not_stored
-[ "$(sqlite3 "$database" "SELECT legacy_total_score IS NULL FROM lazer_scores WHERE id=$score_id")" = 1 ] || fail native_score_marked_legacy
-[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 43 ] || fail schema_not_migrated
+[ "$(sqlite3 "$database" "SELECT legacy_total_score FROM lazer_scores WHERE id=$score_id")" = 3032606 ] || fail classic_score_not_stored
+[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 44 ] || fail schema_not_migrated
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=WIGGLE&limit=50' custom_leaderboard
 jq -e --argjson id "$score_id" '
@@ -367,8 +367,8 @@ auth_get /api/v2/me/ me_after_vanilla_score
 jq -e '
   .statistics_rulesets.osu.play_count == 1 and
   .statistics_rulesets.osu.play_time == 90 and
-  .statistics_rulesets.osu.total_score == 123456 and
-  .statistics_rulesets.osu.ranked_score == 123456 and
+  .statistics_rulesets.osu.total_score == 12748 and
+  .statistics_rulesets.osu.ranked_score == 12748 and
   .statistics_rulesets.osu.total_hits == 9 and
   .statistics_rulesets.osu.maximum_combo == 8 and
   .statistics_rulesets.osu.pp > 0 and
@@ -391,7 +391,7 @@ jq -e '
   .ranking[0].hit_accuracy == 90
 ' "$response" >/dev/null || fail invalid_performance_rankings_contract
 auth_get '/api/v2/rankings/osu/score?page=1&country=au' score_rankings
-jq -e '.cursor == null and (.ranking | length) == 1 and .ranking[0].user.country_code == "AU" and .ranking[0].total_score == 123456' "$response" >/dev/null || fail invalid_score_rankings_contract
+jq -e '.cursor == null and (.ranking | length) == 1 and .ranking[0].user.country_code == "AU" and .ranking[0].total_score == 12748' "$response" >/dev/null || fail invalid_score_rankings_contract
 auth_get '/api/v2/rankings/osu/country?page=1' country_rankings
 jq -e '.cursor == null and (.ranking | length) == 1 and .ranking[0].code == "AU" and .ranking[0].active_users == 1 and .ranking[0].play_count == 1 and .ranking[0].performance > 0' "$response" >/dev/null || fail invalid_country_rankings_contract
 

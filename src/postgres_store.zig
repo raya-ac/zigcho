@@ -173,7 +173,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36 and version != 37 and version != 38 and version != 39 and version != 40 and version != 41 and version != 42 and version != 43) return error.UnsupportedSchemaVersion;
+        } else if (version < 13 or version > 44) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -386,6 +386,9 @@ pub const Store = struct {
         if (version <= 40) try postgres.exec(lease.conn, database_sql.postgresMigration(41));
         if (version <= 41) try postgres.exec(lease.conn, database_sql.postgresMigration(42));
         if (version <= 42) try postgres.exec(lease.conn, database_sql.postgresMigration(43));
+        if (version <= 43) try postgres.exec(lease.conn, database_sql.postgresMigration(44));
+        try self.backfillLazerClassicScoresWithConnection(lease.conn);
+        if (version <= 43) try self.rebuildRankedStats(lease.conn, false);
         try postgres.exec(lease.conn, "DELETE FROM zigcho.user_stats_history WHERE day<((extract(epoch FROM clock_timestamp())::bigint/86400)-89)*86400");
         try self.refreshExternalOnly(lease.conn);
         try postgres.exec(
@@ -4552,6 +4555,26 @@ pub const Store = struct {
         audit.deinit();
     }
 
+    fn backfillLazerClassicScoresWithConnection(self: *Store, conn: *postgres.c.PGconn) !void {
+        try postgres.exec(conn, "BEGIN");
+        errdefer postgres.exec(conn, "ROLLBACK") catch {};
+        var rows = try postgres.query(conn, "SELECT id,ruleset_id,total_score,statistics_json::text,maximum_statistics_json::text FROM zigcho.lazer_scores WHERE legacy_total_score IS NULL ORDER BY id");
+        defer rows.deinit();
+        for (0..rows.rows()) |row| {
+            const id = try rows.int(i64, row, 0);
+            const ruleset_id = try rows.int(i64, row, 1);
+            const total_score = try rows.int(i64, row, 2);
+            const classic = lazer.classicTotalScoreFromJson(self.allocator, ruleset_id, total_score, rows.value(row, 3), rows.value(row, 4)) catch lazer.stableLegacyTotalScore(total_score);
+            var id_buf: [32]u8 = undefined;
+            var classic_buf: [32]u8 = undefined;
+            const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
+            const classic_text = try std.fmt.bufPrint(&classic_buf, "{d}", .{classic});
+            var updated = try postgres.queryParams(self.allocator, conn, "UPDATE zigcho.lazer_scores SET legacy_total_score=$1 WHERE id=$2 AND legacy_total_score IS NULL", &.{ classic_text, id_text });
+            updated.deinit();
+        }
+        try postgres.exec(conn, "COMMIT");
+    }
+
     fn rebuildRankedStats(self: *Store, conn: *postgres.c.PGconn, pre_schema_43: bool) !void {
         var best = try postgres.query(
             conn,
@@ -4563,7 +4586,7 @@ pub const Store = struct {
         const internal_mode = "CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END";
         const lazer_internal_mode = "CASE l.rank_namespace WHEN 'vanilla' THEN l.ruleset_id WHEN 'relax' THEN l.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END";
         const lazer_hits = "coalesce((l.statistics_json->>'meh')::bigint,0)+coalesce((l.statistics_json->>'ok')::bigint,0)+coalesce((l.statistics_json->>'good')::bigint,0)+coalesce((l.statistics_json->>'great')::bigint,0)+coalesce((l.statistics_json->>'perfect')::bigint,0)";
-        const lazer_score = if (pre_schema_43) "coalesce(l.legacy_total_score,l.total_score)" else "coalesce(l.legacy_total_score,l.total_score_without_mods)";
+        const lazer_score = "coalesce(l.legacy_total_score,l.total_score)";
         const reset_sql = try std.fmt.allocPrintSentinel(self.allocator, "UPDATE zigcho.stats st SET " ++
             "total_score=coalesce((SELECT sum(s.score) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT sum({s}) FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
             "plays=coalesce((SELECT count(*) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT count(*) FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
@@ -5174,7 +5197,7 @@ pub const Store = struct {
             "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted AND u.show_profile_stats ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET $3";
         const lazer_sql =
             "WITH source_scores AS (" ++
-            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
+            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
             "FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$1 AND s.rank_namespace=$2)," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
@@ -5486,7 +5509,7 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=$1";
         const lazer_stats_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3)," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3)," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*)::double precision))) pp,sum(accuracy*power(0.95,performance_index))/(20*(1-power(0.95,count(*)::double precision))) accuracy FROM ranked GROUP BY user_id)," ++
@@ -6322,7 +6345,7 @@ pub const Store = struct {
         const ruleset_id = try param(&buffers, &cursor, input.ruleset_id);
         const total_score = try param(&buffers, &cursor, input.total_score);
         const total_score_without_mods = try param(&buffers, &cursor, input.total_score_without_mods);
-        const legacy_total_score: ?[]const u8 = if (input.legacy_total_score) |value| try param(&buffers, &cursor, value) else null;
+        const legacy_total_score = try param(&buffers, &cursor, lazer.classicTotalScore(input));
         const accuracy = try param(&buffers, &cursor, input.accuracy);
         const max_combo = try param(&buffers, &cursor, input.max_combo);
         const pp_text = try param(&buffers, &cursor, pp_value);
@@ -6381,7 +6404,7 @@ pub const Store = struct {
         const user = try param(&buffers, &cursor, user_id);
         const beatmap_id = try param(&buffers, &cursor, input.beatmap_id);
         const stats_mode_text = try param(&buffers, &cursor, stats_mode);
-        const legacy_score = try param(&buffers, &cursor, input.legacy_total_score orelse input.total_score_without_mods);
+        const legacy_score = try param(&buffers, &cursor, lazer.classicTotalScore(input));
         const max_combo = try param(&buffers, &cursor, input.max_combo);
         const hits = try param(&buffers, &cursor, lazer.totalHits(input));
         const namespace = @tagName(input.namespace);
@@ -6413,7 +6436,7 @@ pub const Store = struct {
         else
             "WITH candidates AS (" ++
                 "SELECT b.id beatmap_id,s.pp,s.accuracy,s.score legacy_score,0 source,s.id score_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4) " ++
-                "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score_without_mods),1,s.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
+                "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score),1,s.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
                 "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
                 "SELECT pp,accuracy,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC";
         var result = try postgres.queryParams(self.allocator, conn, sql, &.{ user, ruleset, namespace });
@@ -6605,7 +6628,7 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=$1";
         const lazer_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace='vanilla')," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace='vanilla')," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*)::double precision))) pp,sum(accuracy*power(0.95,performance_index))/(20*(1-power(0.95,count(*)::double precision))) accuracy FROM ranked GROUP BY user_id)," ++
@@ -7359,7 +7382,7 @@ test "postgres score submissions refresh both sides of a daily rank swap" {
     }
 }
 
-test "postgres runtime migrates through native score semantics schema forty three" {
+test "postgres runtime migrates through Classic score schema forty four" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -7380,7 +7403,7 @@ test "postgres runtime migrates through native score semantics schema forty thre
     defer lease.release();
     var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name='chat_message_id'),(to_regclass('zigcho.direct_messages_chat_message') IS NOT NULL)::int,(SELECT count(*) FROM pg_constraint WHERE connamespace='zigcho'::regnamespace AND conname='direct_messages_chat_message_id_fkey' AND convalidated) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 43), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 44), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -7437,7 +7460,7 @@ test "postgres runtime migrates through native score semantics schema forty thre
     defer score_schema.deinit();
     try std.testing.expectEqual(@as(i64, 987654), try score_schema.int(i64, 0, 0));
     try std.testing.expectEqual(@as(i64, 900000), try score_schema.int(i64, 0, 1));
-    try std.testing.expectEqual(@as(i32, 1), try score_schema.int(i32, 0, 2));
+    try std.testing.expectEqual(@as(i32, 0), try score_schema.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try score_schema.int(i32, 0, 3));
     try std.testing.expectEqual(@as(i32, 1), try score_schema.int(i32, 0, 4));
     var bss_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.beatmap_submissions') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_submission_maps') IS NOT NULL)::int,(to_regclass('zigcho.bss_counters') IS NOT NULL)::int,(SELECT count(*) FROM zigcho.bss_counters),(SELECT min(next_id) FROM zigcho.bss_counters),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='beatmap_submissions' AND column_name='replacement_set_id'),(to_regclass('zigcho.beatmap_submissions_replacement') IS NOT NULL)::int");

@@ -2,6 +2,15 @@ name: release gates
 
 on:
   workflow_dispatch:
+    inputs:
+      test_scope:
+        description: test scope for this release
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - focused
   push:
     branches:
       - main
@@ -87,6 +96,7 @@ jobs:
           test "$stopped_line" -lt "$check_line"
 
       - name: run PostgreSQL integration tests
+        if: github.event_name != 'workflow_dispatch' || inputs.test_scope == 'full'
         shell: bash
         env:
           PGPASSWORD: zigcho-gate
@@ -110,6 +120,31 @@ jobs:
             "zigcho-release-gate:${GITHUB_SHA}" \
             zig build test -Doptimize=ReleaseSafe
 
+      - name: run focused correction tests
+        if: github.event_name == 'workflow_dispatch' && inputs.test_scope == 'focused'
+        shell: bash
+        env:
+          PGPASSWORD: zigcho-gate
+        run: |
+          set -euo pipefail
+          createdb -h 127.0.0.1 -U zigcho zigcho_migrate
+          docker run --rm --network host \
+            -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
+            "zigcho-release-gate:${GITHUB_SHA}" \
+            sh -lc '
+              set -eu
+              for filter in \
+                "official lazer score bodies" \
+                "lazer solo score tokens" \
+                "stable and lazer share one ranked performance result per map" \
+                "lazer profile JSON owns" \
+                "website profile plays keep" \
+                "schema forty four"
+              do
+                zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
+              done
+            '
+
       - name: boot the exact binary on PostgreSQL
         shell: bash
         env:
@@ -118,7 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 43
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 44
           test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!

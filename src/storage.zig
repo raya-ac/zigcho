@@ -376,7 +376,7 @@ pub const Store = struct {
         if (c.sqlite3_prepare_v2(self.db, "PRAGMA user_version", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         if (c.sqlite3_step(stmt) == c.SQLITE_ROW) version = c.sqlite3_column_int(stmt, 0);
         _ = c.sqlite3_finalize(stmt);
-        const needs_score_rebuild = version < 28;
+        const needs_score_rebuild = version < 44;
         if (version < 2) try self.exec(database_sql.sqliteMigration(2));
         if (version < 3) try self.exec(database_sql.sqliteMigration(3));
         if (version < 4) try self.exec(database_sql.sqliteMigration(4));
@@ -511,6 +511,8 @@ pub const Store = struct {
             else
                 try self.exec(database_sql.sqliteMigration(43));
         }
+        if (version < 44) try self.exec(database_sql.sqliteMigration(44));
+        try self.backfillLazerClassicScores();
         try self.exec("DELETE FROM user_stats_history WHERE day<((unixepoch()/86400)-89)*86400");
         try self.exec(
             "BEGIN IMMEDIATE;" ++
@@ -825,6 +827,31 @@ pub const Store = struct {
         );
     }
 
+    fn backfillLazerClassicScores(self: *Store) !void {
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var rows: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT id,ruleset_id,total_score,statistics_json,maximum_statistics_json FROM lazer_scores WHERE legacy_total_score IS NULL ORDER BY id", -1, &rows, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(rows);
+        var update: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE lazer_scores SET legacy_total_score=?1 WHERE id=?2 AND legacy_total_score IS NULL", -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(update);
+        while (c.sqlite3_step(rows) == c.SQLITE_ROW) {
+            const id = c.sqlite3_column_int64(rows, 0);
+            const ruleset_id = c.sqlite3_column_int64(rows, 1);
+            const total_score = c.sqlite3_column_int64(rows, 2);
+            const statistics_json = std.mem.span(c.sqlite3_column_text(rows, 3));
+            const maximum_statistics_json = std.mem.span(c.sqlite3_column_text(rows, 4));
+            const classic = lazer.classicTotalScoreFromJson(self.allocator, ruleset_id, total_score, statistics_json, maximum_statistics_json) catch lazer.stableLegacyTotalScore(total_score);
+            _ = c.sqlite3_reset(update);
+            _ = c.sqlite3_clear_bindings(update);
+            _ = c.sqlite3_bind_int(update, 1, classic);
+            _ = c.sqlite3_bind_int64(update, 2, id);
+            if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
+        try self.exec("COMMIT");
+    }
+
     fn rebuildScoreStats(self: *Store, own_transaction: bool) !void {
         if (own_transaction) try self.exec("BEGIN IMMEDIATE");
         errdefer if (own_transaction) self.exec("ROLLBACK") catch {};
@@ -844,7 +871,7 @@ pub const Store = struct {
         const lazer_internal_mode = "CASE l.rank_namespace WHEN 'vanilla' THEN l.ruleset_id WHEN 'relax' THEN l.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END";
         const lazer_hits = "coalesce(CAST(json_extract(l.statistics_json,'$.meh') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.ok') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.good') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.great') AS INTEGER),0)+coalesce(CAST(json_extract(l.statistics_json,'$.perfect') AS INTEGER),0)";
         const rebuild_sql = "UPDATE stats SET " ++
-            "total_score=coalesce((SELECT sum(s.score) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT sum(coalesce(l.legacy_total_score,l.total_score_without_mods)) FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
+            "total_score=coalesce((SELECT sum(s.score) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT sum(coalesce(l.legacy_total_score,l.total_score)) FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
             "plays=coalesce((SELECT count(*) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT count(*) FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
             "play_time=coalesce((SELECT sum(s.time_elapsed/1000) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT sum(max(b.total_length,0)) FROM lazer_scores l JOIN beatmaps b ON b.id=l.beatmap_id WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
             "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN (1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM scores s WHERE s.user_id=stats.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=stats.mode),0)+coalesce((SELECT sum(" ++ lazer_hits ++ ") FROM lazer_scores l WHERE l.user_id=stats.user_id AND " ++ lazer_internal_mode ++ "=stats.mode),0)," ++
@@ -4145,7 +4172,7 @@ pub const Store = struct {
             "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country=1 THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0 AND u.show_profile_stats=1 ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET ?3";
         const lazer_sql =
             "WITH source_scores AS (" ++
-            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
+            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
             "FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?1 AND s.rank_namespace=?2)," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
@@ -4486,7 +4513,7 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=?1";
         const lazer_stats_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,max(b.total_length,0) play_time,b.status,s.beatmap_id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?2 AND s.rank_namespace=?3)," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,max(b.total_length,0) play_time,b.status,s.beatmap_id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?2 AND s.rank_namespace=?3)," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*pow(0.95,performance_index))+416.6667*(1-pow(0.9994,count(*)))) pp,sum(accuracy*pow(0.95,performance_index))/(20*(1-pow(0.95,count(*)))) accuracy FROM ranked GROUP BY user_id)," ++
@@ -5197,7 +5224,7 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND u.restricted=0)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=?1";
         const lazer_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,max(b.total_length,0) play_time,b.status,s.beatmap_id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?2 AND s.rank_namespace='vanilla')," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,max(b.total_length,0) play_time,b.status,s.beatmap_id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=?2 AND s.rank_namespace='vanilla')," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed=1 AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*pow(0.95,performance_index))+416.6667*(1-pow(0.9994,count(*)))) pp,sum(accuracy*pow(0.95,performance_index))/(20*(1-pow(0.95,count(*)))) accuracy FROM ranked GROUP BY user_id)," ++
@@ -5914,7 +5941,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int64(stmt, 3, input.ruleset_id);
         _ = c.sqlite3_bind_int64(stmt, 4, input.total_score);
         _ = c.sqlite3_bind_int64(stmt, 5, input.total_score_without_mods);
-        if (input.legacy_total_score) |n| _ = c.sqlite3_bind_int(stmt, 6, n) else _ = c.sqlite3_bind_null(stmt, 6);
+        _ = c.sqlite3_bind_int(stmt, 6, lazer.classicTotalScore(input));
         _ = c.sqlite3_bind_double(stmt, 7, input.accuracy);
         _ = c.sqlite3_bind_int64(stmt, 8, input.max_combo);
         _ = c.sqlite3_bind_int(stmt, 9, @intFromBool(input.passed));
@@ -5980,7 +6007,7 @@ pub const Store = struct {
         const map_status = c.sqlite3_column_int(map, 1);
         const play_time = c.sqlite3_column_int64(map, 2);
         const namespace = @tagName(input.namespace);
-        const legacy_score = input.legacy_total_score orelse input.total_score_without_mods;
+        const legacy_score = lazer.classicTotalScore(input);
         const hits = lazer.totalHits(input);
 
         var update: ?*c.sqlite3_stmt = null;
@@ -6010,7 +6037,7 @@ pub const Store = struct {
         const sql =
             "WITH candidates AS (" ++
             "SELECT b.id beatmap_id,s.pp,s.accuracy,s.score legacy_score,0 source,s.id score_id FROM scores s JOIN beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=?1 AND s.mode=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4) " ++
-            "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score_without_mods),1,s.id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4))," ++
+            "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score),1,s.id FROM lazer_scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=?1 AND s.ruleset_id=?2 AND s.rank_namespace=?3 AND s.passed=1 AND b.status IN(3,4))," ++
             "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
             "SELECT pp,accuracy,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC";
         var stmt: ?*c.sqlite3_stmt = null;

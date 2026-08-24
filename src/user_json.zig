@@ -327,9 +327,25 @@ fn writeRankHistory(writer: *std.Io.Writer, ruleset_id: u8, history: domain.Stat
     try writer.writeAll("{\"mode\":");
     try std.json.Stringify.value(rulesetName(ruleset_id), .{}, writer);
     try writer.writeAll(",\"data\":[");
-    for (history.slice(), 0..) |point, index| {
-        if (index != 0) try writer.writeByte(',');
-        try writer.print("{d}", .{point.global_rank});
+    const raw = history.slice();
+    if (raw.len != 0) {
+        const wanted_points: usize = 89;
+        const start = raw.len -| wanted_points;
+        const points = raw[start..];
+        const duplicate_single: usize = @intFromBool(points.len == 1);
+        const padding = wanted_points - points.len - duplicate_single;
+        for (0..padding) |index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeByte('0');
+        }
+        if (duplicate_single != 0) {
+            if (padding != 0) try writer.writeByte(',');
+            try writer.print("{d}", .{points[0].global_rank});
+        }
+        for (points, 0..) |point, index| {
+            if (padding != 0 or duplicate_single != 0 or index != 0) try writer.writeByte(',');
+            try writer.print("{d}", .{point.global_rank});
+        }
     }
     try writer.writeAll("]}");
 }
@@ -644,9 +660,9 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectApproxEqAbs(@as(f64, 93.53), object.get("statistics").?.object.get("hit_accuracy").?.float, 0.0001);
     const rank_history = object.get("rank_history").?.object;
     try std.testing.expectEqualStrings("mania", rank_history.get("mode").?.string);
-    try std.testing.expectEqual(@as(usize, 3), rank_history.get("data").?.array.items.len);
-    try std.testing.expectEqual(@as(i64, 3), rank_history.get("data").?.array.items[0].integer);
-    try std.testing.expectEqual(@as(i64, 1), rank_history.get("data").?.array.items[2].integer);
+    try std.testing.expectEqual(@as(usize, 89), rank_history.get("data").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 3), rank_history.get("data").?.array.items[86].integer);
+    try std.testing.expectEqual(@as(i64, 1), rank_history.get("data").?.array.items[88].integer);
     try std.testing.expectEqual(@as(i64, 300), object.get("zigcho_statistics").?.object.get("stable").?.object.get("pp").?.integer);
     try std.testing.expectEqual(@as(i64, 124), object.get("zigcho_statistics").?.object.get("lazer").?.object.get("pp").?.integer);
     try std.testing.expectEqual(@as(i64, 3), object.get("zigcho_score_counts").?.object.get("stable").?.object.get("recent").?.integer);
@@ -713,8 +729,8 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqual(@as(i64, 4), stats_only_counts.get("lazer").?.object.get("best").?.integer);
     try std.testing.expectEqual(@as(i64, 0), stats_only_counts.get("lazer").?.object.get("recent").?.integer);
     const stats_only_history = parsed_stats_only.value.object.get("rank_history").?.object.get("data").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), stats_only_history.len);
-    try std.testing.expectEqual(@as(i64, 3), stats_only_history[0].integer);
+    try std.testing.expectEqual(@as(usize, 89), stats_only_history.len);
+    try std.testing.expectEqual(@as(i64, 3), stats_only_history[86].integer);
     try std.testing.expectEqual(@as(i64, 2), stats_only_history[stats_only_history.len - 1].integer);
     try std.testing.expectEqual(@as(i64, 0), parsed_stats_only.value.object.get("scores_recent_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), parsed_stats_only.value.object.get("beatmap_playcounts_count").?.integer);

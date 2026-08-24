@@ -1,0 +1,3 @@
+BEGIN IMMEDIATE;
+PRAGMA user_version=44;
+COMMIT;

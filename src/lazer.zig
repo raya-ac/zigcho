@@ -332,6 +332,7 @@ pub fn performanceState(input: ScoreInput) !?PerformanceState {
         .n100 = if (input.ruleset_id == 2) statistic(input, "large_tick_hit") else statistic(input, "ok"),
         .n50 = if (input.ruleset_id == 2) statistic(input, "small_tick_hit") else statistic(input, "meh"),
         .misses = statistic(input, "miss"),
+        // PP inputs are intentionally unchanged by the profile-score fix.
         .legacy_total_score = @intCast(@min(input.total_score_without_mods, std.math.maxInt(u32))),
     };
 }
@@ -442,6 +443,71 @@ pub fn stableLegacyTotalScore(total_score: i64) i32 {
     return @intCast(std.math.clamp(total_score, 0, @as(i64, std.math.maxInt(i32))));
 }
 
+fn basicJudgementCount(statistics: std.json.ObjectMap) i64 {
+    const names = [_][]const u8{ "miss", "meh", "ok", "good", "great", "perfect" };
+    var count: i64 = 0;
+    for (names) |name| {
+        const value = statistics.get(name) orelse continue;
+        if (value != .integer or value.integer <= 0) continue;
+        count += value.integer;
+    }
+    return count;
+}
+
+fn roundToEven(value: f64) f64 {
+    const lower = @floor(value);
+    const fraction = value - lower;
+    if (fraction < 0.5) return lower;
+    if (fraction > 0.5) return lower + 1;
+    return if (@mod(lower, 2.0) == 0) lower else lower + 1;
+}
+
+pub fn classicTotalScore(input: ScoreInput) i32 {
+    var object_count = if (input.maximum_statistics) |maximum| basicJudgementCount(maximum) else 0;
+    // Older room payloads did not retain maximum_statistics. Their actual basic
+    // judgements are the closest recoverable object count and avoid silently
+    // falling back to the unrelated score-without-mods field.
+    if (object_count == 0) object_count = basicJudgementCount(input.statistics);
+    const score: f64 = @floatFromInt(input.total_score);
+    const objects: f64 = @floatFromInt(object_count);
+    const converted = switch (input.ruleset_id) {
+        0 => roundToEven((objects * objects * 32.57 + 100_000.0) * score / 1_000_000.0),
+        1 => roundToEven((objects * 1109.0 + 100_000.0) * score / 1_000_000.0),
+        2 => roundToEven(std.math.pow(f64, score / 1_000_000.0 * objects, 2) * 21.62 + score / 10.0),
+        else => score,
+    };
+    if (!std.math.isFinite(converted) or converted <= 0) return 0;
+    return @intFromFloat(@min(converted, @as(f64, @floatFromInt(std.math.maxInt(i32)))));
+}
+
+pub fn classicTotalScoreFromJson(allocator: std.mem.Allocator, ruleset_id: i64, total_score: i64, statistics_json: []const u8, maximum_statistics_json: []const u8) !i32 {
+    var parsed_statistics = try std.json.parseFromSlice(std.json.Value, allocator, statistics_json, .{});
+    defer parsed_statistics.deinit();
+    const statistics = switch (parsed_statistics.value) {
+        .object => |value| value,
+        else => return error.InvalidScore,
+    };
+    var parsed_maximum = try std.json.parseFromSlice(std.json.Value, allocator, maximum_statistics_json, .{});
+    defer parsed_maximum.deinit();
+    const maximum_statistics = switch (parsed_maximum.value) {
+        .object => |value| value,
+        else => return error.InvalidScore,
+    };
+    return classicTotalScore(.{
+        .beatmap_id = 1,
+        .ruleset_id = ruleset_id,
+        .total_score = total_score,
+        .total_score_without_mods = total_score,
+        .accuracy = 0,
+        .max_combo = 0,
+        .passed = false,
+        .mods = null,
+        .statistics = statistics,
+        .maximum_statistics = maximum_statistics,
+        .namespace = .vanilla,
+    });
+}
+
 test "stable scores clamp to lazer's nullable int32 legacy field" {
     try std.testing.expectEqual(@as(i32, 0), stableLegacyTotalScore(-1));
     try std.testing.expectEqual(@as(i32, 1_000_000), stableLegacyTotalScore(1_000_000));
@@ -474,6 +540,12 @@ pub fn parseScore(value: std.json.Value) !ScoreInput {
         else => return error.InvalidScore,
     };
     try validateStatistics(statistics);
+    const maximum_statistics: ?std.json.ObjectMap = if (obj.get("maximum_statistics")) |maximum_value| switch (maximum_value) {
+        .object => |v| v,
+        .null => null,
+        else => return error.InvalidScore,
+    } else null;
+    if (maximum_statistics) |maximum| try validateStatistics(maximum);
     const client_version: ?[]const u8 = if (obj.get("client_version")) |client_value| switch (client_value) {
         .string => |v| v,
         .null => null,
@@ -492,6 +564,7 @@ pub fn parseScore(value: std.json.Value) !ScoreInput {
         .passed = passed,
         .mods = mods,
         .statistics = statistics,
+        .maximum_statistics = maximum_statistics,
         .client_version = client_version,
         .namespace = namespace,
     };

@@ -1700,7 +1700,8 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "https://assets.ppy.sh/old-flags/") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "String.fromCodePoint") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "s.client==='lazer'?'native score':'stable score'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "score without mods") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "score without mods") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "w/o mods") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "https://assets.ppy.sh/medals/web/") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"achievement-icon\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "achievement-recent") != null);
@@ -1709,7 +1710,8 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "custom-achievement-icon") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"rank-history-chart\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "tracking starts now") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "if(points.length<2)return `<section class=\"rank-history\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "if(points.length<2)return `<section class=\"rank-history\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "chartPoints=points.length===1") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-history-metric=\"rank\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-history-metric=\"pp\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "bindProfileHistory(stats)") != null);
@@ -5842,7 +5844,7 @@ test "lazer storage only accepts the typed score input" {
     try std.testing.expectEqual(@as(i64, 75), storage.c.sqlite3_column_int64(stmt, 0));
     try std.testing.expectEqual(@as(i64, 0), storage.c.sqlite3_column_int64(stmt, 1));
     try std.testing.expectEqual(@as(i64, 987654), storage.c.sqlite3_column_int64(stmt, 2));
-    try std.testing.expectEqual(@as(i64, 900000), storage.c.sqlite3_column_int64(stmt, 3));
+    try std.testing.expectEqual(@as(i64, 98765), storage.c.sqlite3_column_int64(stmt, 3));
     try std.testing.expectApproxEqAbs(@as(f64, 0.985), storage.c.sqlite3_column_double(stmt, 4), 0.000001);
     try std.testing.expectEqual(@as(i64, 321), storage.c.sqlite3_column_int64(stmt, 5));
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 6));
@@ -6081,6 +6083,17 @@ test "official lazer score bodies allow omitted mods and reject hostile counters
     try std.testing.expectEqual(@as(?i32, null), input.legacy_total_score);
     try std.testing.expect(input.mods == null);
     try std.testing.expectEqual(lazer.Namespace.vanilla, input.namespace);
+    try std.testing.expectEqual(@as(i64, 302), input.maximum_statistics.?.get("great").?.integer);
+    try std.testing.expectEqual(@as(i32, 3_032_606), lazer.classicTotalScore(input));
+    var taiko = input;
+    taiko.ruleset_id = 1;
+    try std.testing.expectEqual(@as(i32, 429_549), lazer.classicTotalScore(taiko));
+    var catch_score = input;
+    catch_score.ruleset_id = 2;
+    try std.testing.expectEqual(@as(i32, 2_022_208), lazer.classicTotalScore(catch_score));
+    var mania = input;
+    mania.ruleset_id = 3;
+    try std.testing.expectEqual(@as(i32, 987_654), lazer.classicTotalScore(mania));
 
     const invalid = [_][]const u8{
         "{\"rank\":\"SSS\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[]}",
@@ -6344,7 +6357,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(score_id, listed.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, 987654), listed.get("total_score").?.integer);
     try std.testing.expectEqual(@as(i64, 900000), listed.get("total_score_without_mods").?.integer);
-    try std.testing.expect(std.meta.activeTag(listed.get("legacy_total_score").?) == .null);
+    try std.testing.expectEqual(@as(i64, 3032606), listed.get("legacy_total_score").?.integer);
     try std.testing.expectEqualStrings("A", listed.get("rank").?.string);
     try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
     try std.testing.expect(listed.get("ranked").?.bool);
@@ -6367,7 +6380,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(score_id, recent_score.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, 987654), recent_score.get("total_score").?.integer);
     try std.testing.expectEqual(@as(i64, 900000), recent_score.get("total_score_without_mods").?.integer);
-    try std.testing.expect(std.meta.activeTag(recent_score.get("legacy_total_score").?) == .null);
+    try std.testing.expectEqual(@as(i64, 3032606), recent_score.get("legacy_total_score").?.integer);
     try std.testing.expectEqual(@as(i64, 75), recent_score.get("beatmap").?.object.get("id").?.integer);
     try std.testing.expectEqualStrings("artist", recent_score.get("beatmap").?.object.get("beatmapset").?.object.get("artist").?.string);
     try std.testing.expect(recent_score.get("preserve").?.bool);
@@ -6378,7 +6391,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer parsed_score_detail.deinit();
     try std.testing.expectEqual(@as(i64, 987654), parsed_score_detail.value.object.get("total_score").?.integer);
     try std.testing.expectEqual(@as(i64, 900000), parsed_score_detail.value.object.get("total_score_without_mods").?.integer);
-    try std.testing.expect(std.meta.activeTag(parsed_score_detail.value.object.get("legacy_total_score").?) == .null);
+    try std.testing.expectEqual(@as(i64, 3032606), parsed_score_detail.value.object.get("legacy_total_score").?.integer);
     const stored_replay = (try store.lazerReplay(std.testing.allocator, score_id)).?;
     defer std.testing.allocator.free(stored_replay);
     try std.testing.expectEqualSlices(u8, &replay, stored_replay);
@@ -6456,7 +6469,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer parsed_pinned_second_page.deinit();
     try std.testing.expectEqual(score_id, parsed_pinned_second_page.value.array.items[0].object.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, 900000), parsed_pinned_second_page.value.array.items[0].object.get("total_score_without_mods").?.integer);
-    try std.testing.expect(std.meta.activeTag(parsed_pinned_second_page.value.array.items[0].object.get("legacy_total_score").?) == .null);
+    try std.testing.expectEqual(@as(i64, 3032606), parsed_pinned_second_page.value.array.items[0].object.get("legacy_total_score").?.integer);
     const stable_pinned = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .pinned, .stable, 0, 50);
     defer std.testing.allocator.free(stable_pinned);
     var parsed_pinned = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stable_pinned, .{});
@@ -6550,7 +6563,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "ranked play ratings migrate and apply each room once per ruleset" {
@@ -6571,7 +6584,7 @@ test "ranked play ratings migrate and apply each room once per ruleset" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('lazer_ranked_ratings','lazer_ranked_matches'))", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(version_stmt, 0));
     try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(version_stmt, 1));
 
     const initial = try store.lazerRankedRating(10, 0);
@@ -6655,7 +6668,7 @@ test "schema forty widens chat read cursors and preserves public acknowledgement
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT instr(sql,'2000000001') FROM sqlite_master WHERE type='table' AND name='lazer_channel_reads')", -1, &schema, null));
     defer _ = storage.c.sqlite3_finalize(schema);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(schema));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(schema, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(schema, 0));
     try std.testing.expect(storage.c.sqlite3_column_int(schema, 1) > 0);
 }
 
@@ -6737,7 +6750,7 @@ test "schema forty two stores constrained profile history and replay views" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='user_stats_history'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='user_stats_history_lookup'),(SELECT count(*) FROM user_stats_history),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='score_replay_views'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='score_replay_views_owner'),(SELECT count(*) FROM score_replay_views),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='user_stats_history_retention'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='friends_inbound')", -1, &schema, null));
     defer _ = storage.c.sqlite3_finalize(schema);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(schema));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(schema, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(schema, 0));
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 1));
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 2));
     try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(schema, 3));
@@ -6748,7 +6761,7 @@ test "schema forty two stores constrained profile history and replay views" {
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 8));
 }
 
-test "schema forty three separates native score without mods from nullable legacy score" {
+test "schema forty four backfills Classic score without confusing score without mods" {
     const expectConstraint = struct {
         fn run(db: *storage.c.sqlite3, sql: [:0]const u8) !void {
             var message: [*c]u8 = null;
@@ -6781,10 +6794,10 @@ test "schema forty three separates native score without mods from nullable legac
     var migrated: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score,total_score_without_mods,legacy_total_score FROM lazer_scores WHERE id=1", -1, &migrated, null));
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(migrated));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(migrated, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(migrated, 0));
     try std.testing.expectEqual(@as(i64, 987654), storage.c.sqlite3_column_int64(migrated, 1));
     try std.testing.expectEqual(@as(i64, 900000), storage.c.sqlite3_column_int64(migrated, 2));
-    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_NULL), storage.c.sqlite3_column_type(migrated, 3));
+    try std.testing.expectEqual(@as(i64, 98765), storage.c.sqlite3_column_int64(migrated, 3));
     _ = storage.c.sqlite3_finalize(migrated);
     try expectConstraint(store.db, "UPDATE lazer_scores SET legacy_total_score=2147483648 WHERE id=1");
     try expectConstraint(store.db, "UPDATE lazer_scores SET total_score_without_mods=1000000000001 WHERE id=1");
@@ -6802,9 +6815,9 @@ test "schema forty three separates native score without mods from nullable legac
     var repaired: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score_without_mods,legacy_total_score,(SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'lazer_scores_%score%') FROM lazer_scores WHERE id=1", -1, &repaired, null));
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(repaired));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(repaired, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(repaired, 0));
     try std.testing.expectEqual(@as(i64, 765432), storage.c.sqlite3_column_int64(repaired, 1));
-    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_NULL), storage.c.sqlite3_column_type(repaired, 2));
+    try std.testing.expectEqual(@as(i64, 98765), storage.c.sqlite3_column_int64(repaired, 2));
     try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(repaired, 3));
     _ = storage.c.sqlite3_finalize(repaired);
 
@@ -6814,7 +6827,7 @@ test "schema forty three separates native score without mods from nullable legac
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score_without_mods,legacy_total_score FROM lazer_scores WHERE id=1", -1, &compatible, null));
     defer _ = storage.c.sqlite3_finalize(compatible);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(compatible));
-    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(compatible, 0));
+    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(compatible, 0));
     try std.testing.expectEqual(@as(i64, 888000), storage.c.sqlite3_column_int64(compatible, 1));
     try std.testing.expectEqual(@as(i64, 777000), storage.c.sqlite3_column_int64(compatible, 2));
 }
@@ -7309,8 +7322,8 @@ test "stable and lazer share one ranked performance result per map" {
     const token = try store.createLazerScoreToken(1, 75, "11111111111111111111111111111111", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     _ = try store.submitLazerScoreToken(1, 75, token, lazer_input, 350, "[]", "{\"great\":90,\"miss\":10}", "{\"great\":100}", "[]", &.{});
     const after_lazer = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 900), after_lazer.ranked_score);
-    try std.testing.expectEqual(@as(i64, 1900), after_lazer.total_score);
+    try std.testing.expectEqual(@as(i64, 639), after_lazer.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1639), after_lazer.total_score);
     try std.testing.expectEqual(@as(i32, 350), after_lazer.pp);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), after_lazer.accuracy, 0.000001);
 
@@ -7320,7 +7333,7 @@ test "stable and lazer share one ranked performance result per map" {
     _ = try store.insertStableScore(1, later_stable, 400, "later stable replay", 10_000);
     const after_stable = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 1200), after_stable.ranked_score);
-    try std.testing.expectEqual(@as(i64, 3100), after_stable.total_score);
+    try std.testing.expectEqual(@as(i64, 2839), after_stable.total_score);
     try std.testing.expectEqual(@as(i32, 400), after_stable.pp);
     try std.testing.expectApproxEqAbs(@as(f64, 1), after_stable.accuracy, 0.000001);
 
@@ -7348,7 +7361,7 @@ test "stable and lazer share one ranked performance result per map" {
     const lazer_profile = (try store.siteProfile(std.testing.allocator, 1, .lazer, 0)).?;
     defer std.testing.allocator.free(lazer_profile);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_source\":\"lazer\",\"stats_source\":\"lazer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":900,\"total_score\":900,\"pp\":350,\"plays\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":639,\"total_score\":639,\"pp\":350,\"plays\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"stable\"") == null);
     var parsed_lazer_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_profile, .{});
@@ -7356,18 +7369,18 @@ test "stable and lazer share one ranked performance result per map" {
     const lazer_profile_play = parsed_lazer_profile.value.object.get("recent_scores").?.array.items[0].object;
     try std.testing.expectEqual(@as(i64, 1500), lazer_profile_play.get("score").?.integer);
     try std.testing.expectEqual(@as(i64, 900), lazer_profile_play.get("score_without_mods").?.integer);
-    try std.testing.expect(std.meta.activeTag(lazer_profile_play.get("legacy_score").?) == .null);
+    try std.testing.expectEqual(@as(i64, 639), lazer_profile_play.get("legacy_score").?.integer);
     const lazer_first_place = parsed_lazer_profile.value.object.get("first_place_scores").?.array.items[0].object;
     try std.testing.expectEqual(@as(i64, 900), lazer_first_place.get("score_without_mods").?.integer);
-    try std.testing.expect(std.meta.activeTag(lazer_first_place.get("legacy_score").?) == .null);
+    try std.testing.expectEqual(@as(i64, 639), lazer_first_place.get("legacy_score").?.integer);
     const stable_source_stats = (try store.sourceStatsForUser(1, 0, .stable)).?;
     const lazer_source_stats = (try store.sourceStatsForUser(1, 0, .lazer)).?;
     try std.testing.expectEqual(@as(i64, 1200), stable_source_stats.ranked_score);
     try std.testing.expectEqual(@as(i64, 2200), stable_source_stats.total_score);
     try std.testing.expectEqual(@as(i32, 400), stable_source_stats.pp);
     try std.testing.expectEqual(@as(i32, 2), stable_source_stats.plays);
-    try std.testing.expectEqual(@as(i64, 900), lazer_source_stats.ranked_score);
-    try std.testing.expectEqual(@as(i64, 900), lazer_source_stats.total_score);
+    try std.testing.expectEqual(@as(i64, 639), lazer_source_stats.ranked_score);
+    try std.testing.expectEqual(@as(i64, 639), lazer_source_stats.total_score);
     try std.testing.expectEqual(@as(i32, 350), lazer_source_stats.pp);
     try std.testing.expectEqual(@as(i32, 1), lazer_source_stats.plays);
     const combined_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 75, .all, 0)).?;
@@ -7386,7 +7399,7 @@ test "stable and lazer share one ranked performance result per map" {
     _ = try store.applyBeatmapRankAction(1, stable_input.map_md5, .rank, "rebuild combined client stats");
     const rebuilt = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i64, 1200), rebuilt.ranked_score);
-    try std.testing.expectEqual(@as(i64, 3100), rebuilt.total_score);
+    try std.testing.expectEqual(@as(i64, 2839), rebuilt.total_score);
     try std.testing.expectEqual(@as(i32, 400), rebuilt.pp);
     try std.testing.expectEqual(@as(i32, 3), rebuilt.plays);
     try std.testing.expectApproxEqAbs(@as(f64, 1), rebuilt.accuracy, 0.000001);

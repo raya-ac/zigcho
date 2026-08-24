@@ -737,4 +737,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (43);
+INSERT INTO schema_migrations(version) VALUES (44);

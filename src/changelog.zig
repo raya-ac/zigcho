@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const latest_version = "2026.825.0";
+pub const latest_version = "2026.825.1";
 pub const max_updates: usize = 256;
 pub const max_build_id: i64 = @divFloor(std.math.maxInt(i64) - @as(i64, max_updates - 1), 100);
 
@@ -20,6 +20,9 @@ pub const Build = struct {
 };
 
 pub const fallback_builds = [_]Build{
+    .{ .id = 37, .version = "2026.825.1", .display_version = "zigcho release 1.1.1", .created_at = "2026-08-25T01:18:00+09:30", .updates = &.{
+        .{ .name = "2026-08-25-classic-score-and-profile-graphs.md", .created_at = "2026-08-25T01:18:00+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-25-classic-score-and-profile-graphs.md") },
+    } },
     .{ .id = 36, .version = "2026.825.0", .display_version = "zigcho release 1.1", .created_at = "2026-08-25T00:19:25+09:30", .updates = &.{
         .{ .name = "2026-08-25-shared-profiles-and-score-state.md", .created_at = "2026-08-25T00:19:25+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-25-shared-profiles-and-score-state.md") },
     } },

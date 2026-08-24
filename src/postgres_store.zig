@@ -7547,6 +7547,16 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"weight\":{\"percentage\":100.00,\"pp\":26.80}") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
+    {
+        var user_id_buf: [24]u8 = undefined;
+        const user_id_text = try std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var map_insert = try postgres.query(lease.conn, "INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(3,3,'33333333333333333333333333333333','first artist','first title','first diff','mapper',3,10)");
+        map_insert.deinit();
+        var first_insert = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES($1,'33333333333333333333333333333333',0,0,1234,1,1,10,10,0,0,0,0,0,true,true,'first-replay'::bytea,'vanilla',true)", &.{user_id_text});
+        first_insert.deinit();
+    }
     try store.updateSiteProfile(user_id, .{ .bio = "postgres profile", .title = "mapper", .pronouns = "they/them", .location = "adelaide", .website = "https://kai.ovh", .accent = .mint, .preferred_mode = 2, .profile_source = .lazer, .avatar_key = 2, .show_country = false, .show_profile_stats = false, .show_recent_scores = false });
     const hidden_lookup = (try store.userById(std.testing.allocator, user_id)).?;
     defer std.testing.allocator.free(hidden_lookup.name);
@@ -7579,6 +7589,14 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, hidden_owner_profile, "\"recent_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, hidden_owner_profile, "\"first_place_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, hidden_owner_profile, "\"first_place_scores\":[{") != null);
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var first_delete = try postgres.query(lease.conn, "DELETE FROM zigcho.scores WHERE map_md5='33333333333333333333333333333333'");
+        first_delete.deinit();
+        var map_delete = try postgres.query(lease.conn, "DELETE FROM zigcho.beatmaps WHERE id=3");
+        map_delete.deinit();
+    }
     try store.updateSiteProfile(user_id, .{ .bio = "postgres profile", .title = "mapper", .pronouns = "they/them", .location = "adelaide", .website = "https://kai.ovh", .accent = .mint, .preferred_mode = 2, .profile_source = .lazer, .avatar_key = 2, .show_country = true, .show_profile_stats = true, .show_recent_scores = true });
     var relax = score;
     relax.online_checksum = "ffffffffffffffffffffffffffffffff";

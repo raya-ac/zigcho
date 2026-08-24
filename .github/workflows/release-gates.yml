@@ -133,7 +133,7 @@ jobs:
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
-            sh -lc '
+            sh -c '
               set -eu
               for filter in \
                 "official lazer score bodies" \

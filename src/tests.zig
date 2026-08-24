@@ -6384,6 +6384,8 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i64, 2), parsed_ordered_sets.value.object.get("total").?.integer);
     try std.testing.expectEqual(@as(i64, other_metadata.set_id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, metadata.set_id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[1].object.get("id").?.integer);
+    try std.testing.expect(parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("user") == null);
+    try std.testing.expectEqual(@as(i64, mapper.id), parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[1].object.get("user").?.object.get("id").?.integer);
     try std.testing.expect(!parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("availability").?.object.get("download_disabled").?.bool);
     const search = try store.stableSearch(std.testing.allocator, "Fixture", -1, 4, 0);
     defer std.testing.allocator.free(search);

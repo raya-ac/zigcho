@@ -7031,7 +7031,8 @@ pub const Store = struct {
         try jsonString(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 7)));
         try writer.writeAll(",\"related_tags\":");
         try writer.writeAll(lazer.beatmap_tags_array_json);
-        try writer.writeAll(",\"user\":");
+        // The pinned APIBeatmapSet.user setter dereferences null. Search responses
+        // intentionally omit detailed mapper data when it has not been cached.
         var local_profile_stmt: ?*c.sqlite3_stmt = null;
         defer _ = c.sqlite3_finalize(local_profile_stmt);
         if (c.sqlite3_prepare_v2(self.db, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) FROM beatmap_submissions submission JOIN users u ON u.id=submission.owner_id LEFT JOIN team_members tm ON tm.user_id=u.id LEFT JOIN teams t ON t.id=tm.team_id WHERE submission.set_id=?1 AND submission.state='published'", -1, &local_profile_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -7040,6 +7041,7 @@ pub const Store = struct {
         var profile_stmt: ?*c.sqlite3_stmt = null;
         defer _ = c.sqlite3_finalize(profile_stmt);
         if (has_local_profile) {
+            try writer.writeAll(",\"user\":");
             const country = std.mem.span(c.sqlite3_column_text(local_profile_stmt, 3));
             if (country.len != 2) return error.InvalidCountry;
             const local_user: domain.User = .{
@@ -7057,9 +7059,10 @@ pub const Store = struct {
         } else if (creator_id > 0) {
             if (c.sqlite3_prepare_v2(self.db, "SELECT profile_json FROM upstream_user_profiles WHERE user_id=?1 ORDER BY mode=0 DESC,mode LIMIT 1", -1, &profile_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
             _ = c.sqlite3_bind_int(profile_stmt, 1, creator_id);
-            if (c.sqlite3_step(profile_stmt) == c.SQLITE_ROW) try writer.writeAll(std.mem.span(c.sqlite3_column_text(profile_stmt, 0))) else try writer.writeAll("null");
-        } else {
-            try writer.writeAll("null");
+            if (c.sqlite3_step(profile_stmt) == c.SQLITE_ROW) {
+                try writer.writeAll(",\"user\":");
+                try writer.writeAll(std.mem.span(c.sqlite3_column_text(profile_stmt, 0)));
+            }
         }
         try writer.writeAll(",\"beatmaps\":[");
         const maps_sql = "SELECT b.id,b.set_id,b.status,b.md5,b.plays+b.upstream_plays,b.passes+b.upstream_passes,b.mode,b.star_rating,b.hp,b.cs,b.ar,b.od,b.total_length,b.version,b.max_combo,coalesce(m.last_updated,coalesce(strftime('%Y-%m-%dT%H:%M:%SZ',b.last_update,'unixepoch'),'1970-01-01T00:00:00Z')),b.bpm,b.count_circles,b.count_sliders,b.count_spinners,coalesce(owner.id,b.creator_id,0),coalesce(owner.name,b.creator),CASE WHEN b.hit_length>0 THEN b.hit_length ELSE b.total_length END FROM beatmaps b LEFT JOIN beatmapset_metadata m ON m.set_id=b.set_id LEFT JOIN beatmap_submissions submission ON submission.set_id=b.set_id AND submission.state='published' LEFT JOIN users owner ON owner.id=submission.owner_id WHERE b.set_id=?1 ORDER BY b.star_rating,b.id";

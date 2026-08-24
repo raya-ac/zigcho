@@ -2040,10 +2040,12 @@ pub const Store = struct {
         try jsonString(writer, set_result.value(0, 7));
         try writer.writeAll(",\"related_tags\":");
         try writer.writeAll(lazer.beatmap_tags_array_json);
-        try writer.writeAll(",\"user\":");
+        // The pinned APIBeatmapSet.user setter dereferences null. Search responses
+        // intentionally omit detailed mapper data when it has not been cached.
         var local_profile = try postgres.queryParams(self.allocator, conn, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) FROM zigcho.beatmap_submissions submission JOIN zigcho.users u ON u.id=submission.owner_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE submission.set_id=$1 AND submission.state='published'", &.{set});
         defer local_profile.deinit();
         if (local_profile.rows() != 0) {
+            try writer.writeAll(",\"user\":");
             const local_user = try userFromResult(self.allocator, local_profile, 0);
             defer self.allocator.free(local_user.name);
             defer self.allocator.free(local_user.safe_name);
@@ -2053,9 +2055,10 @@ pub const Store = struct {
             const creator = try std.fmt.bufPrint(&creator_buf, "{d}", .{creator_id});
             var profile = try postgres.queryParams(self.allocator, conn, "SELECT profile_json::text FROM zigcho.upstream_user_profiles WHERE user_id=$1 ORDER BY mode=0 DESC,mode LIMIT 1", &.{creator});
             defer profile.deinit();
-            if (profile.rows() != 0) try writer.writeAll(profile.value(0, 0)) else try writer.writeAll("null");
-        } else {
-            try writer.writeAll("null");
+            if (profile.rows() != 0) {
+                try writer.writeAll(",\"user\":");
+                try writer.writeAll(profile.value(0, 0));
+            }
         }
         try writer.writeAll(",\"beatmaps\":[");
         var maps = try postgres.queryParams(self.allocator, conn, "SELECT b.id,b.set_id,b.status,b.md5,b.plays+b.upstream_plays,b.passes+b.upstream_passes,b.mode,b.star_rating,b.hp,b.cs,b.ar,b.od,b.total_length,b.version,b.max_combo,coalesce(m.last_updated,coalesce(to_char(to_timestamp(b.last_update) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),'1970-01-01T00:00:00Z')),b.bpm,b.count_circles,b.count_sliders,b.count_spinners,coalesce(owner.id,b.creator_id,0),coalesce(owner.name,b.creator),CASE WHEN b.hit_length>0 THEN b.hit_length ELSE b.total_length END FROM zigcho.beatmaps b LEFT JOIN zigcho.beatmapset_metadata m ON m.set_id=b.set_id LEFT JOIN zigcho.beatmap_submissions submission ON submission.set_id=b.set_id AND submission.state='published' LEFT JOIN zigcho.users owner ON owner.id=submission.owner_id WHERE b.set_id=$1 ORDER BY b.star_rating,b.id", &.{set});
@@ -6650,6 +6653,7 @@ test "postgres account auth stats and token slice" {
     const ordered_lazer_sets = try store.lazerBeatmapSets(std.testing.allocator, &.{2}, 0, null);
     defer std.testing.allocator.free(ordered_lazer_sets);
     try std.testing.expect(std.mem.indexOf(u8, ordered_lazer_sets, "\"beatmapsets\":[{\"id\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_lazer_sets, "\"user\":null") == null);
     const raw_lazer_score = "{\"beatmap_id\":2,\"ruleset_id\":0,\"total_score\":1234,\"legacy_total_score\":900,\"accuracy\":0.98,\"max_combo\":25,\"passed\":true,\"mods\":[],\"statistics\":{},\"client_version\":\"2026.811.0\"}";
     const parsed_lazer = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw_lazer_score, .{});
     defer parsed_lazer.deinit();

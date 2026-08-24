@@ -429,15 +429,17 @@ index 0000000000000000000000000000000000000000..756a04d4ebfec32affc8a8361f33a023
 +}
 diff --git a/osu.Game.Tests/ZigchoScoreResponseTest.cs b/osu.Game.Tests/ZigchoScoreResponseTest.cs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b1e1e10d6d4217a56ae8877a7f45d64d0f254c60
+index 0000000000000000000000000000000000000000..36d6ed8388820720e0c0740375122d1e021d29c0
 --- /dev/null
 +++ b/osu.Game.Tests/ZigchoScoreResponseTest.cs
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,57 @@
 +// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
 +// See the LICENCE file in the official osu! source tree for full licence text.
 +
++using System.Linq;
 +using Newtonsoft.Json;
 +using NUnit.Framework;
++using osu.Game.Online.API.Requests;
 +using osu.Game.Online.Rooms;
 +
 +namespace osu.Game.Online.Tests
@@ -465,7 +467,27 @@ index 0000000000000000000000000000000000000000..b1e1e10d6d4217a56ae8877a7f45d64d
 +            Assert.That(score.AchievementUnlocks[1].Slug, Is.EqualTo("all-intro-hardrock"));
 +        }
 +
++        [Test]
++        public void TestBeatmapSearchResponseWithoutDetailedMapperDeserialises()
++        {
++            const string response = """
++                                    {"beatmapsets":[{
++                                      "id":1000000002,
++                                      "user_id":4452992,
++                                      "creator":"Ari",
++                                      "title":"fixture",
++                                      "artist":"fixture",
++                                      "beatmaps":[]
++                                    }],"total":1,"cursor":null}
++                                    """;
 +
++            var search = JsonConvert.DeserializeObject<SearchBeatmapSetsResponse>(response);
++
++            Assert.That(search, Is.Not.Null);
++            var set = search!.BeatmapSets.Single();
++            Assert.That(set.Author.Id, Is.EqualTo(4452992));
++            Assert.That(set.Author.Username, Is.EqualTo("Ari"));
++        }
 +    }
 +}
 diff --git a/osu.Game/Beatmaps/APIBeatmapMetadataSource.cs b/osu.Game/Beatmaps/APIBeatmapMetadataSource.cs

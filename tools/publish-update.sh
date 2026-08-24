@@ -78,7 +78,8 @@ short_commit = commit[:8] if commit else "pending"
 repository = os.environ.get("ZIGCHO_RELEASE_REPOSITORY", "raya-ac/zigcho").strip()
 release_url = os.environ.get("ZIGCHO_RELEASE_URL", "").strip()
 client_version = os.environ.get("ZIGCHO_CLIENT_VERSION", "0.1.0-alpha.14").strip()
-schema = os.environ.get("ZIGCHO_SCHEMA", "40").strip()
+builds = os.environ.get("ZIGCHO_RELEASE_BUILDS", "Windows · macOS · Linux · Android · unsigned iOS").strip()
+schema = os.environ.get("ZIGCHO_SCHEMA", "43").strip()
 state = os.environ.get("ZIGCHO_RELEASE_STATE", "live").strip()
 
 commit_value = f"`{short_commit}`"
@@ -89,7 +90,7 @@ release_facts = (
     f"**commit:** {commit_value}\n"
     f"**database:** schema {schema}\n"
     f"**lazer package:** {client_version}\n"
-    "**builds:** Windows · macOS · Linux · Android · unsigned iOS"
+    f"**builds:** {builds}"
 )
 
 fields = [{"name": "release", "value": release_facts, "inline": False}]

@@ -118,7 +118,9 @@ pub const Webhook = struct {
         try w.print("{{\"name\":\"Accuracy\",\"value\":\"{d:.2}%\",\"inline\":true}},", .{data.accuracy * 100.0});
         try w.print("{{\"name\":\"PP\",\"value\":\"{d:.2}\",\"inline\":true}},", .{data.pp});
         try w.print("{{\"name\":\"Score\",\"value\":\"{d}\",\"inline\":true}},", .{data.total_score});
-        try w.print("{{\"name\":\"Mods\",\"value\":\"{s}\",\"inline\":true}},", .{mods_str});
+        try w.writeAll("{\"name\":\"Mods\",\"value\":");
+        try std.json.Stringify.value(mods_str, .{}, &w);
+        try w.writeAll(",\"inline\":true},");
         try w.print("{{\"name\":\"Mode\",\"value\":\"{s}\",\"inline\":true}}", .{mode_str});
         if (data.perfect) try w.writeAll(",{\"name\":\"FC\",\"value\":\"Yes\",\"inline\":true}");
         try w.writeAll("]}]}");
@@ -176,4 +178,30 @@ test "score webhook renders the score specific modded star rating" {
     });
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"★ 6.42\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"value\":\"HR\"") != null);
+}
+
+test "score webhook safely renders lazer mod adjustments" {
+    var buffer: [4096]u8 = undefined;
+    var mod_buffer: [64]u8 = undefined;
+    const json = try Webhook.buildJson(&buffer, &mod_buffer, .{
+        .username = "ari",
+        .user_id = 1,
+        .grade = "A",
+        .mods = 0,
+        .mods_text = "+DT 1.25×DA (AR 9.50, hidden on)",
+        .mode = 0,
+        .rank = 1,
+        .total_score = 900_000,
+        .max_combo = 400,
+        .beatmap_max_combo = 500,
+        .accuracy = 0.98,
+        .pp = 300,
+        .stars = 5,
+        .perfect = false,
+        .artist = "artist",
+        .title = "title",
+        .version = "difficulty",
+        .set_id = 75,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "DT 1.25×DA (AR 9.50, hidden on)") != null);
 }

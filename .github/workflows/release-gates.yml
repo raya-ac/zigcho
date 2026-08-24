@@ -92,13 +92,21 @@ jobs:
           PGPASSWORD: zigcho-gate
         run: |
           set -euo pipefail
+          createdb -h 127.0.0.1 -U zigcho zigcho_pool
           createdb -h 127.0.0.1 -U zigcho zigcho_store
           createdb -h 127.0.0.1 -U zigcho zigcho_migrate
           createdb -h 127.0.0.1 -U zigcho zigcho_bss
+          createdb -h 127.0.0.1 -U zigcho zigcho_room_chat
+          createdb -h 127.0.0.1 -U zigcho zigcho_ranked
+          createdb -h 127.0.0.1 -U zigcho zigcho_history
           docker run --rm --network host \
+            -e 'ZIGCHO_TEST_POSTGRES_URL=host=127.0.0.1 port=5432 dbname=zigcho_pool user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_BSS_URL=host=127.0.0.1 port=5432 dbname=zigcho_bss user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_ROOM_CHAT_URL=host=127.0.0.1 port=5432 dbname=zigcho_room_chat user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_RANKED_URL=host=127.0.0.1 port=5432 dbname=zigcho_ranked user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_HISTORY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             zig build test -Doptimize=ReleaseSafe
 
@@ -110,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 40
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 43
           test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!

@@ -9,7 +9,11 @@ const sqlite = @cImport({
 const required_sqlite_version = 28;
 
 const Kind = enum { text, integer, real, boolean, blob };
-const Column = struct { name: []const u8, kind: Kind };
+const Column = struct {
+    name: []const u8,
+    kind: Kind,
+    source_sql: ?[]const u8 = null,
+};
 const Table = struct {
     name: []const u8,
     columns: []const Column,
@@ -128,7 +132,7 @@ const beatmap_rank_events = [_]Column{
 };
 const lazer_scores = [_]Column{
     .{ .name = "id", .kind = .integer },          .{ .name = "user_id", .kind = .integer },              .{ .name = "beatmap_id", .kind = .integer },
-    .{ .name = "ruleset_id", .kind = .integer },  .{ .name = "total_score", .kind = .integer },          .{ .name = "legacy_total_score", .kind = .integer },
+    .{ .name = "ruleset_id", .kind = .integer },  .{ .name = "total_score", .kind = .integer },          .{ .name = "total_score_without_mods", .kind = .integer, .source_sql = "coalesce(\"legacy_total_score\",\"total_score\")" },
     .{ .name = "accuracy", .kind = .real },       .{ .name = "max_combo", .kind = .integer },            .{ .name = "passed", .kind = .boolean },
     .{ .name = "mods_json", .kind = .text },      .{ .name = "statistics_json", .kind = .text },         .{ .name = "rank_namespace", .kind = .text },
     .{ .name = "client_version", .kind = .text }, .{ .name = "replay", .kind = .blob },                  .{ .name = "submitted_at", .kind = .integer },
@@ -260,11 +264,24 @@ fn appendQuotedColumns(allocator: std.mem.Allocator, list: *std.ArrayList(u8), c
     }
 }
 
+fn appendSourceColumns(allocator: std.mem.Allocator, list: *std.ArrayList(u8), columns: []const Column) !void {
+    for (columns, 0..) |column, index| {
+        if (index != 0) try list.append(allocator, ',');
+        if (column.source_sql) |source_sql| {
+            try list.appendSlice(allocator, source_sql);
+        } else {
+            try list.append(allocator, '"');
+            try list.appendSlice(allocator, column.name);
+            try list.append(allocator, '"');
+        }
+    }
+}
+
 fn sourceSql(allocator: std.mem.Allocator, table: Table) ![:0]u8 {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
     try list.appendSlice(allocator, "SELECT ");
-    try appendQuotedColumns(allocator, &list, table.columns);
+    try appendSourceColumns(allocator, &list, table.columns);
     try list.appendSlice(allocator, " FROM \"");
     try list.appendSlice(allocator, table.name);
     try list.appendSlice(allocator, "\" ORDER BY rowid");

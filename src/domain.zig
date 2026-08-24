@@ -223,9 +223,12 @@ pub const User = struct {
     silence_end: i64 = 0,
     restricted: bool = false,
     online: bool = false,
+    follower_count: i32 = 0,
     banner_version: i64 = 0,
     team: ?TeamSummary = null,
 };
+
+pub const RelationshipAddResult = enum { inserted, existing, ineligible };
 
 pub const ProfileSummary = struct {
     created_at: i64 = 0,
@@ -249,6 +252,7 @@ pub const ProfileSummary = struct {
     nominated_count: i32 = 0,
     guest_count: i32 = 0,
     played_beatmap_count: i32 = 0,
+    follower_count: i32 = 0,
 
     pub fn init(created_at: i64, last_visit: i64, avatar_version: i64, preferred_mode: u8, profile_title: []const u8, profile_location: []const u8, profile_website: []const u8) !ProfileSummary {
         if (preferred_mode > 3 or profile_title.len > 40 or profile_location.len > 60 or profile_website.len > 200) return error.InvalidProfileSummary;
@@ -285,6 +289,7 @@ pub const BatchUserVisibility = struct {
     avatar_version: i64 = 0,
     show_country: bool = true,
     show_profile_stats: bool = true,
+    follower_count: i32 = 0,
 };
 
 test "profile summary owns bounded lazer metadata" {
@@ -314,6 +319,7 @@ pub const Stats = struct {
     max_combo: i32 = 0,
     global_rank: i32 = 0,
     country_rank: i32 = 0,
+    replay_views: i32 = 0,
     grade_ssh: i32 = 0,
     grade_ss: i32 = 0,
     grade_sh: i32 = 0,
@@ -339,6 +345,23 @@ pub const UserScoreCounts = struct {
     firsts: i32 = 0,
     recent: i32 = 0,
     pinned: i32 = 0,
+};
+
+pub const StatsHistoryPoint = struct {
+    day: i64 = 0,
+    pp: i32 = 0,
+    global_rank: i32 = 0,
+};
+
+pub const StatsHistory = struct {
+    pub const max_points = 90;
+
+    points: [max_points]StatsHistoryPoint = [_]StatsHistoryPoint{.{}} ** max_points,
+    len: u8 = 0,
+
+    pub fn slice(self: *const StatsHistory) []const StatsHistoryPoint {
+        return self.points[0..self.len];
+    }
 };
 
 pub const Score = struct {

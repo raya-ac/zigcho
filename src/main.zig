@@ -48,6 +48,7 @@ const object_keys = @import("object_keys.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
+const player_routes = @import("player_routes.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 const lazer_access_lifetime_seconds: i64 = 3600;
@@ -978,6 +979,22 @@ const App = struct {
         user.online = true;
         try bancho.publishLazerPresenceAtEpoch(self.allocator, &self.store, &self.sessions, user, presence_epoch);
         return user;
+    }
+
+    fn websiteViewerId(self: *App, cookie_header: ?[]const u8) ?i32 {
+        const token = web_auth.playerSessionToken(cookie_header) orelse return null;
+        const user = (self.store.authenticateToken(self.allocator, token, web_auth.player_scope) catch |err| {
+            std.log.warn("event=replay_viewer_auth_failed error={t}", .{err});
+            return null;
+        }) orelse return null;
+        defer freeUser(self.allocator, user);
+        return user.id;
+    }
+
+    fn recordReplayViewBestEffort(self: *App, viewer_id: i32, source: storage.ReplaySource, score_id: i64) void {
+        _ = self.store.recordReplayView(viewer_id, source, score_id) catch |err| {
+            std.log.warn("event=replay_view_record_failed viewer_id={d} source={s} score_id={d} error={t}", .{ viewer_id, source.text(), score_id, err });
+        };
     }
 
     fn lazerStats(self: *App, user_id: i32) ![4]?domain.Stats {
@@ -2607,6 +2624,7 @@ const App = struct {
                 try self.store.lazerReplay(self.allocator, score_id);
             const data = replay orelse return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
             defer self.allocator.free(data);
+            self.recordReplayViewBestEffort(user.id, if (stable_score_id != null) .stable else .lazer, stable_score_id orelse score_id);
             var disposition_buf: [96]u8 = undefined;
             const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"kai-{s}-score-{d}.osr\"", .{ if (stable_score_id != null) "stable" else "lazer", stable_score_id orelse score_id });
             return respond(req, .ok, "application/x-osu-replay", data, &.{
@@ -2621,6 +2639,7 @@ const App = struct {
             const score_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
             const replay = (try self.store.siteReplay(self.allocator, score_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
             defer self.allocator.free(replay);
+            if (self.websiteViewerId(cookie_owned)) |viewer_id| self.recordReplayViewBestEffort(viewer_id, .stable, score_id);
             var disposition_buf: [96]u8 = undefined;
             const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"kai-score-{d}.osr\"", .{score_id});
             return respond(req, .ok, "application/octet-stream", replay, &.{
@@ -2635,6 +2654,7 @@ const App = struct {
             const score_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
             const replay = (try self.store.lazerReplay(self.allocator, score_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"replay not found\"}", &.{});
             defer self.allocator.free(replay);
+            if (self.websiteViewerId(cookie_owned)) |viewer_id| self.recordReplayViewBestEffort(viewer_id, .lazer, score_id);
             var disposition_buf: [96]u8 = undefined;
             const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"kai-lazer-score-{d}.osr\"", .{score_id});
             return respond(req, .ok, "application/x-osu-replay", replay, &.{
@@ -3028,10 +3048,12 @@ const App = struct {
             }
             if (req.head.method != .POST) return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &.{});
             const target_id = std.fmt.parseInt(i32, queryField(target, "target") orelse "", 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid target\"}", &.{});
-            const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            const target_user = switch (try player_routes.follow(self.allocator, &self.store, user.id, target_id)) {
+                .not_found => return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{}),
+                .ineligible => return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"user cannot be followed\"}", &.{}),
+                .target => |fresh| fresh,
+            };
             defer freeUser(self.allocator, target_user);
-            if (target_user.restricted or target_user.id == user.id or target_user.id == 3) return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"user cannot be followed\"}", &.{});
-            _ = try self.store.addFriend(user.id, target_user.id);
             const json = try self.friendMutationJson(user.id, target_user);
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
@@ -3573,13 +3595,20 @@ const App = struct {
             defer self.allocator.free(achievements_json);
             const monthly_playcounts_json = try self.store.lazerMonthlyPlaycountsJson(self.allocator, found.id);
             defer self.allocator.free(monthly_playcounts_json);
+            const replays_watched_counts_json = try self.store.lazerReplaysWatchedCountsJson(self.allocator, found.id, user_path.ruleset_id);
+            defer self.allocator.free(replays_watched_counts_json);
             const profile_summary = (try self.store.lazerProfileSummary(found.id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"user not found\"}", &.{});
+            const profile_owner = found.id == requester.id;
+            const stats_history = if (!found.restricted and (profile_owner or profile_summary.show_profile_stats))
+                try self.store.statsHistory(found.id, .all, user_path.ruleset_id)
+            else
+                domain.StatsHistory{};
             const json = try user_json.profileOwnedWithView(self.allocator, found, stats, score_counts, .{
                 .stable_stats = stable_stats,
                 .lazer_stats = lazer_stats,
                 .stable_counts = stable_counts,
                 .lazer_counts = lazer_counts,
-            }, achievements_json, .{ .summary = profile_summary, .requested_ruleset = user_path.ruleset_id, .owner = found.id == requester.id, .monthly_playcounts_json = monthly_playcounts_json });
+            }, achievements_json, .{ .summary = profile_summary, .requested_ruleset = user_path.ruleset_id, .owner = profile_owner, .monthly_playcounts_json = monthly_playcounts_json, .replays_watched_counts_json = replays_watched_counts_json, .stats_history = stats_history });
             defer self.allocator.free(json);
             return respond(req, .ok, "application/json", json, &.{});
         };
@@ -4561,7 +4590,7 @@ const App = struct {
             const user = (try self.store.authenticate(self.allocator, name, password)) orelse return respond(req, .unauthorized, "text/plain", "", &.{});
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            const replay = (try self.store.replay(self.allocator, score_id)) orelse return respond(req, .not_found, "text/plain", "", &.{});
+            const replay = (try player_routes.stableReplay(self.allocator, &self.store, user.id, score_id)) orelse return respond(req, .not_found, "text/plain", "", &.{});
             defer self.allocator.free(replay);
             return respond(req, .ok, "application/octet-stream", replay, &.{});
         }
@@ -4570,7 +4599,7 @@ const App = struct {
             if ((std.mem.eql(u8, path, "/staff") or std.mem.eql(u8, path, "/appeal")) and !web_auth.websiteHost(host_owned)) return respond(req, .not_found, "application/json", "{\"error\":\"not found\"}", &.{});
             const headers = [_]std.http.Header{
                 .{ .name = "cache-control", .value = "no-cache" },
-                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://a.kai.ovh https://assets.kai.ovh https://assets.ppy.sh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
+                .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: https://a.kai.ovh https://assets.kai.ovh https://assets.ppy.sh; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
             };
             return respond(req, if (known_website_page) .ok else .not_found, "text/html; charset=utf-8", index_page, &headers);
@@ -5301,6 +5330,7 @@ fn recalcAllScores(allocator: std.mem.Allocator, store: *sqlite_storage.Store) !
     try store.exec("BEGIN IMMEDIATE");
     try recalcStats(store);
     try store.exec("COMMIT");
+    try store.refreshStatsHistory();
     std.debug.print("done.\n", .{});
 }
 

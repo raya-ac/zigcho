@@ -21,12 +21,12 @@ const articles = [_]Article{
         \\
         \\## start here
         \\
-        \\- [using zigcho!lazer](Help_centre/Upgrading_to_lazer)
-        \\- [multiplayer](Multiplayer)
-        \\- [profiles and score views](Profiles)
-        \\- [performance points](Performance_Points)
-        \\- [beatmap submission](Beatmap_submission)
-        \\- [ranking criteria](Ranking_Criteria)
+        \\- [using zigcho!lazer](/wiki/Help_centre/Upgrading_to_lazer)
+        \\- [multiplayer](/wiki/Multiplayer)
+        \\- [profiles and score views](/wiki/Profiles)
+        \\- [performance points](/wiki/Performance_Points)
+        \\- [beatmap submission](/wiki/Beatmap_submission)
+        \\- [ranking criteria](/wiki/Ranking_Criteria)
         ,
     },
     .{
@@ -147,8 +147,7 @@ pub fn pageJson(allocator: std.mem.Allocator, locale: []const u8, path: []const 
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try output.writer.writeAll("{\"layout\":");
-    try std.json.Stringify.value(if (std.mem.eql(u8, article.path, "Main_page")) "Main_page" else "wiki", .{}, &output.writer);
+    try output.writer.writeAll("{\"layout\":\"wiki\"");
     try output.writer.writeAll(",\"locale\":\"en\",\"markdown\":");
     try std.json.Stringify.value(article.markdown, .{}, &output.writer);
     try output.writer.writeAll(",\"path\":");
@@ -171,9 +170,10 @@ test "local lazer wiki returns exact pages and honest misses" {
     defer std.testing.allocator.free(page);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, page, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("Main_page", parsed.value.object.get("layout").?.string);
+    try std.testing.expectEqualStrings("wiki", parsed.value.object.get("layout").?.string);
     try std.testing.expectEqualStrings("Main_page", parsed.value.object.get("path").?.string);
     try std.testing.expect(parsed.value.object.get("markdown").?.string.len > 100);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("markdown").?.string, "](/wiki/Multiplayer)") != null);
     try std.testing.expect((try pageJson(std.testing.allocator, "en", "Something_that_does_not_exist")) == null);
     try std.testing.expect((try pageJson(std.testing.allocator, "ja", "Main_page")) == null);
 }

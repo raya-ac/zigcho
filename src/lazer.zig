@@ -332,7 +332,7 @@ pub fn performanceState(input: ScoreInput) !?PerformanceState {
         .n100 = if (input.ruleset_id == 2) statistic(input, "large_tick_hit") else statistic(input, "ok"),
         .n50 = if (input.ruleset_id == 2) statistic(input, "small_tick_hit") else statistic(input, "meh"),
         .misses = statistic(input, "miss"),
-        .legacy_total_score = @intCast(@min(input.legacy_total_score orelse input.total_score, std.math.maxInt(u32))),
+        .legacy_total_score = @intCast(@min(input.total_score_without_mods, std.math.maxInt(u32))),
     };
 }
 
@@ -421,7 +421,8 @@ pub const ScoreInput = struct {
     beatmap_id: i64,
     ruleset_id: i64,
     total_score: i64,
-    legacy_total_score: ?i64 = null,
+    total_score_without_mods: i64,
+    legacy_total_score: ?i32 = null,
     accuracy: f64,
     max_combo: i64,
     passed: bool,
@@ -437,6 +438,17 @@ pub const ScoreInput = struct {
     achievement_perfect: bool = false,
 };
 
+pub fn stableLegacyTotalScore(total_score: i64) i32 {
+    return @intCast(std.math.clamp(total_score, 0, @as(i64, std.math.maxInt(i32))));
+}
+
+test "stable scores clamp to lazer's nullable int32 legacy field" {
+    try std.testing.expectEqual(@as(i32, 0), stableLegacyTotalScore(-1));
+    try std.testing.expectEqual(@as(i32, 1_000_000), stableLegacyTotalScore(1_000_000));
+    try std.testing.expectEqual(std.math.maxInt(i32), stableLegacyTotalScore(@as(i64, std.math.maxInt(i32)) + 1));
+    try std.testing.expectEqual(std.math.maxInt(i32), stableLegacyTotalScore(1_000_000_000_000));
+}
+
 pub fn parseScore(value: std.json.Value) !ScoreInput {
     const obj = switch (value) {
         .object => |o| o,
@@ -445,7 +457,9 @@ pub fn parseScore(value: std.json.Value) !ScoreInput {
     const beatmap_id = try boundedInteger(obj, "beatmap_id", 1, std.math.maxInt(i32));
     const ruleset_id = try boundedInteger(obj, "ruleset_id", 0, 3);
     const total_score = try boundedInteger(obj, "total_score", 0, max_total_score);
-    const legacy_total_score = try optionalBoundedInteger(obj, "legacy_total_score", 0, max_total_score);
+    const total_score_without_mods = try optionalBoundedInteger(obj, "total_score_without_mods", 0, max_total_score);
+    const legacy_total_score_value = try optionalBoundedInteger(obj, "legacy_total_score", 0, std.math.maxInt(i32));
+    const legacy_total_score: ?i32 = if (legacy_total_score_value) |score| @intCast(score) else null;
     const accuracy = try boundedNumber(obj, "accuracy", 0, 1);
     const combo = try boundedInteger(obj, "max_combo", 0, max_combo);
     const passed_value = obj.get("passed") orelse return error.InvalidScore;
@@ -471,6 +485,7 @@ pub fn parseScore(value: std.json.Value) !ScoreInput {
         .beatmap_id = beatmap_id,
         .ruleset_id = ruleset_id,
         .total_score = total_score,
+        .total_score_without_mods = total_score_without_mods orelse legacy_total_score_value orelse total_score,
         .legacy_total_score = legacy_total_score,
         .accuracy = accuracy,
         .max_combo = combo,
@@ -532,7 +547,8 @@ pub fn parseSoloScore(value: std.json.Value, beatmap_id: i32) !ScoreInput {
         .beatmap_id = beatmap_id,
         .ruleset_id = ruleset_id,
         .total_score = total_score,
-        .legacy_total_score = total_score_without_mods,
+        .total_score_without_mods = total_score_without_mods,
+        .legacy_total_score = null,
         .accuracy = accuracy,
         .max_combo = combo,
         .passed = passed,
@@ -669,7 +685,7 @@ pub const ChatMessage = struct {
 pub const LeaderboardScore = struct {
     id: i64,
     legacy_score_id: ?i64 = null,
-    legacy_total_score: ?i64 = null,
+    legacy_total_score: ?i32 = null,
     user_id: i32,
     username: []const u8,
     country: []const u8,
@@ -1184,6 +1200,7 @@ pub fn modsDisplay(allocator: std.mem.Allocator, mods_json: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeByte('+');
+    var displayed_settings: u8 = 0;
     for (mods.items) |item| {
         const object = switch (item) {
             .object => |value| value,
@@ -1195,21 +1212,79 @@ pub fn modsDisplay(allocator: std.mem.Allocator, mods_json: []const u8) ![]u8 {
         };
         if (!validAcronym(acronym)) return error.InvalidMod;
         try output.writer.writeAll(acronym);
-        if (std.ascii.eqlIgnoreCase(acronym, "DT") or std.ascii.eqlIgnoreCase(acronym, "NC")) {
-            if (object.get("settings")) |settings_value| switch (settings_value) {
-                .object => |settings| if (settings.get("speed_change")) |rate_value| {
-                    const rate = switch (rate_value) {
-                        .float => |value| value,
-                        .integer => |value| @as(f64, @floatFromInt(value)),
-                        else => continue,
-                    };
-                    if (std.math.isFinite(rate)) try output.writer.print(" {d:.2}×", .{rate});
-                },
-                else => {},
+        const settings = settings: {
+            const settings_value = object.get("settings") orelse break :settings null;
+            break :settings switch (settings_value) {
+                .object => |value| value,
+                else => null,
             };
+        } orelse continue;
+
+        if (settings.get("speed_change")) |rate_value| {
+            const rate = switch (rate_value) {
+                .float => |value| value,
+                .integer => |value| @as(f64, @floatFromInt(value)),
+                else => 0,
+            };
+            if (std.math.isFinite(rate) and rate > 0) {
+                try output.writer.print(" {d:.2}×", .{rate});
+                displayed_settings += 1;
+            }
         }
+
+        var iterator = settings.iterator();
+        var details: u8 = 0;
+        while (iterator.next()) |entry| {
+            if (displayed_settings >= 12) break;
+            const key = entry.key_ptr.*;
+            if (std.mem.eql(u8, key, "speed_change") or !displayableSettingKey(key) or !displayableSettingValue(entry.value_ptr.*)) continue;
+            try output.writer.writeAll(if (details == 0) " (" else ", ");
+            try writeSettingLabel(&output.writer, key);
+            try output.writer.writeByte(' ');
+            try writeSettingValue(&output.writer, entry.value_ptr.*);
+            details += 1;
+            displayed_settings += 1;
+        }
+        if (details != 0) try output.writer.writeByte(')');
     }
     return output.toOwnedSlice();
+}
+
+fn displayableSettingKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > 32) return false;
+    for (key) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    return true;
+}
+
+fn displayableSettingValue(value: std.json.Value) bool {
+    return switch (value) {
+        .bool, .integer => true,
+        .float => |number| std.math.isFinite(number),
+        else => false,
+    };
+}
+
+fn writeSettingLabel(writer: *std.Io.Writer, key: []const u8) !void {
+    const short = if (std.mem.eql(u8, key, "circle_size")) "CS" else if (std.mem.eql(u8, key, "approach_rate")) "AR" else if (std.mem.eql(u8, key, "overall_difficulty")) "OD" else if (std.mem.eql(u8, key, "drain_rate")) "HP" else null;
+    if (short) |label| return writer.writeAll(label);
+    for (key) |byte| try writer.writeByte(if (byte == '_') ' ' else byte);
+}
+
+fn writeSettingValue(writer: *std.Io.Writer, value: std.json.Value) !void {
+    switch (value) {
+        .bool => |enabled| try writer.writeAll(if (enabled) "on" else "off"),
+        .integer => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d:.2}", .{number}),
+        else => unreachable,
+    }
+}
+
+test "mod display includes non-default lazer adjustments" {
+    const display = try modsDisplay(std.testing.allocator,
+        \\[{"acronym":"DT","settings":{"speed_change":1.25}},{"acronym":"DA","settings":{"approach_rate":9.5,"circle_size":4,"hidden":true}},{"acronym":"WG","settings":{"strength":1.2}}]
+    );
+    defer std.testing.allocator.free(display);
+    try std.testing.expectEqualStrings("+DT 1.25×DA (AR 9.50, CS 4, hidden on)WG (strength 1.20)", display);
 }
 
 fn parseMods(object: std.json.ObjectMap, optional: bool) !?std.json.Array {

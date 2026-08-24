@@ -148,6 +148,37 @@ CREATE TABLE stats (
     PRIMARY KEY (user_id, mode)
 );
 
+CREATE TABLE user_stats_history (
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source text NOT NULL CHECK (source IN ('all', 'stable', 'lazer', 'scorev2')),
+    mode smallint NOT NULL CHECK (
+        (source = 'scorev2' AND mode BETWEEN 0 AND 3) OR
+        (source IN ('all', 'stable', 'lazer') AND (mode BETWEEN 0 AND 6 OR mode = 8))
+    ),
+    day bigint NOT NULL CHECK (day >= 0 AND day % 86400 = 0),
+    pp integer NOT NULL CHECK (pp >= 0),
+    global_rank integer NOT NULL CHECK (global_rank >= 0),
+    PRIMARY KEY (user_id, source, mode, day)
+);
+CREATE INDEX user_stats_history_lookup
+    ON user_stats_history(source, mode, day DESC, global_rank, user_id);
+CREATE INDEX user_stats_history_retention
+    ON user_stats_history(day);
+
+CREATE TABLE score_replay_views (
+    source text NOT NULL CHECK (source IN ('stable', 'lazer')),
+    score_id bigint NOT NULL CHECK (score_id > 0),
+    viewer_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    owner_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    mode smallint NOT NULL CHECK (mode BETWEEN 0 AND 6 OR mode = 8),
+    rank_namespace text NOT NULL CHECK (length(rank_namespace) BETWEEN 1 AND 32),
+    viewed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY (source, score_id, viewer_id),
+    CHECK (viewer_id != owner_id)
+);
+CREATE INDEX score_replay_views_owner
+    ON score_replay_views(owner_id, mode, source, rank_namespace, viewed_at DESC);
+
 CREATE TABLE beatmaps (
     id integer PRIMARY KEY,
     set_id integer NOT NULL,
@@ -259,6 +290,7 @@ CREATE TABLE friends (
     friend_id integer REFERENCES users(id) ON DELETE CASCADE,
     PRIMARY KEY (user_id, friend_id)
 );
+CREATE INDEX friends_inbound ON friends(friend_id, user_id);
 
 CREATE TABLE favourites (
     user_id integer REFERENCES users(id) ON DELETE CASCADE,
@@ -451,7 +483,8 @@ CREATE TABLE lazer_scores (
     beatmap_id integer NOT NULL,
     ruleset_id smallint NOT NULL,
     total_score bigint NOT NULL,
-    legacy_total_score bigint,
+    total_score_without_mods bigint NOT NULL CONSTRAINT lazer_scores_total_without_mods_range CHECK(total_score_without_mods BETWEEN 0 AND 1000000000000),
+    legacy_total_score integer CONSTRAINT lazer_scores_legacy_total_score_range CHECK(legacy_total_score IS NULL OR legacy_total_score>=0),
     accuracy double precision NOT NULL,
     max_combo integer NOT NULL,
     passed boolean NOT NULL,
@@ -704,4 +737,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (40);
+INSERT INTO schema_migrations(version) VALUES (43);

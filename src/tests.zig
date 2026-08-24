@@ -50,6 +50,7 @@ const achievements = @import("achievements.zig");
 const changelog = @import("changelog");
 const lazer_route_manifest = @import("lazer_route_manifest.zig");
 const lazer_wiki = @import("lazer_wiki.zig");
+const player_routes = @import("player_routes.zig");
 const index_page = @embedFile("index.html");
 const server_source = @embedFile("main.zig");
 
@@ -1565,7 +1566,115 @@ test "website profile settings and private avatar metadata stay account scoped" 
     try std.testing.expectEqual(@as(i64, 2), reset_summary.avatar_version);
 }
 
+test "private profile stats never enter website or lazer rankings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/private-rankings.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    const public_id = try store.register("public stats", "public-stats@example.invalid", "00000000000000000000000000000000");
+    const private_id = try store.register("private stats", "private-stats@example.invalid", "11111111111111111111111111111111");
+    const viewer_id = try store.register("ranking viewer", "ranking-viewer@example.invalid", "22222222222222222222222222222222");
+    try store.updateCountry(public_id, .{ 'A', 'U' });
+    try store.updateCountry(private_id, .{ 'A', 'U' });
+    const public_settings: domain.SiteProfileSettings = .{ .bio = "", .title = "", .pronouns = "", .location = "", .website = "", .accent = .pink, .preferred_mode = 0, .profile_source = .all, .avatar_key = 1, .show_country = true, .show_profile_stats = true, .show_recent_scores = true };
+    var private_settings = public_settings;
+    private_settings.show_profile_stats = false;
+    try store.updateSiteProfile(public_id, public_settings);
+    try store.updateSiteProfile(private_id, private_settings);
+
+    const map_contents = @embedFile("testdata/synthetic-standard.osu");
+    const map_metadata = try beatmap.parse(map_contents);
+    const map_hash = beatmap.md5(map_contents);
+    try store.upsertBeatmap(map_metadata, &map_hash, 3, 1.7931, 10, map_contents);
+    var public_score: stable_score.Submission = .{
+        .map_md5 = &map_hash,
+        .username = "public stats",
+        .online_checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 100_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260825000000",
+        .client_flags = "0",
+    };
+    const public_score_id = try store.insertStableScore(public_id, public_score, 50, "public replay", 10_000);
+    var private_score = public_score;
+    private_score.username = "private stats";
+    private_score.online_checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    private_score.total_score = 900_000;
+    const private_score_id = try store.insertStableScore(private_id, private_score, 500, "private replay", 10_000);
+
+    public_score.online_checksum = "cccccccccccccccccccccccccccccccc";
+    public_score.total_score = 110_000;
+    public_score.mods = stable_mods.score_v2;
+    _ = try store.insertStableScore(public_id, public_score, 60, "public scorev2 replay", 10_000);
+    private_score.online_checksum = "dddddddddddddddddddddddddddddddd";
+    private_score.total_score = 910_000;
+    private_score.mods = stable_mods.score_v2;
+    _ = try store.insertStableScore(private_id, private_score, 600, "private scorev2 replay", 10_000);
+
+    var lazer_fixture_buf: [2048]u8 = undefined;
+    const lazer_fixture = try std.fmt.bufPrintZ(
+        &lazer_fixture_buf,
+        "INSERT INTO lazer_scores(user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES({d},{d},0,120000,120000,NULL,0.95,12,1,'A','[]','{{}}','{{}}','[]','vanilla',70,1),({d},{d},0,920000,920000,NULL,0.99,92,1,'S','[]','{{}}','{{}}','[]','vanilla',700,1)",
+        .{ public_id, map_metadata.id, private_id, map_metadata.id },
+    );
+    try store.exec(lazer_fixture);
+    try std.testing.expect(try store.recordReplayView(viewer_id, .stable, public_score_id));
+    try std.testing.expect(try store.recordReplayView(viewer_id, .stable, private_score_id));
+
+    for ([_]domain.SiteScoreSource{ .all, .stable, .lazer, .scorev2 }) |source| {
+        const rankings = try store.siteRankings(std.testing.allocator, source, 0, 0);
+        defer std.testing.allocator.free(rankings);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rankings, .{});
+        defer parsed.deinit();
+        const players = parsed.value.object.get("players").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), players.len);
+        try std.testing.expectEqual(@as(i64, public_id), players[0].object.get("id").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), players[0].object.get("rank").?.integer);
+    }
+
+    for ([_]lazer.RankingKind{ .performance, .score }) |kind| {
+        const rankings = try store.lazerRankingsJson(std.testing.allocator, 0, kind, null, 1);
+        defer std.testing.allocator.free(rankings);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rankings, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.object.get("ranking").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(@as(i64, public_id), rows[0].object.get("user").?.object.get("id").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), rows[0].object.get("global_rank").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), rows[0].object.get("replays_watched_by_others").?.integer);
+    }
+
+    const countries_json = try store.lazerRankingsJson(std.testing.allocator, 0, .country, null, 1);
+    defer std.testing.allocator.free(countries_json);
+    var countries = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, countries_json, .{});
+    defer countries.deinit();
+    const country_rows = countries.value.object.get("ranking").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), country_rows.len);
+    try std.testing.expectEqualStrings("AU", country_rows[0].object.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 1), country_rows[0].object.get("active_users").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), country_rows[0].object.get("play_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 100_000), country_rows[0].object.get("ranked_score").?.integer);
+    try std.testing.expectEqual(@as(i64, 50), country_rows[0].object.get("performance").?.integer);
+}
+
 test "website profile plays keep an accessible score details dialog" {
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "const emptyImage='data:image/gif") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "img-src 'self' data: https://a.kai.ovh") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".accent-bot #pinned-plays") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".accent-bot #recent-plays") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-head-tools") != null);
@@ -1588,6 +1697,10 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "setAttribute('aria-expanded'") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "accountRequest(`/api/v1/account/pins/${match[1]}/${match[2]}`") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "download replay ↓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "https://assets.ppy.sh/old-flags/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "String.fromCodePoint") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "s.client==='lazer'?'native score':'stable score'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "score without mods") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "https://assets.ppy.sh/medals/web/") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"achievement-icon\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "achievement-recent") != null);
@@ -1596,7 +1709,10 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "custom-achievement-icon") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"rank-history-chart\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "tracking starts now") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "if(!points.length)return `<section class=\"rank-history\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "if(points.length<2)return `<section class=\"rank-history\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-history-metric=\"rank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-history-metric=\"pp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "bindProfileHistory(stats)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "if(!points.length)return ''") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "speed_change") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "toFixed(2)+'×'") != null);
@@ -2336,11 +2452,63 @@ test "beatmap ranking records nominations and lets BNs set every stable status" 
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"source\":\"all\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"name\":\"requester\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_rankings, "\"pp\":27") != null);
+    var history_update_buf: [128]u8 = undefined;
+    const history_update = try std.fmt.bufPrintZ(&history_update_buf, "UPDATE scores SET submitted_at=unixepoch()-172800 WHERE id={d}", .{pending_score_id});
+    try store.exec(history_update);
+    const observed_history = try store.statsHistory(requester, .all, 0);
+    try std.testing.expectEqual(@as(u8, 1), observed_history.len);
+    try std.testing.expectEqual(@as(i32, 27), observed_history.points[0].pp);
+    try std.testing.expectEqual(@as(i32, 1), observed_history.points[0].global_rank);
+    try std.testing.expectEqual(observed_history, try store.statsHistory(requester, .all, 0));
+    const empty_lazer_history = try store.statsHistory(requester, .lazer, 0);
+    try std.testing.expectEqual(@as(u8, 0), empty_lazer_history.len);
+    const full_modes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 8 };
+    const scorev2_modes = [_]u8{ 0, 1, 2, 3 };
+    for ([_]domain.SiteScoreSource{ .all, .stable, .lazer, .scorev2 }) |history_source| {
+        const history_modes: []const u8 = if (history_source == .scorev2) &scorev2_modes else &full_modes;
+        for (history_modes) |history_mode| {
+            const matrix_history = try store.statsHistory(requester, history_source, history_mode);
+            const expected_len: u8 = if ((history_source == .all or history_source == .stable) and history_mode == 0) 1 else 0;
+            try std.testing.expectEqual(expected_len, matrix_history.len);
+        }
+    }
+    try store.exec("UPDATE scores SET pp=999 WHERE id=(SELECT min(id) FROM scores)");
+    try std.testing.expectEqual(observed_history, try store.statsHistory(requester, .all, 0));
+    try std.testing.expectEqual(@as(i32, 27), (try store.statsHistory(requester, .stable, 0)).points[0].pp);
+    try store.exec("UPDATE scores SET pp=27 WHERE id=(SELECT min(id) FROM scores)");
+    var retained_buf: [512]u8 = undefined;
+    const retained_sql = try std.fmt.bufPrintZ(&retained_buf, "INSERT INTO user_stats_history(user_id,source,mode,day,pp,global_rank) VALUES({d},'all',0,((unixepoch()/86400)-90)*86400,1,9),({d},'all',0,((unixepoch()/86400)-89)*86400,2,8)", .{ requester, requester });
+    try store.exec(retained_sql);
+    var history_score = pending_score;
+    history_score.online_checksum = "44444444444444444444444444444444";
+    history_score.total_score = 700_000;
+    _ = try store.insertStableScore(requester, history_score, 10, "history replay", 12_000);
+    const retained_history = try store.statsHistory(requester, .all, 0);
+    try std.testing.expectEqual(@as(u8, 2), retained_history.len);
+    try std.testing.expectEqual(@as(i32, 2), retained_history.points[0].pp);
+    try std.testing.expectEqual(@as(i32, 27), retained_history.points[1].pp);
+    var pruned: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM user_stats_history WHERE day<((unixepoch()/86400)-89)*86400", -1, &pruned, null));
+    defer _ = storage.c.sqlite3_finalize(pruned);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(pruned));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(pruned, 0));
     const site_profile = (try store.siteProfile(std.testing.allocator, requester, .all, 0)).?;
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"XX\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"rank_history\":[]") != null);
+    {
+        var parsed_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, site_profile, .{});
+        defer parsed_profile.deinit();
+        const selected = parsed_profile.value.object.get("selected_stats").?.object;
+        const ranks = selected.get("rank_history").?.array.items;
+        const pp_values = selected.get("pp_history").?.array.items;
+        const days = selected.get("history_days").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), ranks.len);
+        try std.testing.expectEqual(ranks.len, pp_values.len);
+        try std.testing.expectEqual(ranks.len, days.len);
+        try std.testing.expectEqual(@as(i64, 1), ranks[ranks.len - 1].integer);
+        try std.testing.expectEqual(@as(i64, 27), pp_values[pp_values.len - 1].integer);
+    }
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "Zigcho Fixture") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_mode\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"selected_source\":\"all\"") != null);
@@ -2350,6 +2518,16 @@ test "beatmap ranking records nominations and lets BNs set every stable status" 
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"top_scores\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"recent_scores\":[{") != null);
+    inline for (.{ .{ 4, 404 }, .{ 5, 505 }, .{ 6, 606 }, .{ 8, 808 } }) |fixture| {
+        var relaxed_stats_buf: [192]u8 = undefined;
+        const relaxed_stats = try std.fmt.bufPrintZ(&relaxed_stats_buf, "UPDATE stats SET pp={d},plays=2,total_score={d} WHERE user_id={d} AND mode={d}", .{ fixture[1], fixture[1] * 1000, requester, fixture[0] });
+        try store.exec(relaxed_stats);
+        const namespace_profile = (try store.siteProfile(std.testing.allocator, requester, .all, fixture[0])).?;
+        defer std.testing.allocator.free(namespace_profile);
+        var pp_needle_buf: [48]u8 = undefined;
+        const pp_needle = try std.fmt.bufPrint(&pp_needle_buf, "\"pp\":{d}", .{fixture[1]});
+        try std.testing.expect(std.mem.indexOf(u8, namespace_profile, pp_needle) != null);
+    }
     const recent_activity = try store.lazerRecentActivityJson(std.testing.allocator, requester, 0, 50);
     defer std.testing.allocator.free(recent_activity);
     var parsed_activity = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, recent_activity, .{});
@@ -2393,6 +2571,69 @@ test "beatmap ranking records nominations and lets BNs set every stable status" 
     const reopened_site_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, metadata.id, .all, 0)).?;
     defer std.testing.allocator.free(reopened_site_board);
     try std.testing.expect(std.mem.indexOf(u8, reopened_site_board, "\"scores\":[]") == null);
+}
+
+test "score submissions refresh both sides of a daily rank swap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/history-rank-swap.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const first_id = try store.register("history first", "history-first@example.invalid", "00000000000000000000000000000000");
+    const second_id = try store.register("history second", "history-second@example.invalid", "11111111111111111111111111111111");
+    const map_md5 = "99999999999999999999999999999991";
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(990000001,990000001,'99999999999999999999999999999991','history','rank swap','test','zigcho',3,10)");
+
+    const base: stable_score.Submission = .{
+        .map_md5 = map_md5,
+        .username = "history first",
+        .online_checksum = "99999999999999999999999999999992",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260825000000",
+        .client_flags = "0",
+    };
+    _ = try store.insertStableScore(first_id, base, 40, "first replay", 12_000);
+    var second_low = base;
+    second_low.username = "history second";
+    second_low.online_checksum = "99999999999999999999999999999993";
+    second_low.total_score = 900_000;
+    _ = try store.insertStableScore(second_id, second_low, 20, "second low replay", 12_000);
+    try std.testing.expectEqual(@as(i32, 1), (try store.statsHistory(first_id, .all, 0)).points[0].global_rank);
+    try std.testing.expectEqual(@as(i32, 2), (try store.statsHistory(second_id, .all, 0)).points[0].global_rank);
+
+    var second_high = second_low;
+    second_high.online_checksum = "99999999999999999999999999999994";
+    second_high.total_score = 1_100_000;
+    _ = try store.insertStableScore(second_id, second_high, 80, "second high replay", 12_000);
+    const first_history = try store.statsHistory(first_id, .all, 0);
+    const second_history = try store.statsHistory(second_id, .all, 0);
+    try std.testing.expectEqual(@as(u8, 1), first_history.len);
+    try std.testing.expectEqual(@as(u8, 1), second_history.len);
+    try std.testing.expectEqual(@as(i32, 2), first_history.points[0].global_rank);
+    try std.testing.expectEqual(@as(i32, 1), second_history.points[0].global_rank);
+
+    var ranks: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*),count(DISTINCT global_rank) FROM user_stats_history WHERE source='all' AND mode=0 AND day=(unixepoch()/86400)*86400 AND user_id IN(?1,?2)", -1, &ranks, null));
+    defer _ = storage.c.sqlite3_finalize(ranks);
+    _ = storage.c.sqlite3_bind_int(ranks, 1, first_id);
+    _ = storage.c.sqlite3_bind_int(ranks, 2, second_id);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(ranks));
+    try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(ranks, 0));
+    try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(ranks, 1));
 }
 
 test "profile pins replace the selected map and keep three per stable score slice" {
@@ -3042,19 +3283,21 @@ test "stable friends and favourites stay directional and always include kai" {
     defer store.close();
     try store.migrate();
     try store.exec(
-        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
-            "(40,'sender','sender',x'00',x'00'),(41,'target','target',x'00',x'00')",
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,restricted) VALUES" ++
+            "(40,'sender','sender',x'00',x'00',0),(41,'target','target',x'00',x'00',0),(42,'restricted','restricted',x'00',x'00',1)",
     );
 
     const initial = try store.friendIds(std.testing.allocator, 40);
     defer std.testing.allocator.free(initial);
     try std.testing.expectEqualSlices(i32, &.{3}, initial);
-    try std.testing.expect(try store.addFriend(40, 41));
-    try std.testing.expect(!try store.addFriend(40, 41));
-    try std.testing.expect(!try store.addFriend(40, 40));
-    try std.testing.expect(!try store.addFriend(40, 3));
+    try std.testing.expectEqual(domain.RelationshipAddResult.inserted, try store.addFriend(40, 41));
+    try std.testing.expectEqual(domain.RelationshipAddResult.existing, try store.addFriend(40, 41));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(40, 40));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(40, 3));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(40, 42));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(40, 999_999));
     try std.testing.expect(!try store.friendsAreMutual(40, 41));
-    try std.testing.expect(try store.addFriend(41, 40));
+    try std.testing.expectEqual(domain.RelationshipAddResult.inserted, try store.addFriend(41, 40));
     try std.testing.expect(try store.friendsAreMutual(40, 41));
     try std.testing.expect(try store.removeFriend(41, 40));
     const sender_friends = try store.friendIds(std.testing.allocator, 40);
@@ -3064,6 +3307,15 @@ test "stable friends and favourites stay directional and always include kai" {
     const target_friends = try store.friendIds(std.testing.allocator, 41);
     defer std.testing.allocator.free(target_friends);
     try std.testing.expectEqualSlices(i32, &.{3}, target_friends);
+    try store.exec("UPDATE users SET restricted=1 WHERE id=41");
+    const hidden_friends = try store.friendIds(std.testing.allocator, 40);
+    defer std.testing.allocator.free(hidden_friends);
+    try std.testing.expectEqualSlices(i32, &.{3}, hidden_friends);
+    try std.testing.expect(!try store.friendsAreMutual(40, 41));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(40, 41));
+    try store.exec("UPDATE users SET restricted=0 WHERE id=41; UPDATE users SET restricted=1 WHERE id=40");
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(40, 41));
+    try store.exec("UPDATE users SET restricted=0 WHERE id=40");
     try std.testing.expect(try store.removeFriend(40, 41));
     try std.testing.expect(!try store.removeFriend(40, 41));
     try std.testing.expect(!try store.removeFriend(40, 3));
@@ -3090,6 +3342,250 @@ test "stable friends and favourites stay directional and always include kai" {
     try std.testing.expectError(error.InvalidBeatmapSet, store.removeFavourite(40, 0));
 }
 
+test "lazer follow route reloads the target after the relationship mutation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/follow-route.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,restricted) VALUES" ++
+            "(40,'follower','follower',x'00',x'00',0),(41,'target','target',x'00',x'00',0),(42,'restricted','restricted',x'00',x'00',1)",
+    );
+
+    const target = switch (try player_routes.follow(std.testing.allocator, &store, 40, 41)) {
+        .target => |fresh| fresh,
+        else => return error.ExpectedFollowTarget,
+    };
+    defer {
+        std.testing.allocator.free(target.name);
+        std.testing.allocator.free(target.safe_name);
+    }
+    try std.testing.expectEqual(@as(i32, 1), target.follower_count);
+
+    var compact: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer compact.deinit();
+    try user_json.writeCompact(&compact.writer, target, target.show_country);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, compact.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("follower_count").?.integer);
+
+    try std.testing.expectEqual(player_routes.FollowResult.ineligible, try player_routes.follow(std.testing.allocator, &store, 40, 42));
+    try std.testing.expectEqual(player_routes.FollowResult.not_found, try player_routes.follow(std.testing.allocator, &store, 40, 999_999));
+}
+
+test "Stable replay HTTP session contract hides restricted owners and kai before counting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-replay-route.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,restricted) VALUES" ++
+            "(40,'owner','owner',x'00',x'00',0),(41,'restricted','restricted',x'00',x'00',1),(42,'viewer','viewer',x'00',x'00',0);" ++
+            "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES" ++
+            "(700,40,'00000000000000000000000000000001',0,0,700000,100,0.98,300,300,10,1,0,0,0,0,1,x'7075626c69632d7265706c6179','vanilla',1)," ++
+            "(701,41,'00000000000000000000000000000002',0,0,700001,100,0.98,300,300,10,1,0,0,0,0,1,x'726573747269637465642d7265706c6179','vanilla',1)," ++
+            "(702,3,'00000000000000000000000000000003',0,0,700002,100,0.98,300,300,10,1,0,0,0,0,1,x'6b61692d7265706c6179','vanilla',1)",
+    );
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const viewer = try sessions.create((try store.userById(std.testing.allocator, 42)).?, 0, 0, 0);
+
+    const public_replay = (try player_routes.stableReplay(std.testing.allocator, &store, viewer.user.id, 700)).?;
+    defer std.testing.allocator.free(public_replay);
+    try std.testing.expectEqualStrings("public-replay", public_replay);
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(40, .all, 0));
+
+    try std.testing.expect((try player_routes.stableReplay(std.testing.allocator, &store, viewer.user.id, 701)) == null);
+    try std.testing.expectEqual(@as(i32, 0), try store.replayViewCount(41, .all, 0));
+    try std.testing.expect((try player_routes.stableReplay(std.testing.allocator, &store, viewer.user.id, 702)) == null);
+    try std.testing.expectEqual(@as(i32, 0), try store.replayViewCount(3, .all, 0));
+}
+
+test "stable and lazer share followers and unique replay views" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/shared-social-replay.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
+            "(40,'owner','owner',x'00',x'00'),(41,'viewer','viewer',x'00',x'00');" ++
+            "INSERT INTO stats(user_id,mode,plays) VALUES(40,0,1);" ++
+            "INSERT INTO beatmaps(id,set_id,md5,status,artist,title,version,creator) VALUES" ++
+            "(75,75,'0123456789abcdef0123456789abcdef',3,'artist','title','diff','mapper');" ++
+            "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES" ++
+            "(700,40,'0123456789abcdef0123456789abcdef',0,0,700000,100,0.98,300,300,10,1,0,0,0,0,1,x'737461626c652d7265706c6179','vanilla',1);" ++
+            "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,pp,best,rank_namespace,replay) VALUES" ++
+            "(700,40,75,0,800000,750000,NULL,0.99,350,1,'S','[]','{}','{}','[]',120,1,'vanilla',x'6c617a65722d7265706c6179')",
+    );
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const viewer = try sessions.create((try store.userById(std.testing.allocator, 41)).?, 0, 0, 0);
+
+    // Stable's friend packet writes the same directional relation exposed as
+    // follower_count by lazer's profile response.
+    const stable_add = try clientIntPacket(std.testing.allocator, .friend_add, 40);
+    defer std.testing.allocator.free(stable_add);
+    const stable_add_reply = try bancho.poll(std.testing.allocator, &store, &sessions, viewer, stable_add);
+    defer std.testing.allocator.free(stable_add_reply);
+    const followed_summary = (try store.lazerProfileSummary(40)).?;
+    try std.testing.expectEqual(@as(i32, 1), followed_summary.follower_count);
+    try std.testing.expectEqual(@as(i32, 1), (try store.lazerBatchUserVisibility(40)).?.follower_count);
+    const owner = (try store.userById(std.testing.allocator, 40)).?;
+    defer std.testing.allocator.free(owner.name);
+    defer std.testing.allocator.free(owner.safe_name);
+    try std.testing.expectEqual(@as(i32, 1), owner.follower_count);
+    var compact: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer compact.deinit();
+    try user_json.writeCompact(&compact.writer, owner, owner.show_country);
+    var parsed_compact = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, compact.written(), .{});
+    defer parsed_compact.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_compact.value.object.get("follower_count").?.integer);
+    const lazer_profile = try user_json.profileOwnedWithView(std.testing.allocator, owner, null, .{}, .{}, "[]", .{ .summary = followed_summary });
+    defer std.testing.allocator.free(lazer_profile);
+    var parsed_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_profile, .{});
+    defer parsed_profile.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_profile.value.object.get("follower_count").?.integer);
+
+    // Existing rows stop contributing as soon as either side is restricted,
+    // and neither client can use the stale row to recreate a relationship.
+    try store.exec("UPDATE users SET restricted=1 WHERE id=41");
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerProfileSummary(40)).?.follower_count);
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerBatchUserVisibility(40)).?.follower_count);
+    const restricted_sender_friends = try store.friendIds(std.testing.allocator, 41);
+    defer std.testing.allocator.free(restricted_sender_friends);
+    try std.testing.expectEqualSlices(i32, &.{3}, restricted_sender_friends);
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(41, 40));
+    try store.exec("UPDATE users SET restricted=0 WHERE id=41; UPDATE users SET restricted=1 WHERE id=40");
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerProfileSummary(40)).?.follower_count);
+    const restricted_target_friends = try store.friendIds(std.testing.allocator, 41);
+    defer std.testing.allocator.free(restricted_target_friends);
+    try std.testing.expectEqualSlices(i32, &.{3}, restricted_target_friends);
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(41, 40));
+    try store.exec("UPDATE users SET restricted=0 WHERE id=40");
+
+    const stable_remove = try clientIntPacket(std.testing.allocator, .friend_remove, 40);
+    defer std.testing.allocator.free(stable_remove);
+    const stable_remove_reply = try bancho.poll(std.testing.allocator, &store, &sessions, viewer, stable_remove);
+    defer std.testing.allocator.free(stable_remove_reply);
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerProfileSummary(40)).?.follower_count);
+
+    // Lazer's POST /api/v2/friends uses this operation; Stable reads the same
+    // row for its friends packet and legacy web endpoint.
+    try std.testing.expectEqual(domain.RelationshipAddResult.inserted, try store.addFriend(41, 40));
+    const stable_friend_ids = try store.friendIds(std.testing.allocator, 41);
+    defer std.testing.allocator.free(stable_friend_ids);
+    try std.testing.expect(std.mem.indexOfScalar(i32, stable_friend_ids, 40) != null);
+    try std.testing.expect(std.mem.indexOfScalar(i32, stable_friend_ids, 3) != null);
+    try std.testing.expect(try store.removeFriend(41, 40));
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerProfileSummary(40)).?.follower_count);
+
+    // Mirror the two authenticated download handlers. The score ids are
+    // deliberately identical: source is part of the shared unique-view key.
+    const stable_replay = (try store.stableReplay(std.testing.allocator, 700)).?;
+    defer std.testing.allocator.free(stable_replay);
+    try std.testing.expectEqualStrings("stable-replay", stable_replay);
+    try std.testing.expect(try store.recordReplayView(41, .stable, 700));
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(40, .all, 0));
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(40, .stable, 0));
+    try std.testing.expectEqual(@as(i32, 0), try store.replayViewCount(40, .lazer, 0));
+
+    const lazer_replay = (try store.lazerReplay(std.testing.allocator, 700)).?;
+    defer std.testing.allocator.free(lazer_replay);
+    try std.testing.expectEqualStrings("lazer-replay", lazer_replay);
+    try std.testing.expect(try store.recordReplayView(41, .lazer, 700));
+    try std.testing.expectEqual(@as(i32, 2), try store.replayViewCount(40, .all, 0));
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(40, .stable, 0));
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(40, .lazer, 0));
+    try std.testing.expectEqual(@as(i32, 0), try store.replayViewCount(40, .all, 1));
+    try std.testing.expectEqual(@as(i32, 2), (try store.statsForUser(40, 0)).?.replay_views);
+    try std.testing.expectEqual(@as(i32, 1), (try store.sourceStatsForUser(40, 0, .stable)).?.replay_views);
+    try std.testing.expectEqual(@as(i32, 1), (try store.sourceStatsForUser(40, 0, .lazer)).?.replay_views);
+    try store.exec("UPDATE score_replay_views SET viewed_at=CASE source WHEN 'stable' THEN unixepoch('2026-07-15T00:00:00Z') ELSE unixepoch('2026-08-15T00:00:00Z') END WHERE owner_id=40");
+    const watched_history = try store.lazerReplaysWatchedCountsJson(std.testing.allocator, 40, 0);
+    defer std.testing.allocator.free(watched_history);
+    var parsed_watched_history = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, watched_history, .{});
+    defer parsed_watched_history.deinit();
+    const watched_months = parsed_watched_history.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), watched_months.len);
+    try std.testing.expectEqualStrings("2026-07-01", watched_months[0].object.get("start_date").?.string);
+    try std.testing.expectEqual(@as(i64, 1), watched_months[0].object.get("count").?.integer);
+    try std.testing.expectEqualStrings("2026-08-01", watched_months[1].object.get("start_date").?.string);
+    try std.testing.expectEqual(@as(i64, 1), watched_months[1].object.get("count").?.integer);
+    const empty_watched_history = try store.lazerReplaysWatchedCountsJson(std.testing.allocator, 40, 1);
+    defer std.testing.allocator.free(empty_watched_history);
+    try std.testing.expectEqualStrings("[]", empty_watched_history);
+    try std.testing.expectError(error.InvalidRulesetId, store.lazerReplaysWatchedCountsJson(std.testing.allocator, 40, 4));
+    const ranking = try store.lazerRankingsJson(std.testing.allocator, 0, .performance, null, 1);
+    defer std.testing.allocator.free(ranking);
+    var parsed_ranking = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ranking, .{});
+    defer parsed_ranking.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_ranking.value.object.get("ranking").?.array.items[0].object.get("replays_watched_by_others").?.integer);
+
+    // A repeat download refreshes the ledger row but cannot increase the
+    // unique total, and owners never create rows for their own replays.
+    try std.testing.expect(try store.recordReplayView(41, .stable, 700));
+    try std.testing.expect(try store.recordReplayView(41, .lazer, 700));
+    try std.testing.expect(!try store.recordReplayView(40, .stable, 700));
+    try std.testing.expect(!try store.recordReplayView(40, .lazer, 700));
+    try std.testing.expectEqual(@as(i32, 2), try store.replayViewCount(40, .all, 0));
+
+    // Once the bytes are offloaded, every public Stable/lazer projection must
+    // still advertise the passed replay from replay_objects.
+    try store.exec(
+        "INSERT INTO replay_objects(source,score_id,object_key,etag,object_bytes) VALUES" ++
+            "('stable',700,'replays/stable/700','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',13)," ++
+            "('lazer',700,'replays/lazer/700','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',12);" ++
+            "UPDATE scores SET replay=NULL WHERE id=700;" ++
+            "UPDATE lazer_scores SET replay=NULL WHERE id=700;",
+    );
+    inline for (.{ domain.SiteScoreSource.stable, domain.SiteScoreSource.lazer }) |source| {
+        const board_json = (try store.siteBeatmapLeaderboard(std.testing.allocator, 75, source, 0)).?;
+        defer std.testing.allocator.free(board_json);
+        var board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, board_json, .{});
+        defer board.deinit();
+        try std.testing.expect(board.value.object.get("scores").?.array.items[0].object.get("has_replay").?.bool);
+    }
+    const object_scores_json = try store.lazerUserScoresJson(std.testing.allocator, 40, 0, .recent, .all, 0, 50);
+    defer std.testing.allocator.free(object_scores_json);
+    var object_scores = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, object_scores_json, .{});
+    defer object_scores.deinit();
+    try std.testing.expectEqual(@as(usize, 2), object_scores.value.array.items.len);
+    for (object_scores.value.array.items) |score_value| try std.testing.expect(score_value.object.get("has_replay").?.bool);
+    const object_profile_json = (try store.siteProfile(std.testing.allocator, 40, .all, 0)).?;
+    defer std.testing.allocator.free(object_profile_json);
+    var object_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, object_profile_json, .{});
+    defer object_profile.deinit();
+    const recent_scores = object_profile.value.object.get("recent_scores").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), recent_scores.len);
+    for (recent_scores) |score_value| try std.testing.expect(score_value.object.get("has_replay").?.bool);
+    const lazer_detail_json = (try store.lazerScoreJson(std.testing.allocator, 700, 75)).?;
+    defer std.testing.allocator.free(lazer_detail_json);
+    var lazer_detail = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_detail_json, .{});
+    defer lazer_detail.deinit();
+    try std.testing.expect(lazer_detail.value.object.get("has_replay").?.bool);
+    const stable_client_board = try store.stableLeaderboard(std.testing.allocator, owner, "0123456789abcdef0123456789abcdef", 0, 0, 0);
+    defer std.testing.allocator.free(stable_client_board);
+    var stable_rows = std.mem.splitScalar(u8, stable_client_board, '\n');
+    var stable_replay_row = false;
+    while (stable_rows.next()) |row| {
+        if (std.mem.indexOf(u8, row, "|owner|") == null) continue;
+        const replay_field = row[(std.mem.lastIndexOfScalar(u8, row, '|') orelse continue) + 1 ..];
+        if (std.mem.eql(u8, replay_field, "1")) stable_replay_row = true;
+    }
+    try std.testing.expect(stable_replay_row);
+}
+
 test "stable login owns friend state and restores private message privacy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3100,7 +3596,7 @@ test "stable login owns friend state and restores private message privacy" {
     try store.migrate();
     const player_id = try store.register("social", "social@example.invalid", "00000000000000000000000000000000");
     const friend_id = try store.register("friend", "friend@example.invalid", "11111111111111111111111111111111");
-    try std.testing.expect(try store.addFriend(player_id, friend_id));
+    try std.testing.expectEqual(domain.RelationshipAddResult.inserted, try store.addFriend(player_id, friend_id));
     const body = "social\n00000000000000000000000000000000\n" ++
         "b20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|1";
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
@@ -3152,6 +3648,11 @@ test "stable social packets enforce friend-only dms and away presence contracts"
     const add_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, add);
     defer std.testing.allocator.free(add_reply);
     try std.testing.expect(target.isFriend(40));
+    const add_restricted = try clientIntPacket(std.testing.allocator, .friend_add, 42);
+    defer std.testing.allocator.free(add_restricted);
+    const add_restricted_reply = try bancho.poll(std.testing.allocator, &store, &sessions, target, add_restricted);
+    defer std.testing.allocator.free(add_restricted_reply);
+    try std.testing.expect(!target.isFriend(42));
     const delivered = try clientMessagePacket(std.testing.allocator, .send_private_message, "sender", "delivered once", "target", 40);
     defer std.testing.allocator.free(delivered);
     const delivered_reply = try bancho.poll(std.testing.allocator, &store, &sessions, sender, delivered);
@@ -3746,7 +4247,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 11), builds.len);
+    try std.testing.expectEqual(@as(usize, 12), builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);
@@ -5304,6 +5805,7 @@ test "lazer score input is fully typed and bounded before storage" {
         "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":1,\"mods\":[],\"statistics\":{}}",
         "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":[]}",
         "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{},\"client_version\":4}",
+        "{\"beatmap_id\":1,\"ruleset_id\":0,\"total_score\":10,\"legacy_total_score\":2147483648,\"accuracy\":1,\"max_combo\":1,\"passed\":true,\"mods\":[],\"statistics\":{}}",
     };
     for (invalid) |fixture| {
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});
@@ -5575,7 +6077,8 @@ test "official lazer score bodies allow omitted mods and reject hostile counters
     defer valid.deinit();
     const input = try lazer.parseSoloScore(valid.value, 75);
     try std.testing.expectEqual(@as(i64, 75), input.beatmap_id);
-    try std.testing.expectEqual(@as(?i64, 900000), input.legacy_total_score);
+    try std.testing.expectEqual(@as(i64, 900000), input.total_score_without_mods);
+    try std.testing.expectEqual(@as(?i32, null), input.legacy_total_score);
     try std.testing.expect(input.mods == null);
     try std.testing.expectEqual(lazer.Namespace.vanilla, input.namespace);
 
@@ -5839,6 +6342,9 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(i64, 1), parsed_leaderboard.value.object.get("score_count").?.integer);
     const listed = parsed_leaderboard.value.object.get("scores").?.array.items[0].object;
     try std.testing.expectEqual(score_id, listed.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 987654), listed.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, 900000), listed.get("total_score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(listed.get("legacy_total_score").?) == .null);
     try std.testing.expectEqualStrings("A", listed.get("rank").?.string);
     try std.testing.expectEqual(@as(i64, 302), listed.get("maximum_statistics").?.object.get("great").?.integer);
     try std.testing.expect(listed.get("ranked").?.bool);
@@ -5859,10 +6365,20 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(usize, 1), parsed_recent.value.array.items.len);
     const recent_score = parsed_recent.value.array.items[0].object;
     try std.testing.expectEqual(score_id, recent_score.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 987654), recent_score.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, 900000), recent_score.get("total_score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(recent_score.get("legacy_total_score").?) == .null);
     try std.testing.expectEqual(@as(i64, 75), recent_score.get("beatmap").?.object.get("id").?.integer);
     try std.testing.expectEqualStrings("artist", recent_score.get("beatmap").?.object.get("beatmapset").?.object.get("artist").?.string);
     try std.testing.expect(recent_score.get("preserve").?.bool);
     try std.testing.expect(recent_score.get("has_replay").?.bool);
+    const score_detail = (try store.lazerScoreJson(std.testing.allocator, score_id, 75)).?;
+    defer std.testing.allocator.free(score_detail);
+    const parsed_score_detail = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, score_detail, .{});
+    defer parsed_score_detail.deinit();
+    try std.testing.expectEqual(@as(i64, 987654), parsed_score_detail.value.object.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, 900000), parsed_score_detail.value.object.get("total_score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(parsed_score_detail.value.object.get("legacy_total_score").?) == .null);
     const stored_replay = (try store.lazerReplay(std.testing.allocator, score_id)).?;
     defer std.testing.allocator.free(stored_replay);
     try std.testing.expectEqualSlices(u8, &replay, stored_replay);
@@ -5870,7 +6386,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     defer std.testing.allocator.free(pinned);
     try std.testing.expectEqualStrings("[]", pinned);
 
-    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,x'7265706c6179','vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid()); INSERT INTO profile_score_pins(user_id,source,score_id,mode,rank_namespace) SELECT 1,'stable',max(id),0,'vanilla' FROM scores; INSERT INTO lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,pp,best,rank_namespace,client_version,replay,submitted_at) VALUES(1,75,0,500000,500000,0.99,350,1,'S','[]','{}','{}','[]',250.25,1,'vanilla','combined-profile-test',x'',unixepoch()-20)");
+    try store.exec("UPDATE beatmaps SET status=3 WHERE id=75; INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES(1,'0123456789abcdef0123456789abcdef',0,8,765432,123.5,0.975,300,300,10,2,1,0,0,0,1,x'7265706c6179','vanilla',1); INSERT INTO score_pins(user_id,score_id) VALUES(1,last_insert_rowid()); INSERT INTO profile_score_pins(user_id,source,score_id,mode,rank_namespace) SELECT 1,'stable',max(id),0,'vanilla' FROM scores; INSERT INTO lazer_scores(user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,pp,best,rank_namespace,client_version,replay,submitted_at) VALUES(1,75,0,500000,500000,NULL,0.99,350,1,'S','[]','{}','{}','[]',250.25,1,'vanilla','combined-profile-test',x'',unixepoch()-20)");
     const combined_best = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .best, .all, 0, 50);
     defer std.testing.allocator.free(combined_best);
     var parsed_combined_best = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined_best, .{});
@@ -5939,6 +6455,8 @@ test "lazer solo score tokens are user bound expiring and single use" {
     var parsed_pinned_second_page = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pinned_second_page, .{});
     defer parsed_pinned_second_page.deinit();
     try std.testing.expectEqual(score_id, parsed_pinned_second_page.value.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 900000), parsed_pinned_second_page.value.array.items[0].object.get("total_score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(parsed_pinned_second_page.value.array.items[0].object.get("legacy_total_score").?) == .null);
     const stable_pinned = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .pinned, .stable, 0, 50);
     defer std.testing.allocator.free(stable_pinned);
     var parsed_pinned = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stable_pinned, .{});
@@ -6020,7 +6538,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expect(failed_recent_found);
 
     try store.exec("INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best) VALUES(999,1,'0123456789abcdef0123456789abcdef',0,0,10000,0,0.5,5,5,0,0,5,0,0,0,0,x'6661696c6564','failed-replay-checksum','vanilla',0)");
-    try std.testing.expect((try store.replay(std.testing.allocator, 999)) == null);
+    try std.testing.expect((try store.stableReplay(std.testing.allocator, 999)) == null);
     try std.testing.expect((try store.siteReplay(std.testing.allocator, 999)) == null);
     var stored_failed: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT length(replay) FROM scores WHERE id=999", -1, &stored_failed, null));
@@ -6032,7 +6550,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 40), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "ranked play ratings migrate and apply each room once per ruleset" {
@@ -6053,7 +6571,7 @@ test "ranked play ratings migrate and apply each room once per ruleset" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('lazer_ranked_ratings','lazer_ranked_matches'))", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 40), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(version_stmt, 0));
     try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(version_stmt, 1));
 
     const initial = try store.lazerRankedRating(10, 0);
@@ -6137,8 +6655,199 @@ test "schema forty widens chat read cursors and preserves public acknowledgement
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT instr(sql,'2000000001') FROM sqlite_master WHERE type='table' AND name='lazer_channel_reads')", -1, &schema, null));
     defer _ = storage.c.sqlite3_finalize(schema);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(schema));
-    try std.testing.expectEqual(@as(c_int, 40), storage.c.sqlite3_column_int(schema, 0));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(schema, 0));
     try std.testing.expect(storage.c.sqlite3_column_int(schema, 1) > 0);
+}
+
+test "schema forty two stores constrained profile history and replay views" {
+    const expectConstraint = struct {
+        fn run(db: *storage.c.sqlite3, sql: [:0]const u8) !void {
+            var message: [*c]u8 = null;
+            const result = storage.c.sqlite3_exec(db, sql.ptr, null, null, &message);
+            if (message != null) storage.c.sqlite3_free(message);
+            try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_CONSTRAINT), result);
+        }
+    }.run;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, ".zig-cache/tmp/{s}/profile-history-migration.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec("DROP TABLE score_replay_views; DROP TABLE user_stats_history; PRAGMA user_version=40;");
+    try store.migrate();
+    try store.migrate();
+
+    const user_id = try store.register("history user", "history-user@example.test", "0123456789abcdef0123456789abcdef");
+    const viewer_id = try store.register("history viewer", "history-viewer@example.test", "fedcba9876543210fedcba9876543210");
+    var insert_buffer: [1024]u8 = undefined;
+    const valid = try std.fmt.bufPrintZ(
+        &insert_buffer,
+        "INSERT INTO user_stats_history(user_id,source,mode,day,pp,global_rank) VALUES" ++
+            "({d},'all',8,0,100,1)," ++
+            "({d},'stable',6,0,90,2)," ++
+            "({d},'lazer',8,86400,80,0)," ++
+            "({d},'scorev2',3,0,70,3)",
+        .{ user_id, user_id, user_id, user_id },
+    );
+    try store.exec(valid);
+
+    const invalid = [_]struct {
+        source: []const u8,
+        mode: i32,
+        day: i64,
+        pp: i32,
+        global_rank: i32,
+    }{
+        .{ .source = "unknown", .mode = 0, .day = 0, .pp = 1, .global_rank = 1 },
+        .{ .source = "all", .mode = 7, .day = 0, .pp = 1, .global_rank = 1 },
+        .{ .source = "scorev2", .mode = 4, .day = 0, .pp = 1, .global_rank = 1 },
+        .{ .source = "stable", .mode = 0, .day = 1, .pp = 1, .global_rank = 1 },
+        .{ .source = "lazer", .mode = 0, .day = 0, .pp = -1, .global_rank = 1 },
+        .{ .source = "all", .mode = 0, .day = 0, .pp = 1, .global_rank = -1 },
+    };
+    for (invalid) |fixture| {
+        var invalid_buffer: [384]u8 = undefined;
+        const sql = try std.fmt.bufPrintZ(
+            &invalid_buffer,
+            "INSERT INTO user_stats_history(user_id,source,mode,day,pp,global_rank) VALUES({d},'{s}',{d},{d},{d},{d})",
+            .{ user_id, fixture.source, fixture.mode, fixture.day, fixture.pp, fixture.global_rank },
+        );
+        try expectConstraint(store.db, sql);
+    }
+    var duplicate_buffer: [384]u8 = undefined;
+    const duplicate = try std.fmt.bufPrintZ(&duplicate_buffer, "INSERT INTO user_stats_history(user_id,source,mode,day,pp,global_rank) VALUES({d},'all',8,0,1,1)", .{user_id});
+    try expectConstraint(store.db, duplicate);
+    var foreign_buffer: [384]u8 = undefined;
+    const foreign = try std.fmt.bufPrintZ(&foreign_buffer, "INSERT INTO user_stats_history(user_id,source,mode,day,pp,global_rank) VALUES({d},'all',0,0,1,1)", .{user_id + 1000});
+    try expectConstraint(store.db, foreign);
+
+    var replay_buffer: [512]u8 = undefined;
+    const valid_replay = try std.fmt.bufPrintZ(&replay_buffer, "INSERT INTO score_replay_views(source,score_id,viewer_id,owner_id,mode,rank_namespace) VALUES('stable',1,{d},{d},0,'vanilla')", .{ viewer_id, user_id });
+    try store.exec(valid_replay);
+    const self_replay = try std.fmt.bufPrintZ(&replay_buffer, "INSERT INTO score_replay_views(source,score_id,viewer_id,owner_id,mode,rank_namespace) VALUES('stable',2,{d},{d},0,'vanilla')", .{ user_id, user_id });
+    try expectConstraint(store.db, self_replay);
+    const invalid_replay_mode = try std.fmt.bufPrintZ(&replay_buffer, "INSERT INTO score_replay_views(source,score_id,viewer_id,owner_id,mode,rank_namespace) VALUES('lazer',3,{d},{d},7,'vanilla')", .{ viewer_id, user_id });
+    try expectConstraint(store.db, invalid_replay_mode);
+    const foreign_replay_viewer = try std.fmt.bufPrintZ(&replay_buffer, "INSERT INTO score_replay_views(source,score_id,viewer_id,owner_id,mode,rank_namespace) VALUES('lazer',4,{d},{d},0,'vanilla')", .{ user_id + 1000, user_id });
+    try expectConstraint(store.db, foreign_replay_viewer);
+
+    var schema: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='user_stats_history'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='user_stats_history_lookup'),(SELECT count(*) FROM user_stats_history),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='score_replay_views'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='score_replay_views_owner'),(SELECT count(*) FROM score_replay_views),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='user_stats_history_retention'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='friends_inbound')", -1, &schema, null));
+    defer _ = storage.c.sqlite3_finalize(schema);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(schema));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(schema, 0));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 1));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 2));
+    try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(schema, 3));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 4));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 5));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 6));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 7));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 8));
+}
+
+test "schema forty three separates native score without mods from nullable legacy score" {
+    const expectConstraint = struct {
+        fn run(db: *storage.c.sqlite3, sql: [:0]const u8) !void {
+            var message: [*c]u8 = null;
+            const result = storage.c.sqlite3_exec(db, sql.ptr, null, null, &message);
+            if (message != null) storage.c.sqlite3_free(message);
+            try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_CONSTRAINT), result);
+        }
+    }.run;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, ".zig-cache/tmp/{s}/lazer-score-semantics-migration.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "DROP TRIGGER lazer_scores_legacy_total_score_insert;" ++
+            "DROP TRIGGER lazer_scores_legacy_total_score_update;" ++
+            "DROP TRIGGER lazer_scores_total_score_without_mods_insert;" ++
+            "DROP TRIGGER lazer_scores_total_score_without_mods_update;" ++
+            "ALTER TABLE lazer_scores DROP COLUMN total_score_without_mods;" ++
+            "PRAGMA user_version=42;" ++
+            "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'migration user','migration_user',x'00',x'00');" ++
+            "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(75,75,'0123456789abcdef0123456789abcdef','artist','title','diff','mapper',3);" ++
+            "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace) VALUES(1,1,75,0,987654,900000,0.98,321,1,'A','[]','{}','{}','[]','vanilla')",
+    );
+    try store.migrate();
+    try store.migrate();
+
+    var migrated: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score,total_score_without_mods,legacy_total_score FROM lazer_scores WHERE id=1", -1, &migrated, null));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(migrated));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(migrated, 0));
+    try std.testing.expectEqual(@as(i64, 987654), storage.c.sqlite3_column_int64(migrated, 1));
+    try std.testing.expectEqual(@as(i64, 900000), storage.c.sqlite3_column_int64(migrated, 2));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_NULL), storage.c.sqlite3_column_type(migrated, 3));
+    _ = storage.c.sqlite3_finalize(migrated);
+    try expectConstraint(store.db, "UPDATE lazer_scores SET legacy_total_score=2147483648 WHERE id=1");
+    try expectConstraint(store.db, "UPDATE lazer_scores SET total_score_without_mods=1000000000001 WHERE id=1");
+
+    try store.exec(
+        "DROP TRIGGER lazer_scores_legacy_total_score_insert;" ++
+            "DROP TRIGGER lazer_scores_legacy_total_score_update;" ++
+            "DROP TRIGGER lazer_scores_total_score_without_mods_insert;" ++
+            "DROP TRIGGER lazer_scores_total_score_without_mods_update;" ++
+            "UPDATE lazer_scores SET total_score_without_mods=0,legacy_total_score=765432 WHERE id=1;" ++
+            "PRAGMA user_version=42;",
+    );
+    try store.migrate();
+    try store.migrate();
+    var repaired: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score_without_mods,legacy_total_score,(SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'lazer_scores_%score%') FROM lazer_scores WHERE id=1", -1, &repaired, null));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(repaired));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(repaired, 0));
+    try std.testing.expectEqual(@as(i64, 765432), storage.c.sqlite3_column_int64(repaired, 1));
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_NULL), storage.c.sqlite3_column_type(repaired, 2));
+    try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(repaired, 3));
+    _ = storage.c.sqlite3_finalize(repaired);
+
+    try store.exec("UPDATE lazer_scores SET total_score_without_mods=888000,legacy_total_score=777000 WHERE id=1; PRAGMA user_version=42;");
+    try store.migrate();
+    var compatible: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score_without_mods,legacy_total_score FROM lazer_scores WHERE id=1", -1, &compatible, null));
+    defer _ = storage.c.sqlite3_finalize(compatible);
+    try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(compatible));
+    try std.testing.expectEqual(@as(c_int, 43), storage.c.sqlite3_column_int(compatible, 0));
+    try std.testing.expectEqual(@as(i64, 888000), storage.c.sqlite3_column_int64(compatible, 1));
+    try std.testing.expectEqual(@as(i64, 777000), storage.c.sqlite3_column_int64(compatible, 2));
+}
+
+test "sqlite clamps high Stable scores in every lazer projection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, ".zig-cache/tmp/{s}/stable-lazer-clamp.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'high score','high_score',x'00',x'00');" ++
+            "INSERT INTO beatmaps(id,set_id,md5,mode,status,artist,title,version,creator) VALUES(75,75,'0123456789abcdef0123456789abcdef',0,3,'artist','title','diff','mapper');" ++
+            "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES(700,1,'0123456789abcdef0123456789abcdef',0,0,3000000000,500,0.99,300,300,0,0,0,0,0,1,1,x'7265706c6179','vanilla',1)",
+    );
+
+    const recent_json = try store.lazerUserScoresJson(std.testing.allocator, 1, 0, .recent, .stable, 0, 50);
+    defer std.testing.allocator.free(recent_json);
+    var recent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, recent_json, .{});
+    defer recent.deinit();
+    const recent_score = recent.value.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), recent_score.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i32)), recent_score.get("legacy_total_score").?.integer);
+
+    const board_json = try store.lazerLeaderboardJson(std.testing.allocator, 1, 75, 0, .vanilla, "[]", false, false, 0, .global, 50);
+    defer std.testing.allocator.free(board_json);
+    var board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, board_json, .{});
+    defer board.deinit();
+    const board_score = board.value.object.get("scores").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), board_score.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i32)), board_score.get("legacy_total_score").?.integer);
 }
 
 test "lazer leaderboards combine accepted mods inside each standard namespace" {
@@ -6160,17 +6869,17 @@ test "lazer leaderboards combine accepted mods inside each standard namespace" {
             "(75,75,'0123456789abcdef0123456789abcdef',3,'artist','title','diff','mapper')," ++
             "(76,76,'1123456789abcdef0123456789abcdef',5,'artist','qualified','diff','mapper')," ++
             "(77,77,'2123456789abcdef0123456789abcdef',6,'artist','loved','diff','mapper');" ++
-            "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES" ++
-            "(1,1,75,0,900,900,0.90,90,1,'A','[]','{}','{}','[]','vanilla',90,1)," ++
-            "(2,1,75,0,500,500,0.95,50,1,'A','[{\"acronym\":\"HR\"}]','{}','{}','[]','vanilla',150,0)," ++
-            "(3,2,75,0,700,700,0.97,70,1,'A','[{\"acronym\":\"HR\"}]','{}','{}','[]','vanilla',170,1)," ++
-            "(4,2,75,0,100,100,0.80,10,1,'B','[]','{}','{}','[]','vanilla',20,0)," ++
-            "(5,1,75,0,400,400,0.85,40,1,'B','[{\"acronym\":\"HR\"}]','{}','{}','[]','vanilla',100,0)," ++
-            "(6,1,75,0,600,600,0.90,60,1,'A','[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}]','{}','{}','[]','custom',60,1)," ++
-            "(7,2,75,0,800,800,0.98,80,1,'A','[{\"acronym\":\"WIGGLE\"},{\"acronym\":\"HR\"}]','{}','{}','[]','custom',80,1)," ++
-            "(8,2,75,0,700,700,0.97,70,1,'A','[{\"acronym\":\"AP\"},{\"acronym\":\"WIGGLE\"}]','{}','{}','[]','custom',70,0)," ++
-            "(9,1,76,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1)," ++
-            "(10,1,77,0,900,900,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1);" ++
+            "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES" ++
+            "(1,1,75,0,900,900,NULL,0.90,90,1,'A','[]','{}','{}','[]','vanilla',90,1)," ++
+            "(2,1,75,0,500,500,NULL,0.95,50,1,'A','[{\"acronym\":\"HR\"}]','{}','{}','[]','vanilla',150,0)," ++
+            "(3,2,75,0,700,700,NULL,0.97,70,1,'A','[{\"acronym\":\"HR\"}]','{}','{}','[]','vanilla',170,1)," ++
+            "(4,2,75,0,100,100,NULL,0.80,10,1,'B','[]','{}','{}','[]','vanilla',20,0)," ++
+            "(5,1,75,0,400,400,NULL,0.85,40,1,'B','[{\"acronym\":\"HR\"}]','{}','{}','[]','vanilla',100,0)," ++
+            "(6,1,75,0,600,600,NULL,0.90,60,1,'A','[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}]','{}','{}','[]','custom',60,1)," ++
+            "(7,2,75,0,800,800,NULL,0.98,80,1,'A','[{\"acronym\":\"WIGGLE\"},{\"acronym\":\"HR\"}]','{}','{}','[]','custom',80,1)," ++
+            "(8,2,75,0,700,700,NULL,0.97,70,1,'A','[{\"acronym\":\"AP\"},{\"acronym\":\"WIGGLE\"}]','{}','{}','[]','custom',70,0)," ++
+            "(9,1,76,0,900,900,NULL,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1)," ++
+            "(10,1,77,0,900,900,NULL,0.99,90,1,'S','[]','{}','{}','[]','vanilla',190,1);" ++
             "INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES" ++
             "(4,'0123456789abcdef0123456789abcdef',0,0,650,65,0.96,65,96,4,0,0,0,0,0,1,x'7265706c6179','vanilla',1)," ++
             "(1,'0123456789abcdef0123456789abcdef',0,0,550,55,0.95,55,95,5,0,0,0,0,0,1,x'7265706c6179','vanilla',1)," ++
@@ -6401,8 +7110,8 @@ test "schema twenty two backfills the historical lazer best score" {
                 "PRAGMA user_version=21;" ++
                 "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
                 "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(75,75,'11111111111111111111111111111111','a','one','one','m',3);" ++
-                "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace) VALUES" ++
-                "(1,1,75,0,500,0.5,5,1,'[]','{}','vanilla'),(2,1,75,0,1000,1,10,1,'[]','{}','vanilla'),(3,1,75,0,2000,1,20,0,'[]','{}','vanilla')",
+                "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace) VALUES" ++
+                "(1,1,75,0,500,500,0.5,5,1,'[]','{}','vanilla'),(2,1,75,0,1000,1000,1,10,1,'[]','{}','vanilla'),(3,1,75,0,2000,2000,1,20,0,'[]','{}','vanilla')",
         );
     }
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
@@ -6539,8 +7248,8 @@ test "startup repairs lazer best plays by pp without changing score order" {
         try old_store.exec(
             "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00');" ++
                 "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(75,75,'11111111111111111111111111111111','a','one','one','m',3);" ++
-                "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace,pp,best) VALUES" ++
-                "(1,1,75,0,1000,1,10,1,'[]','{}','vanilla',100,1),(2,1,75,0,900,1,10,1,'[{\"acronym\":\"HR\"}]','{}','vanilla',500,0)",
+                "INSERT INTO lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace,pp,best) VALUES" ++
+                "(1,1,75,0,1000,1000,1,10,1,'[]','{}','vanilla',100,1),(2,1,75,0,900,900,1,10,1,'[{\"acronym\":\"HR\"}]','{}','vanilla',500,0)",
         );
     }
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
@@ -6632,12 +7341,25 @@ test "stable and lazer share one ranked performance result per map" {
     try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"selected_stats\":{\"ranked_score\":1200,\"total_score\":2200,\"pp\":400,\"plays\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"client\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable_profile, "\"client\":\"lazer\"") == null);
+    var parsed_stable_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stable_profile, .{});
+    defer parsed_stable_profile.deinit();
+    const stable_profile_play = parsed_stable_profile.value.object.get("recent_scores").?.array.items[0].object;
+    try std.testing.expectEqual(stable_profile_play.get("score").?.integer, stable_profile_play.get("legacy_score").?.integer);
     const lazer_profile = (try store.siteProfile(std.testing.allocator, 1, .lazer, 0)).?;
     defer std.testing.allocator.free(lazer_profile);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_source\":\"lazer\",\"stats_source\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":900,\"total_score\":900,\"pp\":350,\"plays\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"stable\"") == null);
+    var parsed_lazer_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_profile, .{});
+    defer parsed_lazer_profile.deinit();
+    const lazer_profile_play = parsed_lazer_profile.value.object.get("recent_scores").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 1500), lazer_profile_play.get("score").?.integer);
+    try std.testing.expectEqual(@as(i64, 900), lazer_profile_play.get("score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(lazer_profile_play.get("legacy_score").?) == .null);
+    const lazer_first_place = parsed_lazer_profile.value.object.get("first_place_scores").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 900), lazer_first_place.get("score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(lazer_first_place.get("legacy_score").?) == .null);
     const stable_source_stats = (try store.sourceStatsForUser(1, 0, .stable)).?;
     const lazer_source_stats = (try store.sourceStatsForUser(1, 0, .lazer)).?;
     try std.testing.expectEqual(@as(i64, 1200), stable_source_stats.ranked_score);
@@ -6648,6 +7370,14 @@ test "stable and lazer share one ranked performance result per map" {
     try std.testing.expectEqual(@as(i64, 900), lazer_source_stats.total_score);
     try std.testing.expectEqual(@as(i32, 350), lazer_source_stats.pp);
     try std.testing.expectEqual(@as(i32, 1), lazer_source_stats.plays);
+    const combined_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 75, .all, 0)).?;
+    defer std.testing.allocator.free(combined_board);
+    var parsed_combined_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined_board, .{});
+    defer parsed_combined_board.deinit();
+    const combined_score = parsed_combined_board.value.object.get("scores").?.array.items[0].object;
+    try std.testing.expectEqualStrings("stable", combined_score.get("client").?.string);
+    try std.testing.expectEqual(@as(i64, 1200), combined_score.get("score").?.integer);
+    try std.testing.expectEqual(@as(i64, 400), combined_score.get("pp").?.integer);
     const stable_rankings = try store.siteRankings(std.testing.allocator, .stable, 0, 0);
     defer std.testing.allocator.free(stable_rankings);
     try std.testing.expect(std.mem.indexOf(u8, stable_rankings, "\"source\":\"stable\"") != null);

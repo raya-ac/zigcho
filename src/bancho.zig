@@ -1059,8 +1059,10 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                 allocator.free(found.safe_name);
             }
             try session.friend_ids.ensureUnusedCapacity(allocator, 1);
-            _ = try store.addFriend(session.user.id, friend_id);
-            session.friend_ids.appendAssumeCapacity(friend_id);
+            switch (try store.addFriend(session.user.id, friend_id)) {
+                .inserted, .existing => session.friend_ids.appendAssumeCapacity(friend_id),
+                .ineligible => {},
+            }
         },
         .friend_remove => {
             const friend_id = packetUserId(packet.payload) orelse continue;

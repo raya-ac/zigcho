@@ -99,8 +99,8 @@ auth_get /api/v2/rankings/kudosu kudosu_rankings
 jq -e '.ranking == []' "$response" >/dev/null || fail invalid_kudosu_rankings_contract
 auth_get '/api/v2/rankings/osu/charts?spotlight=1' spotlight_rankings
 jq -e '.ranking == [] and .spotlight.id == 1 and .spotlight.name == "zigcho!lazer" and .beatmapsets == []' "$response" >/dev/null || fail invalid_spotlight_rankings_contract
-auth_get /api/v2/wiki/en/zigcho wiki
-jq -e '.layout == "wiki" and .locale == "en" and .path == "zigcho"' "$response" >/dev/null || fail invalid_wiki_contract
+auth_get /api/v2/wiki/en/Main_page wiki
+jq -e '.layout == "wiki" and .locale == "en" and .path == "Main_page" and (.markdown | contains("](/wiki/Multiplayer)"))' "$response" >/dev/null || fail invalid_wiki_contract
 auth_get /api/v2/changelog changelog
 jq -e '(.streams | length) > 0 and (.builds | length) == 10 and ([.builds[].changelog_entries | length] | add) == 79 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
 auth_get /api/v2/changelog/lazer/2026.809.0 changelog_oldest
@@ -285,7 +285,9 @@ expect_status "$code" 409 reject_token_reuse
 [ "$(sqlite3 "$database" "SELECT mods_json FROM lazer_scores WHERE id=$score_id")" = '[{"acronym":"RX"},{"acronym":"WIGGLE","settings":{"strength":1.25}}]' ] || fail mods_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT statistics_json FROM lazer_scores WHERE id=$score_id")" = '{"great":300,"miss":2}' ] || fail statistics_not_stored_separately
 [ "$(sqlite3 "$database" "SELECT rank_namespace FROM lazer_scores WHERE id=$score_id")" = custom ] || fail custom_namespace_missing
-[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 33 ] || fail schema_not_migrated
+[ "$(sqlite3 "$database" "SELECT total_score_without_mods FROM lazer_scores WHERE id=$score_id")" = 900000 ] || fail score_without_mods_not_stored
+[ "$(sqlite3 "$database" "SELECT legacy_total_score IS NULL FROM lazer_scores WHERE id=$score_id")" = 1 ] || fail native_score_marked_legacy
+[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 43 ] || fail schema_not_migrated
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=WIGGLE&limit=50' custom_leaderboard
 jq -e --argjson id "$score_id" '

@@ -176,6 +176,29 @@ pub const Pool = struct {
 
     pub const default_size = 8;
 
+    fn restoreConnection(self: *Pool, conn: *c.PGconn) bool {
+        _ = self;
+        if (c.PQstatus(conn) != c.CONNECTION_OK) c.PQreset(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) return false;
+
+        const transaction_status = c.PQtransactionStatus(conn);
+        if (transaction_status == c.PQTRANS_IDLE) return true;
+        if (transaction_status == c.PQTRANS_INTRANS or transaction_status == c.PQTRANS_INERROR) {
+            exec(conn, "ROLLBACK") catch {
+                c.PQreset(conn);
+                return c.PQstatus(conn) == c.CONNECTION_OK and c.PQtransactionStatus(conn) == c.PQTRANS_IDLE;
+            };
+            std.log.warn("postgres pool rolled back a transaction left open by its previous lease", .{});
+            return c.PQtransactionStatus(conn) == c.PQTRANS_IDLE;
+        }
+
+        // Synchronous callers should never return a connection while libpq is
+        // active or unable to describe its state. Reset it before reuse rather
+        // than allowing one request to inherit another request's connection.
+        c.PQreset(conn);
+        return c.PQstatus(conn) == c.CONNECTION_OK and c.PQtransactionStatus(conn) == c.PQTRANS_IDLE;
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, conninfo: []const u8, size: usize) !Pool {
         if (size == 0 or size > 64) return error.InvalidPoolSize;
         const owned_conninfo = try allocator.dupeZ(u8, conninfo);
@@ -215,6 +238,7 @@ pub const Pool = struct {
 
         pub fn release(self: *Lease) void {
             const pool = self.pool;
+            if (!pool.restoreConnection(self.conn)) std.log.err("postgres pool could not restore a released connection", .{});
             pool.mutex.lockUncancelable(pool.io);
             std.debug.assert(pool.in_use[self.index]);
             pool.in_use[self.index] = false;
@@ -245,8 +269,7 @@ pub const Pool = struct {
 
             // Reconnection may block on the network, so never hold the pool's
             // availability lock while libpq resets one leased connection.
-            if (c.PQstatus(conn) != c.CONNECTION_OK) c.PQreset(conn);
-            if (c.PQstatus(conn) == c.CONNECTION_OK) return .{ .pool = self, .index = index, .conn = conn };
+            if (self.restoreConnection(conn)) return .{ .pool = self, .index = index, .conn = conn };
 
             self.mutex.lockUncancelable(self.io);
             self.in_use[index] = false;
@@ -291,4 +314,24 @@ test "postgres pool bounds concurrent leases and returns them" {
     thread.join();
     second.release();
     try std.testing.expect(!failed.load(.acquire));
+}
+
+test "postgres pool never carries a transaction into the next lease" {
+    const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_URL") orelse return error.SkipZigTest;
+    const conninfo = std.mem.span(raw_conninfo);
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, conninfo, 1);
+    defer pool.deinit();
+
+    var dirty = pool.acquire();
+    try exec(dirty.conn, "BEGIN");
+    try exec(dirty.conn, "SET LOCAL application_name='zigcho_dirty_lease'");
+    try std.testing.expect(c.PQtransactionStatus(dirty.conn) == c.PQTRANS_INTRANS);
+    dirty.release();
+
+    var clean = pool.acquire();
+    defer clean.release();
+    try std.testing.expect(c.PQtransactionStatus(clean.conn) == c.PQTRANS_IDLE);
+    var application_name = try query(clean.conn, "SHOW application_name");
+    defer application_name.deinit();
+    try std.testing.expect(!std.mem.eql(u8, application_name.value(0, 0), "zigcho_dirty_lease"));
 }

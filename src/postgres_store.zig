@@ -33,6 +33,7 @@ pub const BeatmapSetCreator = sqlite_storage.BeatmapSetCreator;
 pub const ConsumedLazerScoreToken = sqlite_storage.ConsumedLazerScoreToken;
 const archive_object_limit: usize = 128 * 1024 * 1024;
 const max_replay_object_bytes: usize = 32 * 1024 * 1024;
+const visible_follower_count_sql = "CASE WHEN NOT u.restricted AND u.id!=3 THEN (SELECT count(*) FROM zigcho.friends relation JOIN zigcho.users follower ON follower.id=relation.user_id WHERE relation.friend_id=u.id AND relation.user_id!=u.id AND NOT follower.restricted) ELSE 0 END";
 
 fn hasOauthScope(scopes: []const u8, wanted: []const u8) bool {
     var values = std.mem.splitScalar(u8, scopes, ' ');
@@ -172,7 +173,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36 and version != 37 and version != 38 and version != 39 and version != 40) return error.UnsupportedSchemaVersion;
+        } else if (version != 13 and version != 14 and version != 15 and version != 16 and version != 17 and version != 18 and version != 19 and version != 20 and version != 21 and version != 22 and version != 23 and version != 24 and version != 25 and version != 26 and version != 27 and version != 28 and version != 29 and version != 30 and version != 31 and version != 32 and version != 33 and version != 34 and version != 35 and version != 36 and version != 37 and version != 38 and version != 39 and version != 40 and version != 41 and version != 42 and version != 43) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -358,7 +359,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(28);" ++
                     "COMMIT",
             );
-            try self.rebuildRankedStats(lease.conn);
+            try self.rebuildRankedStats(lease.conn, true);
         }
         if (version <= 28) {
             try postgres.exec(
@@ -382,6 +383,10 @@ pub const Store = struct {
         if (version <= 37) try postgres.exec(lease.conn, database_sql.postgresMigration(38));
         if (version <= 38) try postgres.exec(lease.conn, database_sql.postgresMigration(39));
         if (version <= 39) try postgres.exec(lease.conn, database_sql.postgresMigration(40));
+        if (version <= 40) try postgres.exec(lease.conn, database_sql.postgresMigration(41));
+        if (version <= 41) try postgres.exec(lease.conn, database_sql.postgresMigration(42));
+        if (version <= 42) try postgres.exec(lease.conn, database_sql.postgresMigration(43));
+        try postgres.exec(lease.conn, "DELETE FROM zigcho.user_stats_history WHERE day<((extract(epoch FROM clock_timestamp())::bigint/86400)-89)*86400");
         try self.refreshExternalOnly(lease.conn);
         try postgres.exec(
             lease.conn,
@@ -411,6 +416,7 @@ pub const Store = struct {
             .privileges = try result.int(u32, row, 4),
             .silence_end = try result.int(i64, row, 5),
             .restricted = try result.boolean(row, 6),
+            .follower_count = try result.int(i32, row, 13),
             .banner_version = try result.int(i64, row, 7),
             .team = team,
         };
@@ -576,19 +582,23 @@ pub const Store = struct {
         var upsert = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.client_hardware(user_id,osu_path_md5,adapters_md5,uninstall_md5,disk_signature_md5,client_version,running_under_wine) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(user_id,osu_path_md5,adapters_md5,uninstall_md5,disk_signature_md5) DO UPDATE SET client_version=excluded.client_version,running_under_wine=excluded.running_under_wine,last_seen=extract(epoch FROM clock_timestamp())::bigint,occurrences=zigcho.client_hardware.occurrences+1", &.{ id, hardware.osu_path_md5, hardware.adapters_md5, hardware.uninstall_md5, hardware.disk_signature_md5, hardware.client_version, wine });
         upsert.deinit();
 
+        var restriction_changed = false;
         if (matched.items.len != 0) {
             if (try restrictUser(self.allocator, lease.conn, user_id)) {
+                restriction_changed = true;
                 var detail_buf: [128]u8 = undefined;
                 const detail = try std.fmt.bufPrint(&detail_buf, "multiaccount_hwid_exact matched_user:{d}", .{matched.items[0]});
                 try insertAudit(self.allocator, lease.conn, 3, "account.restrict", user_id, detail);
             }
             for (matched.items) |matched_user_id| {
                 if (try restrictUser(self.allocator, lease.conn, matched_user_id)) {
+                    restriction_changed = true;
                     var detail_buf: [128]u8 = undefined;
                     const detail = try std.fmt.bufPrint(&detail_buf, "multiaccount_hwid_exact matched_user:{d}", .{user_id});
                     try insertAudit(self.allocator, lease.conn, 3, "account.restrict", matched_user_id, detail);
                 }
             }
+            if (restriction_changed) try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         }
 
         const owned_matches = try matched.toOwnedSlice(self.allocator);
@@ -607,6 +617,7 @@ pub const Store = struct {
             var detail_buf: [64]u8 = undefined;
             const detail = try std.fmt.bufPrint(&detail_buf, "stable_lastfm_hq flags:{d}", .{flags});
             try insertAudit(self.allocator, lease.conn, 3, "account.restrict", user_id, detail);
+            try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         }
         try postgres.exec(lease.conn, "COMMIT");
         return changed;
@@ -674,8 +685,25 @@ pub const Store = struct {
             "INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES($1,$2,$3,$4,$5,$6,$7,$8,extract(epoch FROM clock_timestamp())::bigint,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT(id) DO NOTHING";
         var lease = self.pool.acquire();
         defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var previous = try postgres.queryParams(self.allocator, lease.conn, "SELECT b.status,b.status_frozen,EXISTS(SELECT 1 FROM zigcho.scores s WHERE s.map_md5=b.md5) OR EXISTS(SELECT 1 FROM zigcho.lazer_scores l WHERE l.beatmap_id=b.id) FROM zigcho.beatmaps b WHERE b.id=$1 FOR UPDATE", &.{map_id});
+        defer previous.deinit();
+        const previous_status: ?i8 = if (previous.rows() == 0) null else try previous.int(i8, 0, 0);
+        const previous_frozen = previous.rows() != 0 and try previous.boolean(0, 1);
+        const had_scores = previous.rows() != 0 and try previous.boolean(0, 2);
         var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ map_id, set_id, md5, metadata.artist, metadata.title, metadata.version, metadata.creator, status_text, total_length, combo, mode, bpm, cs, ar, od, hp, star_rating, metadata.source, metadata.tags, file_param, circles, sliders, spinners });
         result.deinit();
+        if (update_existing) if (previous_status) |old_status| {
+            const effective_status = if (previous_frozen) old_status else status;
+            const leaderboard_changed = (old_status >= 3) != (effective_status >= 3);
+            const ranked_changed = (old_status == 3 or old_status == 4) != (effective_status == 3 or effective_status == 4);
+            if (had_scores and (leaderboard_changed or ranked_changed)) {
+                try self.rebuildRankedStats(lease.conn, false);
+                try self.recordBeatmapStatsHistoryCurrentWithConnection(lease.conn, metadata.id, md5);
+            }
+        };
+        try postgres.exec(lease.conn, "COMMIT");
     }
 
     pub fn upsertBeatmap(self: *Store, metadata: beatmap.Metadata, md5: []const u8, status: i8, stars: f64, max_combo: u32, osu_file: []const u8) !void {
@@ -1282,6 +1310,7 @@ pub const Store = struct {
         if (try count.int(usize, 0, 0) != package.maps.len) return error.BssRevisionMismatch;
 
         const upsert_sql = "INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status,last_update,total_length,max_combo,mode,bpm,cs,ar,od,hp,star_rating,source,tags,osu_file,count_circles,count_sliders,count_spinners) VALUES($1,$2,$3,$4,$5,$6,$7,$8,extract(epoch FROM clock_timestamp())::bigint,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT(id) DO UPDATE SET set_id=excluded.set_id,md5=excluded.md5,artist=excluded.artist,title=excluded.title,version=excluded.version,creator=excluded.creator,creator_id=NULL,status=excluded.status,last_update=excluded.last_update,total_length=excluded.total_length,max_combo=excluded.max_combo,mode=excluded.mode,bpm=excluded.bpm,cs=excluded.cs,ar=excluded.ar,od=excluded.od,hp=excluded.hp,star_rating=excluded.star_rating,source=excluded.source,tags=excluded.tags,osu_file=excluded.osu_file,count_circles=excluded.count_circles,count_sliders=excluded.count_sliders,count_spinners=excluded.count_spinners";
+        var stats_eligibility_changed = false;
         for (package.maps) |map| {
             if (map.metadata.set_id != set_id) return error.BssRevisionMismatch;
             var map_id_buf: [24]u8 = undefined;
@@ -1289,6 +1318,13 @@ pub const Store = struct {
             var active = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.beatmap_submission_maps WHERE set_id=$1 AND beatmap_id=$2 AND active", &.{ set, map_id });
             defer active.deinit();
             if (active.rows() != 1) return error.BssRevisionMismatch;
+            var previous_map = try postgres.queryParams(self.allocator, lease.conn, "SELECT b.status,EXISTS(SELECT 1 FROM zigcho.scores s WHERE s.map_md5=b.md5) OR EXISTS(SELECT 1 FROM zigcho.lazer_scores l WHERE l.beatmap_id=b.id) FROM zigcho.beatmaps b WHERE b.id=$1 FOR UPDATE", &.{map_id});
+            defer previous_map.deinit();
+            if (previous_map.rows() != 0 and try previous_map.boolean(0, 1)) {
+                const old_status = try previous_map.int(i32, 0, 0);
+                const new_status = target.status();
+                stats_eligibility_changed = stats_eligibility_changed or (old_status >= 3) != (new_status >= 3) or (old_status == 3 or old_status == 4) != (new_status == 3 or new_status == 4);
+            }
             const encoded = try postgres.encodeBytea(self.allocator, map.contents);
             defer self.allocator.free(encoded);
             var status_buf: [8]u8 = undefined;
@@ -1319,6 +1355,10 @@ pub const Store = struct {
             const spinners = try std.fmt.bufPrint(&spinners_buf, "{d}", .{map.metadata.count_spinners});
             var upsert = try postgres.queryParams(self.allocator, lease.conn, upsert_sql, &.{ map_id, set, &map.md5, map.metadata.artist, map.metadata.title, map.metadata.version, owner_name, status, total_length, max_combo, mode, bpm, cs, ar, od, hp, stars, map.metadata.source, map.metadata.tags, encoded, circles, sliders, spinners });
             upsert.deinit();
+        }
+        if (stats_eligibility_changed) {
+            try self.rebuildRankedStats(lease.conn, false);
+            try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         }
         var size_buf: [32]u8 = undefined;
         const size = try std.fmt.bufPrint(&size_buf, "{d}", .{archive.len});
@@ -2073,7 +2113,7 @@ pub const Store = struct {
         const viewer_id = try std.fmt.bufPrint(&viewer_buf, "{d}", .{viewer.id});
         const namespace = stable_mods.namespace(requested_mods);
         const uses_pp = std.mem.eql(u8, namespace, "relax") or std.mem.eql(u8, namespace, "autopilot");
-        const filter = " FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.map_md5=$1 AND s.mode=$2 AND s.passed AND s.best AND s.rank_namespace=$3 AND ($4::int!=2 OR s.mods=$5) AND ($4::int!=3 OR s.user_id=$6 OR EXISTS(SELECT 1 FROM zigcho.friends f WHERE f.user_id=$6 AND f.friend_id=s.user_id)) AND ($4::int!=4 OR u.country=$7)";
+        const filter = " FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.map_md5=$1 AND s.mode=$2 AND s.passed AND s.best AND s.rank_namespace=$3 AND ($4::int!=2 OR s.mods=$5) AND ($4::int!=3 OR s.user_id=$6 OR EXISTS(SELECT 1 FROM zigcho.friends f JOIN zigcho.users friend_sender ON friend_sender.id=f.user_id JOIN zigcho.users friend_target ON friend_target.id=f.friend_id WHERE f.user_id=$6 AND f.friend_id=s.user_id AND friend_sender.id!=friend_target.id AND friend_target.id!=3 AND NOT friend_sender.restricted AND NOT friend_target.restricted)) AND ($4::int!=4 OR u.country=$7)";
         const params = &.{ map_md5, mode_text, namespace, board, mods, viewer_id, viewer.country[0..] };
         var lease = self.pool.acquire();
         defer lease.release();
@@ -2123,18 +2163,18 @@ pub const Store = struct {
                 "SELECT count(*)+1" ++ filter ++ " AND (s.score>$8 OR (s.score=$8 AND s.id<$9))", rank_params);
             defer personal_rank.deinit();
             var personal_row = try postgres.queryParams(self.allocator, lease.conn, if (uses_pp)
-                "SELECT s.id,u.name,s.pp,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,coalesce(octet_length(s.replay),0)>0 FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.id=$1"
+                "SELECT s.id,u.name,s.pp,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,(coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)) FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.id=$1"
             else
-                "SELECT s.id,u.name,s.score,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,coalesce(octet_length(s.replay),0)>0 FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.id=$1", &.{personal_id_text});
+                "SELECT s.id,u.name,s.score,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,(coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)) FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id WHERE s.id=$1", &.{personal_id_text});
             defer personal_row.deinit();
             if (personal_row.rows() == 0) return error.DatabaseQueryFailed;
             try writeBoardRow(writer, personal_row, 0, try personal_rank.int(i32, 0, 0), uses_pp);
         }
         try writer.writeByte('\n');
         var rows = try postgres.queryParams(self.allocator, lease.conn, if (uses_pp)
-            "SELECT s.id,u.name,s.pp,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,coalesce(octet_length(s.replay),0)>0" ++ filter ++ " ORDER BY s.pp DESC,s.id ASC LIMIT 50"
+            "SELECT s.id,u.name,s.pp,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,(coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id))" ++ filter ++ " ORDER BY s.pp DESC,s.id ASC LIMIT 50"
         else
-            "SELECT s.id,u.name,s.score,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,coalesce(octet_length(s.replay),0)>0" ++ filter ++ " ORDER BY s.score DESC,s.id ASC LIMIT 50", params);
+            "SELECT s.id,u.name,s.score,s.max_combo,s.n50,s.n100,s.n300,s.nmiss,s.nkatu,s.ngeki,s.perfect,s.mods,s.user_id,s.submitted_at,(coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id))" ++ filter ++ " ORDER BY s.score DESC,s.id ASC LIMIT 50", params);
         defer rows.deinit();
         for (0..rows.rows()) |row| {
             if (row != 0) try writer.writeByte('\n');
@@ -2232,7 +2272,8 @@ pub const Store = struct {
         try writer.writeAll(lazer.beatmap_tags_array_json);
         // The pinned APIBeatmapSet.user setter dereferences null. Search responses
         // intentionally omit detailed mapper data when it has not been cached.
-        var local_profile = try postgres.queryParams(self.allocator, conn, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country FROM zigcho.beatmap_submissions submission JOIN zigcho.users u ON u.id=submission.owner_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE submission.set_id=$1 AND submission.state='published'", &.{set});
+        const local_profile_sql = "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country," ++ visible_follower_count_sql ++ " FROM zigcho.beatmap_submissions submission JOIN zigcho.users u ON u.id=submission.owner_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE submission.set_id=$1 AND submission.state='published'";
+        var local_profile = try postgres.queryParams(self.allocator, conn, local_profile_sql, &.{set});
         defer local_profile.deinit();
         if (local_profile.rows() != 0) {
             try writer.writeAll(",\"user\":");
@@ -2631,7 +2672,8 @@ pub const Store = struct {
             "(SELECT count(*) FROM (SELECT submission.set_id FROM zigcho.beatmap_submissions submission JOIN zigcho.beatmaps b ON b.set_id=submission.set_id WHERE submission.owner_id=u.id AND submission.state='published' GROUP BY submission.set_id HAVING min(b.status)=2) sets)," ++
             "(SELECT count(*) FROM (SELECT submission.set_id FROM zigcho.beatmap_submissions submission JOIN zigcho.beatmaps b ON b.set_id=submission.set_id WHERE submission.owner_id=u.id AND submission.state='published' GROUP BY submission.set_id HAVING min(b.status)=1) sets)," ++
             "(SELECT count(*) FROM (SELECT submission.set_id FROM zigcho.beatmap_submissions submission JOIN zigcho.beatmaps b ON b.set_id=submission.set_id WHERE submission.owner_id=u.id AND submission.state='published' GROUP BY submission.set_id HAVING min(b.status)=5) sets)," ++
-            "(SELECT count(*) FROM (SELECT b.id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=u.id UNION SELECT s.beatmap_id FROM zigcho.lazer_scores s WHERE s.user_id=u.id) played) " ++
+            "(SELECT count(*) FROM (SELECT b.id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=u.id UNION SELECT s.beatmap_id FROM zigcho.lazer_scores s WHERE s.user_id=u.id) played)," ++
+            visible_follower_count_sql ++ " " ++
             "FROM zigcho.users u WHERE u.id=$1";
         var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{id});
         defer result.deinit();
@@ -2655,6 +2697,7 @@ pub const Store = struct {
         summary.graveyard_count = @intCast(@min(@as(i64, std.math.maxInt(i32)), try result.int(i64, 0, 14)));
         summary.nominated_count = @intCast(@min(@as(i64, std.math.maxInt(i32)), try result.int(i64, 0, 15)));
         summary.played_beatmap_count = @intCast(@min(@as(i64, std.math.maxInt(i32)), try result.int(i64, 0, 16)));
+        summary.follower_count = @intCast(@min(@as(i64, std.math.maxInt(i32)), try result.int(i64, 0, 17)));
         return summary;
     }
 
@@ -2663,13 +2706,15 @@ pub const Store = struct {
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT coalesce((SELECT updated_at FROM zigcho.user_avatars a WHERE a.user_id=u.id),u.avatar_key),u.show_country,u.show_profile_stats FROM zigcho.users u WHERE u.id=$1", &.{id});
+        const sql = "SELECT coalesce((SELECT updated_at FROM zigcho.user_avatars a WHERE a.user_id=u.id),u.avatar_key),u.show_country,u.show_profile_stats," ++ visible_follower_count_sql ++ " FROM zigcho.users u WHERE u.id=$1";
+        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{id});
         defer result.deinit();
         if (result.rows() == 0) return null;
         return .{
             .avatar_version = try result.int(i64, 0, 0),
             .show_country = try result.boolean(0, 1),
             .show_profile_stats = try result.boolean(0, 2),
+            .follower_count = try result.int(i32, 0, 3),
         };
     }
 
@@ -2682,6 +2727,32 @@ pub const Store = struct {
         var lease = self.pool.acquire();
         defer lease.release();
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{id});
+        defer result.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeByte('[');
+        for (0..result.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            try output.writer.writeAll("{\"start_date\":");
+            try jsonString(&output.writer, result.value(row, 0));
+            try output.writer.print(",\"count\":{d}}}", .{try result.int(i64, row, 1)});
+        }
+        try output.writer.writeByte(']');
+        return output.toOwnedSlice();
+    }
+
+    pub fn lazerReplaysWatchedCountsJson(self: *Store, allocator: std.mem.Allocator, user_id: i32, ruleset_id: u8) ![]u8 {
+        if (ruleset_id > 3) return error.InvalidRulesetId;
+        var buffers: [2][24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffers[0], "{d}", .{user_id});
+        const mode = try std.fmt.bufPrint(&buffers[1], "{d}", .{ruleset_id});
+        const sql =
+            "SELECT to_char(date_trunc('month',to_timestamp(viewed_at) AT TIME ZONE 'UTC'),'YYYY-MM-DD'),count(*) FROM zigcho.score_replay_views " ++
+            "WHERE owner_id=$1 AND mode=$2 AND rank_namespace='vanilla' " ++
+            "GROUP BY date_trunc('month',to_timestamp(viewed_at) AT TIME ZONE 'UTC') ORDER BY 1";
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ id, mode });
         defer result.deinit();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
@@ -3050,7 +3121,8 @@ pub const Store = struct {
     fn credentialForSafeName(self: *Store, allocator: std.mem.Allocator, safe: []const u8) !?Credential {
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country,u.password_hash,u.password_salt FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.safe_name=$1", &.{safe});
+        const sql = "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country," ++ visible_follower_count_sql ++ ",u.password_hash,u.password_salt FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.safe_name=$1";
+        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{safe});
         defer result.deinit();
         if (result.rows() == 0) return null;
         const user = try userFromResult(allocator, result, 0);
@@ -3058,9 +3130,9 @@ pub const Store = struct {
             allocator.free(user.name);
             allocator.free(user.safe_name);
         }
-        const password_hash = try postgres.decodeBytea(allocator, result.value(0, 13));
+        const password_hash = try postgres.decodeBytea(allocator, result.value(0, 14));
         errdefer allocator.free(password_hash);
-        const password_salt = try postgres.decodeBytea(allocator, result.value(0, 14));
+        const password_salt = try postgres.decodeBytea(allocator, result.value(0, 15));
         return .{ .allocator = allocator, .user = user, .password_hash = password_hash, .password_salt = password_salt };
     }
 
@@ -3108,7 +3180,8 @@ pub const Store = struct {
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.id=$1", &.{id});
+        const sql = "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country," ++ visible_follower_count_sql ++ " FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.id=$1";
+        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{id});
         defer result.deinit();
         if (result.rows() == 0) return null;
         return try userFromResult(allocator, result, 0);
@@ -3119,7 +3192,8 @@ pub const Store = struct {
         defer allocator.free(safe);
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(allocator, lease.conn, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.safe_name=$1", &.{safe});
+        const sql = "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0),u.show_country," ++ visible_follower_count_sql ++ " FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.safe_name=$1";
+        var result = try postgres.queryParams(allocator, lease.conn, sql, &.{safe});
         defer result.deinit();
         if (result.rows() == 0) return null;
         return try userFromResult(allocator, result, 0);
@@ -3130,7 +3204,8 @@ pub const Store = struct {
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(allocator, lease.conn, "SELECT friend_id FROM zigcho.friends WHERE user_id=$1 ORDER BY friend_id LIMIT 1000", &.{id});
+        const sql = "SELECT relation.friend_id FROM zigcho.friends relation JOIN zigcho.users sender ON sender.id=relation.user_id JOIN zigcho.users target ON target.id=relation.friend_id WHERE relation.user_id=$1 AND NOT sender.restricted AND NOT target.restricted ORDER BY relation.friend_id LIMIT 1000";
+        var result = try postgres.queryParams(allocator, lease.conn, sql, &.{id});
         defer result.deinit();
         var list: std.ArrayList(i32) = .empty;
         errdefer list.deinit(allocator);
@@ -3139,17 +3214,25 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    pub fn addFriend(self: *Store, user_id: i32, friend_id: i32) !bool {
-        if (user_id == friend_id or friend_id == 3) return false;
+    pub fn addFriend(self: *Store, user_id: i32, friend_id: i32) !domain.RelationshipAddResult {
         var user_buf: [24]u8 = undefined;
         var friend_buf: [24]u8 = undefined;
         const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
         const friend = try std.fmt.bufPrint(&friend_buf, "{d}", .{friend_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.friends(user_id,friend_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", &.{ user, friend });
+        const sql =
+            "WITH eligible AS (SELECT sender.id user_id,target.id friend_id FROM zigcho.users sender JOIN zigcho.users target ON target.id=$2 " ++
+            "WHERE sender.id=$1 AND sender.id!=target.id AND target.id!=3 AND NOT sender.restricted AND NOT target.restricted)," ++
+            "inserted AS (INSERT INTO zigcho.friends(user_id,friend_id) SELECT user_id,friend_id FROM eligible ON CONFLICT DO NOTHING RETURNING 1) " ++
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM inserted) THEN 1 WHEN EXISTS(SELECT 1 FROM eligible) THEN 2 ELSE 0 END";
+        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ user, friend });
         defer result.deinit();
-        return result.rows() != 0;
+        return switch (try result.int(u8, 0, 0)) {
+            1 => .inserted,
+            2 => .existing,
+            else => .ineligible,
+        };
     }
 
     pub fn removeFriend(self: *Store, user_id: i32, friend_id: i32) !bool {
@@ -3172,9 +3255,48 @@ pub const Store = struct {
         const friend = try std.fmt.bufPrint(&friend_buf, "{d}", .{friend_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT EXISTS(SELECT 1 FROM zigcho.friends WHERE user_id=$1 AND friend_id=$2)::int", &.{ friend, user });
+        const sql = "SELECT EXISTS(SELECT 1 FROM zigcho.friends relation JOIN zigcho.users sender ON sender.id=relation.user_id JOIN zigcho.users target ON target.id=relation.friend_id WHERE relation.user_id=$1 AND relation.friend_id=$2 AND sender.id!=target.id AND target.id!=3 AND NOT sender.restricted AND NOT target.restricted)::int";
+        var result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ friend, user });
         defer result.deinit();
         return try result.int(i32, 0, 0) != 0;
+    }
+
+    fn replayViewCountWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, source: domain.SiteScoreSource, stats_mode: u8) !i32 {
+        if (!domain.validSiteMode(source, stats_mode)) return error.InvalidScoreSource;
+        var buffers: [2][24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&buffers[0], "{d}", .{user_id});
+        const mode = try std.fmt.bufPrint(&buffers[1], "{d}", .{stats_mode});
+        var result = try postgres.queryParams(self.allocator, conn, "SELECT count(*) FROM zigcho.score_replay_views WHERE owner_id=$1 AND mode=$2 AND rank_namespace=$3 AND ($4='all' OR ($4='scorev2' AND source='stable') OR source=$4)", &.{ user, mode, domain.siteNamespace(source, stats_mode), @tagName(source) });
+        defer result.deinit();
+        return try result.int(i32, 0, 0);
+    }
+
+    pub fn replayViewCount(self: *Store, user_id: i32, source: domain.SiteScoreSource, stats_mode: u8) !i32 {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        return self.replayViewCountWithConnection(lease.conn, user_id, source, stats_mode);
+    }
+
+    pub fn recordReplayView(self: *Store, viewer_id: i32, source: ReplaySource, score_id: i64) !bool {
+        if (viewer_id <= 0 or score_id <= 0) return false;
+        var buffers: [2][32]u8 = undefined;
+        const viewer = try std.fmt.bufPrint(&buffers[0], "{d}", .{viewer_id});
+        const score = try std.fmt.bufPrint(&buffers[1], "{d}", .{score_id});
+        const stable_sql =
+            "INSERT INTO zigcho.score_replay_views(source,score_id,viewer_id,owner_id,mode,rank_namespace) " ++
+            "SELECT 'stable',s.id,$1,s.user_id,CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END,s.rank_namespace FROM zigcho.scores s " ++
+            "WHERE s.id=$2 AND s.user_id!=$1 AND s.passed AND s.rank_namespace IN('vanilla','relax','autopilot','scorev2') " ++
+            "ON CONFLICT(source,score_id,viewer_id) DO UPDATE SET viewed_at=extract(epoch FROM clock_timestamp())::bigint RETURNING 1";
+        const lazer_sql =
+            "INSERT INTO zigcho.score_replay_views(source,score_id,viewer_id,owner_id,mode,rank_namespace) " ++
+            "SELECT 'lazer',s.id,$1,s.user_id,CASE s.rank_namespace WHEN 'vanilla' THEN s.ruleset_id WHEN 'relax' THEN s.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END,s.rank_namespace FROM zigcho.lazer_scores s " ++
+            "WHERE s.id=$2 AND s.user_id!=$1 AND s.passed AND s.rank_namespace IN('vanilla','relax','autopilot') " ++
+            "ON CONFLICT(source,score_id,viewer_id) DO UPDATE SET viewed_at=extract(epoch FROM clock_timestamp())::bigint RETURNING 1";
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var result = try postgres.queryParams(self.allocator, lease.conn, if (source == .stable) stable_sql else lazer_sql, &.{ viewer, score });
+        defer result.deinit();
+        return result.rows() != 0;
     }
 
     pub fn blockIds(self: *Store, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
@@ -3624,12 +3746,13 @@ pub const Store = struct {
         for (user_ids.items, 0..) |id, index| {
             var id_buf: [24]u8 = undefined;
             const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
-            var user_row = try postgres.queryParams(allocator, lease.conn, "SELECT id,name,CASE WHEN show_country THEN country ELSE 'XX' END,privileges,restricted FROM zigcho.users WHERE id=$1", &.{id_text});
+            const user_sql = "SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,u.restricted," ++ visible_follower_count_sql ++ " FROM zigcho.users u WHERE u.id=$1";
+            var user_row = try postgres.queryParams(allocator, lease.conn, user_sql, &.{id_text});
             defer user_row.deinit();
             if (user_row.rows() == 0) continue;
             if (index != 0) try output.writer.writeByte(',');
             const country = user_row.value(0, 2);
-            const user_value: domain.User = .{ .id = id, .name = user_row.value(0, 1), .safe_name = "", .country = .{ country[0], country[1] }, .privileges = try user_row.int(u32, 0, 3), .restricted = try user_row.boolean(0, 4) };
+            const user_value: domain.User = .{ .id = id, .name = user_row.value(0, 1), .safe_name = "", .country = .{ country[0], country[1] }, .privileges = try user_row.int(u32, 0, 3), .restricted = try user_row.boolean(0, 4), .follower_count = try user_row.int(i32, 0, 5) };
             try user_json.writeCompact(&output.writer, user_value, true);
         }
         try output.writer.print("],\"total\":{d},\"top_level_count\":{d}}}", .{ try count.int(i32, 0, 0), try count.int(i32, 0, 1) });
@@ -4382,7 +4505,8 @@ pub const Store = struct {
             resolved.deinit();
             context.requests = 0;
         }
-        try self.rebuildRankedStats(lease.conn);
+        try self.rebuildRankedStats(lease.conn, false);
+        try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         try insertBeatmapRankEvent(self.allocator, lease.conn, context.set_id, actor_id, action_name, current, target, reason);
         context.status = target;
         try postgres.exec(lease.conn, "COMMIT");
@@ -4428,7 +4552,7 @@ pub const Store = struct {
         audit.deinit();
     }
 
-    fn rebuildRankedStats(self: *Store, conn: *postgres.c.PGconn) !void {
+    fn rebuildRankedStats(self: *Store, conn: *postgres.c.PGconn, pre_schema_43: bool) !void {
         var best = try postgres.query(
             conn,
             "UPDATE zigcho.lazer_scores SET best=false;" ++
@@ -4439,14 +4563,17 @@ pub const Store = struct {
         const internal_mode = "CASE WHEN (s.mods&8192)!=0 THEN s.mode+8 WHEN (s.mods&128)!=0 THEN s.mode+4 ELSE s.mode END";
         const lazer_internal_mode = "CASE l.rank_namespace WHEN 'vanilla' THEN l.ruleset_id WHEN 'relax' THEN l.ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE -1 END";
         const lazer_hits = "coalesce((l.statistics_json->>'meh')::bigint,0)+coalesce((l.statistics_json->>'ok')::bigint,0)+coalesce((l.statistics_json->>'good')::bigint,0)+coalesce((l.statistics_json->>'great')::bigint,0)+coalesce((l.statistics_json->>'perfect')::bigint,0)";
-        var reset = try postgres.query(conn, "UPDATE zigcho.stats st SET " ++
-            "total_score=coalesce((SELECT sum(s.score) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT sum(coalesce(l.legacy_total_score,l.total_score)) FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
+        const lazer_score = if (pre_schema_43) "coalesce(l.legacy_total_score,l.total_score)" else "coalesce(l.legacy_total_score,l.total_score_without_mods)";
+        const reset_sql = try std.fmt.allocPrintSentinel(self.allocator, "UPDATE zigcho.stats st SET " ++
+            "total_score=coalesce((SELECT sum(s.score) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT sum({s}) FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
             "plays=coalesce((SELECT count(*) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT count(*) FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
             "play_time=coalesce((SELECT sum(s.time_elapsed/1000) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT sum(greatest(b.total_length,0)) FROM zigcho.lazer_scores l JOIN zigcho.beatmaps b ON b.id=l.beatmap_id WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
             "total_hits=coalesce((SELECT sum(s.n300+s.n100+s.n50+CASE WHEN s.mode IN(1,3) THEN s.ngeki+s.nkatu ELSE 0 END) FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode),0)+coalesce((SELECT sum(" ++ lazer_hits ++ ") FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode),0)," ++
             "ranked_score=0," ++
             "max_combo=greatest(coalesce((SELECT max(s.max_combo) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode AND s.passed AND b.status>=3),0),coalesce((SELECT max(l.max_combo) FROM zigcho.lazer_scores l JOIN zigcho.beatmaps b ON b.id=l.beatmap_id WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode AND l.passed AND b.status>=3),0))," ++
-            "pp=0,accuracy=0 WHERE st.user_id!=3 AND (EXISTS(SELECT 1 FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode) OR EXISTS(SELECT 1 FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode))");
+            "pp=0,accuracy=0 WHERE st.user_id!=3 AND (EXISTS(SELECT 1 FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode) OR EXISTS(SELECT 1 FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode))", .{lazer_score}, 0);
+        defer self.allocator.free(reset_sql);
+        var reset = try postgres.query(conn, reset_sql);
         reset.deinit();
         var keys = try postgres.query(conn, "SELECT st.user_id,st.mode FROM zigcho.stats st WHERE st.user_id!=3 AND (EXISTS(SELECT 1 FROM zigcho.scores s WHERE s.user_id=st.user_id AND s.rank_namespace!='scorev2' AND " ++ internal_mode ++ "=st.mode) OR EXISTS(SELECT 1 FROM zigcho.lazer_scores l WHERE l.user_id=st.user_id AND " ++ lazer_internal_mode ++ "=st.mode)) ORDER BY st.user_id,st.mode");
         defer keys.deinit();
@@ -4459,7 +4586,7 @@ pub const Store = struct {
                 8 => "autopilot",
                 else => continue,
             };
-            try self.rebuildCombinedPerformanceWithConnection(conn, user_id, stats_mode % 4, stats_mode, namespace);
+            try self.rebuildCombinedPerformanceWithConnection(conn, user_id, stats_mode % 4, stats_mode, namespace, pre_schema_43);
         }
     }
 
@@ -4497,18 +4624,18 @@ pub const Store = struct {
             update.deinit();
             count += 1;
         }
-        var lazer_scores = try postgres.query(lease.conn, "SELECT s.id,s.beatmap_id,s.ruleset_id,s.total_score,s.legacy_total_score,s.accuracy,s.max_combo,s.passed,s.mods_json::text,s.statistics_json::text,s.rank_namespace,b.osu_file FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE b.osu_file IS NOT NULL ORDER BY s.id");
+        var lazer_scores = try postgres.query(lease.conn, "SELECT s.id,s.beatmap_id,s.ruleset_id,s.total_score,s.total_score_without_mods,s.legacy_total_score,s.accuracy,s.max_combo,s.passed,s.mods_json::text,s.statistics_json::text,s.rank_namespace,b.osu_file FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE b.osu_file IS NOT NULL ORDER BY s.id");
         defer lazer_scores.deinit();
         for (0..lazer_scores.rows()) |row| {
-            const namespace = std.meta.stringToEnum(lazer.Namespace, lazer_scores.value(row, 10)) orelse continue;
+            const namespace = std.meta.stringToEnum(lazer.Namespace, lazer_scores.value(row, 11)) orelse continue;
             if (namespace == .custom) continue;
-            var parsed_mods = std.json.parseFromSlice(std.json.Value, allocator, lazer_scores.value(row, 8), .{}) catch continue;
+            var parsed_mods = std.json.parseFromSlice(std.json.Value, allocator, lazer_scores.value(row, 9), .{}) catch continue;
             defer parsed_mods.deinit();
             const mods = switch (parsed_mods.value) {
                 .array => |value| value,
                 else => continue,
             };
-            var parsed_statistics = std.json.parseFromSlice(std.json.Value, allocator, lazer_scores.value(row, 9), .{}) catch continue;
+            var parsed_statistics = std.json.parseFromSlice(std.json.Value, allocator, lazer_scores.value(row, 10), .{}) catch continue;
             defer parsed_statistics.deinit();
             const statistics = switch (parsed_statistics.value) {
                 .object => |value| value,
@@ -4518,16 +4645,17 @@ pub const Store = struct {
                 .beatmap_id = try lazer_scores.int(i64, row, 1),
                 .ruleset_id = try lazer_scores.int(i64, row, 2),
                 .total_score = try lazer_scores.int(i64, row, 3),
-                .legacy_total_score = if (lazer_scores.isNull(row, 4)) null else try lazer_scores.int(i64, row, 4),
-                .accuracy = try lazer_scores.float(f64, row, 5),
-                .max_combo = try lazer_scores.int(i64, row, 6),
-                .passed = try lazer_scores.boolean(row, 7),
+                .total_score_without_mods = try lazer_scores.int(i64, row, 4),
+                .legacy_total_score = if (lazer_scores.isNull(row, 5)) null else try lazer_scores.int(i32, row, 5),
+                .accuracy = try lazer_scores.float(f64, row, 6),
+                .max_combo = try lazer_scores.int(i64, row, 7),
+                .passed = try lazer_scores.boolean(row, 8),
                 .mods = mods,
                 .statistics = statistics,
                 .namespace = namespace,
             };
             const state = (lazer.performanceState(input) catch continue) orelse continue;
-            const map_file = try postgres.decodeBytea(allocator, lazer_scores.value(row, 11));
+            const map_file = try postgres.decodeBytea(allocator, lazer_scores.value(row, 12));
             defer allocator.free(map_file);
             const performance_input: performance_calculator.Input = .{
                 .mode = @intCast(input.ruleset_id),
@@ -4566,7 +4694,8 @@ pub const Store = struct {
                 "UPDATE zigcho.scores SET best=true WHERE id IN(SELECT id FROM ordered WHERE place=1)",
         );
         best.deinit();
-        try self.rebuildRankedStats(lease.conn);
+        try self.rebuildRankedStats(lease.conn, false);
+        try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         var detail_buf: [192]u8 = undefined;
         const detail = try std.fmt.bufPrint(&detail_buf, "recalculated {d} stable and lazer scores with {s}", .{ count, performance_calculator.engine_version });
         var audit = try postgres.queryParams(allocator, lease.conn, "INSERT INTO zigcho.audit_log(action,target,detail) VALUES('operations.pp_recalc','scores',$1)", &.{detail});
@@ -4628,6 +4757,7 @@ pub const Store = struct {
         defer update.deinit();
         if (update.rows() == 0) return error.InvalidModerationTarget;
         try insertAudit(self.allocator, lease.conn, actor_id, if (restricted) "account.restrict" else "account.unrestrict", target_id, reason);
+        try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         try postgres.exec(lease.conn, "COMMIT");
     }
 
@@ -5041,18 +5171,18 @@ pub const Store = struct {
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*)::double precision))) pp,sum(accuracy*power(0.95,performance_index))/(20*(1-power(0.95,count(*)::double precision))) accuracy FROM ranked GROUP BY user_id)," ++
             "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce((SELECT sum(r.total_score) FROM ranked r WHERE r.user_id=source_scores.user_id),0) ranked_score,coalesce(max(CASE WHEN passed AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id) " ++
-            "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET $3";
+            "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted AND u.show_profile_stats ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET $3";
         const lazer_sql =
             "WITH source_scores AS (" ++
-            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
+            "SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,b.status,s.beatmap_id " ++
             "FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$1 AND s.rank_namespace=$2)," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*)::double precision))) pp,sum(accuracy*power(0.95,performance_index))/(20*(1-power(0.95,count(*)::double precision))) accuracy FROM ranked GROUP BY user_id)," ++
             "activity AS (SELECT user_id,count(*) plays,coalesce(sum(total_score),0) total_score,coalesce((SELECT sum(r.total_score) FROM ranked r WHERE r.user_id=source_scores.user_id),0) ranked_score,coalesce(max(CASE WHEN passed AND status>=3 THEN max_combo ELSE 0 END),0) max_combo FROM source_scores GROUP BY user_id) " ++
-            "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET $3";
+            "SELECT row_number() OVER(ORDER BY coalesce(p.pp,0) DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,coalesce(p.pp,0),coalesce(p.accuracy,0),a.plays,a.ranked_score,a.total_score,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted AND u.show_profile_stats ORDER BY coalesce(p.pp,0) DESC,u.id ASC LIMIT 100 OFFSET $3";
         var result = switch (source) {
-            .all => try postgres.queryParams(allocator, lease.conn, "SELECT row_number() OVER(ORDER BY s.pp DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,s.pp,s.accuracy,s.plays,s.ranked_score,s.total_score,s.max_combo FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND u.id!=3 AND NOT u.restricted AND s.plays>0 ORDER BY s.pp DESC,u.id ASC LIMIT 100 OFFSET $2", &.{ mode_text, offset_text }),
+            .all => try postgres.queryParams(allocator, lease.conn, "SELECT row_number() OVER(ORDER BY s.pp DESC,u.id ASC),u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,s.pp,s.accuracy,s.plays,s.ranked_score,s.total_score,s.max_combo FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND u.id!=3 AND NOT u.restricted AND u.show_profile_stats AND s.plays>0 ORDER BY s.pp DESC,u.id ASC LIMIT 100 OFFSET $2", &.{ mode_text, offset_text }),
             .stable, .lazer, .scorev2 => blk: {
                 var score_mode_buf: [4]u8 = undefined;
                 const score_mode_text = try std.fmt.bufPrint(&score_mode_buf, "{d}", .{domain.siteScoreMode(mode)});
@@ -5085,17 +5215,17 @@ pub const Store = struct {
         var lease = self.pool.acquire();
         defer lease.release();
         const country_sql =
-            "WITH visible AS (SELECT CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.plays,s.ranked_score,s.pp FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted) " ++
+            "WITH visible AS (SELECT CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.plays,s.ranked_score,s.pp FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted AND u.show_profile_stats) " ++
             "SELECT country,count(*),sum(plays),sum(ranked_score),sum(pp) FROM visible WHERE country!='XX' GROUP BY country ORDER BY sum(pp) DESC,country ASC LIMIT 50 OFFSET $2";
         const performance_sql =
-            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo," ++
+            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,least((SELECT count(*) FROM zigcho.score_replay_views v WHERE v.owner_id=u.id AND v.mode=s.mode AND v.rank_namespace='vanilla'),2147483647)::int replay_views," ++
             "row_number() OVER(ORDER BY s.pp DESC,u.id ASC) global_rank,row_number() OVER(PARTITION BY CASE WHEN u.show_country THEN u.country ELSE 'XX' END ORDER BY s.pp DESC,u.id ASC) country_rank " ++
-            "FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted) " ++
+            "FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted AND u.show_profile_stats) " ++
             "SELECT * FROM visible WHERE ($2='' OR country=$2) ORDER BY pp DESC,id ASC LIMIT 50 OFFSET $3";
         const score_sql =
-            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo," ++
+            "WITH visible AS (SELECT u.id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,u.privileges,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,least((SELECT count(*) FROM zigcho.score_replay_views v WHERE v.owner_id=u.id AND v.mode=s.mode AND v.rank_namespace='vanilla'),2147483647)::int replay_views," ++
             "row_number() OVER(ORDER BY s.total_score DESC,u.id ASC) global_rank,row_number() OVER(PARTITION BY CASE WHEN u.show_country THEN u.country ELSE 'XX' END ORDER BY s.total_score DESC,u.id ASC) country_rank " ++
-            "FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted) " ++
+            "FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$1 AND s.plays>0 AND u.id!=3 AND NOT u.restricted AND u.show_profile_stats) " ++
             "SELECT * FROM visible WHERE ($2='' OR country=$2) ORDER BY total_score DESC,id ASC LIMIT 50 OFFSET $3";
         var result = switch (kind) {
             .country => try postgres.queryParams(allocator, lease.conn, country_sql, &.{ mode, offset }),
@@ -5117,8 +5247,8 @@ pub const Store = struct {
             const country_text = result.value(row, 2);
             const cc: [2]u8 = if (country_text.len == 2) .{ country_text[0], country_text[1] } else .{ 'X', 'X' };
             const user: domain.User = .{ .id = try result.int(i32, row, 0), .name = result.value(row, 1), .safe_name = "", .country = cc, .privileges = try result.int(u32, row, 3) };
-            const stats: domain.Stats = .{ .mode = @enumFromInt(ruleset_id), .ranked_score = try result.int(i64, row, 4), .total_score = try result.int(i64, row, 5), .pp = try result.int(i32, row, 6), .plays = try result.int(i32, row, 7), .play_time = try result.int(i32, row, 8), .total_hits = try result.int(i64, row, 9), .accuracy = try result.float(f64, row, 10), .max_combo = try result.int(i32, row, 11) };
-            try user_json.writeRankingStatistics(&output.writer, user, stats, try result.int(i32, row, 12), try result.int(i32, row, 13));
+            const stats: domain.Stats = .{ .mode = @enumFromInt(ruleset_id), .ranked_score = try result.int(i64, row, 4), .total_score = try result.int(i64, row, 5), .pp = try result.int(i32, row, 6), .plays = try result.int(i32, row, 7), .play_time = try result.int(i32, row, 8), .total_hits = try result.int(i64, row, 9), .accuracy = try result.float(f64, row, 10), .max_combo = try result.int(i32, row, 11), .replay_views = try result.int(i32, row, 12) };
+            try user_json.writeRankingStatistics(&output.writer, user, stats, try result.int(i32, row, 13), try result.int(i32, row, 14));
         }
         try output.writer.writeAll("],\"cursor\":null}");
         return output.toOwnedSlice();
@@ -5128,7 +5258,9 @@ pub const Store = struct {
         try writer.writeByte('[');
         for (0..scores.rows()) |row| {
             if (row != 0) try writer.writeByte(',');
-            try writer.print("{{\"id\":{d},\"score\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"mode\":{d},\"namespace\":", .{ try scores.int(i64, row, 0), try scores.int(i64, row, 1), try scores.float(f64, row, 2), try scores.float(f64, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(u8, row, 6) });
+            try writer.print("{{\"id\":{d},\"score\":{d},\"score_without_mods\":{d},\"legacy_score\":", .{ try scores.int(i64, row, 0), try scores.int(i64, row, 1), try scores.int(i64, row, 20) });
+            if (scores.isNull(row, 21)) try writer.writeAll("null") else try writer.print("{d}", .{try scores.int(i32, row, 21)});
+            try writer.print(",\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"mode\":{d},\"namespace\":", .{ try scores.float(f64, row, 2), try scores.float(f64, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(u8, row, 6) });
             try jsonString(writer, scores.value(row, 7));
             try writer.print(",\"passed\":{},\"submitted_at\":{d},\"set_id\":{d},\"map_id\":{d},\"artist\":", .{ try scores.boolean(row, 8), try scores.int(i64, row, 9), try scores.int(i32, row, 10), try scores.int(i32, row, 11) });
             try jsonString(writer, scores.value(row, 12));
@@ -5154,23 +5286,196 @@ pub const Store = struct {
         try writer.writeByte(']');
     }
 
+    fn readStatsHistoryWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, source: domain.SiteScoreSource, stats_mode: u8) !domain.StatsHistory {
+        var buffers: [2][24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&buffers[0], "{d}", .{user_id});
+        const mode = try std.fmt.bufPrint(&buffers[1], "{d}", .{stats_mode});
+        var rows = try postgres.queryParams(
+            self.allocator,
+            conn,
+            "SELECT day,pp,global_rank FROM zigcho.user_stats_history WHERE user_id=$1 AND source=$2 AND mode=$3 AND day BETWEEN ((extract(epoch FROM clock_timestamp())::bigint/86400)-89)*86400 AND (extract(epoch FROM clock_timestamp())::bigint/86400)*86400 ORDER BY day LIMIT 90",
+            &.{ user, @tagName(source), mode },
+        );
+        defer rows.deinit();
+
+        var history: domain.StatsHistory = .{};
+        for (0..@min(rows.rows(), domain.StatsHistory.max_points)) |row| {
+            history.points[row] = .{
+                .day = try rows.int(i64, row, 0),
+                .pp = try rows.int(i32, row, 1),
+                .global_rank = try rows.int(i32, row, 2),
+            };
+            history.len += 1;
+        }
+        return history;
+    }
+
+    fn pruneStatsHistoryWithConnection(_: *Store, conn: *postgres.c.PGconn) !void {
+        try postgres.exec(conn, "DELETE FROM zigcho.user_stats_history WHERE day<((extract(epoch FROM transaction_timestamp())::bigint/86400)-89)*86400");
+    }
+
+    fn recordStatsHistorySliceCurrentWithConnection(self: *Store, conn: *postgres.c.PGconn, source: domain.SiteScoreSource, stats_mode: u8, user_id: i32) !void {
+        const score_mode = domain.siteScoreMode(stats_mode);
+        const namespace = domain.siteNamespace(source, stats_mode);
+        var history_mode_buf: [24]u8 = undefined;
+        const history_mode = try std.fmt.bufPrint(&history_mode_buf, "{d}", .{stats_mode});
+        // Rank is a property of the whole source/mode slice. Updating only the
+        // submitting player can leave both sides of a rank swap at the same
+        // position for the rest of the day.
+        if (user_id != 0) return self.recordStatsHistorySliceCurrentWithConnection(conn, source, stats_mode, 0);
+        if (user_id == 0) {
+            var clear = try postgres.queryParams(self.allocator, conn, "DELETE FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400", &.{ @tagName(source), history_mode });
+            defer clear.deinit();
+        }
+        const sql: [:0]const u8 = switch (source) {
+            .all => if (user_id == 0)
+                "WITH players AS (SELECT s.user_id,s.pp FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.plays>0 AND u.id!=3 AND NOT u.restricted),ordered AS (SELECT user_id,pp,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) " ++
+                    "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400,pp,global_rank FROM ordered " ++
+                    "ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank"
+            else
+                "WITH player AS (SELECT s.user_id,s.pp FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.user_id=$3 AND s.mode=$2 AND s.plays>0 AND u.id!=3 AND NOT u.restricted),ranked AS (SELECT p.user_id,p.pp,1+(SELECT count(*) FROM zigcho.user_stats_history h WHERE h.source=$1 AND h.mode=$2 AND h.day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 AND h.user_id!=p.user_id AND (h.pp>p.pp OR (h.pp=p.pp AND h.user_id<p.user_id))) global_rank FROM player p) " ++
+                    "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400,pp,global_rank FROM ranked " ++
+                    "ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank",
+            .stable, .scorev2 => if (user_id == 0)
+                "WITH source_scores AS (SELECT s.user_id,b.id beatmap_id,s.pp,s.passed,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.mode=$3 AND s.rank_namespace=$4)," ++
+                    "activity AS (SELECT DISTINCT user_id FROM source_scores)," ++
+                    "best AS (SELECT user_id,beatmap_id,max(pp) pp FROM source_scores WHERE passed AND status IN(3,4) GROUP BY user_id,beatmap_id)," ++
+                    "weighted AS (SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC)-1 performance_index FROM best)," ++
+                    "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*))))::integer pp FROM weighted GROUP BY user_id)," ++
+                    "players AS (SELECT a.user_id,coalesce(p.pp,0) pp FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
+                    "ordered AS (SELECT user_id,pp,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) " ++
+                    "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400,pp,global_rank FROM ordered " ++
+                    "ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank"
+            else
+                "WITH source_scores AS (SELECT s.user_id,b.id beatmap_id,s.pp,s.passed,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$5 AND s.mode=$3 AND s.rank_namespace=$4)," ++
+                    "activity AS (SELECT DISTINCT user_id FROM source_scores)," ++
+                    "best AS (SELECT user_id,beatmap_id,max(pp) pp FROM source_scores WHERE passed AND status IN(3,4) GROUP BY user_id,beatmap_id)," ++
+                    "weighted AS (SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC)-1 performance_index FROM best)," ++
+                    "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*))))::integer pp FROM weighted GROUP BY user_id)," ++
+                    "player AS (SELECT a.user_id,coalesce(p.pp,0) pp FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
+                    "ranked AS (SELECT p.user_id,p.pp,1+(SELECT count(*) FROM zigcho.user_stats_history h WHERE h.source=$1 AND h.mode=$2 AND h.day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 AND h.user_id!=p.user_id AND (h.pp>p.pp OR (h.pp=p.pp AND h.user_id<p.user_id))) global_rank FROM player p) " ++
+                    "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400,pp,global_rank FROM ranked " ++
+                    "ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank",
+            .lazer => if (user_id == 0)
+                "WITH source_scores AS (SELECT s.user_id,b.id beatmap_id,s.pp,s.passed,b.status FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$3 AND s.rank_namespace=$4)," ++
+                    "activity AS (SELECT DISTINCT user_id FROM source_scores)," ++
+                    "best AS (SELECT user_id,beatmap_id,max(pp) pp FROM source_scores WHERE passed AND status IN(3,4) GROUP BY user_id,beatmap_id)," ++
+                    "weighted AS (SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC)-1 performance_index FROM best)," ++
+                    "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*))))::integer pp FROM weighted GROUP BY user_id)," ++
+                    "players AS (SELECT a.user_id,coalesce(p.pp,0) pp FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
+                    "ordered AS (SELECT user_id,pp,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) " ++
+                    "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400,pp,global_rank FROM ordered " ++
+                    "ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank"
+            else
+                "WITH source_scores AS (SELECT s.user_id,b.id beatmap_id,s.pp,s.passed,b.status FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$5 AND s.ruleset_id=$3 AND s.rank_namespace=$4)," ++
+                    "activity AS (SELECT DISTINCT user_id FROM source_scores)," ++
+                    "best AS (SELECT user_id,beatmap_id,max(pp) pp FROM source_scores WHERE passed AND status IN(3,4) GROUP BY user_id,beatmap_id)," ++
+                    "weighted AS (SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC)-1 performance_index FROM best)," ++
+                    "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*))))::integer pp FROM weighted GROUP BY user_id)," ++
+                    "player AS (SELECT a.user_id,coalesce(p.pp,0) pp FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
+                    "ranked AS (SELECT p.user_id,p.pp,1+(SELECT count(*) FROM zigcho.user_stats_history h WHERE h.source=$1 AND h.mode=$2 AND h.day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 AND h.user_id!=p.user_id AND (h.pp>p.pp OR (h.pp=p.pp AND h.user_id<p.user_id))) global_rank FROM player p) " ++
+                    "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400,pp,global_rank FROM ranked " ++
+                    "ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank",
+        };
+        var buffers: [3][24]u8 = undefined;
+        const mode = try std.fmt.bufPrint(&buffers[1], "{d}", .{score_mode});
+        const user = try std.fmt.bufPrint(&buffers[2], "{d}", .{user_id});
+        const params: []const ?[]const u8 = if (source == .all)
+            if (user_id == 0)
+                &.{ @tagName(source), history_mode }
+            else
+                &.{ @tagName(source), history_mode, user }
+        else if (user_id == 0)
+            &.{ @tagName(source), history_mode, mode, namespace }
+        else
+            &.{ @tagName(source), history_mode, mode, namespace, user };
+        var insert = try postgres.queryParams(self.allocator, conn, sql, params);
+        defer insert.deinit();
+    }
+
+    fn statsHistoryUserVisibleWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32) !bool {
+        var user_buf: [24]u8 = undefined;
+        const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var visible = try postgres.queryParams(self.allocator, conn, "SELECT 1 FROM zigcho.users WHERE id=$1 AND id!=3 AND NOT restricted", &.{user});
+        defer visible.deinit();
+        return visible.rows() != 0;
+    }
+
+    pub fn statsHistory(self: *Store, user_id: i32, source: domain.SiteScoreSource, stats_mode: u8) !domain.StatsHistory {
+        if (user_id <= 0 or !domain.validSiteMode(source, stats_mode)) return error.InvalidStatsHistory;
+        var lease = self.pool.acquire();
+        defer lease.release();
+        if (!try self.statsHistoryUserVisibleWithConnection(lease.conn, user_id)) return error.InvalidStatsHistory;
+        return self.readStatsHistoryWithConnection(lease.conn, user_id, source, stats_mode);
+    }
+
+    fn recordAllStatsHistoryCurrentWithConnection(self: *Store, conn: *postgres.c.PGconn) !void {
+        try self.pruneStatsHistoryWithConnection(conn);
+        const full_modes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 8 };
+        for ([_]domain.SiteScoreSource{ .all, .stable, .lazer }) |source| {
+            for (full_modes) |stats_mode| try self.recordStatsHistorySliceCurrentWithConnection(conn, source, stats_mode, 0);
+        }
+        for ([_]u8{ 0, 1, 2, 3 }) |stats_mode| try self.recordStatsHistorySliceCurrentWithConnection(conn, .scorev2, stats_mode, 0);
+    }
+
+    fn recordBeatmapStatsHistoryCurrentWithConnection(self: *Store, conn: *postgres.c.PGconn, map_id: i32, md5: []const u8) !void {
+        var map_buf: [24]u8 = undefined;
+        const map = try std.fmt.bufPrint(&map_buf, "{d}", .{map_id});
+        var keys = try postgres.queryParams(
+            self.allocator,
+            conn,
+            "WITH keys(source,mode) AS (" ++
+                "SELECT CASE rank_namespace WHEN 'scorev2' THEN 'scorev2' ELSE 'stable' END,CASE rank_namespace WHEN 'relax' THEN mode+4 WHEN 'autopilot' THEN 8 ELSE mode END FROM zigcho.scores WHERE map_md5=$1 " ++
+                "UNION SELECT 'lazer',CASE rank_namespace WHEN 'relax' THEN ruleset_id+4 WHEN 'autopilot' THEN 8 ELSE ruleset_id END FROM zigcho.lazer_scores WHERE beatmap_id=$2)," ++
+                "expanded(source,mode) AS (SELECT source,mode FROM keys UNION SELECT 'all',mode FROM keys WHERE source!='scorev2') " ++
+                "SELECT DISTINCT source,mode FROM expanded",
+            &.{ md5, map },
+        );
+        defer keys.deinit();
+        var slices = [_][9]bool{[_]bool{false} ** 9} ** 4;
+        for (0..keys.rows()) |row| {
+            const source = domain.parseSiteScoreSource(keys.value(row, 0)) orelse continue;
+            const stats_mode = try keys.int(u8, row, 1);
+            if (stats_mode > 8 or !domain.validSiteMode(source, stats_mode)) continue;
+            slices[@intFromEnum(source)][stats_mode] = true;
+        }
+        try self.pruneStatsHistoryWithConnection(conn);
+        for (slices, 0..) |modes, source_index| {
+            const source: domain.SiteScoreSource = @enumFromInt(source_index);
+            for (modes, 0..) |present, stats_mode| if (present) try self.recordStatsHistorySliceCurrentWithConnection(conn, source, @intCast(stats_mode), 0);
+        }
+    }
+
+    pub fn refreshStatsHistory(self: *Store) !void {
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
+        try postgres.exec(lease.conn, "COMMIT");
+    }
+
     pub fn siteProfile(self: *Store, allocator: std.mem.Allocator, user_id: i32, source: domain.SiteScoreSource, stats_mode: u8) !?[]u8 {
         return self.siteProfileForViewer(allocator, user_id, source, stats_mode, false);
     }
 
     pub fn siteProfileForViewer(self: *Store, allocator: std.mem.Allocator, user_id: i32, source: domain.SiteScoreSource, stats_mode: u8, owner_view: bool) !?[]u8 {
+        if (user_id <= 0 or !domain.validSiteMode(source, stats_mode)) return error.InvalidStatsHistory;
         var id_buf: [24]u8 = undefined;
         var score_mode_buf: [4]u8 = undefined;
+        var stats_mode_buf: [4]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
         const score_mode = domain.siteScoreMode(stats_mode);
         const score_mode_text = try std.fmt.bufPrint(&score_mode_buf, "{d}", .{score_mode});
+        const stats_mode_text = try std.fmt.bufPrint(&stats_mode_buf, "{d}", .{stats_mode});
         const namespace = domain.siteNamespace(source, stats_mode);
         var lease = self.pool.acquire();
         defer lease.release();
-        var user = try postgres.queryParams(allocator, lease.conn, "SELECT u.id,u.name,CASE WHEN $2::boolean OR u.show_country THEN u.country ELSE 'XX' END,u.privileges,u.created_at,u.bio,u.preferred_mode,u.profile_source,coalesce((SELECT updated_at FROM zigcho.user_avatars a WHERE a.user_id=u.id),u.avatar_key),u.profile_title,u.profile_pronouns,u.profile_location,u.profile_website,u.profile_accent,u.show_profile_stats,u.show_recent_scores,coalesce((SELECT updated_at FROM zigcho.user_banners b WHERE b.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets a WHERE a.team_id=t.id AND a.kind='flag'),0) FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.id=$1 AND u.id!=3 AND NOT u.restricted", &.{ id, if (owner_view) "true" else "false" });
+        const user_sql = "SELECT u.id,u.name,CASE WHEN $2::boolean OR u.show_country THEN u.country ELSE 'XX' END,u.privileges,u.created_at,u.bio,u.preferred_mode,u.profile_source,coalesce((SELECT updated_at FROM zigcho.user_avatars a WHERE a.user_id=u.id),u.avatar_key),u.profile_title,u.profile_pronouns,u.profile_location,u.profile_website,u.profile_accent,u.show_profile_stats,u.show_recent_scores,coalesce((SELECT updated_at FROM zigcho.user_banners b WHERE b.user_id=u.id),0),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets a WHERE a.team_id=t.id AND a.kind='flag'),0)," ++ visible_follower_count_sql ++ " FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.id=$1 AND u.id!=3 AND NOT u.restricted";
+        var user = try postgres.queryParams(allocator, lease.conn, user_sql, &.{ id, if (owner_view) "true" else "false" });
         defer user.deinit();
         if (user.rows() == 0) return null;
-        var stats = try postgres.queryParams(allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s WHERE s.user_id=$1 ORDER BY s.mode", &.{id});
+        var stats = try postgres.queryParams(allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,CASE WHEN s.plays>0 THEN (SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND r.plays>0 AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE 0 END FROM zigcho.stats s WHERE s.user_id=$1 ORDER BY s.mode", &.{id});
         defer stats.deinit();
         const stable_stats_sql =
             "WITH source_scores AS (SELECT s.user_id,s.id score_id,s.score total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.time_elapsed/1000 play_time,b.status,b.id beatmap_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.mode=$2 AND s.rank_namespace=$3)," ++
@@ -5181,7 +5486,7 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=$1";
         const lazer_stats_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3)," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3)," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*)::double precision))) pp,sum(accuracy*power(0.95,performance_index))/(20*(1-power(0.95,count(*)::double precision))) accuracy FROM ranked GROUP BY user_id)," ++
@@ -5189,44 +5494,44 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=$1";
         var selected_stats = switch (source) {
-            .all => try postgres.queryParams(allocator, lease.conn, "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s WHERE s.user_id=$1 AND s.mode=$2 AND s.plays>0", &.{ id, score_mode_text }),
+            .all => try postgres.queryParams(allocator, lease.conn, "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.accuracy,s.max_combo,(SELECT count(*)+1 FROM zigcho.stats r JOIN zigcho.users ru ON ru.id=r.user_id WHERE r.mode=s.mode AND r.plays>0 AND ru.id!=3 AND NOT ru.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s WHERE s.user_id=$1 AND s.mode=$2 AND s.plays>0", &.{ id, stats_mode_text }),
             .stable, .scorev2 => try postgres.queryParams(allocator, lease.conn, stable_stats_sql, &.{ id, score_mode_text, namespace }),
             .lazer => try postgres.queryParams(allocator, lease.conn, lazer_stats_sql, &.{ id, score_mode_text, namespace }),
         };
         defer selected_stats.deinit();
-        const stable_columns = "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id map_id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 ";
-        const lazer_columns = "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id map_id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating) FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id ";
+        const stable_columns = "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id map_id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.score score_without_mods,s.score legacy_score FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 ";
+        const lazer_columns = "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id map_id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.total_score_without_mods score_without_mods,s.legacy_total_score legacy_score FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id ";
         const pinned_sql: [:0]const u8 = switch (source) {
-            .all => "WITH pinned_scores(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,pinned_at) AS (" ++
-                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),p.pinned_at FROM zigcho.profile_score_pins p JOIN zigcho.scores s ON p.source='stable' AND s.id=p.score_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE p.user_id=$1 AND p.mode=$2 AND p.rank_namespace=$3 AND s.passed UNION ALL " ++
-                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),p.pinned_at FROM zigcho.profile_score_pins p JOIN zigcho.lazer_scores s ON p.source='lazer' AND s.id=p.score_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE p.user_id=$1 AND p.mode=$2 AND p.rank_namespace=$3 AND s.passed) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating FROM pinned_scores ORDER BY pinned_at DESC,client,id DESC LIMIT 3",
+            .all => "WITH pinned_scores(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,pinned_at) AS (" ++
+                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.score,s.score,p.pinned_at FROM zigcho.profile_score_pins p JOIN zigcho.scores s ON p.source='stable' AND s.id=p.score_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE p.user_id=$1 AND p.mode=$2 AND p.rank_namespace=$3 AND s.passed UNION ALL " ++
+                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.total_score_without_mods,s.legacy_total_score,p.pinned_at FROM zigcho.profile_score_pins p JOIN zigcho.lazer_scores s ON p.source='lazer' AND s.id=p.score_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE p.user_id=$1 AND p.mode=$2 AND p.rank_namespace=$3 AND s.passed) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score FROM pinned_scores ORDER BY pinned_at DESC,client,id DESC LIMIT 3",
             .stable, .scorev2 => stable_columns ++ "JOIN zigcho.profile_score_pins p ON p.source='stable' AND p.score_id=s.id AND p.user_id=s.user_id WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed ORDER BY p.pinned_at DESC,p.score_id DESC LIMIT 3",
             .lazer => lazer_columns ++ "JOIN zigcho.profile_score_pins p ON p.source='lazer' AND p.score_id=s.id AND p.user_id=s.user_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed ORDER BY p.pinned_at DESC,p.score_id DESC LIMIT 3",
         };
         const top_sql: [:0]const u8 = switch (source) {
-            .all => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,beatmap_key) AS (" ++
-                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),b.id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4) UNION ALL " ++
-                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),b.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
+            .all => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,beatmap_key) AS (" ++
+                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.score,s.score,b.id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4) UNION ALL " ++
+                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.total_score_without_mods,s.legacy_total_score,b.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
                 "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY pp DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) map_place FROM candidates) " ++
-                "SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_key ASC,id ASC LIMIT 100",
+                "SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_key ASC,id ASC LIMIT 100",
             .stable, .scorev2 => "WITH candidates AS (" ++ stable_columns ++ "WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4)), ranked AS (SELECT *,row_number() OVER(PARTITION BY map_id ORDER BY pp DESC,id ASC) map_place FROM candidates) SELECT * FROM ranked WHERE map_place=1 ORDER BY pp DESC,map_id ASC,id ASC LIMIT 100",
             .lazer => "WITH candidates AS (" ++ lazer_columns ++ "WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4)), ranked AS (SELECT *,row_number() OVER(PARTITION BY map_id ORDER BY pp DESC,id ASC) map_place FROM candidates) SELECT * FROM ranked WHERE map_place=1 ORDER BY pp DESC,map_id ASC,id ASC LIMIT 100",
         };
         const recent_sql: [:0]const u8 = switch (source) {
-            .all => "WITH recent_scores(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating) AS (" ++
-                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 UNION ALL " ++
-                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating) FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3) " ++
+            .all => "WITH recent_scores(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score) AS (" ++
+                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.score,s.score FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 UNION ALL " ++
+                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.total_score_without_mods,s.legacy_total_score FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3) " ++
                 "SELECT * FROM recent_scores ORDER BY submitted_at DESC,client ASC,id DESC LIMIT 20",
             .lazer => lazer_columns ++ "WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 ORDER BY s.id DESC LIMIT 20",
             .stable, .scorev2 => stable_columns ++ "WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 ORDER BY s.id DESC LIMIT 20",
         };
         const first_sql: [:0]const u8 = switch (source) {
-            .all => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,beatmap_key,user_id) AS (" ++
-                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),b.id,s.user_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted UNION ALL " ++
-                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),b.id,s.user_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted)," ++
-                "per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) map_place FROM per_user WHERE user_place=1),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=1 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,first_count FROM firsts ORDER BY submitted_at DESC,client,id DESC LIMIT 20",
-            .stable, .scorev2 => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,beatmap_key,user_id) AS (SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),b.id,s.user_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted),per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,id ASC) map_place FROM per_user WHERE user_place=1),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=1 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,first_count FROM firsts ORDER BY submitted_at DESC,id DESC LIMIT 20",
-            .lazer => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,beatmap_key,user_id) AS (SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND coalesce(octet_length(s.replay),0)>0,coalesce(nullif(s.star_rating,0),b.star_rating),b.id,s.user_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted),per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,id ASC) map_place FROM per_user WHERE user_place=1),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=1 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,first_count FROM firsts ORDER BY submitted_at DESC,id DESC LIMIT 20",
+            .all => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,beatmap_key,user_id) AS (" ++
+                "SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.score,s.score,b.id,s.user_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted UNION ALL " ++
+                "SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.total_score_without_mods,s.legacy_total_score,b.id,s.user_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted)," ++
+                "per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) map_place FROM per_user WHERE user_place=1),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=1 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,first_count FROM firsts ORDER BY submitted_at DESC,client,id DESC LIMIT 20",
+            .stable, .scorev2 => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,beatmap_key,user_id) AS (SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'stable',NULL::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.score,s.score,b.id,s.user_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted),per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,id ASC) map_place FROM per_user WHERE user_place=1),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=1 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,first_count FROM firsts ORDER BY submitted_at DESC,id DESC LIMIT 20",
+            .lazer => "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,beatmap_key,user_id) AS (SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,'lazer',s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,0),b.star_rating),s.total_score_without_mods,s.legacy_total_score,b.id,s.user_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted),per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,id ASC) map_place FROM per_user WHERE user_place=1),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=1 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,first_count FROM firsts ORDER BY submitted_at DESC,id DESC LIMIT 20",
         };
         var pinned = try postgres.queryParams(allocator, lease.conn, pinned_sql, &.{ id, score_mode_text, namespace });
         defer pinned.deinit();
@@ -5275,19 +5580,25 @@ pub const Store = struct {
         }
         const show_profile_stats = owner_view or try user.boolean(0, 14);
         const show_recent_scores = owner_view or try user.boolean(0, 15);
-        try output.writer.print(",\"stats_public\":{},\"recent_scores_public\":{},\"selected_source\":\"{s}\",\"stats_source\":\"{s}\",\"selected_mode\":{d},\"selected_stats\":", .{ show_profile_stats, show_recent_scores, @tagName(source), if (source == .all) "combined" else @tagName(source), stats_mode });
+        try output.writer.print(",\"follower_count\":{d},\"stats_public\":{},\"recent_scores_public\":{},\"selected_source\":\"{s}\",\"stats_source\":\"{s}\",\"selected_mode\":{d},\"selected_stats\":", .{ try user.int(i32, 0, 21), show_profile_stats, show_recent_scores, @tagName(source), if (source == .all) "combined" else @tagName(source), stats_mode });
         if (!show_profile_stats or selected_stats.rows() == 0) {
             try output.writer.writeAll("null");
         } else {
             const total_score = @max(@as(i64, 0), try selected_stats.int(i64, 0, 1));
             const level = domain.levelFromTotalScore(total_score);
             const global_rank = try selected_stats.int(i32, 0, 7);
-            try output.writer.print("{{\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d},\"level_current\":{d},\"level_progress\":{d},\"rank_history\":[]}}", .{ try selected_stats.int(i64, 0, 0), total_score, try selected_stats.int(i32, 0, 2), try selected_stats.int(i32, 0, 3), try selected_stats.int(i32, 0, 4), try selected_stats.float(f64, 0, 5), try selected_stats.int(i32, 0, 6), global_rank, level.current, level.progress });
+            const selected_pp = try selected_stats.int(i32, 0, 2);
+            const replay_views = try self.replayViewCountWithConnection(lease.conn, user_id, source, stats_mode);
+            const stats_history = try self.readStatsHistoryWithConnection(lease.conn, user_id, source, stats_mode);
+            try output.writer.print("{{\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d},\"level_current\":{d},\"level_progress\":{d},\"replay_views\":{d},", .{ try selected_stats.int(i64, 0, 0), total_score, selected_pp, try selected_stats.int(i32, 0, 3), try selected_stats.int(i32, 0, 4), try selected_stats.float(f64, 0, 5), try selected_stats.int(i32, 0, 6), global_rank, level.current, level.progress, replay_views });
+            try user_json.writeSiteStatsHistory(&output.writer, stats_history);
+            try output.writer.writeByte('}');
         }
         try output.writer.writeAll(",\"stats\":[");
         for (0..if (show_profile_stats) stats.rows() else 0) |row| {
             if (row != 0) try output.writer.writeByte(',');
-            try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d}}}", .{ try stats.int(u8, row, 0), try stats.int(i64, row, 1), try stats.int(i64, row, 2), try stats.int(i32, row, 3), try stats.int(i32, row, 4), try stats.int(i32, row, 5), try stats.int(i64, row, 6), try stats.float(f64, row, 7), try stats.int(i32, row, 8), try stats.int(i32, row, 9) });
+            const raw_mode = try stats.int(u8, row, 0);
+            try output.writer.print("{{\"mode\":{d},\"ranked_score\":{d},\"total_score\":{d},\"pp\":{d},\"plays\":{d},\"play_time\":{d},\"total_hits\":{d},\"accuracy\":{d},\"max_combo\":{d},\"global_rank\":{d},\"replay_views\":{d}}}", .{ raw_mode, try stats.int(i64, row, 1), try stats.int(i64, row, 2), try stats.int(i32, row, 3), try stats.int(i32, row, 4), try stats.int(i32, row, 5), try stats.int(i64, row, 6), try stats.float(f64, row, 7), try stats.int(i32, row, 8), try stats.int(i32, row, 9), try self.replayViewCountWithConnection(lease.conn, user_id, .all, raw_mode) });
         }
         try output.writer.writeAll("],\"pinned_scores\":");
         if (show_profile_stats) try writeSiteScores(&output.writer, &pinned, false) else try output.writer.writeAll("[]");
@@ -5295,7 +5606,7 @@ pub const Store = struct {
         if (show_profile_stats) try writeSiteScores(&output.writer, &top, true) else try output.writer.writeAll("[]");
         try output.writer.writeAll(",\"recent_scores\":");
         if (show_recent_scores) try writeSiteScores(&output.writer, &recent, false) else try output.writer.writeAll("[]");
-        const first_count: i64 = if (!show_profile_stats or firsts.rows() == 0) 0 else try firsts.int(i64, 0, 20);
+        const first_count: i64 = if (!show_profile_stats or firsts.rows() == 0) 0 else try firsts.int(i64, 0, 22);
         try output.writer.print(",\"first_place_count\":{d},\"first_place_scores\":", .{first_count});
         if (show_profile_stats) try writeSiteScores(&output.writer, &firsts, false) else try output.writer.writeAll("[]");
         try output.writer.writeAll(",\"beatmapsets\":[");
@@ -5333,12 +5644,12 @@ pub const Store = struct {
         defer map.deinit();
         if (map.rows() == 0 or try map.int(u8, 0, 0) != score_mode) return null;
         const sql =
-            "WITH candidates(id,user_id,name,country,privileges,total_score,pp,accuracy,max_combo,mods,mode,rank_namespace,submitted_at,client,mods_json,has_replay) AS (" ++
-            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.submitted_at,'stable',NULL::text,coalesce(octet_length(s.replay),0)>0 FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE b.id=$1 AND b.status>=3 AND s.mode=$2 AND s.rank_namespace=$4 AND s.passed AND NOT u.restricted AND u.id!=3 AND ($3='all' OR $3='stable' OR $3='scorev2') AND NOT EXISTS(SELECT 1 FROM zigcho.beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM zigcho.beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') UNION ALL " ++
-            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,s.total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.submitted_at,'lazer',s.mods_json::text,coalesce(octet_length(s.replay),0)>0 FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.beatmap_id=$1 AND b.status>=3 AND s.ruleset_id=$2 AND s.rank_namespace=$4 AND s.passed AND NOT u.restricted AND u.id!=3 AND ($3='all' OR $3='lazer') AND NOT EXISTS(SELECT 1 FROM zigcho.beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM zigcho.beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto'))," ++
-            "per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN $5::boolean THEN pp ELSE total_score::double precision END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) user_place FROM candidates)," ++
+            "WITH candidates(id,user_id,name,country,privileges,total_score,score_without_mods,legacy_score,pp,accuracy,max_combo,mods,mode,rank_namespace,submitted_at,client,mods_json,has_replay) AS (" ++
+            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,s.score,s.score,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.submitted_at,'stable',NULL::text,(coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)) FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE b.id=$1 AND b.status>=3 AND s.mode=$2 AND s.rank_namespace=$4 AND s.passed AND NOT u.restricted AND u.id!=3 AND ($3='all' OR $3='stable' OR $3='scorev2') AND NOT EXISTS(SELECT 1 FROM zigcho.beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM zigcho.beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') UNION ALL " ++
+            "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,u.privileges,s.total_score,s.total_score_without_mods,s.legacy_total_score,s.pp,s.accuracy,s.max_combo,0,s.ruleset_id,s.rank_namespace,s.submitted_at,'lazer',s.mods_json::text,(coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)) FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.beatmap_id=$1 AND b.status>=3 AND s.ruleset_id=$2 AND s.rank_namespace=$4 AND s.passed AND NOT u.restricted AND u.id!=3 AND ($3='all' OR $3='lazer') AND NOT EXISTS(SELECT 1 FROM zigcho.beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM zigcho.beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto'))," ++
+            "per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN $3='all' OR $5::boolean THEN pp ELSE total_score::double precision END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN $5::boolean THEN pp ELSE total_score::double precision END DESC,CASE client WHEN 'stable' THEN 0 ELSE 1 END,id ASC) position FROM per_user WHERE user_place=1) " ++
-            "SELECT position,id,user_id,name,country,privileges,total_score,pp,accuracy,max_combo,mods,rank_namespace,submitted_at,client,mods_json,has_replay FROM board ORDER BY position LIMIT 100";
+            "SELECT position,id,user_id,name,country,privileges,total_score,score_without_mods,legacy_score,pp,accuracy,max_combo,mods,rank_namespace,submitted_at,client,mods_json,has_replay FROM board ORDER BY position LIMIT 100";
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ map_text, mode_text, source_name, namespace, if (uses_pp) "true" else "false" });
         defer result.deinit();
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -5352,13 +5663,15 @@ pub const Store = struct {
             try jsonString(&output.writer, result.value(row, 3));
             try output.writer.writeAll(",\"country\":");
             try jsonString(&output.writer, result.value(row, 4));
-            try output.writer.print(",\"privileges\":{d},\"score\":{d},\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"namespace\":", .{ try result.int(u32, row, 5), try result.int(i64, row, 6), try result.float(f64, row, 7), try result.float(f64, row, 8), try result.int(i32, row, 9), try result.int(i32, row, 10) });
-            try jsonString(&output.writer, result.value(row, 11));
-            try output.writer.print(",\"submitted_at\":{d},\"client\":", .{try result.int(i64, row, 12)});
+            try output.writer.print(",\"privileges\":{d},\"score\":{d},\"score_without_mods\":{d},\"legacy_score\":", .{ try result.int(u32, row, 5), try result.int(i64, row, 6), try result.int(i64, row, 7) });
+            if (result.isNull(row, 8)) try output.writer.writeAll("null") else try output.writer.print("{d}", .{try result.int(i32, row, 8)});
+            try output.writer.print(",\"pp\":{d},\"accuracy\":{d},\"max_combo\":{d},\"mods\":{d},\"namespace\":", .{ try result.float(f64, row, 9), try result.float(f64, row, 10), try result.int(i32, row, 11), try result.int(i32, row, 12) });
             try jsonString(&output.writer, result.value(row, 13));
+            try output.writer.print(",\"submitted_at\":{d},\"client\":", .{try result.int(i64, row, 14)});
+            try jsonString(&output.writer, result.value(row, 15));
             try output.writer.writeAll(",\"mods_json\":");
-            if (result.isNull(row, 14)) try output.writer.writeAll("null") else try output.writer.writeAll(result.value(row, 14));
-            try output.writer.print(",\"has_replay\":{}}}", .{try result.boolean(row, 15)});
+            if (result.isNull(row, 16)) try output.writer.writeAll("null") else try output.writer.writeAll(result.value(row, 16));
+            try output.writer.print(",\"has_replay\":{}}}", .{try result.boolean(row, 17)});
         }
         try output.writer.writeAll("]}");
         var list = output.toArrayList();
@@ -5580,10 +5893,10 @@ pub const Store = struct {
             ") SELECT * FROM combined";
         const sql = try std.fmt.allocPrintSentinel(allocator,
             \\WITH combined AS (
-            \\SELECT 'lazer'::text source,s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,s.best preserve,{s}::bigint pin_epoch
+            \\SELECT 'lazer'::text source,s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,s.total_score_without_mods total_without,s.legacy_total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)) has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,s.best preserve,{s}::bigint pin_epoch
             \\FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE {s} {s} {s}
             \\UNION ALL
-            \\SELECT 'stable'::text source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{{}}'::text statistics_json,'{{}}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,s.best preserve,{s}::bigint pin_epoch
+            \\SELECT 'stable'::text source,4000000000000000000+s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,least(greatest(s.score,0),2147483647)::integer legacy_total_score,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{{}}'::text statistics_json,'{{}}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') ended_at,s.submitted_at submitted_epoch,b.status,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)) has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,s.best preserve,{s}::bigint pin_epoch
             \\FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE {s} {s} {s}
             \\{s} ORDER BY {s} LIMIT $3 OFFSET $4
         , .{ lazer_pin_epoch, lazer_owner_filter, filters[0], if (source == .stable) "AND false" else "", stable_pin_epoch, stable_owner_filter, filters[1], if (source == .lazer) "AND false" else "", select_rows, filters[2] }, 0);
@@ -5598,19 +5911,19 @@ pub const Store = struct {
         for (0..result.rows()) |row| {
             if (row != 0) try output.writer.writeByte(',');
             const stable = std.mem.eql(u8, result.value(row, 0), "stable");
-            const status = try result.int(i32, row, 20);
+            const status = try result.int(i32, row, 21);
             var mods: std.Io.Writer.Allocating = .init(allocator);
             defer mods.deinit();
             var statistics: std.Io.Writer.Allocating = .init(allocator);
             defer statistics.deinit();
             if (stable) {
-                try stable_mods.writeLazerJson(&mods.writer, try result.int(i32, row, 31), true);
-                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, try result.int(i32, row, 32), try result.int(i32, row, 33), try result.int(i32, row, 34), try result.int(i32, row, 35), try result.int(i32, row, 36), try result.int(i32, row, 37));
+                try stable_mods.writeLazerJson(&mods.writer, try result.int(i32, row, 32), true);
+                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, try result.int(i32, row, 33), try result.int(i32, row, 34), try result.int(i32, row, 35), try result.int(i32, row, 36), try result.int(i32, row, 37), try result.int(i32, row, 38));
             }
             try lazer.writeLeaderboardScore(&output.writer, .{
                 .id = try result.int(i64, row, 1),
                 .legacy_score_id = if (stable) lazer.decodeStableScoreId(try result.int(i64, row, 1)) else null,
-                .legacy_total_score = if (stable) try result.int(i64, row, 7) else null,
+                .legacy_total_score = if (stable) lazer.stableLegacyTotalScore(try result.int(i64, row, 7)) else if (result.isNull(row, 9)) null else try result.int(i32, row, 9),
                 .user_id = try result.int(i32, row, 2),
                 .username = result.value(row, 3),
                 .country = result.value(row, 4),
@@ -5618,30 +5931,30 @@ pub const Store = struct {
                 .ruleset_id = try result.int(i32, row, 6),
                 .total_score = try result.int(i64, row, 7),
                 .total_score_without_mods = try result.int(i64, row, 8),
-                .pp = try result.float(f64, row, 9),
-                .accuracy = try result.float(f64, row, 10),
-                .max_combo = try result.int(i32, row, 11),
-                .passed = try result.boolean(row, 12),
-                .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 31), try result.float(f64, row, 10), try result.int(i32, row, 32), try result.int(i32, row, 33), try result.int(i32, row, 34), try result.int(i32, row, 37)) else result.value(row, 13),
-                .mods_json = if (stable) mods.written() else result.value(row, 14),
-                .statistics_json = if (stable) statistics.written() else result.value(row, 15),
-                .maximum_statistics_json = result.value(row, 16),
-                .pauses_json = result.value(row, 17),
-                .ended_at = result.value(row, 18),
+                .pp = try result.float(f64, row, 10),
+                .accuracy = try result.float(f64, row, 11),
+                .max_combo = try result.int(i32, row, 12),
+                .passed = try result.boolean(row, 13),
+                .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 32), try result.float(f64, row, 11), try result.int(i32, row, 33), try result.int(i32, row, 34), try result.int(i32, row, 35), try result.int(i32, row, 38)) else result.value(row, 14),
+                .mods_json = if (stable) mods.written() else result.value(row, 15),
+                .statistics_json = if (stable) statistics.written() else result.value(row, 16),
+                .maximum_statistics_json = result.value(row, 17),
+                .pauses_json = result.value(row, 18),
+                .ended_at = result.value(row, 19),
                 .ranked = status == 3 or status == 4,
-                .preserve = try result.boolean(row, 39),
-                .has_replay = try result.boolean(row, 30),
+                .preserve = try result.boolean(row, 40),
+                .has_replay = try result.boolean(row, 31),
                 .beatmap = .{
                     .id = try result.int(i32, row, 5),
-                    .set_id = try result.int(i32, row, 21),
+                    .set_id = try result.int(i32, row, 22),
                     .status = lazerStatus(status),
-                    .checksum = result.value(row, 22),
-                    .ruleset_id = try result.int(i32, row, 23),
-                    .star_rating = try result.float(f64, row, 24),
-                    .version = result.value(row, 25),
-                    .artist = result.value(row, 26),
-                    .title = result.value(row, 27),
-                    .creator = result.value(row, 28),
+                    .checksum = result.value(row, 23),
+                    .ruleset_id = try result.int(i32, row, 24),
+                    .star_rating = try result.float(f64, row, 25),
+                    .version = result.value(row, 26),
+                    .artist = result.value(row, 27),
+                    .title = result.value(row, 28),
+                    .creator = result.value(row, 29),
                 },
             });
         }
@@ -5664,7 +5977,7 @@ pub const Store = struct {
             "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=$1 AND b.status>=3 AND s.mode=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND NOT u.restricted)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY score DESC,id ASC) AS position,count(*) OVER() AS score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,id,user_id,(SELECT name FROM zigcho.users WHERE id=board.user_id),(SELECT country FROM zigcho.users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,to_char(to_timestamp(submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),status,set_id,map_md5,beatmap_star_rating,version,artist,title,creator,team_id,team_name,team_short_name,team_flag_version " ++
+            "SELECT position,score_count,id,user_id,(SELECT name FROM zigcho.users WHERE id=board.user_id),(SELECT country FROM zigcho.users WHERE id=board.user_id),beatmap_id,mode,score,pp,accuracy,max_combo,n300,n100,n50,ngeki,nkatu,nmiss,perfect,mods,to_char(to_timestamp(submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),status,set_id,map_md5,beatmap_star_rating,version,artist,title,creator,team_id,team_name,team_short_name,team_flag_version,(coalesce(octet_length(replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=board.id)) " ++
             "FROM board WHERE position<=$3 OR user_id=$4 ORDER BY position";
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, limit_text, requester });
         defer result.deinit();
@@ -5695,7 +6008,7 @@ pub const Store = struct {
             const score: lazer.LeaderboardScore = .{
                 .id = try result.int(i64, row, 2),
                 .legacy_score_id = try result.int(i64, row, 2),
-                .legacy_total_score = try result.int(i64, row, 8),
+                .legacy_total_score = lazer.stableLegacyTotalScore(try result.int(i64, row, 8)),
                 .user_id = try result.int(i32, row, 3),
                 .username = result.value(row, 4),
                 .country = result.value(row, 5),
@@ -5714,7 +6027,7 @@ pub const Store = struct {
                 .pauses_json = "[]",
                 .ended_at = result.value(row, 20),
                 .ranked = status == 3 or status == 4,
-                .has_replay = false,
+                .has_replay = try result.boolean(row, 33),
                 .team = if (result.isNull(row, 29)) null else try domain.TeamSummary.init(try result.int(i32, row, 29), result.value(row, 30), result.value(row, 31), try result.int(i64, row, 32)),
                 .beatmap = .{
                     .id = try result.int(i32, row, 6),
@@ -5771,21 +6084,21 @@ pub const Store = struct {
         defer lease.release();
         const sql =
             "WITH candidates AS (" ++
-            "SELECT 'lazer'::text source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score) total_without,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
+            "SELECT 'lazer'::text source,s.id source_id,s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,s.beatmap_id,s.ruleset_id,s.total_score,s.total_score_without_mods total_without,s.legacy_total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id)) has_replay,0 stable_mods,0 n300,0 n100,0 n50,0 ngeki,0 nkatu,0 nmiss,false perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,1 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
             "FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id " ++
             "WHERE s.beatmap_id=$1 AND b.status>=3 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND NOT $6::boolean AND NOT EXISTS(SELECT 1 FROM zigcho.beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM zigcho.beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') " ++
-            "AND ($11='global' OR ($11='country' AND u.country=(SELECT country FROM zigcho.users WHERE id=$10)) OR ($11='friend' AND (s.user_id=$10 OR EXISTS(SELECT 1 FROM zigcho.friends f WHERE f.user_id=$10 AND f.friend_id=s.user_id))) OR ($11='team' AND tm.team_id IS NOT NULL AND tm.team_id=(SELECT team_id FROM zigcho.team_members WHERE user_id=$10))) " ++
+            "AND ($11='global' OR ($11='country' AND u.country=(SELECT country FROM zigcho.users WHERE id=$10)) OR ($11='friend' AND (s.user_id=$10 OR EXISTS(SELECT 1 FROM zigcho.friends f JOIN zigcho.users friend_sender ON friend_sender.id=f.user_id JOIN zigcho.users friend_target ON friend_target.id=f.friend_id WHERE f.user_id=$10 AND f.friend_id=s.user_id AND friend_sender.id!=friend_target.id AND friend_target.id!=3 AND NOT friend_sender.restricted AND NOT friend_target.restricted))) OR ($11='team' AND tm.team_id IS NOT NULL AND tm.team_id=(SELECT team_id FROM zigcho.team_members WHERE user_id=$10))) " ++
             "AND (NOT $5::boolean OR (" ++
             "NOT EXISTS(SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE $3!='custom' OR upper(stored.value->>'acronym') NOT IN('RX','AP') EXCEPT SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE $3!='custom' OR upper(value) NOT IN('RX','AP')) " ++
             "AND NOT EXISTS(SELECT upper(value) FROM jsonb_array_elements_text($4::jsonb) WHERE $3!='custom' OR upper(value) NOT IN('RX','AP') EXCEPT SELECT upper(stored.value->>'acronym') FROM jsonb_array_elements(s.mods_json) stored WHERE $3!='custom' OR upper(stored.value->>'acronym') NOT IN('RX','AP')))) " ++
             "UNION ALL " ++
-            "SELECT 'stable'::text source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{}'::text statistics_json,'{}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND coalesce(octet_length(s.replay),0)>0 has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
+            "SELECT 'stable'::text source,s.id source_id,4000000000000000000+s.id public_id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END country,b.id beatmap_id,s.mode ruleset_id,s.score total_score,s.score total_without,least(greatest(s.score,0),2147483647)::integer legacy_total_score,s.pp,s.accuracy,s.max_combo,s.passed,''::text rank,'[]'::text mods_json,'{}'::text statistics_json,'{}'::text maximum_statistics_json,'[]'::text pauses_json,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') ended_at,b.status,s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='stable' AND ro.score_id=s.id)) has_replay,s.mods stable_mods,s.n300,s.n100,s.n50,s.ngeki,s.nkatu,s.nmiss,s.perfect,b.set_id,b.md5,b.mode map_mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace,0 source_order,tm.team_id,t.name team_name,t.short_name team_short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind='flag'),0) team_flag_version " ++
             "FROM zigcho.scores s JOIN zigcho.users u ON u.id=s.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id JOIN zigcho.beatmaps b ON b.md5=s.map_md5 " ++
             "WHERE b.id=$1 AND b.status>=3 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND NOT u.restricted AND $3!='custom' AND $7::boolean AND (NOT $5::boolean OR (s.mods & $12::integer)=$8) AND NOT EXISTS(SELECT 1 FROM zigcho.beatmap_rank_events veto_event WHERE veto_event.set_id=b.set_id AND veto_event.id=(SELECT max(latest_event.id) FROM zigcho.beatmap_rank_events latest_event WHERE latest_event.set_id=b.set_id) AND veto_event.action='veto') " ++
-            "AND ($11='global' OR ($11='country' AND u.country=(SELECT country FROM zigcho.users WHERE id=$10)) OR ($11='friend' AND (s.user_id=$10 OR EXISTS(SELECT 1 FROM zigcho.friends f WHERE f.user_id=$10 AND f.friend_id=s.user_id))) OR ($11='team' AND tm.team_id IS NOT NULL AND tm.team_id=(SELECT team_id FROM zigcho.team_members WHERE user_id=$10))))," ++
+            "AND ($11='global' OR ($11='country' AND u.country=(SELECT country FROM zigcho.users WHERE id=$10)) OR ($11='friend' AND (s.user_id=$10 OR EXISTS(SELECT 1 FROM zigcho.friends f JOIN zigcho.users friend_sender ON friend_sender.id=f.user_id JOIN zigcho.users friend_target ON friend_target.id=f.friend_id WHERE f.user_id=$10 AND f.friend_id=s.user_id AND friend_sender.id!=friend_target.id AND friend_target.id!=3 AND NOT friend_sender.restricted AND NOT friend_target.restricted))) OR ($11='team' AND tm.team_id IS NOT NULL AND tm.team_id=(SELECT team_id FROM zigcho.team_members WHERE user_id=$10))))," ++
             "ordered AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY CASE WHEN rank_namespace IN('vanilla','relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) user_place FROM candidates)," ++
             "board AS (SELECT *,row_number() OVER(ORDER BY CASE WHEN rank_namespace IN('relax','autopilot') THEN pp ELSE total_score::double precision END DESC,source_order,source_id) position,count(*) OVER() score_count FROM ordered WHERE user_place=1) " ++
-            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace,team_id,team_name,team_short_name,team_flag_version " ++
+            "SELECT position,score_count,source,public_id,user_id,name,country,beatmap_id,ruleset_id,total_score,total_without,legacy_total_score,pp,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,ended_at,status,has_replay,stable_mods,n300,n100,n50,ngeki,nkatu,nmiss,perfect,set_id,md5,map_mode,star_rating,version,artist,title,creator,rank_namespace,team_id,team_name,team_short_name,team_flag_version " ++
             "FROM board WHERE position<=$9 OR user_id=$10 ORDER BY position";
         const gameplay_mask = try param(&buffers, &cursor, stable_mods.leaderboard_gameplay_mask);
         var result = try postgres.queryParams(allocator, lease.conn, sql, &.{ beatmap_text, ruleset, namespace_name, exact_mods_json, filter, classic_only, stable_supported, stable_bits, limit_text, requester, @tagName(scope), gameplay_mask });
@@ -5806,13 +6119,13 @@ pub const Store = struct {
             var statistics: std.Io.Writer.Allocating = .init(allocator);
             defer statistics.deinit();
             if (stable) {
-                try stable_mods.writeLazerJson(&mods.writer, try result.int(i32, row, 23), true);
-                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, try result.int(i32, row, 24), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 28), try result.int(i32, row, 29));
+                try stable_mods.writeLazerJson(&mods.writer, try result.int(i32, row, 24), true);
+                try stable_mods.writeLazerStatistics(&statistics.writer, ruleset_id, try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 28), try result.int(i32, row, 29), try result.int(i32, row, 30));
             }
             const score: lazer.LeaderboardScore = .{
                 .id = try result.int(i64, row, 3),
                 .legacy_score_id = if (stable) lazer.decodeStableScoreId(try result.int(i64, row, 3)) else null,
-                .legacy_total_score = if (stable) try result.int(i64, row, 9) else null,
+                .legacy_total_score = if (stable) lazer.stableLegacyTotalScore(try result.int(i64, row, 9)) else if (result.isNull(row, 11)) null else try result.int(i32, row, 11),
                 .user_id = try result.int(i32, row, 4),
                 .username = result.value(row, 5),
                 .country = result.value(row, 6),
@@ -5820,30 +6133,30 @@ pub const Store = struct {
                 .ruleset_id = try result.int(i32, row, 8),
                 .total_score = try result.int(i64, row, 9),
                 .total_score_without_mods = try result.int(i64, row, 10),
-                .pp = try result.float(f64, row, 11),
-                .accuracy = try result.float(f64, row, 12),
-                .max_combo = try result.int(i32, row, 13),
-                .passed = try result.boolean(row, 14),
-                .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 23), try result.float(f64, row, 12), try result.int(i32, row, 24), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 29)) else result.value(row, 15),
-                .mods_json = if (stable) mods.written() else result.value(row, 16),
-                .statistics_json = if (stable) statistics.written() else result.value(row, 17),
-                .maximum_statistics_json = result.value(row, 18),
-                .pauses_json = result.value(row, 19),
-                .ended_at = result.value(row, 20),
-                .ranked = (try result.int(i32, row, 21)) == 3 or (try result.int(i32, row, 21)) == 4,
-                .has_replay = try result.boolean(row, 22),
-                .team = if (result.isNull(row, 40)) null else try domain.TeamSummary.init(try result.int(i32, row, 40), result.value(row, 41), result.value(row, 42), try result.int(i64, row, 43)),
+                .pp = try result.float(f64, row, 12),
+                .accuracy = try result.float(f64, row, 13),
+                .max_combo = try result.int(i32, row, 14),
+                .passed = try result.boolean(row, 15),
+                .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 24), try result.float(f64, row, 13), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 30)) else result.value(row, 16),
+                .mods_json = if (stable) mods.written() else result.value(row, 17),
+                .statistics_json = if (stable) statistics.written() else result.value(row, 18),
+                .maximum_statistics_json = result.value(row, 19),
+                .pauses_json = result.value(row, 20),
+                .ended_at = result.value(row, 21),
+                .ranked = (try result.int(i32, row, 22)) == 3 or (try result.int(i32, row, 22)) == 4,
+                .has_replay = try result.boolean(row, 23),
+                .team = if (result.isNull(row, 41)) null else try domain.TeamSummary.init(try result.int(i32, row, 41), result.value(row, 42), result.value(row, 43), try result.int(i64, row, 44)),
                 .beatmap = .{
                     .id = try result.int(i32, row, 7),
-                    .set_id = try result.int(i32, row, 31),
-                    .status = lazerStatus(try result.int(i32, row, 21)),
-                    .checksum = result.value(row, 32),
-                    .ruleset_id = try result.int(i32, row, 33),
-                    .star_rating = try result.float(f64, row, 34),
-                    .version = result.value(row, 35),
-                    .artist = result.value(row, 36),
-                    .title = result.value(row, 37),
-                    .creator = result.value(row, 38),
+                    .set_id = try result.int(i32, row, 32),
+                    .status = lazerStatus(try result.int(i32, row, 22)),
+                    .checksum = result.value(row, 33),
+                    .ruleset_id = try result.int(i32, row, 34),
+                    .star_rating = try result.float(f64, row, 35),
+                    .version = result.value(row, 36),
+                    .artist = result.value(row, 37),
+                    .title = result.value(row, 38),
+                    .creator = result.value(row, 39),
                 },
             };
             if (position <= limit) {
@@ -5881,12 +6194,13 @@ pub const Store = struct {
         const map_text = try std.fmt.bufPrint(&map_buf, "{d}", .{beatmap_id});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,s.beatmap_id,s.ruleset_id,s.total_score,coalesce(s.legacy_total_score,s.total_score),s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),b.status,(s.passed AND (octet_length(s.replay)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id))),b.set_id,b.md5,b.mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 AND s.beatmap_id=$2 AND NOT u.restricted", &.{ score_text, map_text });
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.id,s.user_id,u.name,CASE WHEN u.show_country THEN u.country ELSE 'XX' END,s.beatmap_id,s.ruleset_id,s.total_score,s.total_score_without_mods,s.legacy_total_score,s.pp,s.accuracy,s.max_combo,s.passed,s.rank,s.mods_json::text,s.statistics_json::text,s.maximum_statistics_json::text,s.pauses_json::text,to_char(to_timestamp(s.submitted_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),b.status,(s.passed AND (coalesce(octet_length(s.replay),0)>0 OR EXISTS(SELECT 1 FROM zigcho.replay_objects ro WHERE ro.source='lazer' AND ro.score_id=s.id))),b.set_id,b.md5,b.mode,b.star_rating,b.version,b.artist,b.title,b.creator,s.rank_namespace FROM zigcho.lazer_scores s JOIN zigcho.users u ON u.id=s.user_id JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 AND s.beatmap_id=$2 AND NOT u.restricted", &.{ score_text, map_text });
         defer result.deinit();
         if (result.rows() == 0) return null;
-        const status = try result.int(i32, 0, 18);
+        const status = try result.int(i32, 0, 19);
         const score: lazer.LeaderboardScore = .{
             .id = try result.int(i64, 0, 0),
+            .legacy_total_score = if (result.isNull(0, 8)) null else try result.int(i32, 0, 8),
             .user_id = try result.int(i32, 0, 1),
             .username = result.value(0, 2),
             .country = result.value(0, 3),
@@ -5894,29 +6208,29 @@ pub const Store = struct {
             .ruleset_id = try result.int(i32, 0, 5),
             .total_score = try result.int(i64, 0, 6),
             .total_score_without_mods = try result.int(i64, 0, 7),
-            .pp = try result.float(f64, 0, 8),
-            .accuracy = try result.float(f64, 0, 9),
-            .max_combo = try result.int(i32, 0, 10),
-            .passed = try result.boolean(0, 11),
-            .rank = result.value(0, 12),
-            .mods_json = result.value(0, 13),
-            .statistics_json = result.value(0, 14),
-            .maximum_statistics_json = result.value(0, 15),
-            .pauses_json = result.value(0, 16),
-            .ended_at = result.value(0, 17),
+            .pp = try result.float(f64, 0, 9),
+            .accuracy = try result.float(f64, 0, 10),
+            .max_combo = try result.int(i32, 0, 11),
+            .passed = try result.boolean(0, 12),
+            .rank = result.value(0, 13),
+            .mods_json = result.value(0, 14),
+            .statistics_json = result.value(0, 15),
+            .maximum_statistics_json = result.value(0, 16),
+            .pauses_json = result.value(0, 17),
+            .ended_at = result.value(0, 18),
             .ranked = status == 3 or status == 4,
-            .has_replay = try result.boolean(0, 19),
+            .has_replay = try result.boolean(0, 20),
             .beatmap = .{
                 .id = try result.int(i32, 0, 4),
-                .set_id = try result.int(i32, 0, 20),
+                .set_id = try result.int(i32, 0, 21),
                 .status = lazerStatus(status),
-                .checksum = result.value(0, 21),
-                .ruleset_id = try result.int(i32, 0, 22),
-                .star_rating = try result.float(f64, 0, 23),
-                .version = result.value(0, 24),
-                .artist = result.value(0, 25),
-                .title = result.value(0, 26),
-                .creator = result.value(0, 27),
+                .checksum = result.value(0, 22),
+                .ruleset_id = try result.int(i32, 0, 23),
+                .star_rating = try result.float(f64, 0, 24),
+                .version = result.value(0, 25),
+                .artist = result.value(0, 26),
+                .title = result.value(0, 27),
+                .creator = result.value(0, 28),
             },
         };
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -6007,6 +6321,7 @@ pub const Store = struct {
         const beatmap_id = try param(&buffers, &cursor, input.beatmap_id);
         const ruleset_id = try param(&buffers, &cursor, input.ruleset_id);
         const total_score = try param(&buffers, &cursor, input.total_score);
+        const total_score_without_mods = try param(&buffers, &cursor, input.total_score_without_mods);
         const legacy_total_score: ?[]const u8 = if (input.legacy_total_score) |value| try param(&buffers, &cursor, value) else null;
         const accuracy = try param(&buffers, &cursor, input.accuracy);
         const max_combo = try param(&buffers, &cursor, input.max_combo);
@@ -6025,7 +6340,7 @@ pub const Store = struct {
         const previous_pp: f64 = if (previous.rows() == 0) 0 else try previous.float(f64, 0, 1);
         const previous_score: i64 = if (previous.rows() == 0) 0 else try previous.int(i64, 0, 2);
         const is_best = input.passed and (previous_best_id == 0 or pp_value > previous_pp or (pp_value == previous_pp and input.total_score > previous_score));
-        var result = try postgres.queryParams(self.allocator, conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,client_version,pp,best,replay,star_rating) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19) RETURNING id", &.{ user, beatmap_id, ruleset_id, total_score, legacy_total_score, accuracy, max_combo, passed, rank, mods_json, statistics_json, maximum_statistics_json, pauses_json, namespace, input.client_version, pp_text, if (is_best) "true" else "false", replay_encoded, star_rating });
+        var result = try postgres.queryParams(self.allocator, conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,client_version,pp,best,replay,star_rating) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16,$17,$18,$19,$20) RETURNING id", &.{ user, beatmap_id, ruleset_id, total_score, total_score_without_mods, legacy_total_score, accuracy, max_combo, passed, rank, mods_json, statistics_json, maximum_statistics_json, pauses_json, namespace, input.client_version, pp_text, if (is_best) "true" else "false", replay_encoded, star_rating });
         defer result.deinit();
         const score_id = try result.int(i64, 0, 0);
         if (is_best and previous_best_id != 0) {
@@ -6035,6 +6350,11 @@ pub const Store = struct {
             unset.deinit();
         }
         try self.updateLazerStatsWithConnection(conn, user_id, input);
+        if (lazer.statsMode(input)) |stats_mode| {
+            try self.pruneStatsHistoryWithConnection(conn);
+            try self.recordStatsHistorySliceCurrentWithConnection(conn, .lazer, stats_mode, user_id);
+            try self.recordStatsHistorySliceCurrentWithConnection(conn, .all, stats_mode, user_id);
+        }
         var ranked_map = try postgres.queryParams(self.allocator, conn, "SELECT status IN(3,4) FROM zigcho.beatmaps WHERE id=$1", &.{beatmap_id});
         defer ranked_map.deinit();
         const ranked = ranked_map.rows() != 0 and try ranked_map.boolean(0, 0);
@@ -6061,7 +6381,7 @@ pub const Store = struct {
         const user = try param(&buffers, &cursor, user_id);
         const beatmap_id = try param(&buffers, &cursor, input.beatmap_id);
         const stats_mode_text = try param(&buffers, &cursor, stats_mode);
-        const legacy_score = try param(&buffers, &cursor, input.legacy_total_score orelse input.total_score);
+        const legacy_score = try param(&buffers, &cursor, input.legacy_total_score orelse input.total_score_without_mods);
         const max_combo = try param(&buffers, &cursor, input.max_combo);
         const hits = try param(&buffers, &cursor, lazer.totalHits(input));
         const namespace = @tagName(input.namespace);
@@ -6075,20 +6395,28 @@ pub const Store = struct {
         update.deinit();
         var map_update = try postgres.queryParams(self.allocator, conn, "UPDATE zigcho.beatmaps SET plays=plays+1,passes=passes+$1 WHERE id=$2", &.{ if (input.passed) "1" else "0", beatmap_id });
         map_update.deinit();
-        if (input.passed and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceWithConnection(conn, user_id, @intCast(input.ruleset_id), stats_mode, namespace);
+        if (input.passed and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceWithConnection(conn, user_id, @intCast(input.ruleset_id), stats_mode, namespace, false);
     }
 
-    fn rebuildCombinedPerformanceWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, ruleset_id: u8, stats_mode: u8, namespace: []const u8) !void {
+    fn rebuildCombinedPerformanceWithConnection(self: *Store, conn: *postgres.c.PGconn, user_id: i32, ruleset_id: u8, stats_mode: u8, namespace: []const u8, pre_schema_43: bool) !void {
         var buffers: [32][64]u8 = undefined;
         var cursor: usize = 0;
         const user = try param(&buffers, &cursor, user_id);
         const ruleset = try param(&buffers, &cursor, ruleset_id);
         const mode = try param(&buffers, &cursor, stats_mode);
-        var result = try postgres.queryParams(self.allocator, conn, "WITH candidates AS (" ++
-            "SELECT b.id beatmap_id,s.pp,s.accuracy,s.score legacy_score,0 source,s.id score_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4) " ++
-            "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score),1,s.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
-            "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
-            "SELECT pp,accuracy,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC", &.{ user, ruleset, namespace });
+        const sql = if (pre_schema_43)
+            "WITH candidates AS (" ++
+                "SELECT b.id beatmap_id,s.pp,s.accuracy,s.score legacy_score,0 source,s.id score_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4) " ++
+                "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score),1,s.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
+                "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
+                "SELECT pp,accuracy,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC"
+        else
+            "WITH candidates AS (" ++
+                "SELECT b.id beatmap_id,s.pp,s.accuracy,s.score legacy_score,0 source,s.id score_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4) " ++
+                "UNION ALL SELECT s.beatmap_id,s.pp,s.accuracy,coalesce(s.legacy_total_score,s.total_score_without_mods),1,s.id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND b.status IN(3,4))," ++
+                "per_map AS (SELECT *,row_number() OVER(PARTITION BY beatmap_id ORDER BY pp DESC,source ASC,score_id ASC) map_place FROM candidates) " ++
+                "SELECT pp,accuracy,legacy_score FROM per_map WHERE map_place=1 ORDER BY pp DESC,beatmap_id ASC";
+        var result = try postgres.queryParams(self.allocator, conn, sql, &.{ user, ruleset, namespace });
         defer result.deinit();
         var total_pp: f64 = 0;
         var weighted_accuracy: f64 = 0;
@@ -6207,10 +6535,10 @@ pub const Store = struct {
         const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
         var lease = self.pool.acquire();
         defer lease.release();
-        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND NOT u.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))),(SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND NOT u.restricted AND u.country=me.country AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s JOIN zigcho.users me ON me.id=s.user_id WHERE s.user_id=$1 AND s.mode=$2", &.{ id, mode_text });
+        var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,CASE WHEN s.plays>0 THEN (SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND r.plays>0 AND u.id!=3 AND NOT u.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE 0 END,CASE WHEN s.plays>0 THEN (SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND r.plays>0 AND u.id!=3 AND NOT u.restricted AND u.country=me.country AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE 0 END FROM zigcho.stats s JOIN zigcho.users me ON me.id=s.user_id WHERE s.user_id=$1 AND s.mode=$2", &.{ id, mode_text });
         defer result.deinit();
         if (result.rows() == 0) return null;
-        var stats: domain.Stats = .{ .mode = @enumFromInt(mode % 4), .ranked_score = try result.int(i64, 0, 0), .total_score = try result.int(i64, 0, 1), .pp = try result.int(i32, 0, 2), .plays = try result.int(i32, 0, 3), .play_time = try result.int(i32, 0, 4), .total_hits = try result.int(i64, 0, 5), .accuracy = try result.float(f64, 0, 6), .max_combo = try result.int(i32, 0, 7), .global_rank = try result.int(i32, 0, 8), .country_rank = try result.int(i32, 0, 9) };
+        var stats: domain.Stats = .{ .mode = @enumFromInt(mode % 4), .ranked_score = try result.int(i64, 0, 0), .total_score = try result.int(i64, 0, 1), .pp = try result.int(i32, 0, 2), .plays = try result.int(i32, 0, 3), .play_time = try result.int(i32, 0, 4), .total_hits = try result.int(i64, 0, 5), .accuracy = try result.float(f64, 0, 6), .max_combo = try result.int(i32, 0, 7), .global_rank = try result.int(i32, 0, 8), .country_rank = try result.int(i32, 0, 9), .replay_views = try self.replayViewCountWithConnection(lease.conn, user_id, .all, mode) };
         var stable = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.mods,s.accuracy,s.n300,s.n100,s.n50,s.nmiss FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4)", &.{ id, mode_text });
         defer stable.deinit();
         for (0..stable.rows()) |row| stats.addGrade(sqlite_storage.Store.stableGrade(mode, try stable.int(i32, row, 0), try stable.float(f64, row, 1), try stable.int(i32, row, 2), try stable.int(i32, row, 3), try stable.int(i32, row, 4), try stable.int(i32, row, 5)));
@@ -6226,7 +6554,7 @@ pub const Store = struct {
         var lease = self.pool.acquire();
         defer lease.release();
         var result = [_]?domain.Stats{null} ** 4;
-        var rows = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,(SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND NOT u.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))),(SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND NOT u.restricted AND u.country=me.country AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) FROM zigcho.stats s JOIN zigcho.users me ON me.id=s.user_id WHERE s.user_id=$1 AND s.mode BETWEEN 0 AND 3 ORDER BY s.mode", &.{id});
+        var rows = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.mode,s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,CASE WHEN s.plays>0 THEN (SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND r.plays>0 AND u.id!=3 AND NOT u.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE 0 END,CASE WHEN s.plays>0 THEN (SELECT count(1)+1 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND r.plays>0 AND u.id!=3 AND NOT u.restricted AND u.country=me.country AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE 0 END FROM zigcho.stats s JOIN zigcho.users me ON me.id=s.user_id WHERE s.user_id=$1 AND s.mode BETWEEN 0 AND 3 ORDER BY s.mode", &.{id});
         defer rows.deinit();
         for (0..rows.rows()) |row| {
             const mode = try rows.int(u8, row, 0);
@@ -6256,6 +6584,9 @@ pub const Store = struct {
             const mode = try modern.int(u8, row, 0);
             if (result[mode]) |*stats| stats.addGrade(modern.value(row, 1));
         }
+        for (0..result.len) |mode| if (result[mode]) |*stats| {
+            stats.replay_views = try self.replayViewCountWithConnection(lease.conn, user_id, .all, @intCast(mode));
+        };
         return result;
     }
 
@@ -6274,7 +6605,7 @@ pub const Store = struct {
             "players AS (SELECT a.user_id,a.ranked_score,a.total_score,coalesce(p.pp,0) pp,a.plays,a.play_time,coalesce(p.accuracy,0) accuracy,a.max_combo FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=3 AND NOT u.restricted)," ++
             "ordered AS (SELECT *,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) SELECT ranked_score,total_score,pp,plays,play_time,accuracy,max_combo,global_rank FROM ordered WHERE user_id=$1";
         const lazer_sql =
-            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace='vanilla')," ++
+            "WITH source_scores AS (SELECT s.user_id,s.id score_id,coalesce(s.legacy_total_score,s.total_score_without_mods) total_score,s.pp,s.accuracy,s.max_combo,s.passed,greatest(b.total_length,0) play_time,b.status,s.beatmap_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.ruleset_id=$2 AND s.rank_namespace='vanilla')," ++
             "map_scores AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_id ORDER BY pp DESC,score_id ASC) map_place FROM source_scores WHERE passed AND status IN(3,4))," ++
             "ranked AS (SELECT *,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC,score_id ASC)-1 performance_index FROM map_scores WHERE map_place=1)," ++
             "performance AS (SELECT user_id,round(sum(pp*power(0.95,performance_index))+416.6667*(1-power(0.9994,count(*)::double precision))) pp,sum(accuracy*power(0.95,performance_index))/(20*(1-power(0.95,count(*)::double precision))) accuracy FROM ranked GROUP BY user_id)," ++
@@ -6296,6 +6627,7 @@ pub const Store = struct {
             .accuracy = try result.float(f64, 0, 5),
             .max_combo = try result.int(i32, 0, 6),
             .global_rank = try result.int(i32, 0, 7),
+            .replay_views = try self.replayViewCountWithConnection(lease.conn, user_id, source, mode),
         };
     }
 
@@ -6502,8 +6834,11 @@ pub const Store = struct {
         update_map.deinit();
 
         if (updates_player_stats and score.passed and ranked) {
-            try self.rebuildCombinedPerformanceWithConnection(lease.conn, user_id, score.mode, stats_mode, namespace);
+            try self.rebuildCombinedPerformanceWithConnection(lease.conn, user_id, score.mode, stats_mode, namespace, false);
         }
+        try self.pruneStatsHistoryWithConnection(lease.conn);
+        try self.recordStatsHistorySliceCurrentWithConnection(lease.conn, if (std.mem.eql(u8, namespace, "scorev2")) .scorev2 else .stable, stats_mode, user_id);
+        if (updates_player_stats) try self.recordStatsHistorySliceCurrentWithConnection(lease.conn, .all, stats_mode, user_id);
         try self.awardAchievementsWithConnection(lease.conn, user_id, "stable", score_id, .{
             .eligible = score.passed and std.mem.eql(u8, namespace, "vanilla") and ranked,
             .mode = score.mode,
@@ -6518,8 +6853,8 @@ pub const Store = struct {
         return score_id;
     }
 
-    pub fn replay(self: *Store, allocator: std.mem.Allocator, score_id: i64) !?[]u8 {
-        return self.replayData(allocator, .stable, score_id, false);
+    pub fn stableReplay(self: *Store, allocator: std.mem.Allocator, score_id: i64) !?[]u8 {
+        return self.replayData(allocator, .stable, score_id, true);
     }
 
     pub fn putScreenshot(self: *Store, user_id: i32, token: []const u8, extension: []const u8, image: []const u8) !bool {
@@ -6718,11 +7053,12 @@ pub const Store = struct {
         var lease = self.pool.acquire();
         defer lease.release();
         const user = result: {
-            var query_result = try postgres.queryParams(self.allocator, lease.conn, "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,team.name,team.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=team.id AND ta.kind='flag'),0),u.show_country,t.scopes FROM zigcho.oauth_tokens t JOIN zigcho.users u ON u.id=t.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams team ON team.id=tm.team_id WHERE t.token_hash=$1 AND t.revoked_at IS NULL AND t.expires_at>$2", &.{ digest_bytea, now });
+            const sql = "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),0),tm.team_id,team.name,team.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=team.id AND ta.kind='flag'),0),u.show_country," ++ visible_follower_count_sql ++ ",t.scopes FROM zigcho.oauth_tokens t JOIN zigcho.users u ON u.id=t.user_id LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams team ON team.id=tm.team_id WHERE t.token_hash=$1 AND t.revoked_at IS NULL AND t.expires_at>$2";
+            var query_result = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ digest_bytea, now });
             defer query_result.deinit();
             if (query_result.rows() == 0) return null;
             var allowed = required_scope.len == 0;
-            var scopes = std.mem.splitScalar(u8, query_result.value(0, 13), ' ');
+            var scopes = std.mem.splitScalar(u8, query_result.value(0, 14), ' ');
             while (scopes.next()) |scope| if (std.mem.eql(u8, scope, required_scope) or std.mem.eql(u8, scope, "*")) {
                 allowed = true;
                 break;
@@ -6956,7 +7292,74 @@ pub const Store = struct {
     }
 };
 
-test "postgres runtime migrates through room cursor schema forty" {
+test "postgres score submissions refresh both sides of a daily rank swap" {
+    const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_HISTORY_URL") orelse return error.SkipZigTest;
+    var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
+    defer store.close();
+    try store.migrate();
+    const first_id = try store.register("history first", "history-first@example.test", "00000000000000000000000000000000");
+    const second_id = try store.register("history second", "history-second@example.test", "11111111111111111111111111111111");
+    const map_md5 = "99999999999999999999999999999991";
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var map = try postgres.query(lease.conn, "INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(990000001,990000001,'99999999999999999999999999999991','history','rank swap','test','zigcho',3,10)");
+        map.deinit();
+    }
+
+    const base: stable_score.Submission = .{
+        .map_md5 = map_md5,
+        .username = "history first",
+        .online_checksum = "99999999999999999999999999999992",
+        .n300 = 10,
+        .n100 = 0,
+        .n50 = 0,
+        .ngeki = 0,
+        .nkatu = 0,
+        .nmiss = 0,
+        .total_score = 1_000_000,
+        .max_combo = 10,
+        .perfect = true,
+        .grade = "X",
+        .mods = 0,
+        .passed = true,
+        .mode = 0,
+        .client_time = "260825000000",
+        .client_flags = "0",
+    };
+    _ = try store.insertStableScore(first_id, base, 40, "first replay", 12_000);
+    var second_low = base;
+    second_low.username = "history second";
+    second_low.online_checksum = "99999999999999999999999999999993";
+    second_low.total_score = 900_000;
+    _ = try store.insertStableScore(second_id, second_low, 20, "second low replay", 12_000);
+    try std.testing.expectEqual(@as(i32, 1), (try store.statsHistory(first_id, .all, 0)).points[0].global_rank);
+    try std.testing.expectEqual(@as(i32, 2), (try store.statsHistory(second_id, .all, 0)).points[0].global_rank);
+
+    var second_high = second_low;
+    second_high.online_checksum = "99999999999999999999999999999994";
+    second_high.total_score = 1_100_000;
+    _ = try store.insertStableScore(second_id, second_high, 80, "second high replay", 12_000);
+    const first_history = try store.statsHistory(first_id, .all, 0);
+    const second_history = try store.statsHistory(second_id, .all, 0);
+    try std.testing.expectEqual(@as(u8, 1), first_history.len);
+    try std.testing.expectEqual(@as(u8, 1), second_history.len);
+    try std.testing.expectEqual(@as(i32, 2), first_history.points[0].global_rank);
+    try std.testing.expectEqual(@as(i32, 1), second_history.points[0].global_rank);
+    {
+        var buffers: [2][24]u8 = undefined;
+        const first = try std.fmt.bufPrint(&buffers[0], "{d}", .{first_id});
+        const second = try std.fmt.bufPrint(&buffers[1], "{d}", .{second_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var ranks = try postgres.queryParams(std.testing.allocator, lease.conn, "SELECT count(*),count(DISTINCT global_rank) FROM zigcho.user_stats_history WHERE source='all' AND mode=0 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 AND user_id IN($1,$2)", &.{ first, second });
+        defer ranks.deinit();
+        try std.testing.expectEqual(@as(i64, 2), try ranks.int(i64, 0, 0));
+        try std.testing.expectEqual(@as(i64, 2), try ranks.int(i64, 0, 1));
+    }
+}
+
+test "postgres runtime migrates through native score semantics schema forty three" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -6964,9 +7367,10 @@ test "postgres runtime migrates through room cursor schema forty" {
         try old_store.migrate();
         var previous = old_store.pool.acquire();
         defer previous.release();
-        try postgres.exec(previous.conn, "DROP TABLE zigcho.lazer_ranked_matches; DROP TABLE zigcho.lazer_ranked_ratings; DROP TABLE zigcho.lazer_multiplayer_room_history; DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
-        try postgres.exec(previous.conn, "ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; ALTER TABLE zigcho.direct_messages DROP COLUMN chat_message_id; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
+        try postgres.exec(previous.conn, "DROP TABLE IF EXISTS zigcho.score_replay_views; DROP TABLE zigcho.user_stats_history; DROP TABLE zigcho.lazer_ranked_matches; DROP TABLE zigcho.lazer_ranked_ratings; DROP TABLE zigcho.lazer_multiplayer_room_history; DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
+        try postgres.exec(previous.conn, "ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP CONSTRAINT lazer_scores_legacy_total_score_range; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating,DROP COLUMN total_score_without_mods; ALTER TABLE zigcho.lazer_scores ALTER COLUMN legacy_total_score TYPE bigint USING legacy_total_score::bigint; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; ALTER TABLE zigcho.direct_messages DROP COLUMN chat_message_id; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
         try postgres.exec(previous.conn, "ALTER TABLE zigcho.beatmap_archives ALTER COLUMN osz_file SET NOT NULL; ALTER TABLE zigcho.beatmap_media ALTER COLUMN data SET NOT NULL");
+        try postgres.exec(previous.conn, "DELETE FROM zigcho.lazer_scores WHERE id=2147483000; DELETE FROM zigcho.beatmaps WHERE id=2147483000; DELETE FROM zigcho.users WHERE id=2147483000; INSERT INTO zigcho.users(id,name,safe_name,password_hash,password_salt) VALUES(2147483000,'schema43 migration','schema43_migration',decode('00','hex'),decode('00','hex')); INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(2147483000,2147483000,'fffffffffffffffffffffffffffffff0','artist','title','diff','mapper',3); INSERT INTO zigcho.lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace) VALUES(2147483000,2147483000,2147483000,0,987654,900000,0.98,321,true,'[]'::jsonb,'{}'::jsonb,'vanilla')");
     }
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
@@ -6976,7 +7380,7 @@ test "postgres runtime migrates through room cursor schema forty" {
     defer lease.release();
     var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name='chat_message_id'),(to_regclass('zigcho.direct_messages_chat_message') IS NOT NULL)::int,(SELECT count(*) FROM pg_constraint WHERE connamespace='zigcho'::regnamespace AND conname='direct_messages_chat_message_id_fkey' AND convalidated) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 40), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 43), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -7015,6 +7419,27 @@ test "postgres runtime migrates through room cursor schema forty" {
     defer room_cursor_schema.deinit();
     try std.testing.expectEqual(@as(i32, 1), try room_cursor_schema.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try room_cursor_schema.int(i32, 0, 1));
+    var history_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.user_stats_history') IS NOT NULL)::int,(to_regclass('zigcho.user_stats_history_lookup') IS NOT NULL)::int,(to_regclass('zigcho.user_stats_history_retention') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='user_stats_history' AND column_name IN('user_id','source','mode','day','pp','global_rank'))");
+    defer history_schema.deinit();
+    try std.testing.expectEqual(@as(i32, 1), try history_schema.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 1), try history_schema.int(i32, 0, 1));
+    try std.testing.expectEqual(@as(i32, 1), try history_schema.int(i32, 0, 2));
+    try std.testing.expectEqual(@as(i32, 6), try history_schema.int(i32, 0, 3));
+    var replay_views_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.score_replay_views') IS NOT NULL)::int,(to_regclass('zigcho.score_replay_views_owner') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='score_replay_views' AND column_name IN('source','score_id','viewer_id','owner_id','mode','rank_namespace','viewed_at'))");
+    defer replay_views_schema.deinit();
+    try std.testing.expectEqual(@as(i32, 1), try replay_views_schema.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 1), try replay_views_schema.int(i32, 0, 1));
+    try std.testing.expectEqual(@as(i32, 7), try replay_views_schema.int(i32, 0, 2));
+    var friends_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.friends_inbound') IS NOT NULL)::int");
+    defer friends_schema.deinit();
+    try std.testing.expectEqual(@as(i32, 1), try friends_schema.int(i32, 0, 0));
+    var score_schema = try postgres.query(lease.conn, "SELECT total_score,total_score_without_mods,(legacy_total_score IS NULL)::int,(SELECT (data_type='bigint')::int FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name='total_score_without_mods'),(SELECT (data_type='integer')::int FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name='legacy_total_score') FROM zigcho.lazer_scores WHERE id=2147483000");
+    defer score_schema.deinit();
+    try std.testing.expectEqual(@as(i64, 987654), try score_schema.int(i64, 0, 0));
+    try std.testing.expectEqual(@as(i64, 900000), try score_schema.int(i64, 0, 1));
+    try std.testing.expectEqual(@as(i32, 1), try score_schema.int(i32, 0, 2));
+    try std.testing.expectEqual(@as(i32, 1), try score_schema.int(i32, 0, 3));
+    try std.testing.expectEqual(@as(i32, 1), try score_schema.int(i32, 0, 4));
     var bss_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.beatmap_submissions') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_submission_maps') IS NOT NULL)::int,(to_regclass('zigcho.bss_counters') IS NOT NULL)::int,(SELECT count(*) FROM zigcho.bss_counters),(SELECT min(next_id) FROM zigcho.bss_counters),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='beatmap_submissions' AND column_name='replacement_set_id'),(to_regclass('zigcho.beatmap_submissions_replacement') IS NOT NULL)::int");
     defer bss_schema.deinit();
     try std.testing.expectEqual(@as(i32, 1), try bss_schema.int(i32, 0, 0));
@@ -7407,7 +7832,7 @@ test "postgres account auth stats and token slice" {
     const snapshot = (try store.ppSnapshot(score_id)).?;
     try std.testing.expectApproxEqAbs(@as(f64, 26.8), snapshot.score, 0.001);
     try std.testing.expectEqual(@as(i64, 27), snapshot.player);
-    const replay = (try store.replay(std.testing.allocator, score_id)).?;
+    const replay = (try store.stableReplay(std.testing.allocator, score_id)).?;
     defer std.testing.allocator.free(replay);
     try std.testing.expectEqualStrings("replay", replay);
     const website_replay = (try store.siteReplay(std.testing.allocator, score_id)).?;
@@ -7423,6 +7848,13 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, stable_website_board, "\"source\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable_website_board, "\"client\":\"stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable_website_board, "\"client\":\"lazer\"") == null);
+    {
+        var parsed_stable_website_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stable_website_board, .{});
+        defer parsed_stable_website_board.deinit();
+        const stable_website_score = parsed_stable_website_board.value.object.get("scores").?.array.items[0].object;
+        try std.testing.expectEqual(@as(i64, 1_000_000), stable_website_score.get("score_without_mods").?.integer);
+        try std.testing.expectEqual(@as(i64, 1_000_000), stable_website_score.get("legacy_score").?.integer);
+    }
     const classic_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 1, 0, .vanilla, "[]", true, true, 0, .global, 50);
     defer std.testing.allocator.free(classic_lazer_board);
     try std.testing.expect(std.mem.indexOf(u8, classic_lazer_board, "\"score_count\":1") != null);
@@ -7437,7 +7869,7 @@ test "postgres account auth stats and token slice" {
 
     const outsider_id = try store.register("outside", "outside@example.test", "11111111111111111111111111111111");
     try store.updateCountry(outsider_id, .{ 'N', 'Z' });
-    try std.testing.expect(try store.addFriend(user_id, outsider_id));
+    try std.testing.expectEqual(domain.RelationshipAddResult.inserted, try store.addFriend(user_id, outsider_id));
     var outsider_score = score;
     outsider_score.username = "outside";
     outsider_score.online_checksum = "cccccccccccccccccccccccccccccccc";
@@ -7540,7 +7972,45 @@ test "postgres account auth stats and token slice" {
     defer std.testing.allocator.free(site_profile);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"country\":\"AU\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"global_rank\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"rank_history\":[]") != null);
+    {
+        var parsed_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, site_profile, .{});
+        defer parsed_profile.deinit();
+        const selected = parsed_profile.value.object.get("selected_stats").?.object;
+        const ranks = selected.get("rank_history").?.array.items;
+        const pp_values = selected.get("pp_history").?.array.items;
+        const days = selected.get("history_days").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), ranks.len);
+        try std.testing.expectEqual(ranks.len, pp_values.len);
+        try std.testing.expectEqual(ranks.len, days.len);
+        try std.testing.expectEqual(selected.get("global_rank").?.integer, ranks[ranks.len - 1].integer);
+        try std.testing.expectEqual(selected.get("pp").?.integer, pp_values[pp_values.len - 1].integer);
+    }
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var user_id_buf: [24]u8 = undefined;
+        const user_id_text = try std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id});
+        var inserted_history = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) VALUES($1,'all',0,((extract(epoch FROM clock_timestamp())::bigint/86400)-90)*86400,6,10),($1,'all',0,((extract(epoch FROM clock_timestamp())::bigint/86400)-89)*86400,7,9)", &.{user_id_text});
+        defer inserted_history.deinit();
+    }
+    var history_score = score;
+    history_score.online_checksum = "44444444444444444444444444444444";
+    history_score.total_score = 700_000;
+    _ = try store.insertStableScore(user_id, history_score, 10, "history replay", 12_000);
+    const observed_history = try store.statsHistory(user_id, .all, 0);
+    try std.testing.expectEqual(@as(usize, 2), observed_history.len);
+    try std.testing.expectEqual(@as(i32, 7), observed_history.points[0].pp);
+    try std.testing.expectEqual(@as(i32, 9), observed_history.points[0].global_rank);
+    try std.testing.expectEqual(@as(i32, 27), observed_history.points[1].pp);
+    try std.testing.expectEqual(@as(i32, 2), observed_history.points[1].global_rank);
+    try std.testing.expectEqual(observed_history, try store.statsHistory(user_id, .all, 0));
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var pruned = try postgres.query(lease.conn, "SELECT count(*) FROM zigcho.user_stats_history WHERE day<((extract(epoch FROM clock_timestamp())::bigint/86400)-89)*86400");
+        defer pruned.deinit();
+        try std.testing.expectEqual(@as(i64, 0), try pruned.int(i64, 0, 0));
+    }
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"artist\":\"artist\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"passed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, site_profile, "\"pinned_scores\":[{") != null);
@@ -7556,6 +8026,47 @@ test "postgres account auth stats and token slice" {
         map_insert.deinit();
         var first_insert = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES($1,'33333333333333333333333333333333',0,0,1234,1,1,10,10,0,0,0,0,0,true,true,'first-replay'::bytea,'vanilla',true)", &.{user_id_text});
         first_insert.deinit();
+    }
+    try store.updateSiteProfile(user_id, .{ .bio = "postgres profile", .title = "mapper", .pronouns = "they/them", .location = "adelaide", .website = "https://kai.ovh", .accent = .mint, .preferred_mode = 2, .profile_source = .lazer, .avatar_key = 2, .show_country = false, .show_profile_stats = false, .show_recent_scores = false });
+    try std.testing.expect(try store.recordReplayView(3, .stable, score_id));
+    for ([_]domain.SiteScoreSource{ .all, .stable }) |private_source| {
+        const private_site_rankings = try store.siteRankings(std.testing.allocator, private_source, 0, 0);
+        defer std.testing.allocator.free(private_site_rankings);
+        var parsed_private_site = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, private_site_rankings, .{});
+        defer parsed_private_site.deinit();
+        const private_site_players = parsed_private_site.value.object.get("players").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), private_site_players.len);
+        try std.testing.expectEqual(@as(i64, outsider_id), private_site_players[0].object.get("id").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), private_site_players[0].object.get("rank").?.integer);
+    }
+    for ([_]lazer.RankingKind{ .performance, .score }) |private_kind| {
+        const private_lazer_rankings = try store.lazerRankingsJson(std.testing.allocator, 0, private_kind, null, 1);
+        defer std.testing.allocator.free(private_lazer_rankings);
+        var parsed_private_lazer = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, private_lazer_rankings, .{});
+        defer parsed_private_lazer.deinit();
+        const private_lazer_rows = parsed_private_lazer.value.object.get("ranking").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), private_lazer_rows.len);
+        try std.testing.expectEqual(@as(i64, outsider_id), private_lazer_rows[0].object.get("user").?.object.get("id").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), private_lazer_rows[0].object.get("global_rank").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), private_lazer_rows[0].object.get("replays_watched_by_others").?.integer);
+    }
+    try store.updateSiteProfile(user_id, .{ .bio = "postgres profile", .title = "mapper", .pronouns = "they/them", .location = "adelaide", .website = "https://kai.ovh", .accent = .mint, .preferred_mode = 2, .profile_source = .lazer, .avatar_key = 2, .show_country = true, .show_profile_stats = false, .show_recent_scores = false });
+    const private_countries_json = try store.lazerRankingsJson(std.testing.allocator, 0, .country, null, 1);
+    defer std.testing.allocator.free(private_countries_json);
+    var private_countries = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, private_countries_json, .{});
+    defer private_countries.deinit();
+    const private_country_rows = private_countries.value.object.get("ranking").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), private_country_rows.len);
+    try std.testing.expectEqualStrings("NZ", private_country_rows[0].object.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 1), private_country_rows[0].object.get("active_users").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, private_countries_json, "\"code\":\"AU\"") == null);
+    {
+        var score_buf: [24]u8 = undefined;
+        const score_text = try std.fmt.bufPrint(&score_buf, "{d}", .{score_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var remove_privacy_view = try postgres.queryParams(std.testing.allocator, lease.conn, "DELETE FROM zigcho.score_replay_views WHERE viewer_id=3 AND source='stable' AND score_id=$1", &.{score_text});
+        remove_privacy_view.deinit();
     }
     try store.updateSiteProfile(user_id, .{ .bio = "postgres profile", .title = "mapper", .pronouns = "they/them", .location = "adelaide", .website = "https://kai.ovh", .accent = .mint, .preferred_mode = 2, .profile_source = .lazer, .avatar_key = 2, .show_country = false, .show_profile_stats = false, .show_recent_scores = false });
     const hidden_lookup = (try store.userById(std.testing.allocator, user_id)).?;
@@ -7608,6 +8119,15 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, relax_profile, "\"selected_mode\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, relax_profile, "\"namespace\":\"relax\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, relax_profile, "\"namespace\":\"vanilla\"") == null);
+    {
+        var parsed_relax_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, relax_profile, .{});
+        defer parsed_relax_profile.deinit();
+        const selected = parsed_relax_profile.value.object.get("selected_stats").?.object;
+        const pp_values = selected.get("pp_history").?.array.items;
+        try std.testing.expectEqual(@as(i64, 43), selected.get("pp").?.integer);
+        try std.testing.expectEqual(@as(usize, 1), pp_values.len);
+        try std.testing.expectEqual(@as(i64, 43), pp_values[pp_values.len - 1].integer);
+    }
     const relax_stats = (try store.statsForUser(user_id, 4)).?;
     try std.testing.expectEqual(@as(i64, 600_000), relax_stats.ranked_score);
     try std.testing.expectEqual(@as(i32, 43), relax_stats.pp);
@@ -7723,9 +8243,9 @@ test "postgres account auth stats and token slice" {
     try std.testing.expectEqual(lazer_input.passed, consumed_lazer.passed);
     try std.testing.expect((try store.consumedLazerScoreToken(user_id + 1, 2, lazer_token)) == null);
     const combined_stats = (try store.statsForUser(user_id, 0)).?;
-    try std.testing.expectEqual(@as(i64, 2_900_900), combined_stats.total_score);
+    try std.testing.expectEqual(@as(i64, 3_600_900), combined_stats.total_score);
     try std.testing.expectEqual(@as(i64, 1_000_900), combined_stats.ranked_score);
-    try std.testing.expectEqual(@as(i32, 5), combined_stats.plays);
+    try std.testing.expectEqual(@as(i32, 6), combined_stats.plays);
     try std.testing.expectEqual(@as(i32, 25), combined_stats.max_combo);
     const stored_lazer_replay = (try store.lazerReplay(std.testing.allocator, lazer_score_id)).?;
     defer std.testing.allocator.free(stored_lazer_replay);
@@ -7733,6 +8253,21 @@ test "postgres account auth stats and token slice" {
     const lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, .global, 50);
     defer std.testing.allocator.free(lazer_board);
     try std.testing.expect(std.mem.indexOf(u8, lazer_board, "\"has_replay\":true") != null);
+    {
+        var parsed_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_board, .{});
+        defer parsed_board.deinit();
+        const board_score = parsed_board.value.object.get("scores").?.array.items[0].object;
+        try std.testing.expectEqual(@as(i64, 1234), board_score.get("total_score").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), board_score.get("legacy_total_score").?.integer);
+    }
+    const lazer_score_detail = (try store.lazerScoreJson(std.testing.allocator, lazer_score_id, 2)).?;
+    defer std.testing.allocator.free(lazer_score_detail);
+    {
+        var parsed_detail = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_score_detail, .{});
+        defer parsed_detail.deinit();
+        try std.testing.expectEqual(@as(i64, 1234), parsed_detail.value.object.get("total_score").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), parsed_detail.value.object.get("legacy_total_score").?.integer);
+    }
     {
         var score_id_buf: [24]u8 = undefined;
         const score_id_text = try std.fmt.bufPrint(&score_id_buf, "{d}", .{lazer_score_id});
@@ -7744,6 +8279,46 @@ test "postgres account auth stats and token slice" {
     const old_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, .global, 50);
     defer std.testing.allocator.free(old_lazer_board);
     try std.testing.expect(std.mem.indexOf(u8, old_lazer_board, "\"has_replay\":false") != null);
+    const missing_lazer_detail_json = (try store.lazerScoreJson(std.testing.allocator, lazer_score_id, 2)).?;
+    defer std.testing.allocator.free(missing_lazer_detail_json);
+    var missing_lazer_detail = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, missing_lazer_detail_json, .{});
+    defer missing_lazer_detail.deinit();
+    try std.testing.expect(!missing_lazer_detail.value.object.get("has_replay").?.bool);
+    {
+        var stable_id_buf: [24]u8 = undefined;
+        var lazer_id_buf: [24]u8 = undefined;
+        const stable_id_text = try std.fmt.bufPrint(&stable_id_buf, "{d}", .{score_id});
+        const lazer_id_text = try std.fmt.bufPrint(&lazer_id_buf, "{d}", .{lazer_score_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var clear_stable = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.scores SET replay=NULL WHERE id=$1", &.{stable_id_text});
+        clear_stable.deinit();
+        var replay_objects = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.replay_objects(source,score_id,object_key,etag,object_bytes) VALUES('stable',$1::bigint,'replays/stable/postgres-'||$1::text,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',6),('lazer',$2::bigint,'replays/lazer/postgres-'||$2::text,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',32) ON CONFLICT(source,score_id) DO UPDATE SET object_key=excluded.object_key,etag=excluded.etag,object_bytes=excluded.object_bytes", &.{ stable_id_text, lazer_id_text });
+        replay_objects.deinit();
+    }
+    const object_lazer_board = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, .global, 50);
+    defer std.testing.allocator.free(object_lazer_board);
+    try std.testing.expect(std.mem.indexOf(u8, object_lazer_board, "\"has_replay\":true") != null);
+    const object_lazer_detail_json = (try store.lazerScoreJson(std.testing.allocator, lazer_score_id, 2)).?;
+    defer std.testing.allocator.free(object_lazer_detail_json);
+    var object_lazer_detail = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, object_lazer_detail_json, .{});
+    defer object_lazer_detail.deinit();
+    try std.testing.expect(object_lazer_detail.value.object.get("has_replay").?.bool);
+    const object_stable_board_json = (try store.siteBeatmapLeaderboard(std.testing.allocator, 1, .stable, 0)).?;
+    defer std.testing.allocator.free(object_stable_board_json);
+    var object_stable_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, object_stable_board_json, .{});
+    defer object_stable_board.deinit();
+    try std.testing.expect(object_stable_board.value.object.get("scores").?.array.items[0].object.get("has_replay").?.bool);
+    const object_stable_scores_json = try store.lazerUserScoresJson(std.testing.allocator, user_id, 0, .recent, .stable, 0, 50);
+    defer std.testing.allocator.free(object_stable_scores_json);
+    var object_stable_scores = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, object_stable_scores_json, .{});
+    defer object_stable_scores.deinit();
+    try std.testing.expect(object_stable_scores.value.array.items[0].object.get("has_replay").?.bool);
+    const object_stable_profile_json = (try store.siteProfile(std.testing.allocator, user_id, .stable, 0)).?;
+    defer std.testing.allocator.free(object_stable_profile_json);
+    var object_stable_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, object_stable_profile_json, .{});
+    defer object_stable_profile.deinit();
+    try std.testing.expect(object_stable_profile.value.object.get("recent_scores").?.array.items[0].object.get("has_replay").?.bool);
     const lazer_placement = (try store.lazerScoreLeaderboardPlacement(lazer_score_id)).?;
     try std.testing.expect(lazer_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), lazer_placement.rank);
@@ -7763,11 +8338,30 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":900,\"total_score\":900,\"pp\":0,\"plays\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"mods_json\":[]") != null);
+    {
+        var parsed_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_profile, .{});
+        defer parsed_profile.deinit();
+        const profile_score = parsed_profile.value.object.get("recent_scores").?.array.items[0].object;
+        try std.testing.expectEqual(@as(i64, 1234), profile_score.get("score").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), profile_score.get("score_without_mods").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), profile_score.get("legacy_score").?.integer);
+        const first_place_score = parsed_profile.value.object.get("first_place_scores").?.array.items[0].object;
+        try std.testing.expectEqual(@as(i64, 900), first_place_score.get("score_without_mods").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), first_place_score.get("legacy_score").?.integer);
+    }
     const lazer_website_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 2, .lazer, 0)).?;
     defer std.testing.allocator.free(lazer_website_board);
     try std.testing.expect(std.mem.indexOf(u8, lazer_website_board, "\"source\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_website_board, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_website_board, "\"client\":\"stable\"") == null);
+    {
+        var parsed_lazer_website_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lazer_website_board, .{});
+        defer parsed_lazer_website_board.deinit();
+        const lazer_website_score = parsed_lazer_website_board.value.object.get("scores").?.array.items[0].object;
+        try std.testing.expectEqual(@as(i64, 1234), lazer_website_score.get("score").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), lazer_website_score.get("score_without_mods").?.integer);
+        try std.testing.expectEqual(@as(i64, 900), lazer_website_score.get("legacy_score").?.integer);
+    }
     {
         var user_buf: [24]u8 = undefined;
         const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
@@ -7787,12 +8381,50 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(std.mem.indexOf(u8, mixed_client_board, "\"pp\":120") != null);
     try std.testing.expectEqual(@as(i64, team_id), mixed_scores[0].object.get("user").?.object.get("team").?.object.get("id").?.integer);
     try std.testing.expect(parsed_mixed_client_board.value.object.get("user_score").?.object.get("score").?.object.get("id").?.integer >= lazer.stable_score_id_offset);
+    const combined_site_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 2, .all, 0)).?;
+    defer std.testing.allocator.free(combined_site_board);
+    var parsed_combined_site_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined_site_board, .{});
+    defer parsed_combined_site_board.deinit();
+    const combined_site_score = parsed_combined_site_board.value.object.get("scores").?.array.items[0].object;
+    try std.testing.expectEqualStrings("stable", combined_site_score.get("client").?.string);
+    try std.testing.expectEqual(@as(i64, 1100), combined_site_score.get("score").?.integer);
+    try std.testing.expectEqual(@as(i64, 120), combined_site_score.get("pp").?.integer);
     {
         var user_buf: [24]u8 = undefined;
         const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
         var lease = store.pool.acquire();
         defer lease.release();
         var removed = try postgres.queryParams(std.testing.allocator, lease.conn, "DELETE FROM zigcho.scores WHERE user_id=$1 AND map_md5=$2 AND score=1100", &.{ user_text, second_md5 });
+        removed.deinit();
+    }
+    {
+        var user_buf: [24]u8 = undefined;
+        const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var inserted = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,rank_namespace,best) VALUES($1,$2,0,0,3000000000,500,0.99,300,300,0,0,0,0,0,true,true,'high-score-replay'::bytea,'vanilla',true)", &.{ user_text, second_md5 });
+        inserted.deinit();
+    }
+    const high_recent_json = try store.lazerUserScoresJson(std.testing.allocator, user_id, 0, .recent, .stable, 0, 50);
+    defer std.testing.allocator.free(high_recent_json);
+    var high_recent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, high_recent_json, .{});
+    defer high_recent.deinit();
+    const high_recent_score = high_recent.value.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), high_recent_score.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i32)), high_recent_score.get("legacy_total_score").?.integer);
+    const high_board_json = try store.lazerLeaderboardJson(std.testing.allocator, user_id, 2, 0, .vanilla, "[]", false, false, 0, .global, 50);
+    defer std.testing.allocator.free(high_board_json);
+    var high_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, high_board_json, .{});
+    defer high_board.deinit();
+    const high_board_score = high_board.value.object.get("scores").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), high_board_score.get("total_score").?.integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i32)), high_board_score.get("legacy_total_score").?.integer);
+    {
+        var user_buf: [24]u8 = undefined;
+        const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var removed = try postgres.queryParams(std.testing.allocator, lease.conn, "DELETE FROM zigcho.scores WHERE user_id=$1 AND map_md5=$2 AND score=3000000000", &.{ user_text, second_md5 });
         removed.deinit();
     }
     var stable_relax_id: i64 = 0;
@@ -7844,7 +8476,7 @@ test "postgres account auth stats and token slice" {
         const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
         var lease = store.pool.acquire();
         defer lease.release();
-        var inserted = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES($1,2,0,500,500,0.95,50,true,'A','[{\"acronym\":\"HR\"}]'::jsonb,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,'vanilla',150,false) RETURNING id", &.{user_text});
+        var inserted = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES($1,2,0,500,500,NULL,0.95,50,true,'A','[{\"acronym\":\"HR\"}]'::jsonb,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,'vanilla',150,false) RETURNING id", &.{user_text});
         defer inserted.deinit();
         hard_rock_id = try inserted.int(i64, 0, 0);
     }
@@ -7855,13 +8487,21 @@ test "postgres account auth stats and token slice" {
     const hard_rock_placement = (try store.lazerScoreLeaderboardPlacement(hard_rock_id)).?;
     try std.testing.expect(hard_rock_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), hard_rock_placement.rank);
+    const native_profile_json = (try store.siteProfile(std.testing.allocator, user_id, .lazer, 0)).?;
+    defer std.testing.allocator.free(native_profile_json);
+    var native_profile = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, native_profile_json, .{});
+    defer native_profile.deinit();
+    const native_recent = native_profile.value.object.get("recent_scores").?.array.items[0].object;
+    try std.testing.expectEqual(hard_rock_id, native_recent.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 500), native_recent.get("score_without_mods").?.integer);
+    try std.testing.expect(std.meta.activeTag(native_recent.get("legacy_score").?) == .null);
     var custom_id: i64 = 0;
     {
         var user_buf: [24]u8 = undefined;
         const user_text = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
         var lease = store.pool.acquire();
         defer lease.release();
-        var inserted = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES($1,2,0,600,600,0.95,60,true,'A','[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}]'::jsonb,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,'custom',60,true),($1,2,0,800,800,0.98,80,true,'A','[{\"acronym\":\"WIGGLE\"},{\"acronym\":\"HR\"}]'::jsonb,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,'custom',80,false) RETURNING id", &.{user_text});
+        var inserted = try postgres.queryParams(std.testing.allocator, lease.conn, "INSERT INTO zigcho.lazer_scores(user_id,beatmap_id,ruleset_id,total_score,total_score_without_mods,legacy_total_score,accuracy,max_combo,passed,rank,mods_json,statistics_json,maximum_statistics_json,pauses_json,rank_namespace,pp,best) VALUES($1,2,0,600,600,NULL,0.95,60,true,'A','[{\"acronym\":\"RX\"},{\"acronym\":\"WIGGLE\"}]'::jsonb,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,'custom',60,true),($1,2,0,800,800,NULL,0.98,80,true,'A','[{\"acronym\":\"WIGGLE\"},{\"acronym\":\"HR\"}]'::jsonb,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,'custom',80,false) RETURNING id", &.{user_text});
         defer inserted.deinit();
         custom_id = try inserted.int(i64, 0, 0);
     }
@@ -7919,8 +8559,20 @@ test "postgres account auth stats and token slice" {
     const initial_friends = try store.friendIds(std.testing.allocator, user_id);
     defer std.testing.allocator.free(initial_friends);
     try std.testing.expect(std.mem.indexOfScalar(i32, initial_friends, 3) != null);
-    try std.testing.expect(try store.addFriend(user_id, second_id));
-    try std.testing.expect(!try store.addFriend(user_id, second_id));
+    try std.testing.expectEqual(domain.RelationshipAddResult.inserted, try store.addFriend(user_id, second_id));
+    try std.testing.expectEqual(domain.RelationshipAddResult.existing, try store.addFriend(user_id, second_id));
+    try std.testing.expectEqual(@as(i32, 1), (try store.lazerProfileSummary(second_id)).?.follower_count);
+    try std.testing.expectEqual(@as(i32, 1), (try store.lazerBatchUserVisibility(second_id)).?.follower_count);
+    const followed_user = (try store.userById(std.testing.allocator, second_id)).?;
+    defer std.testing.allocator.free(followed_user.name);
+    defer std.testing.allocator.free(followed_user.safe_name);
+    try std.testing.expectEqual(@as(i32, 1), followed_user.follower_count);
+    var compact_user: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer compact_user.deinit();
+    try user_json.writeCompact(&compact_user.writer, followed_user, followed_user.show_country);
+    var parsed_compact_user = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, compact_user.written(), .{});
+    defer parsed_compact_user.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_compact_user.value.object.get("follower_count").?.integer);
     const friends = try store.friendIds(std.testing.allocator, user_id);
     defer std.testing.allocator.free(friends);
     try std.testing.expect(std.mem.indexOfScalar(i32, friends, 3) != null);
@@ -7928,8 +8580,99 @@ test "postgres account auth stats and token slice" {
     const reverse_friends = try store.friendIds(std.testing.allocator, second_id);
     defer std.testing.allocator.free(reverse_friends);
     try std.testing.expect(std.mem.indexOfScalar(i32, reverse_friends, user_id) == null);
+    var relationship_buffers: [2][24]u8 = undefined;
+    const relationship_user = try std.fmt.bufPrint(&relationship_buffers[0], "{d}", .{user_id});
+    const relationship_target = try std.fmt.bufPrint(&relationship_buffers[1], "{d}", .{second_id});
+    {
+        var relationship_lease = store.pool.acquire();
+        defer relationship_lease.release();
+        var restrict_sender = try postgres.queryParams(std.testing.allocator, relationship_lease.conn, "UPDATE zigcho.users SET restricted=true WHERE id=$1 RETURNING id,restricted::int", &.{relationship_user});
+        try std.testing.expectEqual(@as(usize, 1), restrict_sender.rows());
+        try std.testing.expectEqual(user_id, try restrict_sender.int(i32, 0, 0));
+        try std.testing.expectEqual(@as(i32, 1), try restrict_sender.int(i32, 0, 1));
+        restrict_sender.deinit();
+    }
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerProfileSummary(second_id)).?.follower_count);
+    const restricted_sender_friends = try store.friendIds(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(restricted_sender_friends);
+    try std.testing.expectEqualSlices(i32, &.{3}, restricted_sender_friends);
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(user_id, second_id));
+    {
+        var relationship_lease = store.pool.acquire();
+        defer relationship_lease.release();
+        var unrestrict_sender = try postgres.queryParams(std.testing.allocator, relationship_lease.conn, "UPDATE zigcho.users SET restricted=false WHERE id=$1 RETURNING id,restricted::int", &.{relationship_user});
+        try std.testing.expectEqual(@as(usize, 1), unrestrict_sender.rows());
+        try std.testing.expectEqual(user_id, try unrestrict_sender.int(i32, 0, 0));
+        try std.testing.expectEqual(@as(i32, 0), try unrestrict_sender.int(i32, 0, 1));
+        unrestrict_sender.deinit();
+        var restrict_target = try postgres.queryParams(std.testing.allocator, relationship_lease.conn, "UPDATE zigcho.users SET restricted=true WHERE id=$1 RETURNING id,restricted::int", &.{relationship_target});
+        try std.testing.expectEqual(@as(usize, 1), restrict_target.rows());
+        try std.testing.expectEqual(second_id, try restrict_target.int(i32, 0, 0));
+        try std.testing.expectEqual(@as(i32, 1), try restrict_target.int(i32, 0, 1));
+        restrict_target.deinit();
+        var restricted_state = try postgres.queryParams(std.testing.allocator, relationship_lease.conn, "SELECT restricted::int FROM zigcho.users WHERE id=$1", &.{relationship_target});
+        defer restricted_state.deinit();
+        try std.testing.expectEqual(@as(i32, 1), try restricted_state.int(i32, 0, 0));
+        try std.testing.expect(postgres.c.PQtransactionStatus(relationship_lease.conn) == postgres.c.PQTRANS_IDLE);
+    }
+    const restricted_target_friends = try store.friendIds(std.testing.allocator, user_id);
+    defer std.testing.allocator.free(restricted_target_friends);
+    try std.testing.expectEqual(@as(usize, 2), restricted_target_friends.len);
+    try std.testing.expect(std.mem.indexOfScalar(i32, restricted_target_friends, outsider_id) != null);
+    try std.testing.expect(std.mem.indexOfScalar(i32, restricted_target_friends, second_id) == null);
+    try std.testing.expect(std.mem.indexOfScalar(i32, restricted_target_friends, 3) != null);
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(user_id, second_id));
+    {
+        var relationship_lease = store.pool.acquire();
+        defer relationship_lease.release();
+        var unrestrict = try postgres.queryParams(std.testing.allocator, relationship_lease.conn, "UPDATE zigcho.users SET restricted=false WHERE id IN($1,$2)", &.{ relationship_user, relationship_target });
+        unrestrict.deinit();
+    }
+    try std.testing.expectEqual(@as(i32, 1), (try store.lazerProfileSummary(second_id)).?.follower_count);
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(user_id, user_id));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(user_id, 3));
+    try std.testing.expectEqual(domain.RelationshipAddResult.ineligible, try store.addFriend(user_id, 2_000_000_000));
     try std.testing.expect(try store.removeFriend(user_id, second_id));
     try std.testing.expect(!try store.removeFriend(user_id, second_id));
+    try std.testing.expectEqual(@as(i32, 0), (try store.lazerProfileSummary(second_id)).?.follower_count);
+    try std.testing.expect(try store.recordReplayView(second_id, .stable, score_id));
+    try std.testing.expect(try store.recordReplayView(second_id, .lazer, lazer_score_id));
+    try std.testing.expectEqual(@as(i32, 2), try store.replayViewCount(user_id, .all, 0));
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(user_id, .stable, 0));
+    try std.testing.expectEqual(@as(i32, 1), try store.replayViewCount(user_id, .lazer, 0));
+    try std.testing.expectEqual(@as(i32, 2), (try store.statsForUser(user_id, 0)).?.replay_views);
+    {
+        var replay_history_lease = store.pool.acquire();
+        defer replay_history_lease.release();
+        var set_replay_months = try postgres.queryParams(
+            std.testing.allocator,
+            replay_history_lease.conn,
+            "UPDATE zigcho.score_replay_views SET viewed_at=CASE source WHEN 'stable' THEN extract(epoch FROM timestamptz '2026-07-15 00:00:00+00')::bigint ELSE extract(epoch FROM timestamptz '2026-08-15 00:00:00+00')::bigint END WHERE owner_id=$1 RETURNING source",
+            &.{relationship_user},
+        );
+        defer set_replay_months.deinit();
+        try std.testing.expectEqual(@as(usize, 2), set_replay_months.rows());
+    }
+    const replay_watch_history = try store.lazerReplaysWatchedCountsJson(std.testing.allocator, user_id, 0);
+    defer std.testing.allocator.free(replay_watch_history);
+    var parsed_replay_watch_history = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, replay_watch_history, .{});
+    defer parsed_replay_watch_history.deinit();
+    const replay_watch_months = parsed_replay_watch_history.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), replay_watch_months.len);
+    try std.testing.expectEqualStrings("2026-07-01", replay_watch_months[0].object.get("start_date").?.string);
+    try std.testing.expectEqual(@as(i64, 1), replay_watch_months[0].object.get("count").?.integer);
+    try std.testing.expectEqualStrings("2026-08-01", replay_watch_months[1].object.get("start_date").?.string);
+    try std.testing.expectEqual(@as(i64, 1), replay_watch_months[1].object.get("count").?.integer);
+    const empty_replay_watch_history = try store.lazerReplaysWatchedCountsJson(std.testing.allocator, user_id, 1);
+    defer std.testing.allocator.free(empty_replay_watch_history);
+    try std.testing.expectEqualStrings("[]", empty_replay_watch_history);
+    try std.testing.expectError(error.InvalidRulesetId, store.lazerReplaysWatchedCountsJson(std.testing.allocator, user_id, 4));
+    const replay_rankings = try store.lazerRankingsJson(std.testing.allocator, 0, .performance, null, 1);
+    defer std.testing.allocator.free(replay_rankings);
+    try std.testing.expect(std.mem.indexOf(u8, replay_rankings, "\"replays_watched_by_others\":2") != null);
+    try std.testing.expect(try store.recordReplayView(second_id, .stable, score_id));
+    try std.testing.expect(!try store.recordReplayView(user_id, .stable, score_id));
+    try std.testing.expectEqual(@as(i32, 2), try store.replayViewCount(user_id, .all, 0));
     try std.testing.expect(try store.addBlock(user_id, second_id));
     try std.testing.expect(!try store.directMessageAllowed(user_id, second_id));
     try std.testing.expectError(error.DirectMessageBlocked, store.storeDirectMessage(second_id, user_id, "blocked postgres dm"));
@@ -8076,7 +8819,7 @@ test "postgres account auth stats and token slice" {
     failed_stable.online_checksum = "abababababababababababababababab";
     failed_stable.total_score = 111_111;
     const failed_stable_id = try store.insertStableScore(user_id, failed_stable, 0, "failed", 12_000);
-    try std.testing.expect((try store.replay(std.testing.allocator, failed_stable_id)) == null);
+    try std.testing.expect((try store.stableReplay(std.testing.allocator, failed_stable_id)) == null);
     var failed_lazer = lazer_input;
     failed_lazer.passed = false;
     failed_lazer.rank = "F";

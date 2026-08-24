@@ -108,7 +108,7 @@ fn writeUserCore(writer: *std.Io.Writer, user: domain.User, profile_summary: ?do
     }
     try writer.writeAll(",\"profile_colour\":");
     try std.json.Stringify.value(roleColour(user.privileges), .{}, writer);
-    try writer.print(",\"is_active\":{s},\"is_online\":{s},\"is_supporter\":{s},\"support_level\":{d},\"is_admin\":{s},\"is_gmt\":{s},\"is_qat\":false,\"is_bng\":{s},\"is_bot\":{s},\"pm_friends_only\":false", .{
+    try writer.print(",\"is_active\":{s},\"is_online\":{s},\"is_supporter\":{s},\"support_level\":{d},\"is_admin\":{s},\"is_gmt\":{s},\"is_qat\":false,\"is_bng\":{s},\"is_bot\":{s},\"pm_friends_only\":false,\"follower_count\":{d},\"mapping_follower_count\":0", .{
         if (user.restricted) "false" else "true",
         if (user.online or user.id == 3) "true" else "false",
         "true",
@@ -117,6 +117,7 @@ fn writeUserCore(writer: *std.Io.Writer, user: domain.User, profile_summary: ?do
         if (user.privileges & ((@as(u32, 1) << 12) | (@as(u32, 1) << 13) | (@as(u32, 1) << 14)) != 0) "true" else "false",
         if (user.privileges & (@as(u32, 1) << 11) != 0) "true" else "false",
         if (user.id == 3) "true" else "false",
+        if (profile_summary) |summary| summary.follower_count else @max(0, user.follower_count),
     });
 }
 
@@ -130,7 +131,7 @@ fn writeStatistics(writer: *std.Io.Writer, maybe_stats: ?domain.Stats, restricte
     if (ranked and stats.global_rank > 0) try writer.print("{d}", .{stats.global_rank}) else try writer.writeAll("null");
     try writer.writeAll(",\"country_rank\":");
     if (ranked and stats.country_rank > 0) try writer.print("{d}", .{stats.country_rank}) else try writer.writeAll("null");
-    try writer.print(",\"pp\":{d},\"ranked_score\":{d},\"hit_accuracy\":{d:.6},\"play_count\":{d},\"play_time\":{d},\"total_score\":{d},\"total_hits\":{d},\"maximum_combo\":{d},\"replays_watched_by_others\":0,\"grade_counts\":{{\"ssh\":{d},\"ss\":{d},\"sh\":{d},\"s\":{d},\"a\":{d}}}}}", .{
+    try writer.print(",\"pp\":{d},\"ranked_score\":{d},\"hit_accuracy\":{d:.6},\"play_count\":{d},\"play_time\":{d},\"total_score\":{d},\"total_hits\":{d},\"maximum_combo\":{d},\"replays_watched_by_others\":{d},\"grade_counts\":{{\"ssh\":{d},\"ss\":{d},\"sh\":{d},\"s\":{d},\"a\":{d}}}}}", .{
         stats.pp,
         stats.ranked_score,
         stats.accuracy * 100.0,
@@ -139,6 +140,7 @@ fn writeStatistics(writer: *std.Io.Writer, maybe_stats: ?domain.Stats, restricte
         stats.total_score,
         stats.total_hits,
         stats.max_combo,
+        stats.replay_views,
         stats.grade_ssh,
         stats.grade_ss,
         stats.grade_sh,
@@ -154,7 +156,7 @@ pub fn writeRankingStatistics(writer: *std.Io.Writer, user: domain.User, stats: 
     if (global_rank > 0) try writer.print("{d}", .{global_rank}) else try writer.writeAll("null");
     try writer.writeAll(",\"country_rank\":");
     if (country_rank > 0) try writer.print("{d}", .{country_rank}) else try writer.writeAll("null");
-    try writer.print(",\"pp\":{d},\"ranked_score\":{d},\"hit_accuracy\":{d:.6},\"play_count\":{d},\"play_time\":{d},\"total_score\":{d},\"total_hits\":{d},\"maximum_combo\":{d},\"replays_watched_by_others\":0,\"grade_counts\":{{\"ssh\":0,\"ss\":0,\"sh\":0,\"s\":0,\"a\":0}}}}", .{
+    try writer.print(",\"pp\":{d},\"ranked_score\":{d},\"hit_accuracy\":{d:.6},\"play_count\":{d},\"play_time\":{d},\"total_score\":{d},\"total_hits\":{d},\"maximum_combo\":{d},\"replays_watched_by_others\":{d},\"grade_counts\":{{\"ssh\":0,\"ss\":0,\"sh\":0,\"s\":0,\"a\":0}}}}", .{
         stats.pp,
         stats.ranked_score,
         stats.accuracy * 100.0,
@@ -163,6 +165,7 @@ pub fn writeRankingStatistics(writer: *std.Io.Writer, user: domain.User, stats: 
         stats.total_score,
         stats.total_hits,
         stats.max_combo,
+        stats.replay_views,
     });
 }
 
@@ -176,6 +179,7 @@ fn batchProfileSummary(visibility: domain.BatchUserVisibility) domain.ProfileSum
         .avatar_version = @max(0, visibility.avatar_version),
         .show_country = visibility.show_country,
         .show_profile_stats = visibility.show_profile_stats,
+        .follower_count = @max(0, visibility.follower_count),
     };
 }
 
@@ -319,10 +323,34 @@ fn scoreCountsForView(counts: domain.UserScoreCounts, show_stats: bool, show_rec
     };
 }
 
-fn writeRankHistory(writer: *std.Io.Writer, ruleset_id: u8) !void {
+fn writeRankHistory(writer: *std.Io.Writer, ruleset_id: u8, history: domain.StatsHistory) !void {
     try writer.writeAll("{\"mode\":");
     try std.json.Stringify.value(rulesetName(ruleset_id), .{}, writer);
-    try writer.writeAll(",\"data\":[]}");
+    try writer.writeAll(",\"data\":[");
+    for (history.slice(), 0..) |point, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{point.global_rank});
+    }
+    try writer.writeAll("]}");
+}
+
+pub fn writeSiteStatsHistory(writer: *std.Io.Writer, history: domain.StatsHistory) !void {
+    try writer.writeAll("\"rank_history\":[");
+    for (history.slice(), 0..) |point, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{point.global_rank});
+    }
+    try writer.writeAll("],\"pp_history\":[");
+    for (history.slice(), 0..) |point, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{point.pp});
+    }
+    try writer.writeAll("],\"history_days\":[");
+    for (history.slice(), 0..) |point, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{point.day});
+    }
+    try writer.writeByte(']');
 }
 
 pub const ProfileView = struct {
@@ -330,6 +358,8 @@ pub const ProfileView = struct {
     requested_ruleset: u8 = 0,
     owner: bool = false,
     monthly_playcounts_json: []const u8 = "[]",
+    replays_watched_counts_json: []const u8 = "[]",
+    stats_history: domain.StatsHistory = .{},
 };
 
 pub fn profileOwnedWithView(allocator: std.mem.Allocator, user: domain.User, stats: ?domain.Stats, score_counts: domain.UserScoreCounts, sources: ProfileSources, achievements_json: []const u8, view: ProfileView) ![]u8 {
@@ -339,12 +369,13 @@ pub fn profileOwnedWithView(allocator: std.mem.Allocator, user: domain.User, sta
     const show_stats = view.owner or view.summary.show_profile_stats;
     const show_recent = view.owner or view.summary.show_recent_scores;
     const show_historical = show_stats and show_recent;
+    const visible_stats_history = if (show_stats and !user.restricted) view.stats_history else domain.StatsHistory{};
     try writeUserCore(&output.writer, user, view.summary, show_country);
     try writeProfileSummary(&output.writer, view.summary, view.requested_ruleset, show_historical);
     try output.writer.writeAll(",\"statistics\":");
     try writeStatistics(&output.writer, if (show_stats) stats else null, user.restricted or !show_stats);
     try output.writer.writeAll(",\"rank_history\":");
-    try writeRankHistory(&output.writer, view.requested_ruleset);
+    try writeRankHistory(&output.writer, view.requested_ruleset, visible_stats_history);
     try output.writer.writeAll(",\"zigcho_statistics\":{\"stable\":");
     try writeStatistics(&output.writer, if (show_stats) sources.stable_stats else null, user.restricted or !show_stats);
     try output.writer.writeAll(",\"lazer\":");
@@ -386,7 +417,9 @@ pub fn profileOwnedWithView(allocator: std.mem.Allocator, user: domain.User, sta
     try output.writer.writeAll(achievements_json);
     try output.writer.writeAll(",\"monthly_playcounts\":");
     if (show_historical) try output.writer.writeAll(view.monthly_playcounts_json) else try output.writer.writeAll("[]");
-    try output.writer.writeAll(",\"replays_watched_counts\":[]}");
+    try output.writer.writeAll(",\"replays_watched_counts\":");
+    if (show_historical) try output.writer.writeAll(view.replays_watched_counts_json) else try output.writer.writeAll("[]");
+    try output.writer.writeByte('}');
     return output.toOwnedSlice();
 }
 
@@ -572,12 +605,17 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     summary.graveyard_count = 6;
     summary.nominated_count = 7;
     summary.played_beatmap_count = 8;
+    var history: domain.StatsHistory = .{};
+    history.len = 3;
+    history.points[0] = .{ .day = 1_699_827_200, .pp = 300, .global_rank = 3 };
+    history.points[1] = .{ .day = 1_699_913_600, .pp = 360, .global_rank = 2 };
+    history.points[2] = .{ .day = 1_700_000_000, .pp = 424, .global_rank = 1 };
     const profile = try profileOwnedWithView(std.testing.allocator, user, stats, .{ .best = 2, .firsts = 1, .recent = 4 }, .{
         .stable_stats = .{ .pp = 300, .plays = 30 },
         .lazer_stats = .{ .pp = 124, .plays = 13 },
         .stable_counts = .{ .best = 1, .firsts = 1, .recent = 3, .pinned = 1 },
         .lazer_counts = .{ .best = 1, .recent = 1 },
-    }, "[{\"achievement_id\":1,\"achieved_at\":42}]", .{ .summary = summary, .requested_ruleset = 3, .monthly_playcounts_json = "[{\"start_date\":\"2026-08-01T00:00:00Z\",\"count\":43}]" });
+    }, "[{\"achievement_id\":1,\"achieved_at\":42}]", .{ .summary = summary, .requested_ruleset = 3, .monthly_playcounts_json = "[{\"start_date\":\"2026-08-01T00:00:00Z\",\"count\":43}]", .replays_watched_counts_json = "[{\"start_date\":\"2026-08-01\",\"count\":7}]", .stats_history = history });
     defer std.testing.allocator.free(profile);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, profile, .{});
     defer parsed.deinit();
@@ -606,7 +644,9 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectApproxEqAbs(@as(f64, 93.53), object.get("statistics").?.object.get("hit_accuracy").?.float, 0.0001);
     const rank_history = object.get("rank_history").?.object;
     try std.testing.expectEqualStrings("mania", rank_history.get("mode").?.string);
-    try std.testing.expectEqual(@as(usize, 0), rank_history.get("data").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 3), rank_history.get("data").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 3), rank_history.get("data").?.array.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), rank_history.get("data").?.array.items[2].integer);
     try std.testing.expectEqual(@as(i64, 300), object.get("zigcho_statistics").?.object.get("stable").?.object.get("pp").?.integer);
     try std.testing.expectEqual(@as(i64, 124), object.get("zigcho_statistics").?.object.get("lazer").?.object.get("pp").?.integer);
     try std.testing.expectEqual(@as(i64, 3), object.get("zigcho_score_counts").?.object.get("stable").?.object.get("recent").?.integer);
@@ -620,6 +660,10 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqualStrings("medals", profile_order[4].string);
     try std.testing.expectEqualStrings("kudosu", profile_order[5].string);
     try std.testing.expectEqual(@as(i64, 43), object.get("monthly_playcounts").?.array.items[0].object.get("count").?.integer);
+    const watched_counts = object.get("replays_watched_counts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), watched_counts.len);
+    try std.testing.expectEqualStrings("2026-08-01", watched_counts[0].object.get("start_date").?.string);
+    try std.testing.expectEqual(@as(i64, 7), watched_counts[0].object.get("count").?.integer);
 
     summary.show_country = false;
     summary.show_profile_stats = false;
@@ -652,10 +696,13 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqualStrings("kudosu", private_order[2].string);
 
     summary.show_profile_stats = true;
+    var stale_history = history;
+    stale_history.points[stale_history.len - 1].pp = 400;
+    stale_history.points[stale_history.len - 1].global_rank = 2;
     const stats_only_profile = try profileOwnedWithView(std.testing.allocator, user, stats, .{ .best = 2, .recent = 4 }, .{
         .stable_counts = .{ .best = 2, .recent = 3, .pinned = 1 },
         .lazer_counts = .{ .best = 4, .recent = 5, .pinned = 3 },
-    }, "[]", .{ .summary = summary, .requested_ruleset = 0 });
+    }, "[]", .{ .summary = summary, .requested_ruleset = 0, .replays_watched_counts_json = "[{\"start_date\":\"2026-08-01\",\"count\":7}]", .stats_history = stale_history });
     defer std.testing.allocator.free(stats_only_profile);
     var parsed_stats_only = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stats_only_profile, .{});
     defer parsed_stats_only.deinit();
@@ -665,8 +712,22 @@ test "lazer profile JSON owns ruleset stats and role flags" {
     try std.testing.expectEqual(@as(i64, 0), stats_only_counts.get("stable").?.object.get("recent").?.integer);
     try std.testing.expectEqual(@as(i64, 4), stats_only_counts.get("lazer").?.object.get("best").?.integer);
     try std.testing.expectEqual(@as(i64, 0), stats_only_counts.get("lazer").?.object.get("recent").?.integer);
+    const stats_only_history = parsed_stats_only.value.object.get("rank_history").?.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), stats_only_history.len);
+    try std.testing.expectEqual(@as(i64, 3), stats_only_history[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), stats_only_history[stats_only_history.len - 1].integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed_stats_only.value.object.get("scores_recent_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), parsed_stats_only.value.object.get("beatmap_playcounts_count").?.integer);
     try std.testing.expectEqual(@as(usize, 0), parsed_stats_only.value.object.get("monthly_playcounts").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed_stats_only.value.object.get("replays_watched_counts").?.array.items.len);
+    var stats_only_has_historical = false;
+    var stats_only_has_recent = false;
+    for (parsed_stats_only.value.object.get("profile_order").?.array.items) |section| {
+        if (std.mem.eql(u8, section.string, "historical")) stats_only_has_historical = true;
+        if (std.mem.eql(u8, section.string, "recent_activity")) stats_only_has_recent = true;
+    }
+    try std.testing.expect(!stats_only_has_historical);
+    try std.testing.expect(!stats_only_has_recent);
 
     summary.show_profile_stats = false;
     summary.show_recent_scores = true;

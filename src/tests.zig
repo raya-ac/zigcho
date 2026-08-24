@@ -1606,6 +1606,8 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "online · '+esc(presence.client_label)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "beatmaps.kai.ovh") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "stored sets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "'irc.kai.ovh':['shared IRC','TLS IRC access to the same Stable, lazer and website chat history.','6697/tls','reserved']") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "['irc.kai.ovh','shared IRC']") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "<option value=\"kick\">kick from game</option>") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "<option value=\"revoke_sessions\">revoke every session</option>") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "['reports','reports']") != null);

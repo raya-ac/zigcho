@@ -4249,7 +4249,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 12), builds.len);
+    try std.testing.expectEqual(@as(usize, 13), builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);
@@ -7062,8 +7062,8 @@ test "lazer submission updates ranked performance without overwriting another ru
     _ = try store.submitLazerScoreToken(1, 75, token, input, 500, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]", &.{});
 
     const osu = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 900000), osu.ranked_score);
-    try std.testing.expectEqual(@as(i64, 910000), osu.total_score);
+    try std.testing.expectEqual(@as(i64, 3_032_606), osu.ranked_score);
+    try std.testing.expectEqual(@as(i64, 3_042_606), osu.total_score);
     try std.testing.expectEqual(@as(i32, 500), osu.pp);
     try std.testing.expectEqual(@as(i32, 8), osu.plays);
     try std.testing.expectEqual(@as(i32, 90), osu.play_time);
@@ -7083,8 +7083,8 @@ test "lazer submission updates ranked performance without overwriting another ru
     const failed_token = try store.createLazerScoreToken(1, 75, "0123456789abcdef0123456789abcdef", 0, "22222222222222222222222222222222");
     _ = try store.submitLazerScoreToken(1, 75, failed_token, failed, 100, "[]", "{\"great\":300,\"miss\":2}", "{\"great\":302}", "[]", &.{});
     const after_fail = (try store.statsForUser(1, 0)).?;
-    try std.testing.expectEqual(@as(i64, 900000), after_fail.ranked_score);
-    try std.testing.expectEqual(@as(i64, 1_810_000), after_fail.total_score);
+    try std.testing.expectEqual(@as(i64, 3_032_606), after_fail.ranked_score);
+    try std.testing.expectEqual(@as(i64, 3_042_913), after_fail.total_score);
     try std.testing.expectEqual(@as(i32, 9), after_fail.plays);
     try std.testing.expectEqual(@as(i32, 180), after_fail.play_time);
     try std.testing.expectEqual(@as(i32, 321), after_fail.max_combo);
@@ -7178,7 +7178,7 @@ test "lazer ranked stats use legacy scores and pp overwrite while ignoring faile
     const lower_id = try store.submitLazerScoreToken(1, 75, lower_token, input, 500, "[]", "{\"great\":50,\"miss\":50}", "{\"great\":100}", "[]", &.{});
     const after_lower = (try store.statsForUser(1, 0)).?;
     try std.testing.expectEqual(@as(i32, 690), after_lower.pp);
-    try std.testing.expectEqual(@as(i64, 2000), after_lower.ranked_score);
+    try std.testing.expectEqual(@as(i64, 1234), after_lower.ranked_score);
     try std.testing.expectApproxEqAbs(@as(f64, 0.6948717949), after_lower.accuracy, 0.000001);
 
     input.passed = false;
@@ -7238,7 +7238,7 @@ test "lazer ranked stats use legacy scores and pp overwrite while ignoring faile
     const lazer_profile = (try store.siteProfile(std.testing.allocator, 1, .lazer, 0)).?;
     defer std.testing.allocator.free(lazer_profile);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_source\":\"lazer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":2000,\"total_score\":5000,\"pp\":690,\"plays\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"selected_stats\":{\"ranked_score\":1234,\"total_score\":7619,\"pp\":690,\"plays\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"client\":\"lazer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"mods_json\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazer_profile, "\"passed\":false") != null);

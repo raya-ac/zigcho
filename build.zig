@@ -157,7 +157,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addObjectFile(pp_library);
     tests.step.dependOn(&cargo.step);
     const run_tests = b.addRunArtifact(tests);
-    const changelog_tests = b.addTest(.{ .root_module = changelog_mod });
+    const changelog_tests = b.addTest(.{ .root_module = changelog_mod, .filters = test_filters });
     const run_changelog_tests = b.addRunArtifact(changelog_tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);

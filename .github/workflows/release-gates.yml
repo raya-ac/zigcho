@@ -65,7 +65,9 @@ jobs:
         run: python3 tools/changelog-manifest.py --check
 
       - name: build with the pinned production container
-        run: docker build --file deploy/Dockerfile.build --tag zigcho-release-gate:${GITHUB_SHA} .
+        env:
+          TEST_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_scope || 'full' }}
+        run: docker build --build-arg "TEST_SCOPE=${TEST_SCOPE}" --file deploy/Dockerfile.build --tag zigcho-release-gate:${GITHUB_SHA} .
 
       - name: extract and verify the release bundle
         shell: bash

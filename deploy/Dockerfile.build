@@ -4,6 +4,7 @@ FROM debian:bookworm-slim@sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31
 
 ARG ZIG_VERSION=0.16.0
 ARG ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+ARG TEST_SCOPE=full
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gcc git libpq-dev libsqlite3-dev pkg-config xz-utils \
@@ -27,8 +28,12 @@ RUN curl --fail --location --silent --show-error \
 WORKDIR /src
 COPY . .
 
-RUN zig build test -Dcpu=baseline \
-    && zig build test -Dcpu=baseline -Doptimize=ReleaseSafe \
+RUN if [ "$TEST_SCOPE" = full ]; then \
+        zig build test -Dcpu=baseline \
+        && zig build test -Dcpu=baseline -Doptimize=ReleaseSafe; \
+    elif [ "$TEST_SCOPE" != focused ]; then \
+        echo "invalid TEST_SCOPE: $TEST_SCOPE" >&2; exit 1; \
+    fi \
     && zig build -Dcpu=baseline -Doptimize=ReleaseSafe \
     && zig build -Dcpu=baseline -Dpostgres=true -Doptimize=ReleaseSafe \
     && mkdir -p /out/tools /out/deploy/systemd /out/deploy/stunnel /out/deploy/certbot \

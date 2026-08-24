@@ -42,6 +42,12 @@ jobs:
           test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" --jq .conclusion)" = "success"
           test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" --jq .head_sha)" = "$SOURCE_REVISION"
 
+      - name: check out the exact release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+
       - name: download the exact platform artifacts
         uses: actions/download-artifact@v7
         with:
@@ -82,6 +88,6 @@ jobs:
           gh release create "$tag" artifacts/lazer/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$SOURCE_REVISION" \
-            --title "zigcho!lazer ${CLIENT_VERSION}" \
+            --title "zigcho release 1 · zigcho!lazer ${CLIENT_VERSION}" \
             --prerelease \
-            --notes "${CLIENT_VERSION} fixes the in-game beatmap listing getting stuck before it ever sent a search. opening the listing now forces a fresh request instead of waiting for startup or login state to change. every package below was built and checksum-verified on GitHub; nothing was built on a player machine. source: ${SOURCE_REVISION}."
+            --notes-file updates/2026-08-24-lazer-multiplayer-profiles-and-routes.md

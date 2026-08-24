@@ -18,7 +18,7 @@ concurrency:
 
 env:
   OSU_REVISION: 12df2e4ff254975f4b66ae9efda808837ee9beea
-  CLIENT_TEST_FILTER: FullyQualifiedName~TrustedDomainOnlineStoreTest|FullyQualifiedName~PollingChatClientTest|FullyQualifiedName~ZigchoPollingPresenceTest|FullyQualifiedName~TestShowRefreshesSearch|FullyQualifiedName~ZigchoLeaderboardAvailabilityTest|FullyQualifiedName~ZigchoLeaderboardModsTest|FullyQualifiedName~ZigchoRealtimeServicePolicyTest|FullyQualifiedName~ZigchoScoreResponseTest
+  CLIENT_TEST_FILTER: FullyQualifiedName~TrustedDomainOnlineStoreTest|FullyQualifiedName~PollingChatClientTest|FullyQualifiedName~ZigchoPollingPresenceTest|FullyQualifiedName~ZigchoPlaylistRoomResponseTest|FullyQualifiedName~ZigchoProfileMedalsTest|FullyQualifiedName~ZigchoProfileResponseTest|FullyQualifiedName~ZigchoStaticRouteResponseTest|FullyQualifiedName~TestShowRefreshesSearch|FullyQualifiedName~TestSingleRatingBucket|FullyQualifiedName~TestZigchoMedalsRender|FullyQualifiedName~ZigchoLeaderboardAvailabilityTest|FullyQualifiedName~ZigchoLeaderboardModsTest|FullyQualifiedName~ZigchoRealtimeServicePolicyTest|FullyQualifiedName~ZigchoScoreResponseTest
 
 jobs:
   client-tests:
@@ -54,7 +54,18 @@ jobs:
           grep -Fq 'playableBeatmap.BeatmapInfo.OnlineID = -1' work/osu-client/osu.Game/Screens/Edit/Submission/SubmissionBeatmapExporter.cs
           grep -Fq 'ovh.kai.zigcholazer' work/osu-client/osu.Android/AndroidManifest.xml
           grep -Fq 'ovh.kai.zigcholazer' work/osu-client/osu.iOS/Info.plist
+          grep -Fq 'achievement.ImageUrl' work/osu-client/osu.Game/Overlays/Profile/Sections/MedalsSection.cs
+          grep -Fq 'https://a.kai.ovh/' work/osu-client/osu.Game/Users/ZigchoProfileMedia.cs
+          grep -Fq 'https://assets.ppy.sh/medals/web/' work/osu-client/osu.Game/Users/ZigchoProfileMedia.cs
+          grep -Fq 'authentication.Revoke();' work/osu-client/osu.Game/Online/API/APIAccess.cs
+          grep -Fq '/oauth/revoke' work/osu-client/osu.Game/Online/API/OAuth.cs
           if grep -R -n -E 'DEVELOPER BUILD|osu! \(development\)' work/osu-client/osu.Game work/osu-client/osu.Desktop; then
+            exit 1
+          fi
+          if grep -n -E 'https://[as]\.ppy\.sh' \
+            work/osu-client/osu.Game/Users/Drawables/DrawableAvatar.cs \
+            work/osu-client/osu.Game/Users/Medal.cs \
+            work/osu-client/osu.Game/Overlays/Profile/Sections/Recent/MedalIcon.cs; then
             exit 1
           fi
 

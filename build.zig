@@ -1,5 +1,21 @@
 const std = @import("std");
 
+fn isUpdateMarkdownName(name: []const u8) bool {
+    if (name.len < "2000-01-01-a.md".len or !std.mem.endsWith(u8, name, ".md")) return false;
+    for (name, 0..) |char, index| {
+        const valid = if (index < 4 or (index >= 5 and index < 7) or (index >= 8 and index < 10))
+            std.ascii.isDigit(char)
+        else if (index == 4 or index == 7 or index == 10)
+            char == '-'
+        else if (index >= name.len - 3)
+            (index == name.len - 3 and char == '.') or (index == name.len - 2 and char == 'm') or (index == name.len - 1 and char == 'd')
+        else
+            std.ascii.isLower(char) or std.ascii.isDigit(char) or char == '-';
+        if (!valid) return false;
+    }
+    return true;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -31,7 +47,7 @@ pub fn build(b: *std.Build) void {
     var update_manifest: u64 = 0;
     var update_iterator = updates_dir.iterate();
     while (update_iterator.next(build_io) catch |err| std.debug.panic("cannot read updates/: {t}", .{err})) |entry| {
-        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, "2026-") or !std.mem.endsWith(u8, entry.name, ".md")) continue;
+        if (entry.kind != .file or !isUpdateMarkdownName(entry.name)) continue;
         update_count += 1;
         update_manifest ^= std.hash.Wyhash.hash(0, entry.name);
     }
@@ -134,7 +150,11 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addObjectFile(pp_library);
     tests.step.dependOn(&cargo.step);
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run all tests").dependOn(&run_tests.step);
+    const changelog_tests = b.addTest(.{ .root_module = changelog_mod });
+    const run_changelog_tests = b.addRunArtifact(changelog_tests);
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_changelog_tests.step);
 
     const anticheat_smoke_mod = b.createModule(.{
         .root_source_file = b.path("src/anticheat_host_smoke.zig"),

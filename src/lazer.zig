@@ -646,6 +646,13 @@ pub fn queryIds(allocator: std.mem.Allocator, target: []const u8, limit: usize) 
     return ids.toOwnedSlice(allocator);
 }
 
+pub fn lookupRulesetId(raw: ?[]const u8) !?u8 {
+    const value = raw orelse return null;
+    const ruleset_id = std.fmt.parseInt(u8, value, 10) catch return error.InvalidRulesetId;
+    if (ruleset_id > 3) return error.InvalidRulesetId;
+    return ruleset_id;
+}
+
 pub const ChatMessage = struct {
     id: i64,
     channel_id: i64,
@@ -681,6 +688,7 @@ pub const LeaderboardScore = struct {
     pauses_json: []const u8,
     ended_at: []const u8,
     ranked: bool,
+    preserve: bool = true,
     has_replay: bool = false,
     team: ?domain.TeamSummary = null,
     beatmap: ?BeatmapSummary = null,
@@ -733,7 +741,7 @@ pub fn writeLeaderboardScore(writer: *std.Io.Writer, score: LeaderboardScore) !v
     try writer.writeAll(score.maximum_statistics_json);
     try writer.writeAll(",\"pauses\":");
     try writer.writeAll(score.pauses_json);
-    try writer.print(",\"has_replay\":{s},\"ranked\":{s},\"preserve\":true,\"processed\":true,\"user\":{{\"id\":{d},\"username\":", .{ if (score.has_replay) "true" else "false", if (score.ranked) "true" else "false", score.user_id });
+    try writer.print(",\"has_replay\":{s},\"ranked\":{s},\"preserve\":{s},\"processed\":true,\"user\":{{\"id\":{d},\"username\":", .{ if (score.has_replay) "true" else "false", if (score.ranked) "true" else "false", if (score.preserve) "true" else "false", score.user_id });
     try std.json.Stringify.value(score.username, .{}, writer);
     try writer.print(",\"avatar_url\":\"https://a.kai.ovh/{d}\",\"country_code\":", .{score.user_id});
     try std.json.Stringify.value(score.country, .{}, writer);
@@ -911,13 +919,30 @@ pub fn validChannelId(channel_id: i64) bool {
     return channel_id >= 1 and channel_id <= 4;
 }
 
+pub const room_channel_base: i64 = 2_000_000_000;
+
+pub fn roomChannelId(room_id: i64) ?i64 {
+    if (room_id <= 0 or room_id > std.math.maxInt(i32) - room_channel_base) return null;
+    return room_channel_base + room_id;
+}
+
+pub fn roomChannelRoom(channel_id: i64) ?i64 {
+    if (channel_id <= room_channel_base or channel_id > std.math.maxInt(i32)) return null;
+    return channel_id - room_channel_base;
+}
+
+pub fn roomChannelName(buffer: []u8, room_id: i64) ![]const u8 {
+    if (roomChannelId(room_id) == null) return error.InvalidMultiplayerRoom;
+    return std.fmt.bufPrint(buffer, "#lazermp_{d}", .{room_id});
+}
+
 pub fn privateChannelId(other_user_id: i32) ?i64 {
-    if (other_user_id <= 0) return null;
+    if (other_user_id <= 0 or other_user_id >= room_channel_base - 1_000_000) return null;
     return 1_000_000 + @as(i64, other_user_id);
 }
 
 pub fn privateChannelUser(channel_id: i64) ?i32 {
-    if (channel_id <= 1_000_000 or channel_id > 1_000_000 + std.math.maxInt(i32)) return null;
+    if (channel_id <= 1_000_000 or channel_id >= room_channel_base) return null;
     return @intCast(channel_id - 1_000_000);
 }
 
@@ -942,7 +967,7 @@ pub fn directMessageOther(target: []const u8, viewer_id: i32) ?i32 {
 }
 
 pub fn validAnyChannelId(channel_id: i64) bool {
-    return validChannelId(channel_id) or privateChannelUser(channel_id) != null;
+    return validChannelId(channel_id) or privateChannelUser(channel_id) != null or roomChannelRoom(channel_id) != null;
 }
 
 pub fn channelName(channel_id: i64) ?[]const u8 {
@@ -961,6 +986,10 @@ pub fn channelId(name: []const u8) ?i64 {
     if (std.mem.eql(u8, name, "#lobby")) return 3;
     if (std.mem.eql(u8, name, "#lazer")) return 4;
     return null;
+}
+
+pub fn writeSystemBotPresence(writer: *std.Io.Writer) !void {
+    try writer.writeAll("{\"online\":true,\"client\":\"bot\",\"client_label\":\"kai\",\"activity\":\"online\",\"detail\":\"bot account\",\"mode\":null,\"mods\":null,\"beatmap_id\":null}");
 }
 
 pub fn writeChatChannel(writer: *std.Io.Writer, channel_id: i64, last_message_id: ?i64, last_read_id: ?i64) !void {
@@ -988,6 +1017,19 @@ pub fn writePrivateChatChannel(writer: *std.Io.Writer, channel_id: i64, name: []
     try writer.print("{{\"channel_id\":{d},\"name\":", .{channel_id});
     try std.json.Stringify.value(name, .{}, writer);
     try writer.writeAll(",\"description\":\"private messages\",\"type\":5,\"last_message_id\":");
+    if (last_message_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+    try writer.writeAll(",\"last_read_id\":");
+    if (last_read_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
+    try writer.writeAll(",\"message_length_limit\":2000}");
+}
+
+pub fn writeRoomChatChannel(writer: *std.Io.Writer, room_id: i64, last_message_id: ?i64, last_read_id: ?i64) !void {
+    const channel_id = roomChannelId(room_id) orelse return error.UnknownChannel;
+    var name_buffer: [64]u8 = undefined;
+    const name = try roomChannelName(&name_buffer, room_id);
+    try writer.print("{{\"channel_id\":{d},\"name\":", .{channel_id});
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeAll(",\"description\":\"multiplayer room chat\",\"type\":2,\"last_message_id\":");
     if (last_message_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");
     try writer.writeAll(",\"last_read_id\":");
     if (last_read_id) |id| try writer.print("{d}", .{id}) else try writer.writeAll("null");

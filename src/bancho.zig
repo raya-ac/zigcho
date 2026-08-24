@@ -106,11 +106,13 @@ pub fn parseStableLoginDetails(details: []const u8) !StableLoginDetails {
     };
 }
 pub const session_idle_seconds: i64 = 300;
+pub const lazer_presence_lease_seconds: i64 = 120;
 
 const SnapshotUser = struct {
     id: i32,
     name: []u8,
     country: [2]u8,
+    show_country: bool,
     privileges: u32,
     restricted: bool,
 };
@@ -135,7 +137,8 @@ const SessionSnapshot = struct {
             .user = .{
                 .id = session.user.id,
                 .name = try allocator.dupe(u8, session.user.name),
-                .country = session.user.country,
+                .country = if (session.user.show_country) session.user.country else .{ 'X', 'X' },
+                .show_country = session.user.show_country,
                 .privileges = session.user.privileges,
                 .restricted = session.user.restricted,
             },
@@ -161,6 +164,149 @@ const SessionSnapshot = struct {
         return self.info_text[0..self.info_len];
     }
 };
+
+const LazerPresenceSnapshot = struct {
+    user: domain.User,
+    utc_offset: i8 = 0,
+    action: u8 = 0,
+    mode: u8 = 0,
+    mods: i32 = 0,
+    map_id: i32 = 0,
+    map_md5: [32]u8 = [_]u8{0} ** 32,
+    info_text: [96]u8 = [_]u8{0} ** 96,
+    info_len: usize = 0,
+    longitude: f32 = 0,
+    latitude: f32 = 0,
+
+    fn init(user: domain.User) LazerPresenceSnapshot {
+        var result: LazerPresenceSnapshot = .{ .user = user };
+        if (!result.user.show_country) result.user.country = .{ 'X', 'X' };
+        const text = "using lazer";
+        @memcpy(result.info_text[0..text.len], text);
+        result.info_len = text.len;
+        return result;
+    }
+
+    fn info(self: *const LazerPresenceSnapshot) []const u8 {
+        return self.info_text[0..self.info_len];
+    }
+};
+
+fn capturedUser(capture: *const LoginCapture, user_id: i32) bool {
+    for (capture.sessions.items) |snapshot| if (snapshot.user.id == user_id) return true;
+    return false;
+}
+
+const PreparedLazerPresence = struct {
+    allocator: std.mem.Allocator,
+    user_id: i32,
+    seen_at: i64,
+    presence_bytes: ?[]u8 = null,
+    stats_bytes: ?[]u8 = null,
+
+    fn deinit(self: *PreparedLazerPresence) void {
+        if (self.presence_bytes) |bytes| self.allocator.free(bytes);
+        if (self.stats_bytes) |bytes| self.allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
+const PreparedLazerPresences = struct {
+    allocator: std.mem.Allocator,
+    epoch: u64,
+    items: std.ArrayList(PreparedLazerPresence) = .empty,
+
+    fn deinit(self: *PreparedLazerPresences) void {
+        for (self.items.items) |*item| item.deinit();
+        self.items.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn find(self: *const PreparedLazerPresences, user_id: i32) ?*const PreparedLazerPresence {
+        for (self.items.items) |*item| if (item.user_id == user_id) return item;
+        return null;
+    }
+};
+
+const presence_request_bit: u8 = 1 << 0;
+const stats_request_bit: u8 = 1 << 1;
+
+fn notePresenceRequest(requests: *std.AutoHashMap(i32, u8), user_id: i32, bits: u8) !void {
+    if (user_id <= 0) return;
+    const result = try requests.getOrPut(user_id);
+    if (!result.found_existing) result.value_ptr.* = 0;
+    result.value_ptr.* |= bits;
+}
+
+/// Prepare database-backed lazer presence packets before the global Stable
+/// session mutex is acquired. `pollLocked` only re-checks current Stable
+/// ownership and copies these owned bytes into the response.
+fn prepareLazerPresences(allocator: std.mem.Allocator, store: *storage.Store, body: []const u8, epoch: u64) !PreparedLazerPresences {
+    var prepared: PreparedLazerPresences = .{ .allocator = allocator, .epoch = epoch };
+    errdefer prepared.deinit();
+    var requests = std.AutoHashMap(i32, u8).init(allocator);
+    defer requests.deinit();
+
+    var reader: protocol.Reader = .{ .data = body };
+    while (try reader.next()) |packet| switch (packet.id) {
+        .user_stats_request, .user_presence_request => {
+            var payload: protocol.PayloadReader = .{ .data = packet.payload };
+            const count = try payload.int(u16);
+            const bit = if (packet.id == .user_stats_request) stats_request_bit else presence_request_bit;
+            for (0..count) |_| try notePresenceRequest(&requests, try payload.int(i32), bit);
+            if (payload.pos != packet.payload.len) return error.InvalidPresenceRequest;
+        },
+        .user_presence_request_all => {
+            if (packet.payload.len != @sizeOf(i32)) continue;
+            const now = std.Io.Clock.real.now(store.io).toSeconds();
+            const ids = try store.recentOauthUserIds(allocator, now - lazer_presence_lease_seconds);
+            defer allocator.free(ids);
+            for (ids) |user_id| try notePresenceRequest(&requests, user_id, presence_request_bit);
+        },
+        else => {},
+    };
+
+    const now = std.Io.Clock.real.now(store.io).toSeconds();
+    const cutoff = now - lazer_presence_lease_seconds;
+    var iterator = requests.iterator();
+    while (iterator.next()) |entry| {
+        const user_id = entry.key_ptr.*;
+        if (!try store.lazerUserOnline(user_id, cutoff)) continue;
+        const user = (try store.userById(allocator, user_id)) orelse continue;
+        defer {
+            allocator.free(user.name);
+            allocator.free(user.safe_name);
+        }
+        if (user.restricted) continue;
+        const snapshot = LazerPresenceSnapshot.init(user);
+        var item: PreparedLazerPresence = .{ .allocator = allocator, .user_id = user_id, .seen_at = now };
+        errdefer item.deinit();
+        if (entry.value_ptr.* & presence_request_bit != 0) {
+            var output = protocol.Writer.init(allocator);
+            defer output.deinit();
+            try presence(&output, &snapshot);
+            item.presence_bytes = try allocator.dupe(u8, output.bytes());
+        }
+        if (entry.value_ptr.* & stats_request_bit != 0) {
+            var output = protocol.Writer.init(allocator);
+            defer output.deinit();
+            try stats(&output, store, &snapshot);
+            item.stats_bytes = try allocator.dupe(u8, output.bytes());
+        }
+        try prepared.items.append(allocator, item);
+    }
+    return prepared;
+}
+
+fn writePreparedLazerPresence(out: *protocol.Writer, sessions: *sessions_mod.Sessions, prepared: *const PreparedLazerPresences, user_id: i32, include_presence: bool, include_stats: bool) !bool {
+    if (prepared.epoch != sessions.lazer_presence_epoch) return false;
+    if (sessions.onlineByUser(user_id) != null) return false;
+    const item = prepared.find(user_id) orelse return false;
+    if (include_presence) if (item.presence_bytes) |bytes| try out.raw(bytes);
+    if (include_stats) if (item.stats_bytes) |bytes| try out.raw(bytes);
+    try sessions.lazer_leases.put(user_id, item.seen_at);
+    return true;
+}
 
 const LoginCapture = struct {
     allocator: std.mem.Allocator,
@@ -202,7 +348,8 @@ fn presence(w: *protocol.Writer, s: anytype) !void {
     try w.int(i32, s.user.id);
     try w.string(s.user.name);
     try w.byte(@intCast(@as(i16, s.utc_offset) + 24));
-    try w.byte(country.numeric(&s.user.country));
+    const visible_country: [2]u8 = if (s.user.show_country) s.user.country else .{ 'X', 'X' };
+    try w.byte(country.numeric(&visible_country));
     const visible_privileges = if (s.user.restricted) s.user.privileges & ~@as(u32, 1) else s.user.privileges;
     try w.byte(clientPrivileges(visible_privileges, false) | (@as(u8, s.mode) << 5));
     try w.float(f32, s.longitude);
@@ -269,6 +416,7 @@ fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sess
         capture.sessions.deinit(allocator);
     }
     for (sessions.items.items) |item| {
+        if (item.presence_suppressed) continue;
         const snapshot = try SessionSnapshot.init(allocator, item);
         errdefer {
             var owned = snapshot;
@@ -370,6 +518,23 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         try presence(&out, other);
         try stats(&out, store, other);
     };
+    const lazer_presence_epoch = captureLazerPresenceEpoch(sessions);
+    const lazer_now = std.Io.Clock.real.now(store.io).toSeconds();
+    const lazer_cutoff = lazer_now - lazer_presence_lease_seconds;
+    const lazer_ids = try store.recentOauthUserIds(allocator, lazer_cutoff);
+    defer allocator.free(lazer_ids);
+    for (lazer_ids) |user_id| {
+        if (capturedUser(&capture, user_id)) continue;
+        const lazer_user = (try store.userById(allocator, user_id)) orelse continue;
+        defer {
+            allocator.free(lazer_user.name);
+            allocator.free(lazer_user.safe_name);
+        }
+        if (lazer_user.restricted or !try noteLazerPresenceAtEpoch(sessions, user_id, lazer_now, lazer_presence_epoch)) continue;
+        const snapshot = LazerPresenceSnapshot.init(lazer_user);
+        try presence(&out, &snapshot);
+        try stats(&out, store, &snapshot);
+    }
     if (capture.restricted) {
         try out.packetEmpty(.account_restricted);
         try protocol.writeMessage(&out, "kai", "Your account is restricted. If this was a mistake, contact staff so we can review it.", own.user.name, 3);
@@ -382,7 +547,11 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         sessions.mutex.lockUncancelable(sessions.io);
         defer sessions.mutex.unlock(sessions.io);
         if (sessions.byToken(capture.token)) |current| {
-            if (current.user.id == capture.user_id) try sessions.broadcast(announce.bytes(), current);
+            if (current.user.id == capture.user_id) {
+                try current.pending_dm_reads.ensureUnusedCapacity(allocator, unread_messages.len);
+                for (unread_messages) |message| current.pending_dm_reads.appendAssumeCapacity(message.id);
+                try sessions.broadcast(announce.bytes(), current);
+            }
         }
     }
     const result_token = try allocator.dupe(u8, capture.token);
@@ -791,14 +960,19 @@ fn leaveMatchLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessio
     broadcastMatchStateLocked(allocator, sessions, match, true) catch {};
 }
 
-fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+fn broadcastUserLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, except: ?*sessions_mod.Session) void {
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
     const start = event.begin(.user_logout) catch return;
-    event.int(i32, session.user.id) catch return;
+    event.int(i32, user_id) catch return;
     event.byte(0) catch return;
     event.finish(start);
-    sessions.broadcast(event.bytes(), session) catch {};
+    sessions.broadcast(event.bytes(), except) catch {};
+}
+
+fn broadcastLogoutLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
+    if (session.presence_suppressed) return;
+    broadcastUserLogoutLocked(allocator, sessions, session.user.id, session);
 }
 
 fn removeSessionLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) void {
@@ -823,13 +997,37 @@ fn pruneExpiredLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sess
     }
 }
 
-fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8, logged_out: *bool) ![]u8 {
+fn pruneLazerPresenceLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions) !void {
+    const now = std.Io.Clock.real.now(sessions.io).toSeconds();
+    var expired: std.ArrayList(i32) = .empty;
+    defer expired.deinit(allocator);
+    var iterator = sessions.lazer_leases.iterator();
+    while (iterator.next()) |entry| {
+        if (now - entry.value_ptr.* >= lazer_presence_lease_seconds) try expired.append(allocator, entry.key_ptr.*);
+    }
+    for (expired.items) |user_id| {
+        if (!sessions.lazer_leases.remove(user_id)) continue;
+        sessions.lazer_presence_epoch +%= 1;
+        if (sessions.onlineByUser(user_id) != null) continue;
+        broadcastUserLogoutLocked(allocator, sessions, user_id, null);
+    }
+}
+
+pub fn captureLazerPresenceEpoch(sessions: *sessions_mod.Sessions) u64 {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    return sessions.lazer_presence_epoch;
+}
+
+fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8, prepared_lazer: *const PreparedLazerPresences, logged_out: *bool, delivered_dm_ids: *std.ArrayList(i64)) ![]u8 {
     const now = std.Io.Clock.real.now(sessions.io).toSeconds();
     session.last_seen = now;
     var out = protocol.Writer.init(allocator);
     defer out.deinit();
     try out.raw(session.queue.items);
+    try delivered_dm_ids.appendSlice(allocator, session.pending_dm_reads.items);
     session.queue.clearRetainingCapacity();
+    session.pending_dm_reads.clearRetainingCapacity();
     var reader: protocol.Reader = .{ .data = body };
     while (try reader.next()) |packet| switch (packet.id) {
         .ping => {},
@@ -855,7 +1053,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
         .friend_add => {
             const friend_id = packetUserId(packet.payload) orelse continue;
             if (friend_id == session.user.id or friend_id == 3 or session.isFriend(friend_id)) continue;
-            if (sessions.byUser(friend_id) == null) {
+            if (sessions.onlineByUser(friend_id) == null) {
                 const found = (try store.userById(allocator, friend_id)) orelse continue;
                 allocator.free(found.name);
                 allocator.free(found.safe_name);
@@ -907,7 +1105,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                 continue;
             }
             if (packet.id == .send_private_message) {
-                if (sessions.byName(target_name)) |target| {
+                if (sessions.onlineByName(target_name)) |target| {
                     if (target.is_bot) {
                         if (try commands.handleNowPlaying(allocator, store, session, text)) continue;
                         if (try commands.handleCommand(allocator, store, sessions, session, text, session.user.name, &out) == .handled) continue;
@@ -925,7 +1123,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             defer message.deinit();
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
             if (packet.id == .send_private_message) {
-                if (sessions.byName(target_name)) |target| {
+                if (sessions.onlineByName(target_name)) |target| {
                     if (!target.is_bot) {
                         if (target.block_non_friend_dms and !target.isFriend(session.user.id)) {
                             try writeDmBlocked(&out, target.user.name);
@@ -950,15 +1148,14 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                         if (target.action == 1 and target.away().len != 0) {
                             try protocol.writeMessage(&out, target.user.name, target.away(), session.user.name, target.user.id);
                         }
-                        store.storeDirectMessage(session.user.id, target.user.id, text) catch |err| switch (err) {
+                        const direct_message_id = store.storeDirectMessage(session.user.id, target.user.id, text) catch |err| switch (err) {
                             error.DirectMessageBlocked => {
                                 try writeDmBlocked(&out, target.user.name);
                                 continue;
                             },
                             else => return err,
                         };
-                        try queuePacket(target, allocator, message.bytes());
-                        store.markDirectMessagesRead(target.user.id, session.user.id) catch |err| std.log.warn("direct message read state failed: {s}", .{@errorName(err)});
+                        try target.enqueueDirectMessage(allocator, direct_message_id, message.bytes());
                     }
                 } else if (try store.userByName(allocator, target_name)) |target_user| {
                     defer {
@@ -978,7 +1175,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                         try writeDmBlocked(&out, target_user.name);
                         continue;
                     }
-                    store.storeDirectMessage(session.user.id, target_user.id, text) catch |err| switch (err) {
+                    _ = store.storeDirectMessage(session.user.id, target_user.id, text) catch |err| switch (err) {
                         error.DirectMessageBlocked => {
                             try writeDmBlocked(&out, target_user.name);
                             continue;
@@ -1266,7 +1463,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             const wanted = try payload.int(i32);
             if (payload.pos != packet.payload.len or wanted < 0 or wanted >= 16) continue;
             const target_id = match.slots[@intCast(wanted)].user_id orelse continue;
-            const target = sessions.byUser(target_id) orelse continue;
+            const target = sessions.onlineByUser(target_id) orelse continue;
             match.host_id = target_id;
             var transfer = protocol.Writer.init(allocator);
             defer transfer.deinit();
@@ -1335,7 +1532,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
         .match_invite => {
             const target_id = packetUserId(packet.payload) orelse continue;
             const match = sessions.matchById(session.match_id orelse continue) orelse continue;
-            const target = sessions.byUser(target_id) orelse continue;
+            const target = sessions.onlineByUser(target_id) orelse continue;
             if (target.is_bot) {
                 try protocol.writeMessage(&out, "kai", "I'm too busy!", session.user.name, 3);
                 continue;
@@ -1396,21 +1593,34 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             const count = try p.int(u16);
             var i: usize = 0;
-            while (i < count) : (i += 1) if (sessions.byUser(try p.int(i32))) |s| try stats(&out, store, s);
+            while (i < count) : (i += 1) {
+                const user_id = try p.int(i32);
+                if (sessions.onlineByUser(user_id)) |s|
+                    try stats(&out, store, s)
+                else
+                    _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, user_id, false, true);
+            }
         },
         .user_presence_request => {
             var p: protocol.PayloadReader = .{ .data = packet.payload };
             const count = try p.int(u16);
             var i: usize = 0;
-            while (i < count) : (i += 1) if (sessions.byUser(try p.int(i32))) |s| try presence(&out, s);
+            while (i < count) : (i += 1) {
+                const user_id = try p.int(i32);
+                if (sessions.onlineByUser(user_id)) |s|
+                    try presence(&out, s)
+                else
+                    _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, user_id, true, false);
+            }
         },
         .user_presence_request_all => {
             if (packet.payload.len != @sizeOf(i32)) continue;
-            for (sessions.items.items) |target| if (!target.user.restricted) try presence(&out, target);
+            for (sessions.items.items) |target| if (!target.user.restricted and !target.presence_suppressed) try presence(&out, target);
+            for (prepared_lazer.items.items) |item| _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, item.user_id, true, false);
         },
         .start_spectating => {
             const target_id = packetUserId(packet.payload) orelse continue;
-            const host = sessions.byUser(target_id) orelse continue;
+            const host = sessions.onlineByUser(target_id) orelse continue;
             try attachSpectatorLocked(allocator, sessions, session, host);
         },
         .stop_spectating => {
@@ -1447,28 +1657,149 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
     return allocator.dupe(u8, out.bytes());
 }
 
+fn markDeliveredDirectMessages(store: *storage.Store, user_id: i32, message_ids: []const i64) void {
+    for (message_ids) |message_id| {
+        _ = store.markDirectMessageRead(user_id, message_id) catch |err| {
+            std.log.warn("event=stable_dm_read_failed user_id={d} message_id={d} error={t}", .{ user_id, message_id, err });
+            continue;
+        };
+    }
+}
+
+fn drainSuppressedLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) ![]u8 {
+    const result = try allocator.dupe(u8, session.queue.items);
+    session.queue.clearRetainingCapacity();
+    session.pending_dm_reads.clearRetainingCapacity();
+    removeSessionLocked(allocator, sessions, session);
+    return result;
+}
+
 pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
+    var delivered_dm_ids: std.ArrayList(i64) = .empty;
+    defer delivered_dm_ids.deinit(allocator);
+    const lazer_presence_epoch = captureLazerPresenceEpoch(sessions);
+    var prepared_lazer = try prepareLazerPresences(allocator, store, body, lazer_presence_epoch);
+    defer prepared_lazer.deinit();
     sessions.mutex.lockUncancelable(sessions.io);
-    defer sessions.mutex.unlock(sessions.io);
+    pruneLazerPresenceLocked(allocator, sessions) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
+    if (session.presence_suppressed) {
+        const result = drainSuppressedLocked(allocator, sessions, session) catch |err| {
+            sessions.mutex.unlock(sessions.io);
+            return err;
+        };
+        sessions.mutex.unlock(sessions.io);
+        return result;
+    }
+    const user_id = session.user.id;
     var logged_out = false;
-    const result = try pollLocked(allocator, store, sessions, session, body, &logged_out);
+    const result = pollLocked(allocator, store, sessions, session, body, &prepared_lazer, &logged_out, &delivered_dm_ids) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
     if (logged_out) removeSessionLocked(allocator, sessions, session);
+    sessions.mutex.unlock(sessions.io);
+    markDeliveredDirectMessages(store, user_id, delivered_dm_ids.items);
     return result;
 }
 
 pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, token: []const u8, body: []const u8) !?[]u8 {
+    var delivered_dm_ids: std.ArrayList(i64) = .empty;
+    defer delivered_dm_ids.deinit(allocator);
+    // Do not let an unknown token trigger the database-backed presence
+    // preparation pass. The token is checked again after preparation because
+    // a concurrent reconnect may replace it in between.
     sessions.mutex.lockUncancelable(sessions.io);
-    defer sessions.mutex.unlock(sessions.io);
     pruneExpiredLocked(allocator, sessions);
-    const session = sessions.byToken(token) orelse return null;
+    const token_was_live = sessions.byToken(token) != null;
+    const lazer_presence_epoch = sessions.lazer_presence_epoch;
+    sessions.mutex.unlock(sessions.io);
+    if (!token_was_live) return null;
+    var prepared_lazer = try prepareLazerPresences(allocator, store, body, lazer_presence_epoch);
+    defer prepared_lazer.deinit();
+    sessions.mutex.lockUncancelable(sessions.io);
+    pruneExpiredLocked(allocator, sessions);
+    pruneLazerPresenceLocked(allocator, sessions) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
+    const session = sessions.byToken(token) orelse {
+        sessions.mutex.unlock(sessions.io);
+        return null;
+    };
     if (session.queue_overflowed) {
         removeSessionLocked(allocator, sessions, session);
+        sessions.mutex.unlock(sessions.io);
         return null;
     }
+    if (session.presence_suppressed) {
+        const result = drainSuppressedLocked(allocator, sessions, session) catch |err| {
+            sessions.mutex.unlock(sessions.io);
+            return err;
+        };
+        sessions.mutex.unlock(sessions.io);
+        return result;
+    }
+    const user_id = session.user.id;
     var logged_out = false;
-    const result = try pollLocked(allocator, store, sessions, session, body, &logged_out);
+    const result = pollLocked(allocator, store, sessions, session, body, &prepared_lazer, &logged_out, &delivered_dm_ids) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
     if (logged_out) removeSessionLocked(allocator, sessions, session);
+    sessions.mutex.unlock(sessions.io);
+    markDeliveredDirectMessages(store, user_id, delivered_dm_ids.items);
     return result;
+}
+
+pub fn suppressForTakeover(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, message: []const u8) !bool {
+    var packet = protocol.Writer.init(allocator);
+    defer packet.deinit();
+    try packet.packetString(.notification, message);
+    try packet.packetInt(.restart, 0);
+    if (packet.bytes().len > sessions_mod.max_queue_bytes) return error.SessionQueueOverflow;
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.onlineByUser(user_id) orelse return false;
+    try session.queue.ensureTotalCapacity(allocator, packet.bytes().len);
+    closeLobbyLocked(allocator, sessions, session, null) catch {};
+    leaveMatchLocked(allocator, sessions, session, null);
+    detachSpectatorLocked(allocator, sessions, session) catch {};
+    clearSpectatorsForHostLocked(allocator, sessions, session);
+    session.queue.clearRetainingCapacity();
+    session.pending_dm_reads.clearRetainingCapacity();
+    session.queue_overflowed = false;
+    session.queue.appendSliceAssumeCapacity(packet.bytes());
+    broadcastLogoutLocked(allocator, sessions, session);
+    session.presence_suppressed = true;
+    return true;
+}
+
+/// Roll back only the Stable session created by a login result whose
+/// post-login takeover failed. Token ownership prevents a delayed cleanup from
+/// removing a newer reconnect for the same account.
+pub fn rollbackLogin(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, token: []const u8) bool {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.byToken(token) orelse return false;
+    if (session.user.id != user_id) return false;
+    removeSessionLocked(allocator, sessions, session);
+    return true;
+}
+
+pub fn setUserCountryVisibility(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, country_code: [2]u8, visible: bool) void {
+    var event = protocol.Writer.init(allocator);
+    defer event.deinit();
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.byUser(user_id) orelse return;
+    session.user.country = country_code;
+    session.user.show_country = visible;
+    if (session.presence_suppressed or session.user.restricted) return;
+    presence(&event, session) catch return;
+    sessions.broadcast(event.bytes(), null) catch {};
 }
 
 pub fn disconnectRestrictedUser(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32) void {
@@ -1481,13 +1812,82 @@ pub fn disconnectRestrictedUser(allocator: std.mem.Allocator, sessions: *session
 pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, mode: u8, mods: i32) !void {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
-    const session = sessions.byUser(user_id) orelse return;
+    const session = sessions.onlineByUser(user_id) orelse return;
     session.mode = mode;
     session.mods = mods;
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
     try stats(&event, store, session);
     try sessions.broadcast(event.bytes(), null);
+}
+
+pub fn noteLazerPresence(sessions: *sessions_mod.Sessions, user_id: i32, seen_at: i64) !void {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    try sessions.lazer_leases.put(user_id, seen_at);
+}
+
+fn noteLazerPresenceAtEpoch(sessions: *sessions_mod.Sessions, user_id: i32, seen_at: i64, expected_epoch: u64) !bool {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    if (sessions.lazer_presence_epoch != expected_epoch or sessions.onlineByUser(user_id) != null) return false;
+    try sessions.lazer_leases.put(user_id, seen_at);
+    return true;
+}
+
+pub fn publishLazerPresenceAtEpoch(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user: domain.User, expected_epoch: u64) !void {
+    if (user.restricted) return;
+    const now = std.Io.Clock.real.now(sessions.io).toSeconds();
+    sessions.mutex.lockUncancelable(sessions.io);
+    if (sessions.lazer_presence_epoch != expected_epoch) {
+        sessions.mutex.unlock(sessions.io);
+        return;
+    }
+    if (sessions.onlineByUser(user.id) != null) {
+        sessions.mutex.unlock(sessions.io);
+        return;
+    }
+    if (sessions.lazer_leases.getPtr(user.id)) |last_seen| {
+        last_seen.* = now;
+        sessions.mutex.unlock(sessions.io);
+        return;
+    }
+    sessions.mutex.unlock(sessions.io);
+
+    const snapshot = LazerPresenceSnapshot.init(user);
+    var event = protocol.Writer.init(allocator);
+    defer event.deinit();
+    try presence(&event, &snapshot);
+    try stats(&event, store, &snapshot);
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    if (sessions.lazer_presence_epoch != expected_epoch) return;
+    if (sessions.onlineByUser(user.id) != null) return;
+    if (sessions.lazer_leases.getPtr(user.id)) |last_seen| {
+        last_seen.* = now;
+        return;
+    }
+    try sessions.lazer_leases.put(user.id, now);
+    try sessions.broadcast(event.bytes(), null);
+}
+
+pub fn publishLazerPresence(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user: domain.User) !void {
+    return publishLazerPresenceAtEpoch(allocator, store, sessions, user, captureLazerPresenceEpoch(sessions));
+}
+
+pub fn publishLazerLogout(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32) !void {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    sessions.lazer_presence_epoch +%= 1;
+    if (!sessions.lazer_leases.remove(user_id)) return;
+    broadcastUserLogoutLocked(allocator, sessions, user_id, null);
+}
+
+pub fn forgetLazerPresence(sessions: *sessions_mod.Sessions, user_id: i32) void {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    sessions.lazer_presence_epoch +%= 1;
+    _ = sessions.lazer_leases.remove(user_id);
 }
 
 pub fn publishAnnouncement(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, text: []const u8) !void {
@@ -1497,4 +1897,162 @@ pub fn publishAnnouncement(allocator: std.mem.Allocator, sessions: *sessions_mod
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     try sessions.broadcastChannel("#announce", message.bytes(), null);
+}
+
+test "lazer logout invalidates presence prepared by an earlier Stable poll" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-presence-epoch.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    const tokens = try store.issueGameTokenPair(user_id, 60, 60, false);
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const prepared_epoch = captureLazerPresenceEpoch(&sessions);
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 1, .little);
+    std.mem.writeInt(i32, payload[2..6], user_id, .little);
+    var request: [13]u8 = undefined;
+    std.mem.writeInt(u16, request[0..2], @intFromEnum(protocol.ClientPacket.user_presence_request), .little);
+    request[2] = 0;
+    std.mem.writeInt(u32, request[3..7], payload.len, .little);
+    @memcpy(request[7..], &payload);
+    var prepared = try prepareLazerPresences(std.testing.allocator, &store, &request, prepared_epoch);
+    defer prepared.deinit();
+    try std.testing.expect(prepared.find(user_id) != null);
+
+    try noteLazerPresence(&sessions, user_id, std.Io.Clock.real.now(std.testing.io).toSeconds());
+    try std.testing.expect(try store.revokeToken(&tokens.refresh));
+    try publishLazerLogout(std.testing.allocator, &sessions, user_id);
+
+    var out = protocol.Writer.init(std.testing.allocator);
+    defer out.deinit();
+    sessions.mutex.lockUncancelable(sessions.io);
+    const wrote_presence = writePreparedLazerPresence(&out, &sessions, &prepared, user_id, true, false) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
+    const lease_recreated = sessions.lazer_leases.contains(user_id);
+    sessions.mutex.unlock(sessions.io);
+    try std.testing.expect(!wrote_presence);
+    try std.testing.expectEqual(@as(usize, 0), out.bytes().len);
+    try std.testing.expect(!lease_recreated);
+}
+
+test "lazer logout invalidates an earlier Stable login presence snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-login-presence-epoch.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    const tokens = try store.issueGameTokenPair(user_id, 60, 60, false);
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const snapshot_epoch = captureLazerPresenceEpoch(&sessions);
+    const now = std.Io.Clock.real.now(std.testing.io).toSeconds();
+    const online_ids = try store.recentOauthUserIds(std.testing.allocator, now - lazer_presence_lease_seconds);
+    defer std.testing.allocator.free(online_ids);
+    try std.testing.expectEqualSlices(i32, &.{user_id}, online_ids);
+
+    try std.testing.expect(try store.revokeToken(&tokens.refresh));
+    try publishLazerLogout(std.testing.allocator, &sessions, user_id);
+    try std.testing.expect(!try noteLazerPresenceAtEpoch(&sessions, user_id, now, snapshot_epoch));
+    try std.testing.expect(!sessions.lazer_leases.contains(user_id));
+}
+
+test "lazer logout invalidates authenticate then publish presence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/lazer-auth-presence-epoch.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+    const tokens = try store.issueGameTokenPair(user_id, 60, 60, false);
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const auth_epoch = captureLazerPresenceEpoch(&sessions);
+    const user = (try store.authenticateToken(std.testing.allocator, &tokens.access, "identify")).?;
+    defer {
+        std.testing.allocator.free(user.name);
+        std.testing.allocator.free(user.safe_name);
+    }
+
+    try std.testing.expect(try store.revokeToken(&tokens.refresh));
+    try publishLazerLogout(std.testing.allocator, &sessions, user_id);
+    try publishLazerPresenceAtEpoch(std.testing.allocator, &store, &sessions, user, auth_epoch);
+    try std.testing.expect(!sessions.lazer_leases.contains(user_id));
+}
+
+test "failed Stable takeover rolls back only its login-owned session" {
+    if (storage.is_postgres) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-takeover-rollback.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const observer_id = try store.register("observer", "observer@example.invalid", "00000000000000000000000000000000");
+    const user_id = try store.register("ari", "ari@example.invalid", "00000000000000000000000000000000");
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const observer_user = (try store.userById(std.testing.allocator, observer_id)).?;
+    const observer = try sessions.create(observer_user, 0, 0, 0);
+    const login_body = "ari\n00000000000000000000000000000000\nb20260811|0|0|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0";
+    var result = try login(std.testing.allocator, &store, &sessions, login_body, .{ 'A', 'U' }, 0, 0);
+    defer result.deinit();
+    try std.testing.expectEqual(user_id, result.user_id);
+    observer.queue.clearRetainingCapacity();
+
+    var oauth_table_renamed = false;
+    defer if (oauth_table_renamed) store.exec("ALTER TABLE oauth_tokens_unavailable RENAME TO oauth_tokens") catch {};
+    try store.exec("ALTER TABLE oauth_tokens RENAME TO oauth_tokens_unavailable");
+    oauth_table_renamed = true;
+    try std.testing.expectError(error.DatabaseQueryFailed, store.revokeGameTokensForUser(user_id));
+    try std.testing.expect(rollbackLogin(std.testing.allocator, &sessions, result.user_id, result.token));
+    try store.exec("ALTER TABLE oauth_tokens_unavailable RENAME TO oauth_tokens");
+    oauth_table_renamed = false;
+
+    try std.testing.expect(sessions.byToken(result.token) == null);
+    try std.testing.expect(sessions.byUser(user_id) == null);
+    var logout_reader: protocol.Reader = .{ .data = observer.queue.items };
+    const logout = (try logout_reader.next()).?;
+    try std.testing.expectEqual(@intFromEnum(protocol.ServerPacket.user_logout), @intFromEnum(logout.id));
+    var logout_payload: protocol.PayloadReader = .{ .data = logout.payload };
+    try std.testing.expectEqual(user_id, try logout_payload.int(i32));
+    try std.testing.expect((try logout_reader.next()) == null);
+
+    var reconnect = try login(std.testing.allocator, &store, &sessions, login_body, .{ 'A', 'U' }, 0, 0);
+    defer reconnect.deinit();
+    const reconnect_token = try std.testing.allocator.dupe(u8, reconnect.token);
+    defer std.testing.allocator.free(reconnect_token);
+    var replacement = try login(std.testing.allocator, &store, &sessions, login_body, .{ 'A', 'U' }, 0, 0);
+    defer replacement.deinit();
+    try std.testing.expect(!rollbackLogin(std.testing.allocator, &sessions, user_id, reconnect_token));
+    try std.testing.expect(sessions.byToken(replacement.token) != null);
+}
+
+test "Stable login rollback removes the session even when logout allocation fails" {
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    _ = try sessions.create(.{ .id = 7, .name = try std.testing.allocator.dupe(u8, "observer"), .safe_name = try std.testing.allocator.dupe(u8, "observer") }, 0, 0, 0);
+    const login_session = try sessions.create(.{ .id = 8, .name = try std.testing.allocator.dupe(u8, "login"), .safe_name = try std.testing.allocator.dupe(u8, "login") }, 0, 0, 0);
+    const token = login_session.token;
+    var empty: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&empty);
+    try std.testing.expect(rollbackLogin(failing.allocator(), &sessions, login_session.user.id, &token));
+    try std.testing.expect(sessions.byUser(8) == null);
+    try std.testing.expect(sessions.byToken(&token) == null);
 }

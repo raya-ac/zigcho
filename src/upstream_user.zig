@@ -1,4 +1,5 @@
 const std = @import("std");
+const domain = @import("domain.zig");
 
 pub const Profile = struct {
     id: i32,
@@ -92,9 +93,8 @@ pub fn validate(profile: Profile) !void {
 }
 
 fn writeStatistics(writer: *std.Io.Writer, profile: Profile) !void {
-    const current_level: i32 = @intFromFloat(@floor(profile.level));
-    const level_progress: i32 = @intFromFloat(@min(100, @round((profile.level - @floor(profile.level)) * 100.0)));
-    try writer.print("{{\"level\":{{\"current\":{d},\"progress\":{d}}},\"is_ranked\":{s},\"global_rank\":", .{ current_level, level_progress, if (profile.global_rank > 0) "true" else "false" });
+    const level = domain.levelFromTotalScore(profile.total_score);
+    try writer.print("{{\"level\":{{\"current\":{d},\"progress\":{d}}},\"is_ranked\":{s},\"global_rank\":", .{ level.current, level.progress, if (profile.global_rank > 0) "true" else "false" });
     if (profile.global_rank > 0) try writer.print("{d}", .{profile.global_rank}) else try writer.writeAll("null");
     try writer.writeAll(",\"country_rank\":");
     if (profile.country_rank > 0) try writer.print("{d}", .{profile.country_rank}) else try writer.writeAll("null");
@@ -131,9 +131,48 @@ pub fn jsonOwned(allocator: std.mem.Allocator, profile: Profile) ![]u8 {
     try std.json.Stringify.value(mode, .{}, &output.writer);
     try output.writer.writeAll(":");
     try writeStatistics(&output.writer, profile);
-    try output.writer.writeAll("},\"groups\":[],\"badges\":[],\"profile_order\":[\"top_ranks\",\"medals\"],\"user_achievements\":[],\"monthly_playcounts\":[],\"replays_watched_counts\":[],\"rank_history\":{\"mode\":");
+    try output.writer.writeAll("},\"groups\":[],\"badges\":[],\"scores_best_count\":0,\"scores_first_count\":0,\"scores_recent_count\":0,\"scores_pinned_count\":0,\"beatmap_playcounts_count\":0,\"profile_order\":[],\"user_achievements\":[],\"monthly_playcounts\":[],\"replays_watched_counts\":[],\"rank_history\":{\"mode\":");
     try std.json.Stringify.value(mode, .{}, &output.writer);
     try output.writer.writeAll(",\"data\":[]}}");
+    return output.toOwnedSlice();
+}
+
+pub fn lookupJsonOwned(allocator: std.mem.Allocator, profile_json: []const u8, ruleset_id: u8) ![]u8 {
+    if (ruleset_id > 3) return error.InvalidUpstreamUser;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, profile_json, .{});
+    defer parsed.deinit();
+    var profile = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidUpstreamUser,
+    };
+    const statistics = switch (profile.get("statistics") orelse return error.InvalidUpstreamUser) {
+        .object => |object| object,
+        else => return error.InvalidUpstreamUser,
+    };
+    const rank = statistics.get("global_rank") orelse return error.InvalidUpstreamUser;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    var first = true;
+    var fields = profile.iterator();
+    while (fields.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "statistics_rulesets") or std.mem.eql(u8, entry.key_ptr.*, "global_rank")) continue;
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, &output.writer);
+        try output.writer.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, &output.writer);
+    }
+    if (!first) try output.writer.writeByte(',');
+    try output.writer.writeAll("\"global_rank\":{\"rank\":");
+    switch (rank) {
+        .integer => |value| if (value > 0) try output.writer.print("{d}", .{value}) else try output.writer.writeAll("null"),
+        .float => |value| if (std.math.isFinite(value) and value > 0 and value <= std.math.maxInt(i32)) try output.writer.print("{d}", .{@as(i64, @intFromFloat(value))}) else try output.writer.writeAll("null"),
+        .null => try output.writer.writeAll("null"),
+        else => return error.InvalidUpstreamUser,
+    }
+    try output.writer.print(",\"ruleset_id\":{d}", .{ruleset_id});
+    try output.writer.writeAll("}}");
     return output.toOwnedSlice();
 }
 
@@ -166,5 +205,15 @@ test "upstream mapper json carries real identity avatar and statistics" {
     try std.testing.expectEqual(@as(i64, 4_452_992), parsed.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("https://a.ppy.sh/4452992", parsed.value.object.get("avatar_url").?.string);
     try std.testing.expectEqual(@as(i64, 50_128), parsed.value.object.get("statistics").?.object.get("global_rank").?.integer);
-    try std.testing.expectEqual(@as(i64, 65), parsed.value.object.get("statistics").?.object.get("level").?.object.get("progress").?.integer);
+    try std.testing.expectEqual(@as(i64, 64), parsed.value.object.get("statistics").?.object.get("level").?.object.get("progress").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("profile_order").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("scores_best_count").?.integer);
+
+    const lookup = try lookupJsonOwned(std.testing.allocator, json, 0);
+    defer std.testing.allocator.free(lookup);
+    var parsed_lookup = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lookup, .{});
+    defer parsed_lookup.deinit();
+    try std.testing.expectEqual(@as(i64, 50_128), parsed_lookup.value.object.get("global_rank").?.object.get("rank").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed_lookup.value.object.get("global_rank").?.object.get("ruleset_id").?.integer);
+    try std.testing.expect(parsed_lookup.value.object.get("statistics_rulesets") == null);
 }

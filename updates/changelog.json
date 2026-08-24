@@ -1,0 +1,575 @@
+{
+  "schema": 1,
+  "builds": [
+    {
+      "id": 35,
+      "version": "2026.824.0",
+      "display_version": "zigcho release 1",
+      "created_at": "2026-08-24T18:18:10+09:30",
+      "updates": [
+        {
+          "name": "2026-08-24-lazer-multiplayer-profiles-and-routes.md",
+          "created_at": "2026-08-24T18:18:10+09:30",
+          "commit": "",
+          "sha256": "c31638a4cd140a9f19a7d23a52d161087a330a7d05b0bdfa1354e8d3a69a2a4b"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "version": "2026.823.0",
+      "created_at": "2026-08-23T02:15:00+09:30",
+      "updates": [
+        {
+          "name": "2026-08-23-maps-rooms-and-presence.md",
+          "created_at": "2026-08-23T18:09:51+09:30",
+          "commit": "",
+          "sha256": "60d0e76bd3bb4abe9fad1f89d3eada1fe47f1914fcb66ffdad9fb779bae62cdb"
+        },
+        {
+          "name": "2026-08-23-bss-local-mappers.md",
+          "created_at": "2026-08-23T15:03:08+09:30",
+          "commit": "",
+          "sha256": "2dd6ac17df8063b432577700f773a8a567cb0982dcf27038cb7d5d16268addef"
+        },
+        {
+          "name": "2026-08-23-lazer-profiles-and-sessions.md",
+          "created_at": "2026-08-23T02:15:00+09:30",
+          "commit": "",
+          "sha256": "d79c9f59f103a67fabe9f46de367455049e90c594eb345f00526a6fea62156a5"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "version": "2026.822.0",
+      "created_at": "2026-08-22T20:24:54+09:30",
+      "updates": [
+        {
+          "name": "2026-08-22-mirror-and-object-backups.md",
+          "created_at": "2026-08-22T20:24:54+09:30",
+          "commit": "a419d2970a194db5b274deb80d1672188f56d729",
+          "sha256": "1e59f58b90c5862b927ed82706e8e92f2f73b8f24058ab73542250a2a08cfb45"
+        },
+        {
+          "name": "2026-08-22-achievements-presence-and-controls.md",
+          "created_at": "2026-08-22T20:24:49+09:30",
+          "commit": "d6fc4e35fc858d8fbe3f59a5c19418bc7cc8dc21",
+          "sha256": "a16efb7076894df0d695089160197829d5dc10a9879ebd71867d6240516efb51"
+        },
+        {
+          "name": "2026-08-22-stable-lazer-identity-and-rates.md",
+          "created_at": "2026-08-22T19:39:40+09:30",
+          "commit": "ec82b77f5a1c621a8f6fccbadb3f668be61b727f",
+          "sha256": "c772ab4c97557e5e256518d7107c9fff4d23392530f6bd988c08c0c06d23c9a2"
+        },
+        {
+          "name": "2026-08-22-lazer-pp-and-shared-boards.md",
+          "created_at": "2026-08-22T16:01:06+09:30",
+          "commit": "a9683ac42f03899862d8a2e890c4af933e91df51",
+          "sha256": "b711e16339512afc9d18babb5fdb262be7a14bdb4fa8a8bdf1e34ca3598cd4c4"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "version": "2026.816.0",
+      "created_at": "2026-08-16T23:33:56+09:30",
+      "updates": [
+        {
+          "name": "2026-08-16-object-storage-cutover.md",
+          "created_at": "2026-08-16T23:33:56+09:30",
+          "commit": "6561e503a8629204ff3be5191c5ca1ff64a6bb93",
+          "sha256": "1fe73fc85390e8199dcbf23c603168cd8f2e515fd35b646fb9472b2433e75f13"
+        },
+        {
+          "name": "2026-08-16-lazer-pp-bests.md",
+          "created_at": "2026-08-16T21:39:35+09:30",
+          "commit": "b4325cedee38904facf133e1ce57d17c6ee66b91",
+          "sha256": "97af460527ff5ab1026dfa1459fff97bc0a1b0047400896cb344c743cf5b8483"
+        },
+        {
+          "name": "2026-08-16-object-storage.md",
+          "created_at": "2026-08-16T21:24:29+09:30",
+          "commit": "a9592bd8b3e13a01c98735610592999312bff59d",
+          "sha256": "13cfa73a0feeb97764363669971c5d979cc32a9b5f502cb9360f1b5d0a999209"
+        },
+        {
+          "name": "2026-08-16-lazer-profiles-and-results.md",
+          "created_at": "2026-08-16T19:28:30+09:30",
+          "commit": "ff488dbb81a66bb72eeb7080597c382438bfff6a",
+          "sha256": "4025b7a82c2e8c777d1ba15c93a75db43e5a313471394c5c56207c973ac27b0d"
+        },
+        {
+          "name": "2026-08-16-lazer-ranked-play.md",
+          "created_at": "2026-08-16T16:02:59+09:30",
+          "commit": "fd597ac7d24a75760038b1ea52949a3744a2b992",
+          "sha256": "9e5dc8c990636e915bd8600a376b6a3e4970258e7ceb42af5ae4beb1de910a46"
+        },
+        {
+          "name": "2026-08-16-lazer-quick-play.md",
+          "created_at": "2026-08-16T14:09:37+09:30",
+          "commit": "3a739e2c1cd7a49b29b531663c1fdaf57c13d46b",
+          "sha256": "b7f6dd8e26c74adeb48f0a5ea62e58fd7cfed0a65e3a7ab06a4329a2109cd5e5"
+        },
+        {
+          "name": "2026-08-16-lazer-alpha-seven.md",
+          "created_at": "2026-08-16T12:58:35+09:30",
+          "commit": "d419cf608c2adafb3d3fc17637f0c1ec3a6a74a5",
+          "sha256": "eb07f5a4fbcb3e77c97ea964bd3f84ac0f017108f34f43b1ac95c21428cfef29"
+        },
+        {
+          "name": "2026-08-16-lazer-alpha-six.md",
+          "created_at": "2026-08-16T11:31:25+09:30",
+          "commit": "124e04d4253f12a291fe8accc9aa4df30ad9e13a",
+          "sha256": "0b94db33571bced4e817f1daf36c6928b970bc92e93c2e7f651ad530df258382"
+        },
+        {
+          "name": "2026-08-16-lazer-alpha-five.md",
+          "created_at": "2026-08-16T09:05:43+09:30",
+          "commit": "60f44aeb49b0a2b6719399dfed12d2a08dabfa40",
+          "sha256": "c4cf357f8c26520ab4fa0c68891cdc8a8f9ce32de76dcc1d7d9e2bcc96ee4fac"
+        },
+        {
+          "name": "2026-08-16-lazer-alpha-four.md",
+          "created_at": "2026-08-16T08:24:08+09:30",
+          "commit": "3774e4d2ac4a642fdc88465195cb5446b6182cda",
+          "sha256": "50e8c1202d33e81250c00900d536c5feb6575a0f81d84a4abc0e186175878d7a"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "version": "2026.815.0",
+      "created_at": "2026-08-15T23:18:38+09:30",
+      "updates": [
+        {
+          "name": "2026-08-15-lazer-leaderboards.md",
+          "created_at": "2026-08-15T23:18:38+09:30",
+          "commit": "e681eef6ae0574fe2278c456fa3f1862423178aa",
+          "sha256": "baf475bf31f36a0c0d0e8c423f66a92812b71da089af12a0ab898a9ba39f144a"
+        },
+        {
+          "name": "2026-08-15-lazer-alpha-two.md",
+          "created_at": "2026-08-15T22:03:26+09:30",
+          "commit": "d5c2808915bc25fd2a417342e910effa0b0f8e9d",
+          "sha256": "8746a1506a948a78154b02c2092995a0260f4b78b21c61290020b47db2c2c6f9"
+        },
+        {
+          "name": "2026-08-15-lazer-maps-and-chat.md",
+          "created_at": "2026-08-15T19:05:00+09:30",
+          "commit": "b7c819ca3faf914721665bee9a7dd30225238ae8",
+          "sha256": "159f86deb4c4b00fdaaadac1c3ca89f4e80dbb9dba9bdf072a742eda48f8ea82"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "version": "2026.814.0",
+      "created_at": "2026-08-14T16:58:32+09:30",
+      "updates": [
+        {
+          "name": "2026-08-14-profile-score-details.md",
+          "created_at": "2026-08-14T16:58:32+09:30",
+          "commit": "a9b869c96619a59b62c5ac87eaffe571d15b4b45",
+          "sha256": "230599e47be862534ae04000bcbd53cd5c3372f4367a3cbcddf2770113a8ffe3"
+        },
+        {
+          "name": "2026-08-14-player-pages-and-replays.md",
+          "created_at": "2026-08-14T14:38:13+09:30",
+          "commit": "d5f7f8819b6a8613adcd7f24de309cea43c7c22d",
+          "sha256": "5fdae1f37e6e92fcea607fd43cf7fbced2506c54397e167db7a160766b4c3e9f"
+        },
+        {
+          "name": "2026-08-14-web-accounts-and-avatars.md",
+          "created_at": "2026-08-14T13:36:55+09:30",
+          "commit": "628eb9778e3520853703d5ddb7652e2bec335a6c",
+          "sha256": "de77caf1b8e87ab143890a8cd4a5276c6b4b4785b2f04023c0858a972703c078"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "version": "2026.813.0",
+      "created_at": "2026-08-13T15:45:58+09:30",
+      "updates": [
+        {
+          "name": "2026-08-13-lazer-windows-alpha.md",
+          "created_at": "2026-08-13T15:45:58+09:30",
+          "commit": "ed546ce0186447971ef4e29a21782f4b515e5acc",
+          "sha256": "50e0e38d880b366be07bf4a695e7e8fa96719b863a337fcf84a08cc52273bc32"
+        },
+        {
+          "name": "2026-08-13-lazer-ranked-stats.md",
+          "created_at": "2026-08-13T14:50:04+09:30",
+          "commit": "3da613ae97f7036b734e21cd82200b3e9e772740",
+          "sha256": "cb012cd9dd2e55e4c0c9be66b46364a7bdfe7359b65eb6b04b415e51c961735e"
+        },
+        {
+          "name": "2026-08-13-stable-is-finished.md",
+          "created_at": "2026-08-13T07:29:04+09:30",
+          "commit": "d0db0e9f5759ade535209a1f2d3f5eaaeb201f6e",
+          "sha256": "614885fbaac5e6a84ba9521a61080dda70f0e474c514ac54682aa96f7cdfc7ec"
+        },
+        {
+          "name": "2026-08-13-stable-is-live.md",
+          "created_at": "2026-08-13T05:39:25+09:30",
+          "commit": "70564d1c7c7a14a7442ccd55293176bc5500fbf7",
+          "sha256": "cba58bb99e804e16517312669d6b42f81d7297e95ab4f9c35b48355d49321860"
+        },
+        {
+          "name": "2026-08-13-bounded-map-hydration.md",
+          "created_at": "2026-08-13T04:46:02+09:30",
+          "commit": "c499748f4f86bcfcf4cffd3874c1c6ab5559de3b",
+          "sha256": "71b568a08191e529112ee580dee500aa176186779cf4b7621798f3c1746f7038"
+        },
+        {
+          "name": "2026-08-13-online-release-preflight.md",
+          "created_at": "2026-08-13T04:33:36+09:30",
+          "commit": "c5f8ab82a261dc240c800513d8cefa2b1c8e7d87",
+          "sha256": "91128578e651bab2ec98ddc5e9cc3110747f2833297df350724cc6b6d02605c3"
+        },
+        {
+          "name": "2026-08-13-stable-map-media.md",
+          "created_at": "2026-08-13T04:16:36+09:30",
+          "commit": "a81ab57df435b16e593aeeec7e2da1e1cd867e5d",
+          "sha256": "4c8a460aa60f35728ba1e29144a2953bd93ff2121111c663a393ce688b9f0c00"
+        },
+        {
+          "name": "2026-08-13-stable-screenshots.md",
+          "created_at": "2026-08-13T03:36:56+09:30",
+          "commit": "285bfb8ca3211a7e20264ffb728f6f7836bf0e75",
+          "sha256": "76c09d84c00f362cdb89bb14b2c1fa0fa91f4f999ca25d1b0ecf44b5a8056d04"
+        },
+        {
+          "name": "2026-08-13-stable-social-state.md",
+          "created_at": "2026-08-13T01:58:29+09:30",
+          "commit": "76dbe6bbecd5daafe5d523bc4aca5fb24dd9a7fa",
+          "sha256": "c0b3591b947b0e8d0fbbbf71e52bd0eb81691f830cd73d639325685693d6950c"
+        },
+        {
+          "name": "2026-08-13-stable-scoring-and-bn-status.md",
+          "created_at": "2026-08-13T00:55:59+09:30",
+          "commit": "372c3217bf7a2fd891156109147fbf88f58239bd",
+          "sha256": "ea069ba1dd67e9c963253d62601c074c4bf45161fc478dc35b432a3f3c2c7bdc"
+        },
+        {
+          "name": "2026-08-13-stable-backups-and-map-cache.md",
+          "created_at": "2026-08-13T00:17:24+09:30",
+          "commit": "2ad0991afb0ec0211a12e662a54035adc343c4c1",
+          "sha256": "a36dbc2522e71bc3cbdbee0ae746f6d9bc93b3e676ad61f700ea9e5c41944870"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "version": "2026.812.0",
+      "created_at": "2026-08-12T23:48:02+09:30",
+      "updates": [
+        {
+          "name": "2026-08-12-weighted-plays-and-mods.md",
+          "created_at": "2026-08-12T23:48:02+09:30",
+          "commit": "4a1fb9eda0127fa6a9d96fbbc57db70c224db305",
+          "sha256": "3f9d4ad0135149a52e39fc2b0014ddcf85022d2832385f55733b09b5a63c6a51"
+        },
+        {
+          "name": "2026-08-12-slash-np-and-profile-plays.md",
+          "created_at": "2026-08-12T23:22:40+09:30",
+          "commit": "106dcb4120f754092fa5fdc32dcc50dd07ee34c5",
+          "sha256": "4f001011fa70e54307ae1c9eb99c7ee0d7977c761b04350621b2587b6608d337"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "version": "2026.811.0",
+      "created_at": "2026-08-11T19:36:33+09:30",
+      "updates": [
+        {
+          "name": "2026-08-11-stable-staff-and-operations.md",
+          "created_at": "2026-08-11T19:36:33+09:30",
+          "commit": "bcc7aeb12439ffacc7e425a44e6c449df0dcf38d",
+          "sha256": "9add66234b936cfaa3f104f90c9b4ea53f7f1c89e196a1232e4a9a1c337f45c3"
+        },
+        {
+          "name": "2026-08-11-split-score-pages.md",
+          "created_at": "2026-08-11T18:01:01+09:30",
+          "commit": "831af913b5d05b540340c9c2913c85bd8a5d75cf",
+          "sha256": "39f5d3260ad19c3570640517ffba9129a18233807534493870779ddc84154d0f"
+        },
+        {
+          "name": "2026-08-11-connected-player-pages.md",
+          "created_at": "2026-08-11T16:44:24+09:30",
+          "commit": "db2c6830595694cbc9612005585a9025cfc48117",
+          "sha256": "c658bab5cede152681a795c7d35bda267043d7b84a3e3ad856b4a8e51ebd2724"
+        },
+        {
+          "name": "2026-08-11-stable-map-ranking.md",
+          "created_at": "2026-08-11T16:15:35+09:30",
+          "commit": "64c5c9b571642f3d919aaeddeef9d7c759e38183",
+          "sha256": "b9ee336f26be7225875a18e682b36b3fd24c81f2ed107b706560b330519246de"
+        },
+        {
+          "name": "2026-08-11-stable-chat-and-moderation.md",
+          "created_at": "2026-08-11T15:26:08+09:30",
+          "commit": "a532f1d30bc033e81501d1e37ce2311921827b16",
+          "sha256": "d0d6e4cc0ce2cb6c9cce120a30271013c8513d2f6b36c2415cdd59d5fec95c5d"
+        },
+        {
+          "name": "2026-08-11-postgres-runtime-cutover.md",
+          "created_at": "2026-08-11T14:47:37+09:30",
+          "commit": "c309a9e3b2d8928dab87a8b3455be6df60c89f91",
+          "sha256": "c6a4da63c7facf9156f4c73d45c01fbfaee3ccbd505aa5a42bca300e1b44f3c6"
+        },
+        {
+          "name": "2026-08-11-postgres-migration-foundation.md",
+          "created_at": "2026-08-11T14:09:01+09:30",
+          "commit": "088c5d7338d0a16805d758db953b70316108964c",
+          "sha256": "ecf22144ae23ef1dc53f38e4ce354d9dba6181a9bf977cd02b1194128b85bc5f"
+        },
+        {
+          "name": "2026-08-11-stable-hwid-and-kai-colour.md",
+          "created_at": "2026-08-11T13:30:49+09:30",
+          "commit": "9597244b6b3f36ae99ae4529909d8ae75dc458c5",
+          "sha256": "36f7f61a0a3a20d834d2278a97283887c65906f2064548f669dc9f328baa5cd5"
+        },
+        {
+          "name": "2026-08-11-stable-lobby-channels.md",
+          "created_at": "2026-08-11T12:49:52+09:30",
+          "commit": "75af8e7568e3cb6ec5a695e1da108d96b3cacb40",
+          "sha256": "743e847d6177a08d9810a0dbefe26121d8a3c16b96c249c166975a9846dc4162"
+        },
+        {
+          "name": "2026-08-11-stable-spectating.md",
+          "created_at": "2026-08-11T12:24:40+09:30",
+          "commit": "43c69196eecca0af5ed981457a316afc68c18e26",
+          "sha256": "45574edcc8f759f5980e6ddc237a0e97ffbece485dd727409a32728af769b8ab"
+        },
+        {
+          "name": "2026-08-11-stable-referees-and-abort.md",
+          "created_at": "2026-08-11T11:59:19+09:30",
+          "commit": "27bf6ed9913768b9b3a8d8952f9b63243d7aa06f",
+          "sha256": "11fb5bd7a98d67567bc43dbd34e802095ae1d3ffde870eda0c80e6fc73c9390f"
+        },
+        {
+          "name": "2026-08-11-stable-invites-and-tourney.md",
+          "created_at": "2026-08-11T11:43:19+09:30",
+          "commit": "7093a8611885467b4159e1d1685548bff50eb403",
+          "sha256": "fee2cab9285e134f1761cd3ee31e9fb8af8b85037b4e3cde450ff93739076a26"
+        },
+        {
+          "name": "2026-08-11-stable-match-play.md",
+          "created_at": "2026-08-11T11:26:17+09:30",
+          "commit": "2afe0d68c99bd041fef19d3773132d255960054b",
+          "sha256": "38f460180fe2a5c3bc8c7c439b17230d3ddd803272923f78db1694a2369547a2"
+        },
+        {
+          "name": "2026-08-11-stable-registration-check.md",
+          "created_at": "2026-08-11T11:03:22+09:30",
+          "commit": "36ae6042c551bf8aa3f9508686d769b2eb5152fa",
+          "sha256": "6c2b6e47bdd444bc461c9ae6dc9a54d3be7e30e45104b4cffe2b4f451ae4791a"
+        },
+        {
+          "name": "2026-08-11-stable-multiplayer-rooms.md",
+          "created_at": "2026-08-11T10:51:20+09:30",
+          "commit": "2fba854fc1e1d3de9f0c7fbedcf7c379596f81d4",
+          "sha256": "d9830eace513800706e4e2a0d18155fe07466e559930c151aa2ba44fb2344092"
+        },
+        {
+          "name": "2026-08-11-hostile-score-input.md",
+          "created_at": "2026-08-11T10:25:03+09:30",
+          "commit": "2237d5426f38c73abda52bf8ab8a88b91658b5b9",
+          "sha256": "a40a17cfcb7d97385d2ff63e342eb2a81ce5579b63c4d895799982be01b41a1d"
+        },
+        {
+          "name": "2026-08-11-auth-locks-and-score-tokens.md",
+          "created_at": "2026-08-11T10:05:55+09:30",
+          "commit": "469461b82da22261239dff07c14d18f06a0e460f",
+          "sha256": "a057e65a157aad6489fd992794ae8eac9f84211f88a5e437a52c432897e4160a"
+        },
+        {
+          "name": "2026-08-11-session-cleanup.md",
+          "created_at": "2026-08-11T09:39:27+09:30",
+          "commit": "e7c2382deb8bc713090e881706af9fad7204bdd1",
+          "sha256": "1df6f00db443e17373d18d166a9abef4866985b5de9b9042add3fc6c64e11a85"
+        },
+        {
+          "name": "2026-08-11-p0-lifetime-fixes.md",
+          "created_at": "2026-08-11T09:26:32+09:30",
+          "commit": "14583014581fb9ed4103b24a81d61c66f9ceeeee",
+          "sha256": "a8d92fd0be10538b2804fe34d2426d2e5818eae17ffc34274e4cc3a4b5e4d247"
+        },
+        {
+          "name": "2026-08-11-old-map-hydration.md",
+          "created_at": "2026-08-11T06:57:18+09:30",
+          "commit": "6b9d07ca2a6a28f837920615b347ead3f16d177f",
+          "sha256": "0829b5af571cfcc68a421cb8311679237a30aa0d31e7b1fabc4a57ff61521cb0"
+        },
+        {
+          "name": "2026-08-11-akatsuki-pp-and-recalc.md",
+          "created_at": "2026-08-11T00:03:24+09:30",
+          "commit": "931907e50a33204ab566be4e6e5fd8c9d6dfa39e",
+          "sha256": "f0a6772a08debab9796d10407791ec552289aa6a7717930b0aa1cf736f47257a"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "version": "2026.810.0",
+      "created_at": "2026-08-10T06:33:02+09:30",
+      "updates": [
+        {
+          "name": "2026-08-10-relax-autopilot-pp-leaderboard.md",
+          "created_at": "2026-08-10T06:33:02+09:30",
+          "commit": "ce944ce389c0f017ca674195a90cd887d4c93562",
+          "sha256": "29a56d0682b6fd27c5c97fdd7efc31e966217d4b2aa3a3a305251ead4f36f797"
+        },
+        {
+          "name": "2026-08-10-async-score-submit.md",
+          "created_at": "2026-08-10T05:45:49+09:30",
+          "commit": "c4e7f47619643678746a6541255afdd0a9ecbe6e",
+          "sha256": "c385696560522d545c1416f7b35f4ade1219eeeddcfcdc4bca3c0f2c4d53ccb9"
+        },
+        {
+          "name": "2026-08-10-instant-maps.md",
+          "created_at": "2026-08-10T03:50:57+09:30",
+          "commit": "4ef5c1d666806649ee5d914fdac7984655796655",
+          "sha256": "4e23b4dbc8f317e164977a422f656aa73d1ad198ee1046424d82895415f84fdd"
+        },
+        {
+          "name": "2026-08-10-mirror-and-webhook-fixes.md",
+          "created_at": "2026-08-10T03:39:58+09:30",
+          "commit": "96a3566a3496820e8193a31299f26d86db550c81",
+          "sha256": "48082fcdf1ce571130965a499e1571ae178e40fa4c37ebeffd1f80603aba4010"
+        },
+        {
+          "name": "2026-08-10-bot-commands.md",
+          "created_at": "2026-08-10T03:39:58+09:30",
+          "commit": "96a3566a3496820e8193a31299f26d86db550c81",
+          "sha256": "5299c74d8702edb266d94d40189be1104052e97fe599e24506b535b62a03fae8"
+        },
+        {
+          "name": "2026-08-10-async-hydration.md",
+          "created_at": "2026-08-10T03:39:58+09:30",
+          "commit": "96a3566a3496820e8193a31299f26d86db550c81",
+          "sha256": "600d0fec1729f83183ad3c98553a85ce450d7e5fde8c3aff5df46caf8d8f3102"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "version": "2026.809.0",
+      "created_at": "2026-08-09T20:16:04+09:30",
+      "updates": [
+        {
+          "name": "2026-08-09-webhook-details.md",
+          "created_at": "2026-08-09T20:16:04+09:30",
+          "commit": "44102190c65ea83a120d78613c23c90980b1b5e3",
+          "sha256": "17b5c3d95f3740293c487596c0b1b1d8ff445c867bed11df431e5b7d01c6fefe"
+        },
+        {
+          "name": "2026-08-09-mirror-swap.md",
+          "created_at": "2026-08-09T19:25:46+09:30",
+          "commit": "dbc319cb359bf9d0d3b2b77f8d3651a9a24ee1f6",
+          "sha256": "a1e7ed2affb7adf83f45935042268ed621bfdef1c0376db3f2a9883ae318a140"
+        },
+        {
+          "name": "2026-08-09-score-checksum-username.md",
+          "created_at": "2026-08-09T18:02:28+09:30",
+          "commit": "d25d303c57fcbe71daac94d4f98f39d271a517b6",
+          "sha256": "5868808db19ac8b15566a40286cb8e09121402df618698d858c3874b45aa3bdc"
+        },
+        {
+          "name": "2026-08-09-leaderboard-timestamp.md",
+          "created_at": "2026-08-09T18:02:28+09:30",
+          "commit": "d25d303c57fcbe71daac94d4f98f39d271a517b6",
+          "sha256": "4537f91f57965b058eac43faaddd42c6ebced0361cc5727aa812acaaee97f432"
+        },
+        {
+          "name": "2026-08-09-default-anime-avatars.md",
+          "created_at": "2026-08-09T14:06:51+09:30",
+          "commit": "8d325d478e8f6b43d64b793085e6fcbe2b6aaecb",
+          "sha256": "42a15a669c74a30f9ca0f7daa44ebb25feb389b046b44ec130a25b089856e00f"
+        },
+        {
+          "name": "2026-08-09-chat-countries-and-kai.md",
+          "created_at": "2026-08-09T13:50:56+09:30",
+          "commit": "9b3abdb68ccbb1febc4abc6d75e4060ea020d6f9",
+          "sha256": "02ae32cd603532d9a0e0888b64f7786b8d2be3569c6a43e232a9d407adb2c1f3"
+        },
+        {
+          "name": "2026-08-09-remove-stale-handoff.md",
+          "created_at": "2026-08-09T12:47:47+09:30",
+          "commit": "df469e7ca1ad4c20f69598ef9beffe0ce42452d5",
+          "sha256": "eed31ef8d4c0d8888d20031ec9b3d0ce9955800ea3ce9b4b3470340bb10e56d5"
+        },
+        {
+          "name": "2026-08-09-empty-failed-replays.md",
+          "created_at": "2026-08-09T12:46:16+09:30",
+          "commit": "d3f69b68bc5f609486c198365b681ac77d154bc1",
+          "sha256": "91b1364717cd135bcd4963dd8f6726700c89c5b062daa31b6cd480508e5f90c9"
+        },
+        {
+          "name": "2026-08-09-score-rejection-logs.md",
+          "created_at": "2026-08-09T12:04:54+09:30",
+          "commit": "7643094627be3fc029ce0986ddfcd9cbdbe65d9d",
+          "sha256": "eab5ce584a13d2a5841a252a81bc5eab216318fbca873a21a9f06aeff062c062"
+        },
+        {
+          "name": "2026-08-09-clean-pause.md",
+          "created_at": "2026-08-09T11:59:51+09:30",
+          "commit": "8c1653c51c0d47b8981d477b4d22dd2b2801d213",
+          "sha256": "6a4c9901d266b67ed576746a751613e0b179883d91241787ee3b95371bfb0de1"
+        },
+        {
+          "name": "2026-08-09-stable-maps-and-chat.md",
+          "created_at": "2026-08-09T11:56:33+09:30",
+          "commit": "49ab8d9fd05ac0dabc7381cbde8dd2b26bf0af9b",
+          "sha256": "69cf148e0c0b6e2c88e65ab903fc08a048ceb9b79c9a3da5fb272b40af6e3182"
+        },
+        {
+          "name": "2026-08-09-real-client-registration.md",
+          "created_at": "2026-08-09T11:26:44+09:30",
+          "commit": "301ec6fc70cf920d0811522c9ef42e32f8034fde",
+          "sha256": "cc855f641087490d9512c7099961cff2bd211161acc5c2831697dff3e34df484"
+        },
+        {
+          "name": "2026-08-09-real-lazer-multipart.md",
+          "created_at": "2026-08-09T11:17:56+09:30",
+          "commit": "47646c888c70fb1c144013c79431cd70237bbb19",
+          "sha256": "88ee2875429b135f2bcf7cb87dbe5247ca490a97991ee76165cecb35e3db60d7"
+        },
+        {
+          "name": "2026-08-09-lazer-password-edge.md",
+          "created_at": "2026-08-09T11:07:05+09:30",
+          "commit": "00394bf94df1438906da7942ba8ee7500c92fd99",
+          "sha256": "d69077879530684b078b43bd38060ff7cf284bf1b94ff91e24adcbc552b24d6f"
+        },
+        {
+          "name": "2026-08-09-real-lazer-account-contract.md",
+          "created_at": "2026-08-09T10:53:29+09:30",
+          "commit": "0f0fe142ab72c90ef6e698ee69057c0f0c619e43",
+          "sha256": "ca0de1c66d16df671f3fd039e732873e65a8e2bb79f44d16af4a746e95cc0456"
+        },
+        {
+          "name": "2026-08-09-discovery-downloads-and-hosts.md",
+          "created_at": "2026-08-09T10:14:45+09:30",
+          "commit": "793809dcfc7fba500abbd27f3a73277652fe1531",
+          "sha256": "d4b5e6d3ce90b9a4c7ae6a1c126a475a89fa5bca6a657c222b6d7f86a575962a"
+        },
+        {
+          "name": "2026-08-09-linux-release-build.md",
+          "created_at": "2026-08-09T09:43:12+09:30",
+          "commit": "662c1f9664a1904f04e1bd3d012b4888108332f5",
+          "sha256": "5814984ca5c3f19a3b367bbf2c1a9cfcd71c2ee49a78e57f435559185d922c51"
+        },
+        {
+          "name": "2026-08-09-beatmaps-and-pp.md",
+          "created_at": "2026-08-09T09:32:46+09:30",
+          "commit": "f882d06dfda02bb72706a221c149914f51b49245",
+          "sha256": "a06bc819ad137d16385b066ce874d7cd632e6a7533bbb6585822bfed5650a28e"
+        }
+      ]
+    }
+  ]
+}

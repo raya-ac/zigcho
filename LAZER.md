@@ -2,11 +2,11 @@
 
 the client is pinned to osu `12df2e4ff254975f4b66ae9efda808837ee9beea`. completion means that exact client can sign in, stay online, use every normal player surface, play and submit, download its replay, use rooms and spectating, then recover from a server restart without falling back to osu or offline mode.
 
-there are 81 request targets in the pinned player client. the three beatmap submission requests now run through our own lazer-only BSS. uploading needs premium, sets stay mapper-owned, and pending packages go into the same BN queue as everything else. installers and distribution signing are not requirements. GitHub runners build the same patch for Windows, macOS, Linux, Android and iOS.
+there are 86 mapped request targets in the pinned player client, with no missing or placeholder entries. the three beatmap submission requests run through our own lazer-only BSS. uploading needs premium, sets stay mapper-owned, and pending packages go into the same BN queue as everything else. installers and distribution signing are not requirements. GitHub runners build the same patch for Windows, macOS, Linux, Android and iOS.
 
 ## closure matrix
 
-| slice | required player path | current proof | left before complete |
+| slice | required player path | current proof | next real-player check |
 |---|---|---|---|
 | account and sessions | registration, oauth, `/me`, logout, expiry, one game session across Stable and lazer | rotating one-use refresh tokens, PostgreSQL tests, owned token tests, cross-client takeover tests | one packaged-client restart/reconnect run |
 | online state | local player online, kai online as id 3, activity, bot DMs, notification socket | presence, bot and websocket contract tests | packaged-client visual check |
@@ -37,8 +37,8 @@ there are 81 request targets in the pinned player client. the three beatmap subm
 - realtime: presence, notification websocket, multiplayer SignalR and spectator SignalR
 - BSS: premium-gated id reservation, full package upload, incremental patching and BN queue handoff
 
-## current open work
+## after this release
 
-1. exercise the packaged client against production for each visual row above and fix anything it exposes.
-2. remove the alpha wording only when those checks are green.
-3. commit, push, deploy once, verify the public hosts, then post one final changelog.
+there is no installer or signing todo. the five portable GitHub packages are the alpha.14 release boundary. any real-player bug after that reopens its exact row above; it does not hold this release behind an installer we do not want.
+
+changelog and news content comes from the bounded raw GitHub feed in `updates/changelog.json`. the server keeps the complete checked-in history as its no-network fallback and caches the last valid remote copy. adding a Markdown entry and updating that manifest on main does not rebuild the server or any client.

@@ -89,9 +89,9 @@ runuser --user postgres -- env \
   ZIGCHO_POSTGRES_ADMIN_URL="dbname=postgres host=/var/run/postgresql connect_timeout=5" \
   ZIGCHO_EXPECTED_SCHEMA="$current_schema" \
   "$candidate/tools/restore-postgres-drill.sh" "$backup"
-runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check
 systemctl stop "$service"
 service_stopped=yes
+runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check
 recalculated=no
 if [ "$candidate_pp" != "$previous_pp" ] || [ "$current_schema" -lt 29 ]; then
   runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" recalc

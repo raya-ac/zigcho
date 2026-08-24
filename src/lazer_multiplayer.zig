@@ -1,15 +1,24 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const lazer = @import("lazer.zig");
 const storage = @import("runtime_storage.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 
 pub const max_rooms = 64;
+const max_pending_archives = max_rooms * 2;
+
+fn publicCountry(user: domain.User) [2]u8 {
+    return if (user.show_country) user.country else .{ 'X', 'X' };
+}
 pub const Activity = enum { lobby, queue, multiplayer, playing };
 pub const max_connections = 128;
 pub const max_users = 16;
 pub const max_playlist = 32;
 pub const max_matchmaking_maps = 16;
-pub const max_room_scores = 128;
+// A playlist room may accept up to 1,000 attempts from each of its 16 users.
+// Keep that whole supported contract available for the eventual archive rather
+// than silently rotating older attempts out of the room history.
+pub const max_room_scores = max_users * 1000;
 pub const max_room_participants = 128;
 pub const matchmaking_rounds = 3;
 const ranked_player_count = 2;
@@ -17,7 +26,10 @@ const ranked_hand_size = 5;
 const max_ranked_cards = max_playlist * ranked_player_count;
 const max_hub_message = 60 * 1024;
 const ranked_pick_seconds: i64 = 30;
+const pending_match_timeout_seconds: i64 = 30;
+const multiplayer_score_grace_seconds: i64 = 5 * 60;
 const timespan_ticks_per_millisecond: i64 = 10_000;
+const timespan_ticks_per_second: i64 = std.time.ms_per_s * timespan_ticks_per_millisecond;
 
 const matchmaking_stage = struct {
     const waiting_for_clients_join: u8 = 0;
@@ -70,9 +82,151 @@ pub fn roomListFilter(requester_id: i32, mode: []const u8, status: ?[]const u8, 
 }
 
 fn archiveIncludesUser(allocator: std.mem.Allocator, participant_ids_json: []const u8, user_id: i32) bool {
-    const parsed = std.json.parseFromSlice([]i32, allocator, participant_ids_json, .{}) catch return false;
+    return archiveIncludesUserFallible(allocator, participant_ids_json, user_id) catch false;
+}
+
+fn archiveIncludesUserFallible(allocator: std.mem.Allocator, participant_ids_json: []const u8, user_id: i32) !bool {
+    const parsed = try std.json.parseFromSlice([]i32, allocator, participant_ids_json, .{});
     defer parsed.deinit();
     return std.mem.indexOfScalar(i32, parsed.value, user_id) != null;
+}
+
+fn jsonInteger(value: ?std.json.Value) ?i64 {
+    return switch (value orelse return null) {
+        .integer => |integer| integer,
+        else => null,
+    };
+}
+
+fn jsonFloat(value: ?std.json.Value) ?f64 {
+    return switch (value orelse return null) {
+        .float => |number| number,
+        .integer => |integer| @floatFromInt(integer),
+        else => null,
+    };
+}
+
+fn archivedScoreRecord(value: std.json.Value) ?RoomScoreRecord {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const score_id = jsonInteger(object.get("score_id")) orelse return null;
+    const user_id = jsonInteger(object.get("user_id")) orelse return null;
+    const playlist_item_id = jsonInteger(object.get("playlist_item_id")) orelse return null;
+    const total_score = jsonInteger(object.get("total_score")) orelse return null;
+    const max_combo = jsonInteger(object.get("max_combo")) orelse return null;
+    const passed = switch (object.get("passed") orelse return null) {
+        .bool => |flag| flag,
+        else => return null,
+    };
+    if (score_id <= 0 or user_id <= 0 or user_id > std.math.maxInt(i32) or playlist_item_id <= 0 or max_combo < 0 or max_combo > std.math.maxInt(i32)) return null;
+    return .{
+        .score_id = score_id,
+        .user_id = @intCast(user_id),
+        .playlist_item_id = playlist_item_id,
+        .total_score = total_score,
+        .accuracy = jsonFloat(object.get("accuracy")) orelse return null,
+        .max_combo = @intCast(max_combo),
+        .passed = passed,
+    };
+}
+
+fn archivedScoreTokenRecord(value: std.json.Value) ?RoomScoreTokenRecord {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const token_id = jsonInteger(object.get("token_id")) orelse return null;
+    const user_id = jsonInteger(object.get("user_id")) orelse return null;
+    const playlist_item_id = jsonInteger(object.get("playlist_item_id")) orelse return null;
+    const score_id: ?i64 = if (object.get("score_id")) |score_value| switch (score_value) {
+        .null => null,
+        .integer => |id| if (id > 0) id else return null,
+        else => return null,
+    } else null;
+    if (token_id <= 0 or user_id <= 0 or user_id > std.math.maxInt(i32) or playlist_item_id <= 0) return null;
+    return .{ .token_id = token_id, .user_id = @intCast(user_id), .playlist_item_id = playlist_item_id, .score_id = score_id };
+}
+
+fn archivedScoreContext(allocator: std.mem.Allocator, room_json: []const u8, playlist_item_id: i64) !?RoomScoreContext {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, room_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const playlist = switch (root.get("playlist") orelse return null) {
+        .array => |array| array,
+        else => return null,
+    };
+    for (playlist.items) |value| {
+        const item = switch (value) {
+            .object => |object| object,
+            else => continue,
+        };
+        if ((jsonInteger(item.get("id")) orelse continue) != playlist_item_id) continue;
+        const beatmap_id = jsonInteger(item.get("beatmap_id")) orelse continue;
+        const ruleset_id = jsonInteger(item.get("ruleset_id")) orelse continue;
+        if (beatmap_id <= 0 or beatmap_id > std.math.maxInt(i32) or ruleset_id < 0 or ruleset_id > 3) return null;
+        return .{ .beatmap_id = @intCast(beatmap_id), .ruleset_id = @intCast(ruleset_id) };
+    }
+    return null;
+}
+
+fn archivedScoreTokenBound(allocator: std.mem.Allocator, room_json: []const u8, token_id: i64, user_id: i32, playlist_item_id: i64) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, room_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidMultiplayerArchive,
+    };
+    const values = switch (root.get("zigcho_score_tokens") orelse return false) {
+        .array => |array| array,
+        else => return error.InvalidMultiplayerArchive,
+    };
+    if (values.items.len > max_room_scores) return error.InvalidMultiplayerArchive;
+    var matched: ?bool = null;
+    for (values.items) |value| {
+        const token = archivedScoreTokenRecord(value) orelse return error.InvalidMultiplayerArchive;
+        if (token.token_id != token_id) continue;
+        if (matched != null) return error.InvalidMultiplayerArchive;
+        matched = token.user_id == user_id and token.playlist_item_id == playlist_item_id;
+    }
+    return matched orelse false;
+}
+
+fn archivedRoomRealtime(allocator: std.mem.Allocator, room_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, room_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidMultiplayerArchive,
+    };
+    const category = switch (root.get("category") orelse return error.InvalidMultiplayerArchive) {
+        .string => |value| value,
+        else => return error.InvalidMultiplayerArchive,
+    };
+    if (std.mem.eql(u8, category, "realtime")) return true;
+    if (std.mem.eql(u8, category, "normal")) return false;
+    return error.InvalidMultiplayerArchive;
+}
+
+fn archivedScores(allocator: std.mem.Allocator, room_json: []const u8, playlist_item_id: i64, visitor: anytype) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, room_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const records = switch (root.get("zigcho_score_records") orelse return) {
+        .array => |array| array,
+        else => return,
+    };
+    for (records.items) |value| {
+        const score = archivedScoreRecord(value) orelse continue;
+        if (score.playlist_item_id == playlist_item_id) try visitor.visit(score);
+    }
 }
 
 pub fn parseRoomUserPath(path: []const u8) ?RoomUserPath {
@@ -123,11 +277,19 @@ pub const RoomScoreContext = struct {
 };
 
 pub const RoomScoreResult = struct {
+    token_id: ?i64 = null,
     score_id: i64,
     total_score: i64,
     accuracy: f64,
     max_combo: i32,
     passed: bool,
+};
+
+const RoomScoreTokenRecord = struct {
+    token_id: i64,
+    user_id: i32,
+    playlist_item_id: i64,
+    score_id: ?i64 = null,
 };
 
 const RoomScoreRecord = struct {
@@ -139,6 +301,70 @@ const RoomScoreRecord = struct {
     max_combo: i32,
     passed: bool,
 };
+
+pub const room_score_around_limit = 10;
+
+pub const RoomScoreRanking = struct {
+    position: usize,
+    higher_ids: [room_score_around_limit]i64 = [_]i64{0} ** room_score_around_limit,
+    higher_count: usize = 0,
+    lower_ids: [room_score_around_limit]i64 = [_]i64{0} ** room_score_around_limit,
+    lower_count: usize = 0,
+};
+
+const RoomPersistence = enum { none, archive, checkpoint };
+
+fn scoreRanksBefore(left: RoomScoreRecord, right: RoomScoreRecord) bool {
+    if (left.total_score != right.total_score) return left.total_score > right.total_score;
+    return left.score_id < right.score_id;
+}
+
+fn sortRoomScores(scores: []RoomScoreRecord) void {
+    std.mem.sort(RoomScoreRecord, scores, {}, struct {
+        fn lessThan(_: void, left: RoomScoreRecord, right: RoomScoreRecord) bool {
+            return scoreRanksBefore(left, right);
+        }
+    }.lessThan);
+}
+
+fn scoreEligibleForHighScore(score: RoomScoreRecord, realtime: bool) bool {
+    // osu-web only promotes passing playlist scores, while realtime rooms also
+    // retain failed results. A zero score never creates a high-score row.
+    return score.total_score > 0 and (realtime or score.passed);
+}
+
+fn considerHighScore(allocator: std.mem.Allocator, high_scores: *std.ArrayList(RoomScoreRecord), score: RoomScoreRecord, realtime: bool) !void {
+    if (!scoreEligibleForHighScore(score, realtime)) return;
+    for (high_scores.items) |*existing| if (existing.user_id == score.user_id) {
+        if (scoreRanksBefore(score, existing.*)) existing.* = score;
+        return;
+    };
+    try high_scores.append(allocator, score);
+}
+
+fn rankingForScore(exact: RoomScoreRecord, high_scores: []const RoomScoreRecord) RoomScoreRanking {
+    var ranking: RoomScoreRanking = .{ .position = 1 };
+    for (high_scores) |score| ranking.position += @intFromBool(scoreRanksBefore(score, exact));
+
+    // Official scoresAround excludes the exact score's user. Higher scores are
+    // returned nearest-first in score_asc order; lower scores are nearest-first
+    // in the normal score_desc order.
+    var index = high_scores.len;
+    while (index != 0 and ranking.higher_count < room_score_around_limit) {
+        index -= 1;
+        const score = high_scores[index];
+        if (score.user_id == exact.user_id or !scoreRanksBefore(score, exact)) continue;
+        ranking.higher_ids[ranking.higher_count] = score.score_id;
+        ranking.higher_count += 1;
+    }
+    for (high_scores) |score| {
+        if (ranking.lower_count == room_score_around_limit) break;
+        if (score.user_id == exact.user_id or !scoreRanksBefore(exact, score)) continue;
+        ranking.lower_ids[ranking.lower_count] = score.score_id;
+        ranking.lower_count += 1;
+    }
+    return ranking;
+}
 
 fn FixedRaw(comptime capacity: usize) type {
     return struct {
@@ -331,6 +557,18 @@ pub const MessagePackReader = struct {
     }
 };
 
+fn checkedInteger(comptime T: type, value: i64) !T {
+    return std.math.cast(T, value) orelse error.InvalidMultiplayerArguments;
+}
+
+fn checkedReaderInteger(comptime T: type, reader: *MessagePackReader) !T {
+    return checkedInteger(T, try reader.integer());
+}
+
+fn checkedNullableInteger(comptime T: type, value: ?i64) !?T {
+    return if (value) |integer| try checkedInteger(T, integer) else null;
+}
+
 pub const MessagePackWriter = struct {
     writer: *std.Io.Writer,
 
@@ -442,6 +680,7 @@ const RoomUser = struct {
     beatmap_id: ?i32 = null,
     voted_skip: bool = false,
     role: u8 = 0,
+    team_id: ?i32 = null,
 };
 
 const RoomParticipant = struct {
@@ -534,11 +773,19 @@ const RankedPlayState = struct {
     gameplay_item: i64 = 0,
     round_winner_id: ?i32 = null,
     pick_countdown: ?RankedStageCountdown = null,
+    result_persisted: bool = false,
 
     fn userIndex(self: *const RankedPlayState, user_id: i32) ?usize {
         for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
         return null;
     }
+};
+
+const RankedResultContext = struct {
+    room_id: i64,
+    ruleset_id: u8,
+    winner_id: i32,
+    loser_id: i32,
 };
 
 const RankedStageCountdown = struct {
@@ -549,6 +796,20 @@ const RankedStageCountdown = struct {
     fn remainingTicks(self: RankedStageCountdown, now_ms: i64) i64 {
         return @max(0, self.deadline_ms - now_ms) * timespan_ticks_per_millisecond;
     }
+};
+
+const MatchStartCountdownState = struct {
+    id: i32,
+    deadline_ms: i64,
+
+    fn remainingTicks(self: MatchStartCountdownState, now_ms: i64) i64 {
+        return @max(0, self.deadline_ms - now_ms) * timespan_ticks_per_millisecond;
+    }
+};
+
+const PlaylistAdvance = struct {
+    expired: ?PlaylistItem = null,
+    next_item_id: ?i64 = null,
 };
 
 const Settings = struct {
@@ -566,6 +827,11 @@ const Room = struct {
     id: i64,
     state: u8 = 0,
     settings: Settings,
+    starts_at: i64 = 0,
+    ends_at: i64 = 0,
+    max_attempts: ?i32 = null,
+    locked: bool = false,
+    match_start_countdown: ?MatchStartCountdownState = null,
     users: [max_users]?RoomUser = [_]?RoomUser{null} ** max_users,
     user_count: usize = 0,
     host_id: i32,
@@ -573,17 +839,28 @@ const Room = struct {
     host_country: [2]u8 = .{ 'X', 'X' },
     playlist: [max_playlist]?PlaylistItem = [_]?PlaylistItem{null} ** max_playlist,
     playlist_count: usize = 0,
-    channel_id: i32 = 4,
+    channel_id: i32 = 0,
     matchmaking: ?MatchmakingState = null,
     ranked_play: ?RankedPlayState = null,
     allowed_users: [max_users]i32 = [_]i32{0} ** max_users,
     allowed_user_count: usize = 0,
-    scores: [max_room_scores]?RoomScoreRecord = [_]?RoomScoreRecord{null} ** max_room_scores,
-    score_count: usize = 0,
-    score_cursor: usize = 0,
+    score_tokens: std.ArrayList(RoomScoreTokenRecord) = .empty,
+    scores: std.ArrayList(RoomScoreRecord) = .empty,
     participants: [max_room_participants]?RoomParticipant = [_]?RoomParticipant{null} ** max_room_participants,
     participant_count: usize = 0,
     ended: bool = false,
+
+    fn deinit(self: *Room, allocator: std.mem.Allocator) void {
+        self.score_tokens.deinit(allocator);
+        self.scores.deinit(allocator);
+    }
+
+    fn scoreTokenIndex(self: *const Room, token_id: i64, user_id: i32, playlist_item_id: i64) ?usize {
+        for (self.score_tokens.items, 0..) |token, index| {
+            if (token.token_id == token_id and token.user_id == user_id and token.playlist_item_id == playlist_item_id) return index;
+        }
+        return null;
+    }
 
     fn userIndex(self: *const Room, user_id: i32) ?usize {
         for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
@@ -651,9 +928,11 @@ pub const Connection = struct {
     queue_pool_id: ?i32 = null,
     pending_match_id: ?u32 = null,
     io: std.Io,
+    invocation_mutex: std.Io.Mutex = .init,
     write_mutex: std.Io.Mutex = .init,
     socket: ?*std.http.Server.WebSocket = null,
-    alive: bool = true,
+    alive: std.atomic.Value(bool) = .init(true),
+    accepting_invocations: std.atomic.Value(bool) = .init(true),
 
     fn retain(self: *Connection) void {
         _ = self.references.fetchAdd(1, .monotonic);
@@ -669,28 +948,47 @@ pub const Connection = struct {
     fn send(self: *Connection, frame: []const u8) void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
-        if (!self.alive) return;
+        if (!self.alive.load(.acquire)) return;
         const socket = self.socket orelse return;
         socket.writeMessage(frame, .binary) catch {
-            self.alive = false;
+            self.accepting_invocations.store(false, .release);
+            self.alive.store(false, .release);
         };
     }
 
     fn close(self: *Connection) void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
-        self.alive = false;
+        self.accepting_invocations.store(false, .release);
+        if (self.alive.load(.acquire)) if (self.socket) |socket| socket.writeMessage("", .connection_close) catch {};
+        self.alive.store(false, .release);
         self.socket = null;
     }
+};
+
+const DisconnectEffects = struct {
+    recipients: [max_connections]*Connection = undefined,
+    recipient_count: usize = 0,
+    left_user: ?RoomUser = null,
+    new_host: ?i32 = null,
+    ranked_ended: bool = false,
+    ranked_room_id: ?i64 = null,
+    ended_room: ?*Room = null,
+    ranked_event: ?[]u8 = null,
+    queue_peer: ?*Connection = null,
+    queue_peer_left: bool = false,
+    queue_pool_id: ?i32 = null,
 };
 
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    archive_mutex: std.Io.Mutex = .init,
     store: ?*storage.Store = null,
     map_sync: ?*beatmap_sync.Sync = null,
     mutex: std.Io.Mutex = .init,
     rooms: [max_rooms]?*Room = [_]?*Room{null} ** max_rooms,
+    pending_archives: [max_pending_archives]?*Room = [_]?*Room{null} ** max_pending_archives,
     connections: std.ArrayList(*Connection) = .empty,
     matchmaking_maps: [4][max_matchmaking_maps]?storage.Store.MatchmakingBeatmap = [_][max_matchmaking_maps]?storage.Store.MatchmakingBeatmap{[_]?storage.Store.MatchmakingBeatmap{null} ** max_matchmaking_maps} ** 4,
     matchmaking_map_counts: [4]usize = [_]usize{0} ** 4,
@@ -698,6 +996,7 @@ pub const Manager = struct {
     next_room_id: i64 = 1,
     next_pending_match_id: u32 = 1,
     next_countdown_id: i32 = 1,
+    shutting_down: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
         return .{ .allocator = allocator, .io = io };
@@ -706,6 +1005,53 @@ pub const Manager = struct {
     pub fn bindStore(self: *Manager, store: *storage.Store) !void {
         self.store = store;
         self.next_room_id = @max(self.next_room_id, try store.nextLazerMultiplayerRoomId());
+        const checkpoints = try store.lazerMultiplayerRoomCheckpoints(self.allocator);
+        defer {
+            for (checkpoints) |*checkpoint| checkpoint.deinit();
+            self.allocator.free(checkpoints);
+        }
+        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
+        for (checkpoints) |checkpoint| {
+            const restored = restoreRoomCheckpoint(self.allocator, checkpoint.room_json, now_seconds) catch |err| {
+                std.log.err("event=lazer_multiplayer_room_restore_failed room_id={d} error={t}", .{ checkpoint.room_id, err });
+                continue;
+            };
+            const room = restored orelse continue;
+            if (room.id != checkpoint.room_id) {
+                room.deinit(self.allocator);
+                self.allocator.destroy(room);
+                std.log.err("event=lazer_multiplayer_room_restore_failed room_id={d} error=id_mismatch", .{checkpoint.room_id});
+                continue;
+            }
+            if (roomHasEnded(room, now_seconds)) {
+                try self.applyRoomCountryVisibility(room);
+                room.ended = true;
+                self.archiveRoom(room);
+                continue;
+            }
+            const slot = self.roomSlotLocked() orelse {
+                room.deinit(self.allocator);
+                self.allocator.destroy(room);
+                return error.MultiplayerRoomLimit;
+            };
+            self.hydrateRoom(room) catch |err| {
+                room.deinit(self.allocator);
+                self.allocator.destroy(room);
+                // Keep the hidden checkpoint intact. A transient database or
+                // beatmap hydration failure must not prevent the server from
+                // starting, and a later restart can retry the same snapshot.
+                std.log.warn("event=lazer_multiplayer_room_restore_hydration_failed room_id={d} error={t}", .{ checkpoint.room_id, err });
+                continue;
+            };
+            try self.applyRoomCountryVisibility(room);
+            store.deleteLazerMultiplayerRoomCheckpoint(room.id) catch |err| {
+                room.deinit(self.allocator);
+                self.allocator.destroy(room);
+                return err;
+            };
+            self.rooms[slot] = room;
+            std.log.info("event=lazer_multiplayer_room_restored room_id={d} participants={d} scores={d}", .{ room.id, room.participant_count, room.scores.items.len });
+        }
     }
 
     pub fn bindBeatmapSync(self: *Manager, sync: *beatmap_sync.Sync) void {
@@ -765,6 +1111,35 @@ pub const Manager = struct {
         try beatmap.put(arena, "hit_length", .{ .integer = info.hit_length });
     }
 
+    fn userCountryVisible(self: *Manager, user_id: i32) !bool {
+        const store = self.store orelse return false;
+        const visibility = (try store.lazerBatchUserVisibility(user_id)) orelse return false;
+        return visibility.show_country;
+    }
+
+    fn applyRoomCountryVisibility(self: *Manager, room: *Room) !void {
+        for (&room.users) |*entry| if (entry.*) |*user| {
+            if (!try self.userCountryVisible(user.id)) user.country = .{ 'X', 'X' };
+            if (user.id == room.host_id) room.host_country = user.country;
+        };
+        for (room.participants[0..room.participant_count]) |*entry| if (entry.*) |*participant| {
+            if (!try self.userCountryVisible(participant.id)) participant.country = .{ 'X', 'X' };
+        };
+    }
+
+    fn sanitizeArchivedApiUser(self: *Manager, arena: std.mem.Allocator, value: *std.json.Value) !void {
+        const object = switch (value.*) {
+            .object => |*object| object,
+            else => return,
+        };
+        const id_value = object.get("id") orelse return;
+        const user_id: i32 = switch (id_value) {
+            .integer => |id| if (id > 0 and id <= std.math.maxInt(i32)) @intCast(id) else return,
+            else => return,
+        };
+        if (!try self.userCountryVisible(user_id)) try object.put(arena, "country_code", .{ .string = "XX" });
+    }
+
     fn writeHydratedArchiveJson(self: *Manager, writer: *std.Io.Writer, room_json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, room_json, .{});
         defer parsed.deinit();
@@ -772,11 +1147,40 @@ pub const Manager = struct {
             .object => |*object| object,
             else => return error.InvalidMultiplayerArchive,
         };
+        if (room.getPtr("host")) |host| try self.sanitizeArchivedApiUser(parsed.arena.allocator(), host);
+        if (room.getPtr("recent_participants")) |participants_value| switch (participants_value.*) {
+            .array => |*participants| for (participants.items) |*participant| try self.sanitizeArchivedApiUser(parsed.arena.allocator(), participant),
+            else => {},
+        };
         if (room.getPtr("playlist")) |playlist_value| switch (playlist_value.*) {
             .array => |*playlist| for (playlist.items) |*item| try self.hydrateArchivedPlaylistItem(parsed.arena.allocator(), item),
             else => {},
         };
         if (room.getPtr("current_playlist_item")) |item| try self.hydrateArchivedPlaylistItem(parsed.arena.allocator(), item);
+        // Room-token bindings are persistence metadata, not part of the public
+        // osu-web room model. Never disclose unused score token identifiers.
+        _ = room.orderedRemove("zigcho_score_tokens");
+        try std.json.Stringify.value(parsed.value, .{}, writer);
+    }
+
+    fn writeSanitizedArchiveLeaderboardJson(self: *Manager, writer: *std.Io.Writer, leaderboard_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, leaderboard_json, .{});
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |*object| object,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        if (root.getPtr("leaderboard")) |leaderboard_value| switch (leaderboard_value.*) {
+            .array => |*entries| for (entries.items) |*entry| switch (entry.*) {
+                .object => |*object| if (object.getPtr("user")) |user| try self.sanitizeArchivedApiUser(parsed.arena.allocator(), user),
+                else => {},
+            },
+            else => {},
+        };
+        if (root.getPtr("user_score")) |score| switch (score.*) {
+            .object => |*object| if (object.getPtr("user")) |user| try self.sanitizeArchivedApiUser(parsed.arena.allocator(), user),
+            else => {},
+        };
         try std.json.Stringify.value(parsed.value, .{}, writer);
     }
 
@@ -811,9 +1215,74 @@ pub const Manager = struct {
     }
 
     pub fn deinit(self: *Manager) void {
-        for (&self.rooms) |*entry| if (entry.*) |room| self.allocator.destroy(room);
+        self.shutdown();
+        for (&self.rooms) |*entry| if (entry.*) |room| {
+            room.deinit(self.allocator);
+            self.allocator.destroy(room);
+        };
+        for (&self.pending_archives) |*entry| if (entry.*) |room| {
+            room.deinit(self.allocator);
+            self.allocator.destroy(room);
+        };
         for (self.connections.items) |connection| connection.release();
         self.connections.deinit(self.allocator);
+    }
+
+    /// Tell the pinned client that this is a planned interruption and archive
+    /// every active room before the process gives up its sockets. This is
+    /// idempotent so both the server shutdown path and deinit may call it.
+    pub fn shutdown(self: *Manager) void {
+        self.archive_mutex.lockUncancelable(self.io);
+        defer self.archive_mutex.unlock(self.io);
+        var connections: [max_connections]*Connection = undefined;
+        var connection_count: usize = 0;
+        var rooms: [max_rooms + max_pending_archives]*Room = undefined;
+        var room_count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        if (self.shutting_down) {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        self.shutting_down = true;
+        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
+        for (self.connections.items) |connection| {
+            if (!connection.alive.load(.acquire) or connection_count == connections.len) continue;
+            connection.room_id = null;
+            connection.lobby_pool_id = null;
+            connection.queue_pool_id = null;
+            connection.pending_match_id = null;
+            connection.retain();
+            connections[connection_count] = connection;
+            connection_count += 1;
+        }
+        for (&self.rooms) |*entry| if (entry.*) |room| {
+            entry.* = null;
+            room.ended = room.settings.match_type != 0 or roomHasEnded(room, now_seconds);
+            rooms[room_count] = room;
+            room_count += 1;
+        };
+        for (&self.pending_archives) |*entry| if (entry.*) |room| {
+            entry.* = null;
+            rooms[room_count] = room;
+            room_count += 1;
+        };
+        self.pending_matches = [_]?PendingMatch{null} ** max_rooms;
+        self.mutex.unlock(self.io);
+
+        const frame = eventNoArgsOwned(self.allocator, "ServerShuttingDown") catch null;
+        defer if (frame) |owned| self.allocator.free(owned);
+        for (connections[0..connection_count]) |connection| {
+            if (frame) |owned| connection.send(owned);
+            connection.close();
+            connection.release();
+        }
+        for (rooms[0..room_count]) |room| {
+            if (room.settings.match_type == 0 and !room.ended)
+                self.checkpointPlaylistRoom(room)
+            else
+                self.archiveRoomUnderGate(room);
+        }
+        std.log.info("event=lazer_multiplayer_shutdown connections={d} rooms={d}", .{ connection_count, room_count });
     }
 
     fn nowMs(self: *const Manager) i64 {
@@ -831,39 +1300,165 @@ pub const Manager = struct {
         return countdown;
     }
 
-    fn archiveRoom(self: *Manager, room: *Room) void {
-        defer self.allocator.destroy(room);
-        room.ended = true;
-        const store = self.store orelse {
-            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error=store_unavailable", .{room.id});
+    fn rankedResultContext(room: *const Room) !?RankedResultContext {
+        const ranked = room.ranked_play orelse return null;
+        if (ranked.stage != ranked_stage.ended or ranked.result_persisted) return null;
+        const winner_id = ranked.winning_user_id orelse return null;
+        var loser_id: ?i32 = null;
+        for (ranked.users) |entry| if (entry) |user| if (user.id != winner_id) {
+            if (loser_id != null) return error.InvalidRankedPlayResult;
+            loser_id = user.id;
+        };
+        const loser = loser_id orelse return error.InvalidRankedPlayResult;
+        const ruleset_id = ruleset: {
+            for (room.playlist) |entry| if (entry) |item| break :ruleset item.ruleset_id;
+            return error.InvalidRankedPlayResult;
+        };
+        return .{ .room_id = room.id, .ruleset_id = ruleset_id, .winner_id = winner_id, .loser_id = loser };
+    }
+
+    fn applyRankedResult(room: *Room, context: RankedResultContext, result: storage.Store.LazerRankedResult) !void {
+        const ranked = if (room.ranked_play) |*state| state else return error.InvalidRankedPlayResult;
+        if (ranked.result_persisted) return;
+        if (room.id != context.room_id or ranked.stage != ranked_stage.ended or ranked.winning_user_id != context.winner_id) return error.RankedPlayResultConflict;
+        for (&ranked.users) |*entry| if (entry.*) |*user| {
+            if (user.id == context.winner_id) {
+                user.rating = result.winner_rating_before;
+                user.rating_after = result.winner_rating_after;
+            } else if (user.id == context.loser_id) {
+                user.rating = result.loser_rating_before;
+                user.rating_after = result.loser_rating_after;
+            }
+        };
+        ranked.result_persisted = true;
+    }
+
+    /// Persist a result for a detached room. The caller owns the room pointer
+    /// (normally through the archive gate), so no manager mutex is needed.
+    fn persistRankedResult(self: *Manager, room: *Room) !void {
+        const store = self.store orelse return;
+        const context = (try rankedResultContext(room)) orelse return;
+        const result = try store.applyLazerRankedResult(context.room_id, context.ruleset_id, context.winner_id, context.loser_id);
+        try applyRankedResult(room, context, result);
+        std.log.info("event=lazer_ranked_rating_persisted room_id={d} ruleset_id={d} winner_id={d} loser_id={d} applied={s}", .{ context.room_id, context.ruleset_id, context.winner_id, context.loser_id, if (result.applied) "true" else "false" });
+    }
+
+    /// Capture only immutable ids under the manager mutex, settle the database
+    /// without blocking unrelated rooms, then re-lock briefly to publish the
+    /// authoritative ratings if this room is still live. If it was detached in
+    /// the meantime, the archive path applies the same idempotent DB result.
+    fn persistLiveRankedResult(self: *Manager, room_id: i64) !void {
+        const store = self.store orelse return;
+        self.mutex.lockUncancelable(self.io);
+        const room = self.roomByIdLocked(room_id) orelse {
+            self.mutex.unlock(self.io);
             return;
         };
+        const context = rankedResultContext(room) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        } orelse {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        self.mutex.unlock(self.io);
+
+        const result = try store.applyLazerRankedResult(context.room_id, context.ruleset_id, context.winner_id, context.loser_id);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const current = self.roomByIdLocked(room_id) orelse return;
+        try applyRankedResult(current, context, result);
+        std.log.info("event=lazer_ranked_rating_persisted room_id={d} ruleset_id={d} winner_id={d} loser_id={d} applied={s}", .{ context.room_id, context.ruleset_id, context.winner_id, context.loser_id, if (result.applied) "true" else "false" });
+    }
+
+    fn rankedStateEventForRoom(self: *Manager, room_id: i64) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const room = self.roomByIdLocked(room_id) orelse return null;
+        return try eventMatchStateOwned(self.allocator, room);
+    }
+
+    fn saveRoomSnapshot(self: *Manager, room: *Room, persistence: RoomPersistence) !void {
+        const store = self.store orelse return error.StoreUnavailable;
         var room_output: std.Io.Writer.Allocating = .init(self.allocator);
         defer room_output.deinit();
-        writeRoomJson(&room_output.writer, room) catch |err| {
-            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
-            return;
-        };
+        try writeRoomJson(&room_output.writer, room, 0, std.Io.Clock.real.now(self.io).toSeconds(), persistence);
         var leaderboard_output: std.Io.Writer.Allocating = .init(self.allocator);
         defer leaderboard_output.deinit();
-        writeRoomLeaderboardJson(&leaderboard_output.writer, room, 0) catch |err| {
-            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
-            return;
-        };
+        try writeRoomLeaderboardJson(&leaderboard_output.writer, room, 0);
         var participants_output: std.Io.Writer.Allocating = .init(self.allocator);
         defer participants_output.deinit();
-        participants_output.writer.writeByte('[') catch return;
+        try participants_output.writer.writeByte('[');
         for (room.participants[0..room.participant_count], 0..) |entry, index| if (entry) |participant| {
-            if (index != 0) participants_output.writer.writeByte(',') catch return;
-            participants_output.writer.print("{d}", .{participant.id}) catch return;
+            if (index != 0) try participants_output.writer.writeByte(',');
+            try participants_output.writer.print("{d}", .{participant.id});
         };
-        participants_output.writer.writeByte(']') catch return;
+        try participants_output.writer.writeByte(']');
         const owner_id = if (room.participant_count != 0) room.participants[0].?.id else room.host_id;
-        store.saveLazerMultiplayerRoomArchive(room.id, owner_id, roomCategory(room), room_output.written(), leaderboard_output.written(), participants_output.written()) catch |err| {
-            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
+        try store.saveLazerMultiplayerRoomArchive(room.id, owner_id, roomCategory(room), room_output.written(), leaderboard_output.written(), participants_output.written());
+    }
+
+    fn queuePendingArchive(self: *Manager, room: *Room) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.store == null or self.shutting_down) return false;
+        for (self.pending_archives) |entry| if (entry) |pending| if (pending == room) return true;
+        for (&self.pending_archives) |*entry| if (entry.* == null) {
+            entry.* = room;
+            return true;
+        };
+        std.log.err("event=lazer_multiplayer_archive_retry_capacity_exhausted room_id={d}", .{room.id});
+        return false;
+    }
+
+    fn removePendingArchive(self: *Manager, room: *Room) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (&self.pending_archives) |*entry| if (entry.* == room) {
+            entry.* = null;
             return;
         };
-        std.log.info("event=lazer_multiplayer_room_archived room_id={d} participants={d} scores={d}", .{ room.id, room.participant_count, room.score_count });
+    }
+
+    fn discardRoom(self: *Manager, room: *Room) void {
+        room.deinit(self.allocator);
+        self.allocator.destroy(room);
+    }
+
+    fn archiveRoomUnderGate(self: *Manager, room: *Room) void {
+        const retained = self.queuePendingArchive(room);
+        room.ended = true;
+        self.persistRankedResult(room) catch |err| {
+            std.log.err("event=lazer_ranked_rating_archive_retry_failed room_id={d} error={t}", .{ room.id, err });
+            if (!retained) self.discardRoom(room);
+            return;
+        };
+        self.saveRoomSnapshot(room, .archive) catch |err| {
+            std.log.warn("event=lazer_multiplayer_room_archive_failed room_id={d} error={t}", .{ room.id, err });
+            if (!retained) self.discardRoom(room);
+            return;
+        };
+        std.log.info("event=lazer_multiplayer_room_archived room_id={d} participants={d} scores={d}", .{ room.id, room.participant_count, room.scores.items.len });
+        if (retained) self.removePendingArchive(room);
+        self.discardRoom(room);
+    }
+
+    fn archiveRoom(self: *Manager, room: *Room) void {
+        self.archive_mutex.lockUncancelable(self.io);
+        defer self.archive_mutex.unlock(self.io);
+        self.archiveRoomUnderGate(room);
+    }
+
+    fn checkpointPlaylistRoom(self: *Manager, room: *Room) void {
+        defer {
+            room.deinit(self.allocator);
+            self.allocator.destroy(room);
+        }
+        self.saveRoomSnapshot(room, .checkpoint) catch |err| {
+            std.log.err("event=lazer_multiplayer_room_checkpoint_failed room_id={d} error={t}", .{ room.id, err });
+            return;
+        };
+        std.log.info("event=lazer_multiplayer_room_checkpointed room_id={d} participants={d} scores={d}", .{ room.id, room.participant_count, room.scores.items.len });
     }
 
     fn roomByIdLocked(self: *Manager, room_id: i64) ?*Room {
@@ -871,7 +1466,21 @@ pub const Manager = struct {
         return null;
     }
 
+    fn archivedRoomForParticipant(self: *Manager, allocator: std.mem.Allocator, room_id: i64, user_id: i32) !?storage.Store.MultiplayerRoomArchive {
+        const store = self.store orelse return null;
+        var archive = (try store.lazerMultiplayerRoomArchive(allocator, room_id)) orelse return null;
+        if (!archiveIncludesUser(allocator, archive.participant_ids_json, user_id)) {
+            archive.deinit();
+            return null;
+        }
+        return archive;
+    }
+
     fn roomSlotLocked(self: *Manager) ?usize {
+        var owned: usize = 0;
+        for (self.rooms) |entry| owned += @intFromBool(entry != null);
+        for (self.pending_archives) |entry| owned += @intFromBool(entry != null);
+        if (owned >= max_rooms) return null;
         for (self.rooms, 0..) |entry, index| if (entry == null) return index;
         return null;
     }
@@ -879,7 +1488,7 @@ pub const Manager = struct {
     fn connectionByUserLocked(self: *Manager, user_id: i32) ?*Connection {
         var found: ?*Connection = null;
         for (self.connections.items) |connection| {
-            if (connection.alive and connection.user_id == user_id) found = connection;
+            if (connection.alive.load(.acquire) and connection.user_id == user_id) found = connection;
         }
         return found;
     }
@@ -897,49 +1506,202 @@ pub const Manager = struct {
         return null;
     }
 
+    pub fn currentRoomId(self: *Manager, user_id: i32) ?i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.rooms) |entry| if (entry) |room| if (room.userIndex(user_id) != null) return room.id;
+        return null;
+    }
+
+    pub fn roomChannelAccess(self: *Manager, user_id: i32, channel_id: i64) ?i64 {
+        const room_id = lazer.roomChannelRoom(channel_id) orelse return null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const room = self.roomByIdLocked(room_id) orelse return null;
+        if (room.channel_id != channel_id or room.userIndex(user_id) == null) return null;
+        return room_id;
+    }
+
+    pub fn roomChannelUsersJson(self: *Manager, allocator: std.mem.Allocator, user_id: i32, channel_id: i64) !?[]u8 {
+        const room_id = lazer.roomChannelRoom(channel_id) orelse return null;
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const room = self.roomByIdLocked(room_id) orelse return null;
+        if (room.channel_id != channel_id or room.userIndex(user_id) == null) return null;
+        try output.writer.writeByte('[');
+        var written: usize = 0;
+        for (room.users) |entry| if (entry) |participant| {
+            if (written != 0) try output.writer.writeByte(',');
+            try writeApiUserJson(&output.writer, participant.id, participant.name.slice(), participant.country);
+            written += 1;
+        };
+        try output.writer.writeByte(']');
+        return try output.toOwnedSlice();
+    }
+
+    pub fn archiveExpiredRooms(self: *Manager, now_seconds: i64) usize {
+        self.archive_mutex.lockUncancelable(self.io);
+        defer self.archive_mutex.unlock(self.io);
+        var expired: [max_rooms + max_pending_archives]*Room = undefined;
+        var expired_count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (&self.rooms) |*entry| if (entry.*) |room| {
+            if (!room.ended and (room.ends_at <= 0 or now_seconds < room.ends_at)) continue;
+            entry.* = null;
+            room.ended = true;
+            for (self.connections.items) |connection| {
+                if (connection.room_id == room.id) connection.room_id = null;
+            }
+            expired[expired_count] = room;
+            expired_count += 1;
+        };
+        for (self.pending_archives) |entry| if (entry) |room| {
+            expired[expired_count] = room;
+            expired_count += 1;
+        };
+        self.mutex.unlock(self.io);
+        for (expired[0..expired_count]) |room| self.archiveRoomUnderGate(room);
+        return expired_count;
+    }
+
+    pub fn expirePendingMatches(self: *Manager, now_seconds: i64) usize {
+        var targets: [max_connections]*Connection = undefined;
+        var target_count: usize = 0;
+        var pools: [max_rooms]i32 = undefined;
+        var pool_count: usize = 0;
+        var expired_count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (&self.pending_matches) |*entry| if (entry.*) |pending| {
+            if (now_seconds < pending.created_at or now_seconds - pending.created_at < pending_match_timeout_seconds) continue;
+            for (pending.users, 0..) |user_id, index| {
+                if (!pending.joined[index]) continue;
+                const connection = self.connectionByUserLocked(user_id) orelse continue;
+                if (connection.pending_match_id != pending.id) continue;
+                connection.pending_match_id = null;
+                connection.queue_pool_id = null;
+                connection.retain();
+                targets[target_count] = connection;
+                target_count += 1;
+            }
+            if (std.mem.indexOfScalar(i32, pools[0..pool_count], pending.pool_id) == null) {
+                pools[pool_count] = pending.pool_id;
+                pool_count += 1;
+            }
+            entry.* = null;
+            expired_count += 1;
+        };
+        self.mutex.unlock(self.io);
+        defer releaseRecipients(targets[0..target_count]);
+        const left = eventNoArgsOwned(self.allocator, "MatchmakingQueueLeft") catch null;
+        defer if (left) |frame| self.allocator.free(frame);
+        if (left) |frame| sendRecipients(targets[0..target_count], frame);
+        for (pools[0..pool_count]) |pool_id| self.publishLobbyStatus(pool_id) catch {};
+        return expired_count;
+    }
+
     pub fn disconnectUser(self: *Manager, user_id: i32) bool {
         var targets: [max_connections]*Connection = undefined;
         var count: usize = 0;
         self.mutex.lockUncancelable(self.io);
         for (self.connections.items) |connection| {
-            if (!connection.alive or connection.user_id != user_id or count == targets.len) continue;
+            if (!connection.alive.load(.acquire) or connection.user_id != user_id or count == targets.len) continue;
             connection.retain();
             targets[count] = connection;
             count += 1;
         }
         self.mutex.unlock(self.io);
+        const disconnect_frame = eventNoArgsOwned(self.allocator, "DisconnectRequested") catch null;
+        defer if (disconnect_frame) |frame| self.allocator.free(frame);
+        var disconnected = false;
         for (targets[0..count]) |connection| {
-            connection.close();
+            var effects: DisconnectEffects = .{};
+            connection.invocation_mutex.lockUncancelable(self.io);
+            self.mutex.lockUncancelable(self.io);
+            const still_current = std.mem.indexOfScalar(*Connection, self.connections.items, connection) != null and
+                connection.alive.load(.acquire) and connection.user_id == user_id;
+            if (still_current) {
+                // Wait for this identity's final invocation, close the gate,
+                // and detach every room/queue/list membership before takeover
+                // returns. A frame parsed concurrently will fail its second
+                // accepting_invocations check when the gate is released.
+                connection.accepting_invocations.store(false, .release);
+                self.detachConnectionLocked(connection, &effects);
+                disconnected = true;
+            }
+            self.mutex.unlock(self.io);
+            connection.invocation_mutex.unlock(self.io);
+            if (still_current) {
+                if (disconnect_frame) |frame| connection.send(frame);
+                connection.close();
+                self.finishDisconnect(&effects);
+            }
             connection.release();
         }
-        return count != 0;
+        return disconnected;
+    }
+
+    pub fn setUserCountryVisibility(self: *Manager, user_id: i32, country: [2]u8, visible: bool) void {
+        const projected = if (visible) country else .{ 'X', 'X' };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.connections.items) |connection| {
+            if (connection.user_id == user_id) connection.user_country = projected;
+        }
+        for (self.rooms) |entry| if (entry) |room| {
+            if (room.host_id == user_id) room.host_country = projected;
+            for (&room.users) |*room_user| if (room_user.*) |*value| {
+                if (value.id == user_id) value.country = projected;
+            };
+            for (room.participants[0..room.participant_count]) |*participant| if (participant.*) |*value| {
+                if (value.id == user_id) value.country = projected;
+            };
+        };
     }
 
     pub fn restCreateRoom(self: *Manager, allocator: std.mem.Allocator, user: domain.User, body: []const u8) ![]u8 {
-        const room = try parseRestRoom(self.allocator, user, body);
-        errdefer self.allocator.destroy(room);
+        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
+        const room = try parseRestRoom(self.allocator, user, body, now_seconds, false);
+        errdefer {
+            room.deinit(self.allocator);
+            self.allocator.destroy(room);
+        }
         try self.hydrateRoom(room);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.rooms) |entry| if (entry) |existing| if (existing.userIndex(user.id) != null) return error.AlreadyInMultiplayerRoom;
         const slot = self.roomSlotLocked() orelse return error.MultiplayerRoomLimit;
         room.id = self.next_room_id;
-        self.next_room_id += 1;
-        room.channel_id = 4;
-        if (self.connectionByUserLocked(user.id)) |connection| connection.room_id = room.id;
-        self.rooms[slot] = room;
+        room.channel_id = @intCast(lazer.roomChannelId(room.id) orelse return error.MultiplayerRoomLimit);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try writeRoomJson(&output.writer, room);
+        writeRoomJson(&output.writer, room, user.id, now_seconds, .none) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        const response = try output.toOwnedSlice();
+        self.next_room_id += 1;
+        if (room.settings.match_type != 0) {
+            if (self.connectionByUserLocked(user.id)) |connection| connection.room_id = room.id;
+        }
+        self.rooms[slot] = room;
         std.log.info("event=lazer_multiplayer_rest_room_created room_id={d} host_id={d}", .{ room.id, user.id });
-        return output.toOwnedSlice();
+        return response;
     }
 
     pub fn restJoinRoom(self: *Manager, allocator: std.mem.Allocator, user: domain.User, room_id: i64, password: []const u8) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        var added_slot: ?usize = null;
+        errdefer if (added_slot) |slot| {
+            const room = self.roomByIdLocked(room_id) orelse unreachable;
+            room.users[slot] = null;
+            room.user_count -= 1;
+        };
         for (self.rooms) |entry| if (entry) |existing| if (existing.id != room_id and existing.userIndex(user.id) != null) return error.AlreadyInMultiplayerRoom;
         const room = self.roomByIdLocked(room_id) orelse return error.MultiplayerRoomNotFound;
+        if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds())) return error.MultiplayerRoomNotFound;
         if (!std.mem.eql(u8, room.settings.password.slice(), password)) return error.InvalidMultiplayerPassword;
         if (!room.userAllowed(user.id)) return error.MultiplayerPermissionDenied;
         if (room.userIndex(user.id) == null) {
@@ -948,16 +1710,25 @@ pub const Manager = struct {
             const slot = for (room.users, 0..) |entry, index| {
                 if (entry == null) break index;
             } else return error.MultiplayerRoomFull;
-            room.users[slot] = try defaultRoomUser(user.id, user.name, user.country);
+            var joined = try defaultRoomUser(user.id, user.name, publicCountry(user));
+            if (room.settings.match_type == 2) joined.team_id = nextTeamId(room);
+            room.users[slot] = joined;
             room.user_count += 1;
-            room.rememberParticipant(room.users[slot].?);
+            added_slot = slot;
         }
-        if (self.connectionByUserLocked(user.id)) |connection| connection.room_id = room_id;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try writeRoomJson(&output.writer, room);
+        writeRoomJson(&output.writer, room, user.id, std.Io.Clock.real.now(self.io).toSeconds(), .none) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        const response = try output.toOwnedSlice();
+        if (added_slot != null) room.rememberParticipant(room.users[added_slot.?].?);
+        if (room.settings.match_type != 0) {
+            if (self.connectionByUserLocked(user.id)) |connection| connection.room_id = room_id;
+        }
         std.log.info("event=lazer_multiplayer_rest_room_joined room_id={d} user_id={d}", .{ room_id, user.id });
-        return output.toOwnedSlice();
+        return response;
     }
 
     pub fn restPartRoom(self: *Manager, user_id: i32, room_id: i64) !void {
@@ -976,7 +1747,7 @@ pub const Manager = struct {
             connection.room_id = null;
         };
         var ended_room: ?*Room = null;
-        if (room.user_count == 0) {
+        if (room.user_count == 0 and room.settings.match_type != 0) {
             for (&self.rooms) |*entry| if (entry.* == room) {
                 entry.* = null;
                 break;
@@ -1056,7 +1827,7 @@ pub const Manager = struct {
     fn recipientsLocked(self: *Manager, room_id: i64, exclude: ?*Connection, output: *[max_connections]*Connection) usize {
         var count: usize = 0;
         for (self.connections.items) |connection| {
-            if (!connection.alive or connection == exclude or connection.room_id != room_id) continue;
+            if (!connection.alive.load(.acquire) or connection == exclude or connection.room_id != room_id) continue;
             if (count == output.len) break;
             connection.retain();
             output[count] = connection;
@@ -1080,17 +1851,81 @@ pub const Manager = struct {
         connection.* = .{
             .allocator = self.allocator,
             .user_id = user.id,
-            .user_country = user.country,
+            .user_country = publicCountry(user),
             .io = self.io,
             .socket = socket,
         };
         try connection.user_name.set(user.name);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.connections.items.len >= max_connections) return error.MultiplayerConnectionLimit;
-        try self.connections.append(self.allocator, connection);
-        std.log.info("event=lazer_multiplayer_connected user_id={d}", .{user.id});
-        return connection;
+        while (true) {
+            var replaced: ?*Connection = null;
+            self.mutex.lockUncancelable(self.io);
+            if (self.shutting_down) {
+                self.mutex.unlock(self.io);
+                return error.ServerShuttingDown;
+            }
+            for (self.connections.items) |existing| {
+                if (!existing.alive.load(.acquire) or existing.user_id != user.id) continue;
+                existing.retain();
+                replaced = existing;
+                break;
+            }
+            if (replaced == null) {
+                if (self.connections.items.len >= max_connections) {
+                    self.mutex.unlock(self.io);
+                    return error.MultiplayerConnectionLimit;
+                }
+                self.connections.append(self.allocator, connection) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.mutex.unlock(self.io);
+                std.log.info("event=lazer_multiplayer_connected user_id={d}", .{user.id});
+                return connection;
+            }
+            self.mutex.unlock(self.io);
+
+            const existing = replaced.?;
+            // Wait only for this identity's final invocation boundary. Other
+            // users and rooms continue independently, and no socket write is
+            // performed while this gate is held.
+            existing.invocation_mutex.lockUncancelable(self.io);
+            self.mutex.lockUncancelable(self.io);
+            const index = std.mem.indexOfScalar(*Connection, self.connections.items, existing);
+            if (self.shutting_down) {
+                self.mutex.unlock(self.io);
+                existing.invocation_mutex.unlock(self.io);
+                existing.release();
+                return error.ServerShuttingDown;
+            }
+            if (index == null or !existing.alive.load(.acquire) or existing.user_id != user.id) {
+                self.mutex.unlock(self.io);
+                existing.invocation_mutex.unlock(self.io);
+                existing.release();
+                continue;
+            }
+            existing.accepting_invocations.store(false, .release);
+            connection.room_id = existing.room_id;
+            connection.lobby_pool_id = existing.lobby_pool_id;
+            connection.queue_pool_id = existing.queue_pool_id;
+            connection.pending_match_id = existing.pending_match_id;
+            existing.room_id = null;
+            existing.lobby_pool_id = null;
+            existing.queue_pool_id = null;
+            existing.pending_match_id = null;
+            self.connections.items[index.?] = connection;
+            self.mutex.unlock(self.io);
+            existing.invocation_mutex.unlock(self.io);
+
+            if (eventNoArgsOwned(self.allocator, "DisconnectRequested")) |frame| {
+                defer self.allocator.free(frame);
+                existing.send(frame);
+            } else |_| {}
+            existing.close();
+            existing.release();
+            std.log.info("event=lazer_multiplayer_connection_replaced user_id={d}", .{user.id});
+            std.log.info("event=lazer_multiplayer_connected user_id={d}", .{user.id});
+            return connection;
+        }
     }
 
     fn removeConnectionLocked(self: *Manager, connection: *Connection) void {
@@ -1112,10 +1947,6 @@ pub const Manager = struct {
         if (room.ranked_play) |*ranked| if (ranked.stage != ranked_stage.ended) {
             if (ranked.userIndex(connection.user_id)) |ranked_user_index| ranked.users[ranked_user_index].?.life = 0;
             ranked.winning_user_id = rankedWinner(ranked);
-            for (&ranked.users) |*entry| if (entry.*) |*ranked_user| if (ranked.winning_user_id) |winner_id| {
-                const rating_delta: i32 = if (ranked_user.id == winner_id) 16 else -16;
-                ranked_user.rating_after = ranked_user.rating + rating_delta;
-            };
             ranked.stage = ranked_stage.ended;
             ranked.pick_countdown = null;
             ranked_ended.* = true;
@@ -1143,32 +1974,21 @@ pub const Manager = struct {
         return self.recipientsLocked(room_id, connection, recipients);
     }
 
-    fn disconnect(self: *Manager, connection: *Connection) void {
-        connection.close();
-        var recipients: [max_connections]*Connection = undefined;
-        var left_user: ?RoomUser = null;
-        var new_host: ?i32 = null;
-        var ranked_ended = false;
-        var ended_room: ?*Room = null;
-        var ranked_event: ?[]u8 = null;
-        defer if (ranked_event) |event| self.allocator.free(event);
-        var queue_peer: ?*Connection = null;
-        var queue_peer_left = false;
-        var queue_pool_id: ?i32 = connection.queue_pool_id;
-        self.mutex.lockUncancelable(self.io);
+    fn detachConnectionLocked(self: *Manager, connection: *Connection, effects: *DisconnectEffects) void {
+        effects.queue_pool_id = connection.queue_pool_id;
         if (connection.pending_match_id) |match_id| {
             if (self.pendingMatchByIdLocked(match_id)) |pending| {
                 const index = pending.userIndex(connection.user_id) orelse 0;
                 const peer_index = 1 - index;
-                queue_pool_id = pending.pool_id;
+                effects.queue_pool_id = pending.pool_id;
                 if (pending.joined[peer_index]) {
                     const peer_id = pending.users[peer_index];
                     if (self.connectionByUserLocked(peer_id)) |peer| {
                         peer.pending_match_id = null;
                         peer.queue_pool_id = if (pending.is_duel) null else pending.pool_id;
                         peer.retain();
-                        queue_peer = peer;
-                        queue_peer_left = pending.is_duel;
+                        effects.queue_peer = peer;
+                        effects.queue_peer_left = pending.is_duel;
                     }
                 }
             }
@@ -1178,18 +1998,28 @@ pub const Manager = struct {
         connection.queue_pool_id = null;
         connection.lobby_pool_id = null;
         const room_id = connection.room_id;
-        const count = self.leaveLocked(connection, &recipients, &left_user, &new_host, &ranked_ended, &ended_room);
-        if (ranked_ended) if (room_id) |id| if (self.roomByIdLocked(id)) |room| {
-            ranked_event = eventMatchStateOwned(self.allocator, room) catch null;
+        effects.recipient_count = self.leaveLocked(connection, &effects.recipients, &effects.left_user, &effects.new_host, &effects.ranked_ended, &effects.ended_room);
+        if (effects.ranked_ended) effects.ranked_room_id = room_id;
+        if (effects.ranked_ended) if (room_id) |id| if (self.roomByIdLocked(id)) |room| {
+            effects.ranked_event = eventMatchStateOwned(self.allocator, room) catch null;
         };
-        defer releaseRecipients(recipients[0..count]);
-        defer if (queue_peer) |peer| peer.release();
         self.removeConnectionLocked(connection);
-        self.mutex.unlock(self.io);
-        if (ended_room) |ended| self.archiveRoom(ended);
-        std.log.info("event=lazer_multiplayer_disconnected user_id={d}", .{connection.user_id});
-        if (queue_peer) |peer| {
-            const frame_result = if (queue_peer_left)
+    }
+
+    fn finishDisconnect(self: *Manager, effects: *DisconnectEffects) void {
+        defer releaseRecipients(effects.recipients[0..effects.recipient_count]);
+        defer if (effects.queue_peer) |peer| peer.release();
+        defer if (effects.ranked_event) |event| self.allocator.free(event);
+        if (effects.ranked_ended and effects.ended_room == null) if (effects.ranked_room_id) |room_id| {
+            self.persistLiveRankedResult(room_id) catch |err| std.log.err("event=lazer_ranked_rating_persist_failed room_id={d} error={t}", .{ room_id, err });
+            if (self.rankedStateEventForRoom(room_id) catch null) |updated| {
+                if (effects.ranked_event) |old| self.allocator.free(old);
+                effects.ranked_event = updated;
+            }
+        };
+        if (effects.ended_room) |ended| self.archiveRoom(ended);
+        if (effects.queue_peer) |peer| {
+            const frame_result = if (effects.queue_peer_left)
                 eventNoArgsOwned(self.allocator, "MatchmakingQueueLeft")
             else
                 eventQueueStatusOwned(self.allocator, 0);
@@ -1198,30 +2028,41 @@ pub const Manager = struct {
                 peer.send(frame);
             } else |_| {}
         }
-        if (queue_pool_id) |pool| self.publishLobbyStatus(pool) catch {};
-        if (left_user) |user| {
+        if (effects.queue_pool_id) |pool| self.publishLobbyStatus(pool) catch {};
+        if (effects.left_user) |user| {
             if (eventUserOwned(self.allocator, "UserLeft", user)) |frame| {
                 defer self.allocator.free(frame);
-                sendRecipients(recipients[0..count], frame);
+                sendRecipients(effects.recipients[0..effects.recipient_count], frame);
             } else |_| {}
         }
-        if (ranked_event) |event| sendRecipients(recipients[0..count], event);
-        connection.release();
-        if (new_host) |host_id| {
+        if (effects.ranked_event) |event| sendRecipients(effects.recipients[0..effects.recipient_count], event);
+        if (effects.new_host) |host_id| {
             if (eventIntegersOwned(self.allocator, "HostChanged", &.{host_id})) |frame| {
                 defer self.allocator.free(frame);
-                sendRecipients(recipients[0..count], frame);
+                sendRecipients(effects.recipients[0..effects.recipient_count], frame);
             } else |_| {}
         }
     }
 
-    pub fn roomsJson(self: *Manager, allocator: std.mem.Allocator, only_room_id: ?i64, filter: ?RoomListFilter) !?[]u8 {
+    fn disconnect(self: *Manager, connection: *Connection) void {
+        connection.close();
+        var effects: DisconnectEffects = .{};
+        self.mutex.lockUncancelable(self.io);
+        self.detachConnectionLocked(connection, &effects);
+        self.mutex.unlock(self.io);
+        self.finishDisconnect(&effects);
+        std.log.info("event=lazer_multiplayer_disconnected user_id={d}", .{connection.user_id});
+        connection.release();
+    }
+
+    pub fn roomsJson(self: *Manager, allocator: std.mem.Allocator, only_room_id: ?i64, filter: ?RoomListFilter, requester_id: i32) !?[]u8 {
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
+        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
         self.mutex.lockUncancelable(self.io);
         if (only_room_id) |room_id| {
             if (self.roomByIdLocked(room_id)) |room| {
-                writeRoomJson(&output.writer, room) catch |err| {
+                writeRoomJson(&output.writer, room, requester_id, now_seconds, .none) catch |err| {
                     self.mutex.unlock(self.io);
                     return err;
                 };
@@ -1242,7 +2083,9 @@ pub const Manager = struct {
         var written: usize = 0;
         for (self.rooms) |entry| if (entry) |room| {
             if (filter) |value| {
-                if (value.mode == .ended) continue;
+                const ended = roomHasEnded(room, now_seconds);
+                if (value.mode == .ended and !ended) continue;
+                if (value.mode != .ended and ended) continue;
                 if (value.mode == .owned and room.host_id != value.requester_id) continue;
                 if (value.mode == .participated and room.participantIndex(value.requester_id) == null) continue;
                 if (value.status) |wanted| if ((wanted == .idle) != (room.state == 0)) continue;
@@ -1252,7 +2095,7 @@ pub const Manager = struct {
                 self.mutex.unlock(self.io);
                 return err;
             };
-            writeRoomJson(&output.writer, room) catch |err| {
+            writeRoomJson(&output.writer, room, requester_id, now_seconds, .none) catch |err| {
                 self.mutex.unlock(self.io);
                 return err;
             };
@@ -1284,44 +2127,241 @@ pub const Manager = struct {
 
     pub fn scoreContext(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64) ?RoomScoreContext {
         self.mutex.lockUncancelable(self.io);
+        if (self.roomByIdLocked(room_id)) |room| {
+            if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds()) or room.userIndex(user_id) == null) {
+                self.mutex.unlock(self.io);
+                return null;
+            }
+            const item_index = room.itemIndex(playlist_item_id) orelse {
+                self.mutex.unlock(self.io);
+                return null;
+            };
+            const item = room.playlist[item_index].?;
+            self.mutex.unlock(self.io);
+            return .{ .beatmap_id = item.beatmap_id, .ruleset_id = item.ruleset_id };
+        }
+        self.mutex.unlock(self.io);
+        var archive = (self.archivedRoomForParticipant(self.allocator, room_id, user_id) catch return null) orelse return null;
+        defer archive.deinit();
+        return archivedScoreContext(self.allocator, archive.room_json, playlist_item_id) catch null;
+    }
+
+    /// New score tokens may only be minted while the room is live.
+    pub fn scoreTokenContext(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64) ?RoomScoreContext {
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const room = self.roomByIdLocked(room_id) orelse return null;
-        if (room.userIndex(user_id) == null) return null;
+        if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds()) or room.userIndex(user_id) == null) return null;
         const item_index = room.itemIndex(playlist_item_id) orelse return null;
         const item = room.playlist[item_index].?;
         return .{ .beatmap_id = item.beatmap_id, .ruleset_id = item.ruleset_id };
     }
 
-    pub fn roomScoreIds(self: *Manager, allocator: std.mem.Allocator, user_id: i32, room_id: i64, playlist_item_id: i64) !?[]i64 {
+    /// Bind the opaque database token to the room and playlist item before it
+    /// is returned to the client. This is deliberately kept in the room
+    /// snapshot so an already-issued token can finish across a graceful
+    /// restart or after the room is archived.
+    pub fn bindRoomScoreToken(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, token_id: i64) !void {
+        if (token_id <= 0) return error.InvalidMultiplayerScoreToken;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const room = self.roomByIdLocked(room_id) orelse return null;
-        if (room.userIndex(user_id) == null or room.itemIndex(playlist_item_id) == null) return null;
+        const room = self.roomByIdLocked(room_id) orelse return error.MultiplayerRoomNotFound;
+        if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds())) return error.MultiplayerRoomNotFound;
+        if (room.userIndex(user_id) == null or room.itemIndex(playlist_item_id) == null) return error.MultiplayerPermissionDenied;
+        for (room.score_tokens.items) |token| if (token.token_id == token_id) {
+            if (token.user_id == user_id and token.playlist_item_id == playlist_item_id) return;
+            return error.InvalidMultiplayerScoreToken;
+        };
+        if (room.score_tokens.items.len >= max_room_scores) return error.MultiplayerScoreTokenLimit;
+        try room.score_tokens.append(self.allocator, .{ .token_id = token_id, .user_id = user_id, .playlist_item_id = playlist_item_id });
+    }
+
+    /// A token minted before the room ended may complete during osu-web's
+    /// bounded five-minute grace period. The participant and playlist checks
+    /// remain identical to archived score reads.
+    pub fn scoreSubmissionContext(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, token_id: i64) ?RoomScoreContext {
+        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
+        _ = self.archiveExpiredRooms(now_seconds);
+        self.mutex.lockUncancelable(self.io);
+        if (self.roomByIdLocked(room_id)) |room| {
+            if (!roomHasEnded(room, now_seconds) and room.userIndex(user_id) != null and room.scoreTokenIndex(token_id, user_id, playlist_item_id) != null) {
+                const item = room.playlist[
+                    room.itemIndex(playlist_item_id) orelse {
+                        self.mutex.unlock(self.io);
+                        return null;
+                    }
+                ].?;
+                self.mutex.unlock(self.io);
+                return .{ .beatmap_id = item.beatmap_id, .ruleset_id = item.ruleset_id };
+            }
+            self.mutex.unlock(self.io);
+            return null;
+        }
+        self.mutex.unlock(self.io);
+        var archive = (self.archivedRoomForParticipant(self.allocator, room_id, user_id) catch return null) orelse return null;
+        defer archive.deinit();
+        if (now_seconds > std.math.add(i64, archive.ended_at, multiplayer_score_grace_seconds) catch return null) return null;
+        if (!(archivedScoreTokenBound(self.allocator, archive.room_json, token_id, user_id, playlist_item_id) catch return null)) return null;
+        return archivedScoreContext(self.allocator, archive.room_json, playlist_item_id) catch null;
+    }
+
+    pub fn roomScoreIds(self: *Manager, allocator: std.mem.Allocator, user_id: i32, room_id: i64, playlist_item_id: i64) !?[]i64 {
+        self.mutex.lockUncancelable(self.io);
+        if (self.roomByIdLocked(room_id)) |room| {
+            if (room.userIndex(user_id) == null or room.itemIndex(playlist_item_id) == null) {
+                self.mutex.unlock(self.io);
+                return null;
+            }
+            var ids: std.ArrayList(i64) = .empty;
+            errdefer ids.deinit(allocator);
+            var high_scores: std.ArrayList(RoomScoreRecord) = .empty;
+            defer high_scores.deinit(allocator);
+            const realtime = room.settings.match_type != 0;
+            for (room.scores.items) |score| if (score.playlist_item_id == playlist_item_id) considerHighScore(allocator, &high_scores, score, realtime) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.mutex.unlock(self.io);
+            sortRoomScores(high_scores.items);
+            for (high_scores.items) |score| try ids.append(allocator, score.score_id);
+            return @as(?[]i64, try ids.toOwnedSlice(allocator));
+        }
+        self.mutex.unlock(self.io);
+        var archive = (try self.archivedRoomForParticipant(allocator, room_id, user_id)) orelse return null;
+        defer archive.deinit();
+        if ((try archivedScoreContext(allocator, archive.room_json, playlist_item_id)) == null) return null;
+        const realtime = try archivedRoomRealtime(allocator, archive.room_json);
         var ids: std.ArrayList(i64) = .empty;
         errdefer ids.deinit(allocator);
-        for (room.scores) |entry| if (entry) |score| if (score.playlist_item_id == playlist_item_id) try ids.append(allocator, score.score_id);
+        const HighScoreCollector = struct {
+            allocator: std.mem.Allocator,
+            realtime: bool,
+            records: std.ArrayList(RoomScoreRecord) = .empty,
+
+            fn visit(visitor: *@This(), score: RoomScoreRecord) !void {
+                try considerHighScore(visitor.allocator, &visitor.records, score, visitor.realtime);
+            }
+        };
+        var collector: HighScoreCollector = .{ .allocator = allocator, .realtime = realtime };
+        defer collector.records.deinit(allocator);
+        try archivedScores(allocator, archive.room_json, playlist_item_id, &collector);
+        sortRoomScores(collector.records.items);
+        for (collector.records.items) |score| try ids.append(allocator, score.score_id);
         return @as(?[]i64, try ids.toOwnedSlice(allocator));
     }
 
     pub fn roomScoreIdForUser(self: *Manager, requester_id: i32, room_id: i64, playlist_item_id: i64, user_id: i32) ?i64 {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const room = self.roomByIdLocked(room_id) orelse return null;
-        if (room.userIndex(requester_id) == null or room.itemIndex(playlist_item_id) == null) return null;
-        var best: ?RoomScoreRecord = null;
-        for (room.scores) |entry| if (entry) |score| if (score.playlist_item_id == playlist_item_id and score.user_id == user_id) {
-            if (best == null or score.total_score > best.?.total_score or (score.total_score == best.?.total_score and score.score_id < best.?.score_id)) best = score;
+        if (self.roomByIdLocked(room_id)) |room| {
+            if (room.userIndex(requester_id) == null or room.itemIndex(playlist_item_id) == null) {
+                self.mutex.unlock(self.io);
+                return null;
+            }
+            var best: ?RoomScoreRecord = null;
+            for (room.scores.items) |score| if (score.playlist_item_id == playlist_item_id and score.user_id == user_id) {
+                if (!scoreEligibleForHighScore(score, room.settings.match_type != 0)) continue;
+                if (best == null or score.total_score > best.?.total_score or (score.total_score == best.?.total_score and score.score_id < best.?.score_id)) best = score;
+            };
+            self.mutex.unlock(self.io);
+            return if (best) |score| score.score_id else null;
+        }
+        self.mutex.unlock(self.io);
+        var archive = (self.archivedRoomForParticipant(self.allocator, room_id, requester_id) catch return null) orelse return null;
+        defer archive.deinit();
+        if ((archivedScoreContext(self.allocator, archive.room_json, playlist_item_id) catch return null) == null) return null;
+        const realtime = archivedRoomRealtime(self.allocator, archive.room_json) catch return null;
+        const Finder = struct {
+            user_id: i32,
+            realtime: bool,
+            best: ?RoomScoreRecord = null,
+
+            fn visit(visitor: *@This(), score: RoomScoreRecord) !void {
+                if (score.user_id != visitor.user_id or !scoreEligibleForHighScore(score, visitor.realtime)) return;
+                if (visitor.best == null or score.total_score > visitor.best.?.total_score or (score.total_score == visitor.best.?.total_score and score.score_id < visitor.best.?.score_id)) visitor.best = score;
+            }
         };
-        return if (best) |score| score.score_id else null;
+        var finder: Finder = .{ .user_id = user_id, .realtime = realtime };
+        archivedScores(self.allocator, archive.room_json, playlist_item_id, &finder) catch return null;
+        return if (finder.best) |score| score.score_id else null;
+    }
+
+    pub fn roomScoreRanking(self: *Manager, allocator: std.mem.Allocator, requester_id: i32, room_id: i64, playlist_item_id: i64, score_id: i64) !?RoomScoreRanking {
+        self.mutex.lockUncancelable(self.io);
+        if (self.roomByIdLocked(room_id)) |room| {
+            if (room.userIndex(requester_id) == null or room.itemIndex(playlist_item_id) == null) {
+                self.mutex.unlock(self.io);
+                return null;
+            }
+            var exact: ?RoomScoreRecord = null;
+            var high_scores: std.ArrayList(RoomScoreRecord) = .empty;
+            defer high_scores.deinit(allocator);
+            const realtime = room.settings.match_type != 0;
+            for (room.scores.items) |score| if (score.playlist_item_id == playlist_item_id) {
+                if (score.score_id == score_id) exact = score;
+                considerHighScore(allocator, &high_scores, score, realtime) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+            };
+            self.mutex.unlock(self.io);
+            const found = exact orelse return null;
+            sortRoomScores(high_scores.items);
+            return rankingForScore(found, high_scores.items);
+        }
+        self.mutex.unlock(self.io);
+        var archive = (try self.archivedRoomForParticipant(allocator, room_id, requester_id)) orelse return null;
+        defer archive.deinit();
+        if ((try archivedScoreContext(allocator, archive.room_json, playlist_item_id)) == null) return null;
+        const realtime = try archivedRoomRealtime(allocator, archive.room_json);
+        const RankingCollector = struct {
+            allocator: std.mem.Allocator,
+            realtime: bool,
+            score_id: i64,
+            exact: ?RoomScoreRecord = null,
+            high_scores: std.ArrayList(RoomScoreRecord) = .empty,
+
+            fn visit(visitor: *@This(), score: RoomScoreRecord) !void {
+                if (score.score_id == visitor.score_id) visitor.exact = score;
+                try considerHighScore(visitor.allocator, &visitor.high_scores, score, visitor.realtime);
+            }
+        };
+        var collector: RankingCollector = .{ .allocator = allocator, .realtime = realtime, .score_id = score_id };
+        defer collector.high_scores.deinit(allocator);
+        try archivedScores(allocator, archive.room_json, playlist_item_id, &collector);
+        const found = collector.exact orelse return null;
+        sortRoomScores(collector.high_scores.items);
+        return rankingForScore(found, collector.high_scores.items);
     }
 
     pub fn roomContainsScore(self: *Manager, requester_id: i32, room_id: i64, playlist_item_id: i64, score_id: i64) bool {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const room = self.roomByIdLocked(room_id) orelse return false;
-        if (room.userIndex(requester_id) == null or room.itemIndex(playlist_item_id) == null) return false;
-        for (room.scores) |entry| if (entry) |score| if (score.playlist_item_id == playlist_item_id and score.score_id == score_id) return true;
-        return false;
+        if (self.roomByIdLocked(room_id)) |room| {
+            if (room.userIndex(requester_id) == null or room.itemIndex(playlist_item_id) == null) {
+                self.mutex.unlock(self.io);
+                return false;
+            }
+            for (room.scores.items) |score| if (score.playlist_item_id == playlist_item_id and score.score_id == score_id) {
+                self.mutex.unlock(self.io);
+                return true;
+            };
+            self.mutex.unlock(self.io);
+            return false;
+        }
+        self.mutex.unlock(self.io);
+        var archive = (self.archivedRoomForParticipant(self.allocator, room_id, requester_id) catch return false) orelse return false;
+        defer archive.deinit();
+        if ((archivedScoreContext(self.allocator, archive.room_json, playlist_item_id) catch return false) == null) return false;
+        const Finder = struct {
+            score_id: i64,
+            found: bool = false,
+
+            fn visit(visitor: *@This(), score: RoomScoreRecord) !void {
+                if (score.score_id == visitor.score_id) visitor.found = true;
+            }
+        };
+        var finder: Finder = .{ .score_id = score_id };
+        archivedScores(self.allocator, archive.room_json, playlist_item_id, &finder) catch return false;
+        return finder.found;
     }
 
     pub fn roomLeaderboardJson(self: *Manager, allocator: std.mem.Allocator, requester_id: i32, room_id: i64) !?[]u8 {
@@ -1340,7 +2380,10 @@ pub const Manager = struct {
         const store = self.store orelse return null;
         var archive = (try store.lazerMultiplayerRoomArchive(allocator, room_id)) orelse return null;
         defer archive.deinit();
-        return @as(?[]u8, try allocator.dupe(u8, archive.leaderboard_json));
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try self.writeSanitizedArchiveLeaderboardJson(&output.writer, archive.leaderboard_json);
+        return @as(?[]u8, try output.toOwnedSlice());
     }
 
     pub fn serve(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !void {
@@ -1352,13 +2395,13 @@ pub const Manager = struct {
         try socket.writeMessage("{}\x1e", handshake.opcode);
         const connection = try self.connect(user, socket);
         defer self.disconnect(connection);
-        while (connection.alive) {
+        while (connection.alive.load(.acquire)) {
             const message = socket.readSmallMessage() catch return;
             switch (message.opcode) {
                 .ping => {
                     connection.write_mutex.lockUncancelable(connection.io);
                     defer connection.write_mutex.unlock(connection.io);
-                    if (connection.alive) try socket.writeMessage(message.data, .pong);
+                    if (connection.alive.load(.acquire)) try socket.writeMessage(message.data, .pong);
                 },
                 .binary => try self.handleFrames(connection, message.data),
                 else => {},
@@ -1388,6 +2431,7 @@ pub const Manager = struct {
     }
 
     fn handleHubMessage(self: *Manager, connection: *Connection, payload: []const u8) !void {
+        if (!connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) return error.ConnectionClose;
         var reader: MessagePackReader = .{ .data = payload };
         const count = try reader.arrayLen();
         if (count == 0) return error.InvalidSignalRMessage;
@@ -1408,7 +2452,16 @@ pub const Manager = struct {
         } else try reader.string();
         const target = try reader.string();
         const argument_count = try reader.arrayLen();
-        self.handleInvocation(connection, invocation_id, target, argument_count, &reader) catch |err| {
+        connection.invocation_mutex.lockUncancelable(self.io);
+        // The connection may have been replaced while this frame was parsed
+        // and waiting for the invocation gate.
+        if (!connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) {
+            connection.invocation_mutex.unlock(self.io);
+            return error.ConnectionClose;
+        }
+        const invocation_result = self.handleInvocation(connection, invocation_id, target, argument_count, &reader);
+        connection.invocation_mutex.unlock(self.io);
+        invocation_result catch |err| {
             std.log.warn("event=lazer_multiplayer_invocation_failed user_id={d} target={s} error={t}", .{ connection.user_id, target, err });
             if (invocation_id) |id| {
                 const frame = completionErrorOwned(self.allocator, id, "multiplayer request was not accepted") catch return;
@@ -1440,11 +2493,11 @@ pub const Manager = struct {
         if (std.mem.eql(u8, target, "LeaveRoom")) return self.leaveRoom(connection, invocation_id);
         if (std.mem.eql(u8, target, "TransferHost")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
-            return self.transferHost(connection, invocation_id, @intCast(try reader.integer()));
+            return self.transferHost(connection, invocation_id, try checkedReaderInteger(i32, reader));
         }
         if (std.mem.eql(u8, target, "KickUser")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
-            return self.kickUser(connection, invocation_id, @intCast(try reader.integer()));
+            return self.kickUser(connection, invocation_id, try checkedReaderInteger(i32, reader));
         }
         if (std.mem.eql(u8, target, "ChangeSettings")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
@@ -1452,7 +2505,7 @@ pub const Manager = struct {
         }
         if (std.mem.eql(u8, target, "ChangeState")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
-            return self.changeState(connection, invocation_id, @intCast(try reader.integer()));
+            return self.changeState(connection, invocation_id, try checkedReaderInteger(u8, reader));
         }
         if (std.mem.eql(u8, target, "ChangeBeatmapAvailability")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
@@ -1462,7 +2515,7 @@ pub const Manager = struct {
             if (argument_count != 2) return error.InvalidMultiplayerArguments;
             const beatmap_id = try reader.nullableInteger();
             const ruleset_id = try reader.nullableInteger();
-            return self.changeStyle(connection, invocation_id, if (beatmap_id) |value| @intCast(value) else null, if (ruleset_id) |value| @intCast(value) else null);
+            return self.changeStyle(connection, invocation_id, try checkedNullableInteger(i32, beatmap_id), try checkedNullableInteger(i32, ruleset_id));
         }
         if (std.mem.eql(u8, target, "ChangeUserMods")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
@@ -1486,15 +2539,15 @@ pub const Manager = struct {
         if (std.mem.eql(u8, target, "VoteToSkipIntro")) return self.voteSkip(connection, invocation_id);
         if (std.mem.eql(u8, target, "InvitePlayer")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
-            return self.invitePlayer(connection, invocation_id, @intCast(try reader.integer()));
+            return self.invitePlayer(connection, invocation_id, try checkedReaderInteger(i32, reader));
         }
         if (std.mem.eql(u8, target, "SendMatchRequest")) {
-            for (0..argument_count) |_| try reader.skip(0);
-            return self.finishVoid(connection, invocation_id);
+            if (argument_count != 1) return error.InvalidMultiplayerArguments;
+            return self.sendMatchRequest(connection, invocation_id, try reader.raw());
         }
         if (std.mem.eql(u8, target, "GetMatchmakingPools") or std.mem.eql(u8, target, "GetMatchmakingPoolsOfType")) {
             if (argument_count > 1) return error.InvalidMultiplayerArguments;
-            const pool_type: u8 = if (argument_count == 1) @intCast(try reader.integer()) else 0;
+            const pool_type: u8 = if (argument_count == 1) try checkedReaderInteger(u8, reader) else 0;
             return self.getMatchmakingPools(connection, invocation_id, pool_type);
         }
         if (std.mem.eql(u8, target, "MatchmakingJoinLobby")) {
@@ -1506,7 +2559,7 @@ pub const Manager = struct {
             const request = try reader.raw();
             var request_reader: MessagePackReader = .{ .data = request };
             if (try request_reader.arrayLen() < 1) return error.InvalidMultiplayerArguments;
-            return self.joinMatchmakingLobby(connection, invocation_id, @intCast(try request_reader.integer()));
+            return self.joinMatchmakingLobby(connection, invocation_id, try checkedReaderInteger(i32, &request_reader));
         }
         if (std.mem.eql(u8, target, "MatchmakingLeaveLobby")) {
             if (argument_count != 0) return error.InvalidMultiplayerArguments;
@@ -1514,7 +2567,7 @@ pub const Manager = struct {
         }
         if (std.mem.eql(u8, target, "MatchmakingJoinQueue")) {
             if (argument_count != 1) return error.InvalidMultiplayerArguments;
-            return self.joinMatchmakingQueue(connection, invocation_id, @intCast(try reader.integer()));
+            return self.joinMatchmakingQueue(connection, invocation_id, try checkedReaderInteger(i32, reader));
         }
         if (std.mem.eql(u8, target, "MatchmakingLeaveQueue")) {
             if (argument_count != 0) return error.InvalidMultiplayerArguments;
@@ -1532,8 +2585,8 @@ pub const Manager = struct {
             return self.issueMatchmakingDuel(
                 connection,
                 invocation_id,
-                @intCast(try request_reader.integer()),
-                @intCast(try request_reader.integer()),
+                try checkedReaderInteger(i32, &request_reader),
+                try checkedReaderInteger(i32, &request_reader),
             );
         }
         if (std.mem.eql(u8, target, "MatchmakingAcceptDuel")) {
@@ -1577,7 +2630,10 @@ pub const Manager = struct {
         };
         room.id = self.next_room_id;
         self.next_room_id += 1;
-        room.channel_id = 4;
+        room.channel_id = @intCast(lazer.roomChannelId(room.id) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerRoomLimit;
+        });
         connection.room_id = room.id;
         self.rooms[slot] = room;
         response = completionRoomOwned(self.allocator, id, room, self.nowMs()) catch |err| {
@@ -1605,14 +2661,39 @@ pub const Manager = struct {
         var joined_ranked_playlist: [ranked_hand_size]?PlaylistItem = [_]?PlaylistItem{null} ** ranked_hand_size;
         defer for (match_state_events) |event| if (event) |frame| self.allocator.free(frame);
         self.mutex.lockUncancelable(self.io);
-        if (connection.room_id != null) {
+        if (connection.room_id) |current_room_id| {
+            if (current_room_id != room_id) {
+                self.mutex.unlock(self.io);
+                return error.AlreadyInMultiplayerRoom;
+            }
+            const current_room = self.roomByIdLocked(room_id) orelse {
+                connection.room_id = null;
+                self.mutex.unlock(self.io);
+                return error.MultiplayerRoomNotFound;
+            };
+            if (current_room.userIndex(connection.user_id) == null) {
+                connection.room_id = null;
+                self.mutex.unlock(self.io);
+                return error.NotInMultiplayerRoom;
+            }
+            response = completionRoomOwned(self.allocator, id, current_room, self.nowMs()) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
             self.mutex.unlock(self.io);
-            return error.AlreadyInMultiplayerRoom;
+            defer self.allocator.free(response);
+            connection.send(response);
+            std.log.info("event=lazer_multiplayer_room_rebound room_id={d} user_id={d}", .{ room_id, connection.user_id });
+            return;
         }
         const room = self.roomByIdLocked(room_id) orelse {
             self.mutex.unlock(self.io);
             return error.MultiplayerRoomNotFound;
         };
+        if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds())) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerRoomNotFound;
+        }
         if (!std.mem.eql(u8, room.settings.password.slice(), password)) {
             self.mutex.unlock(self.io);
             return error.InvalidMultiplayerPassword;
@@ -1620,6 +2701,23 @@ pub const Manager = struct {
         if (!room.userAllowed(connection.user_id)) {
             self.mutex.unlock(self.io);
             return error.MultiplayerPermissionDenied;
+        }
+        // A graceful restart restores the room's participant membership before
+        // any websocket exists. When that user reconnects and explicitly joins
+        // the room, bind the new connection to the restored membership rather
+        // than appending the same user a second time.
+        if (room.userIndex(connection.user_id) != null) {
+            connection.room_id = room_id;
+            response = completionRoomOwned(self.allocator, id, room, self.nowMs()) catch |err| {
+                connection.room_id = null;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.mutex.unlock(self.io);
+            defer self.allocator.free(response);
+            connection.send(response);
+            std.log.info("event=lazer_multiplayer_room_membership_restored room_id={d} user_id={d}", .{ room_id, connection.user_id });
+            return;
         }
         const limit: usize = room.settings.max_participants orelse max_users;
         if (room.user_count >= limit) {
@@ -1633,6 +2731,7 @@ pub const Manager = struct {
             return error.MultiplayerRoomFull;
         };
         joined = try defaultRoomUser(connection.user_id, connection.user_name.slice(), connection.user_country);
+        if (room.settings.match_type == 2) joined.team_id = nextTeamId(room);
         room.users[user_slot] = joined;
         room.user_count += 1;
         connection.room_id = room_id;
@@ -1741,6 +2840,13 @@ pub const Manager = struct {
         };
         defer releaseRecipients(recipients[0..count]);
         self.mutex.unlock(self.io);
+        if (ranked_ended and ended_room == null) if (room_id) |id| {
+            self.persistLiveRankedResult(id) catch |err| std.log.err("event=lazer_ranked_rating_persist_failed room_id={d} error={t}", .{ id, err });
+            if (self.rankedStateEventForRoom(id) catch null) |updated| {
+                if (ranked_event) |old| self.allocator.free(old);
+                ranked_event = updated;
+            }
+        };
         if (ended_room) |ended| self.archiveRoom(ended);
         if (left_user) |user| {
             const event = try eventUserOwned(self.allocator, "UserLeft", user);
@@ -1822,6 +2928,10 @@ pub const Manager = struct {
     fn changeSettings(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, encoded: []const u8) !void {
         var settings = try parseSettings(encoded);
         var recipients: [max_connections]*Connection = undefined;
+        var reset_users: [max_users]i32 = undefined;
+        var reset_user_count: usize = 0;
+        var team_users: [max_users]struct { id: i32, team_id: i32 } = undefined;
+        var team_user_count: usize = 0;
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
             self.mutex.unlock(self.io);
@@ -1832,22 +2942,54 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return error.MultiplayerPermissionDenied;
         }
+        if (settings.max_participants) |limit| if (limit < room.user_count) {
+            self.mutex.unlock(self.io);
+            return error.InvalidMultiplayerParticipantLimit;
+        };
+        const room_before = room.*;
         if (settings.playlist_item_id == 0 or room.itemIndex(settings.playlist_item_id) == null) settings.playlist_item_id = room.settings.playlist_item_id;
         room.settings = settings;
         for (&room.users) |*entry| {
             if (entry.*) |*user| {
-                if (user.state == 1) user.state = 0;
+                if (user.state == 1) {
+                    user.state = 0;
+                    reset_users[reset_user_count] = user.id;
+                    reset_user_count += 1;
+                }
+                if (settings.match_type == 2) {
+                    if (user.team_id == null) user.team_id = nextTeamId(room);
+                    team_users[team_user_count] = .{ .id = user.id, .team_id = user.team_id.? };
+                    team_user_count += 1;
+                } else user.team_id = null;
             }
         }
         const count = self.recipientsLocked(room_id, null, &recipients);
         defer releaseRecipients(recipients[0..count]);
-        const event = eventSettingsOwned(self.allocator, "SettingsChanged", room.settings) catch |err| {
+        const settings_event = eventSettingsOwned(self.allocator, "SettingsChanged", room.settings) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        errdefer self.allocator.free(settings_event);
+        const room_state_event = eventMatchRoomStateOwned(self.allocator, room) catch |err| {
+            room.* = room_before;
             self.mutex.unlock(self.io);
             return err;
         };
         self.mutex.unlock(self.io);
-        defer self.allocator.free(event);
-        sendRecipients(recipients[0..count], event);
+        defer self.allocator.free(settings_event);
+        defer self.allocator.free(room_state_event);
+        sendRecipients(recipients[0..count], settings_event);
+        sendRecipients(recipients[0..count], room_state_event);
+        for (reset_users[0..reset_user_count]) |user_id| {
+            const state_event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ user_id, 0 });
+            defer self.allocator.free(state_event);
+            sendRecipients(recipients[0..count], state_event);
+        }
+        for (team_users[0..team_user_count]) |team| {
+            const team_event = try eventTeamStateOwned(self.allocator, team.id, team.team_id);
+            defer self.allocator.free(team_event);
+            sendRecipients(recipients[0..count], team_event);
+        }
         try self.finishVoid(connection, invocation_id);
     }
 
@@ -1866,6 +3008,8 @@ pub const Manager = struct {
         defer for (match_events) |event| if (event) |frame| self.allocator.free(frame);
         var playlist_event: ?[]u8 = null;
         defer if (playlist_event) |event| self.allocator.free(event);
+        var playlist_settings_event: ?[]u8 = null;
+        defer if (playlist_settings_event) |event| self.allocator.free(event);
         var results_ready = false;
         var ranked_removed_card: ?RankedCard = null;
         var ranked_removed_user: ?i32 = null;
@@ -1876,6 +3020,8 @@ pub const Manager = struct {
         defer if (ranked_countdown_event) |event| self.allocator.free(event);
         var changed_room_state: ?i32 = null;
         var emitted_user_state: u8 = new_state;
+        var ranked_result_room_id: ?i64 = null;
+        var ranked_result_event_index: ?usize = null;
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
             self.mutex.unlock(self.io);
@@ -1981,6 +3127,22 @@ pub const Manager = struct {
                     ranked.stage = ranked_stage.results;
                     match_snapshots[match_snapshot_count] = room.*;
                     match_snapshot_count += 1;
+                } else {
+                    const advanced = advanceRoomPlaylist(room);
+                    if (advanced.expired) |item| {
+                        playlist_event = eventPlaylistOwned(self.allocator, "PlaylistItemChanged", item) catch |err| {
+                            room.* = room_before;
+                            self.mutex.unlock(self.io);
+                            return err;
+                        };
+                    }
+                    if (advanced.next_item_id != null) {
+                        playlist_settings_event = eventSettingsOwned(self.allocator, "SettingsChanged", room.settings) catch |err| {
+                            room.* = room_before;
+                            self.mutex.unlock(self.io);
+                            return err;
+                        };
+                    }
                 }
             }
         } else if (new_state == 0 and room.matchmaking != null and room.matchmaking.?.stage == matchmaking_stage.results) {
@@ -2028,13 +3190,9 @@ pub const Manager = struct {
                 ranked.gameplay_item = 0;
                 if (!rankedHasRoundsRemaining(ranked)) {
                     ranked.winning_user_id = rankedWinner(ranked);
-                    for (&ranked.users) |*entry| if (entry.*) |*user| {
-                        if (ranked.winning_user_id) |winner_id| {
-                            const rating_delta: i32 = if (user.id == winner_id) 16 else -16;
-                            user.rating_after = user.rating + rating_delta;
-                        }
-                    };
                     ranked.stage = ranked_stage.ended;
+                    ranked_result_room_id = room.id;
+                    ranked_result_event_index = match_snapshot_count;
                     match_snapshots[match_snapshot_count] = room.*;
                     match_snapshot_count += 1;
                 } else {
@@ -2084,6 +3242,13 @@ pub const Manager = struct {
             }
         };
         self.mutex.unlock(self.io);
+        if (ranked_result_room_id) |id| {
+            self.persistLiveRankedResult(id) catch |err| std.log.err("event=lazer_ranked_rating_persist_failed room_id={d} error={t}", .{ id, err });
+            if (self.rankedStateEventForRoom(id) catch null) |updated| if (ranked_result_event_index) |index| {
+                if (match_events[index]) |old| self.allocator.free(old);
+                match_events[index] = updated;
+            };
+        }
         const user_state_event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ connection.user_id, emitted_user_state });
         defer self.allocator.free(user_state_event);
         sendRecipients(recipients[0..count], user_state_event);
@@ -2110,6 +3275,7 @@ pub const Manager = struct {
             sendRecipients(start_players[0..start_count], event);
         }
         if (playlist_event) |event| sendRecipients(recipients[0..count], event);
+        if (playlist_settings_event) |event| sendRecipients(recipients[0..count], event);
         if (ranked_removed_card) |card| if (ranked_removed_user) |user_id| {
             const event = try eventRankedCardUserOwned(self.allocator, "RankedPlayCardRemoved", user_id, card);
             defer self.allocator.free(event);
@@ -2198,10 +3364,254 @@ pub const Manager = struct {
         try self.finishVoid(connection, invocation_id);
     }
 
+    fn sendMatchRequest(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, encoded: []const u8) !void {
+        const ParsedRequest = union(enum) {
+            change_team: i32,
+            start_countdown: i64,
+            stop_countdown: i32,
+            avatar_action: i64,
+            ranked_hand_replay: []const u8,
+            set_lock: bool,
+            roll: ?i64,
+            change_slot: u8,
+        };
+        var reader: MessagePackReader = .{ .data = encoded };
+        if (try reader.arrayLen() != 2) return error.InvalidMultiplayerArguments;
+        const request_type = try reader.integer();
+        const payload = try reader.raw();
+        if (reader.pos != reader.data.len) return error.InvalidMultiplayerArguments;
+        var payload_reader: MessagePackReader = .{ .data = payload };
+        if (try payload_reader.arrayLen() != 1) return error.InvalidMultiplayerArguments;
+        const request: ParsedRequest = switch (request_type) {
+            0 => .{ .change_team = std.math.cast(i32, try payload_reader.integer()) orelse return error.InvalidMultiplayerArguments },
+            1 => .{ .start_countdown = try payload_reader.integer() },
+            2 => .{ .stop_countdown = std.math.cast(i32, try payload_reader.integer()) orelse return error.InvalidMultiplayerArguments },
+            3 => .{ .avatar_action = try payload_reader.integer() },
+            4 => .{ .ranked_hand_replay = try payload_reader.raw() },
+            5 => .{ .set_lock = try payload_reader.boolean() },
+            6 => .{ .roll = try payload_reader.nullableInteger() },
+            7 => .{ .change_slot = std.math.cast(u8, try payload_reader.integer()) orelse return error.InvalidMultiplayerArguments },
+            else => return error.UnsupportedMultiplayerMethod,
+        };
+        if (payload_reader.pos != payload_reader.data.len) return error.InvalidMultiplayerArguments;
+        switch (request) {
+            .change_team => |team_id| try self.changeTeam(connection, invocation_id, team_id),
+            .start_countdown => |duration_ticks| try self.startMatchCountdown(connection, invocation_id, duration_ticks),
+            .stop_countdown => |countdown_id| try self.stopMatchCountdown(connection, invocation_id, countdown_id),
+            .avatar_action => |action| try self.matchmakingAvatarAction(connection, invocation_id, action),
+            .ranked_hand_replay => |frames| try self.rankedHandReplay(connection, invocation_id, frames),
+            .set_lock => |locked| try self.setRoomLock(connection, invocation_id, locked),
+            .roll => |max| try self.roll(connection, invocation_id, max),
+            .change_slot => |slot_id| try self.changeSlot(connection, invocation_id, slot_id),
+        }
+    }
+
+    fn changeTeam(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, team_id: i32) !void {
+        if (team_id < 0 or team_id > 1) return error.InvalidMultiplayerTeam;
+        var recipients: [max_connections]*Connection = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        const user_index = room.userIndex(connection.user_id).?;
+        const user = &room.users[user_index].?;
+        if (room.settings.match_type != 2 or room.state != 0 or (room.locked and room.host_id != connection.user_id and user.role != 1)) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        user.team_id = team_id;
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventTeamStateOwned(self.allocator, connection.user_id, team_id);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn startMatchCountdown(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, duration_ticks: i64) !void {
+        if (duration_ticks < timespan_ticks_per_second or duration_ticks > 10 * 60 * timespan_ticks_per_second) return error.InvalidMultiplayerCountdown;
+        const duration_ms = @divFloor(duration_ticks, timespan_ticks_per_millisecond);
+        var recipients: [max_connections]*Connection = undefined;
+        var countdown: MatchStartCountdownState = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        const user_index = room.userIndex(connection.user_id).?;
+        if ((room.host_id != connection.user_id and room.users[user_index].?.role != 1) or room.state != 0 or room.match_start_countdown != null) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        countdown = .{ .id = self.next_countdown_id, .deadline_ms = self.nowMs() + duration_ms };
+        self.next_countdown_id = if (self.next_countdown_id == std.math.maxInt(i32)) 1 else self.next_countdown_id + 1;
+        room.match_start_countdown = countdown;
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventMatchStartCountdownOwned(self.allocator, countdown, self.nowMs());
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn stopMatchCountdown(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, countdown_id: i32) !void {
+        var recipients: [max_connections]*Connection = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        const user_index = room.userIndex(connection.user_id).?;
+        if ((room.host_id != connection.user_id and room.users[user_index].?.role != 1) or room.match_start_countdown == null or room.match_start_countdown.?.id != countdown_id) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        room.match_start_countdown = null;
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventRankedCountdownStoppedOwned(self.allocator, countdown_id);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn setRoomLock(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, locked: bool) !void {
+        var recipients: [max_connections]*Connection = undefined;
+        var snapshot: Room = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        const user_index = room.userIndex(connection.user_id).?;
+        if (room.host_id != connection.user_id and room.users[user_index].?.role != 1) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        room.locked = locked;
+        snapshot = room.*;
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventMatchRoomStateOwned(self.allocator, &snapshot);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn changeSlot(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, slot_id: u8) !void {
+        var recipients: [max_connections]*Connection = undefined;
+        var snapshot: Room = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        const user_index = room.userIndex(connection.user_id).?;
+        const limit: usize = room.settings.max_participants orelse max_users;
+        if (slot_id >= limit or room.users[slot_id] != null or room.state != 0 or (room.locked and room.host_id != connection.user_id and room.users[user_index].?.role != 1)) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        room.users[slot_id] = room.users[user_index];
+        room.users[user_index] = null;
+        snapshot = room.*;
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventMatchRoomStateOwned(self.allocator, &snapshot);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn roll(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, requested_max: ?i64) !void {
+        const max = requested_max orelse 100;
+        if (max < 2 or max > 1_000_000) return error.InvalidMultiplayerRoll;
+        var random: [8]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const result = @as(i64, @intCast(std.mem.readInt(u64, &random, .little) % @as(u64, @intCast(max)))) + 1;
+        var recipients: [max_connections]*Connection = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        if (self.roomByIdLocked(room_id).?.userIndex(connection.user_id) == null) {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        }
+        const count = self.recipientsLocked(room_id, null, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventRollOwned(self.allocator, connection.user_id, max, result);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn matchmakingAvatarAction(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, action: i64) !void {
+        if (action != 0) return error.InvalidMultiplayerAvatarAction;
+        var recipients: [max_connections]*Connection = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        if (room.matchmaking == null or room.userIndex(connection.user_id) == null) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        const count = self.recipientsLocked(room_id, connection, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventMatchmakingAvatarActionOwned(self.allocator, connection.user_id, action);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
+    fn rankedHandReplay(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, frames: []const u8) !void {
+        var frames_reader: MessagePackReader = .{ .data = frames };
+        const frame_count = try frames_reader.arrayLen();
+        if (frame_count > 256) return error.InvalidMultiplayerReplay;
+        for (0..frame_count) |_| try frames_reader.skip(0);
+        if (frames_reader.pos != frames_reader.data.len) return error.InvalidMultiplayerReplay;
+        var recipients: [max_connections]*Connection = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const room_id = connection.room_id orelse {
+            self.mutex.unlock(self.io);
+            return error.NotInMultiplayerRoom;
+        };
+        const room = self.roomByIdLocked(room_id).?;
+        if (room.ranked_play == null or room.userIndex(connection.user_id) == null) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPermissionDenied;
+        }
+        const count = self.recipientsLocked(room_id, connection, &recipients);
+        defer releaseRecipients(recipients[0..count]);
+        self.mutex.unlock(self.io);
+        const event = try eventRankedHandReplayOwned(self.allocator, connection.user_id, frames);
+        defer self.allocator.free(event);
+        sendRecipients(recipients[0..count], event);
+        try self.finishVoid(connection, invocation_id);
+    }
+
     fn startMatch(self: *Manager, connection: *Connection, invocation_id: ?[]const u8) !void {
         var recipients: [max_connections]*Connection = undefined;
         var loaders: [max_connections]*Connection = undefined;
         var loader_count: usize = 0;
+        var countdown_id: ?i32 = null;
         var state_events: [max_users]?[]u8 = [_]?[]u8{null} ** max_users;
         defer for (&state_events) |*entry| if (entry.*) |event| self.allocator.free(event);
         self.mutex.lockUncancelable(self.io);
@@ -2229,6 +3639,8 @@ pub const Manager = struct {
             self.mutex.unlock(self.io);
             return error.NoReadyMultiplayerPlayers;
         }
+        countdown_id = if (room.match_start_countdown) |countdown| countdown.id else null;
+        room.match_start_countdown = null;
         room.state = 1;
         const count = self.recipientsLocked(room_id, null, &recipients);
         defer releaseRecipients(recipients[0..count]);
@@ -2245,6 +3657,11 @@ pub const Manager = struct {
         const room_event = try eventIntegersOwned(self.allocator, "RoomStateChanged", &.{1});
         defer self.allocator.free(room_event);
         sendRecipients(recipients[0..count], room_event);
+        if (countdown_id) |id| {
+            const countdown_event = try eventRankedCountdownStoppedOwned(self.allocator, id);
+            defer self.allocator.free(countdown_event);
+            sendRecipients(recipients[0..count], countdown_event);
+        }
         for (state_events) |entry| if (entry) |event| sendRecipients(recipients[0..count], event);
         const load = try eventNoArgsOwned(self.allocator, "LoadRequested");
         defer self.allocator.free(load);
@@ -2254,20 +3671,30 @@ pub const Manager = struct {
 
     fn abortMatch(self: *Manager, connection: *Connection, invocation_id: ?[]const u8) !void {
         var recipients: [max_connections]*Connection = undefined;
+        var changed_users: [max_users]i32 = undefined;
+        var changed_user_count: usize = 0;
+        var countdown_id: ?i32 = null;
         self.mutex.lockUncancelable(self.io);
         const room_id = connection.room_id orelse {
             self.mutex.unlock(self.io);
             return error.NotInMultiplayerRoom;
         };
         const room = self.roomByIdLocked(room_id).?;
-        if (room.host_id != connection.user_id) {
+        const requester_index = room.userIndex(connection.user_id).?;
+        if (room.host_id != connection.user_id and room.users[requester_index].?.role != 1) {
             self.mutex.unlock(self.io);
             return error.MultiplayerPermissionDenied;
         }
+        countdown_id = if (room.match_start_countdown) |countdown| countdown.id else null;
+        room.match_start_countdown = null;
         room.state = 0;
         for (&room.users) |*entry| {
             if (entry.*) |*user| {
-                if (user.state >= 2 and user.state <= 7) user.state = 0;
+                if (user.state >= 2 and user.state <= 7) {
+                    user.state = 0;
+                    changed_users[changed_user_count] = user.id;
+                    changed_user_count += 1;
+                }
             }
         }
         const count = self.recipientsLocked(room_id, null, &recipients);
@@ -2276,6 +3703,16 @@ pub const Manager = struct {
         const room_event = try eventIntegersOwned(self.allocator, "RoomStateChanged", &.{0});
         defer self.allocator.free(room_event);
         sendRecipients(recipients[0..count], room_event);
+        if (countdown_id) |id| {
+            const countdown_event = try eventRankedCountdownStoppedOwned(self.allocator, id);
+            defer self.allocator.free(countdown_event);
+            sendRecipients(recipients[0..count], countdown_event);
+        }
+        for (changed_users[0..changed_user_count]) |user_id| {
+            const state_event = try eventIntegersOwned(self.allocator, "UserStateChanged", &.{ user_id, 0 });
+            defer self.allocator.free(state_event);
+            sendRecipients(recipients[0..count], state_event);
+        }
         const abort_event = try eventIntegersOwned(self.allocator, "GameplayAborted", &.{1});
         defer self.allocator.free(abort_event);
         sendRecipients(recipients[0..count], abort_event);
@@ -2313,7 +3750,10 @@ pub const Manager = struct {
             if (entry) |existing| item.id = @max(item.id, existing.id + 1);
         }
         item.owner_id = connection.user_id;
-        item.order = @intCast(room.playlist_count);
+        item.order = nextPlaylistOrder(room) orelse {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerPlaylistFull;
+        };
         room.playlist[slot] = item;
         room.playlist_count += 1;
         const count = self.recipientsLocked(room_id, null, &recipients);
@@ -2432,7 +3872,7 @@ pub const Manager = struct {
         const password_slice = room.settings.password.slice();
         @memcpy(password[0..password_slice.len], password_slice);
         password_len = password_slice.len;
-        for (self.connections.items) |candidate| if (candidate.user_id == user_id and candidate.room_id == null and candidate.alive) {
+        for (self.connections.items) |candidate| if (candidate.user_id == user_id and candidate.room_id == null and candidate.alive.load(.acquire)) {
             candidate.retain();
             target = candidate;
             break;
@@ -2492,7 +3932,7 @@ pub const Manager = struct {
         var user_count: usize = 0;
         self.mutex.lockUncancelable(self.io);
         for (self.connections.items) |candidate| {
-            if (!candidate.alive) continue;
+            if (!candidate.alive.load(.acquire)) continue;
             if (candidate.lobby_pool_id == pool_id and recipient_count < recipients.len) {
                 candidate.retain();
                 recipients[recipient_count] = candidate;
@@ -2704,7 +4144,7 @@ pub const Manager = struct {
         }
         connection.queue_pool_id = pool_id;
         for (self.connections.items) |candidate| {
-            if (candidate == connection or candidate.user_id == connection.user_id or !candidate.alive or candidate.room_id != null or candidate.queue_pool_id != pool_id or candidate.pending_match_id != null) continue;
+            if (candidate == connection or candidate.user_id == connection.user_id or !candidate.alive.load(.acquire) or candidate.room_id != null or candidate.queue_pool_id != pool_id or candidate.pending_match_id != null) continue;
             peer = candidate;
             break;
         }
@@ -2818,13 +4258,16 @@ pub const Manager = struct {
         room.settings.auto_start.len = 1;
         room.allowed_users[0] = pending.users[0];
         room.allowed_users[1] = pending.users[1];
-        for (pending.users, 0..) |user_id, index| if (pool_type == 0) {
-            room.matchmaking.?.users[index] = .{ .id = user_id };
-            room.matchmaking.?.user_count += 1;
-        } else {
-            room.ranked_play.?.users[index] = .{ .id = user_id };
-            room.ranked_play.?.user_count += 1;
-        };
+        for (pending.users, 0..) |user_id, index| {
+            if (pool_type == 0) {
+                room.matchmaking.?.users[index] = .{ .id = user_id };
+                room.matchmaking.?.user_count += 1;
+            } else {
+                const rating = if (self.store) |store| (try store.lazerRankedRating(user_id, mode)).rating else @as(i32, 1500);
+                room.ranked_play.?.users[index] = .{ .id = user_id, .rating = rating, .rating_after = rating };
+                room.ranked_play.?.user_count += 1;
+            }
+        }
         for (0..map_count) |index| {
             const map = self.matchmaking_maps[mode][index].?;
             var item: PlaylistItem = .{
@@ -3217,6 +4660,44 @@ pub const Manager = struct {
         try self.finishVoid(connection, invocation_id);
     }
 
+    pub fn advanceExpiredMatchCountdowns(self: *Manager, now_ms: i64) !usize {
+        var advanced: usize = 0;
+        while (true) {
+            var recipients: [max_connections]*Connection = undefined;
+            var host: ?*Connection = null;
+            var countdown_id: i32 = 0;
+            var room_id: i64 = 0;
+            self.mutex.lockUncancelable(self.io);
+            const room = expired: {
+                for (self.rooms) |entry| if (entry) |candidate| {
+                    const countdown = candidate.match_start_countdown orelse continue;
+                    if (candidate.state == 0 and countdown.deadline_ms <= now_ms) break :expired candidate;
+                };
+                self.mutex.unlock(self.io);
+                return advanced;
+            };
+            countdown_id = room.match_start_countdown.?.id;
+            room_id = room.id;
+            room.match_start_countdown = null;
+            if (self.connectionByUserLocked(room.host_id)) |connection| if (connection.room_id == room.id) {
+                connection.retain();
+                host = connection;
+            };
+            const recipient_count = self.recipientsLocked(room.id, null, &recipients);
+            defer releaseRecipients(recipients[0..recipient_count]);
+            self.mutex.unlock(self.io);
+            const stopped = try eventRankedCountdownStoppedOwned(self.allocator, countdown_id);
+            defer self.allocator.free(stopped);
+            sendRecipients(recipients[0..recipient_count], stopped);
+            if (host) |connection| {
+                defer connection.release();
+                self.startMatch(connection, null) catch |err| if (err != error.NoReadyMultiplayerPlayers)
+                    std.log.warn("event=lazer_multiplayer_countdown_start_failed room_id={d} error={t}", .{ room_id, err });
+            }
+            advanced += 1;
+        }
+    }
+
     pub fn advanceExpiredRankedPicks(self: *Manager, now_ms: i64) !usize {
         var advanced: usize = 0;
         while (true) {
@@ -3270,6 +4751,11 @@ pub const Manager = struct {
                 };
                 self.mutex.unlock(self.io);
                 defer releaseRecipients(recipients[0..recipient_count]);
+                self.persistLiveRankedResult(room_id) catch |err| std.log.err("event=lazer_ranked_rating_persist_failed room_id={d} error={t}", .{ room_id, err });
+                if (self.rankedStateEventForRoom(room_id) catch null) |updated| {
+                    if (frames[1]) |old| self.allocator.free(old);
+                    frames[1] = updated;
+                }
                 sendRecipients(recipients[0..recipient_count], frames[0].?);
                 sendRecipients(recipients[0..recipient_count], frames[1].?);
                 std.log.warn("event=lazer_ranked_pick_ended room_id={d} error=no_playable_card", .{room_id});
@@ -3333,6 +4819,107 @@ pub const Manager = struct {
         }
     }
 
+    fn recordArchivedRoomScore(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, score: RoomScoreResult) !void {
+        // Serialize with close/retry/checkpoint archive writers without
+        // blocking live rooms, websocket connects, or matchmaking on the
+        // manager-wide state mutex while storage and JSON work completes.
+        self.archive_mutex.lockUncancelable(self.io);
+        defer self.archive_mutex.unlock(self.io);
+        const store = self.store orelse return error.StoreUnavailable;
+        var archive = (try store.lazerMultiplayerRoomArchive(self.allocator, room_id)) orelse return error.MultiplayerRoomNotFound;
+        defer archive.deinit();
+        if (!try archiveIncludesUserFallible(self.allocator, archive.participant_ids_json, user_id)) return error.MultiplayerPermissionDenied;
+        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
+        if (now_seconds > std.math.add(i64, archive.ended_at, multiplayer_score_grace_seconds) catch return error.MultiplayerRoomNotFound) return error.MultiplayerRoomNotFound;
+        if ((try archivedScoreContext(self.allocator, archive.room_json, playlist_item_id)) == null) return error.MultiplayerPermissionDenied;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, archive.room_json, .{});
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |*object| object,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        const records = switch ((root.getPtr("zigcho_score_records") orelse return error.InvalidMultiplayerArchive).*) {
+            .array => |*array| array,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        const token_id = score.token_id orelse return error.InvalidMultiplayerScoreToken;
+        const tokens = switch ((root.getPtr("zigcho_score_tokens") orelse return error.InvalidMultiplayerScoreToken).*) {
+            .array => |*array| array,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        if (tokens.items.len > max_room_scores) return error.InvalidMultiplayerArchive;
+        var token_index: ?usize = null;
+        for (tokens.items, 0..) |value, index| {
+            const token = archivedScoreTokenRecord(value) orelse return error.InvalidMultiplayerArchive;
+            if (token.token_id != token_id) continue;
+            if (token_index != null) return error.InvalidMultiplayerArchive;
+            if (token.user_id != user_id or token.playlist_item_id != playlist_item_id) return error.InvalidMultiplayerScoreToken;
+            token_index = index;
+        }
+        const bound_token_index = token_index orelse return error.InvalidMultiplayerScoreToken;
+        const bound_token = archivedScoreTokenRecord(tokens.items[bound_token_index]) orelse return error.InvalidMultiplayerArchive;
+        for (records.items) |value| if (archivedScoreRecord(value)) |existing| {
+            if (existing.score_id != score.score_id) continue;
+            if (existing.user_id != user_id or existing.playlist_item_id != playlist_item_id or bound_token.score_id != score.score_id) return error.InvalidMultiplayerArchive;
+            return;
+        } else return error.InvalidMultiplayerArchive;
+        if (bound_token.score_id != null) return error.InvalidMultiplayerScoreToken;
+        if (records.items.len >= max_room_scores) return error.MultiplayerScoreLimit;
+
+        const arena = parsed.arena.allocator();
+        var score_object: std.json.ObjectMap = .empty;
+        try score_object.put(arena, "score_id", .{ .integer = score.score_id });
+        try score_object.put(arena, "user_id", .{ .integer = user_id });
+        try score_object.put(arena, "playlist_item_id", .{ .integer = playlist_item_id });
+        try score_object.put(arena, "total_score", .{ .integer = score.total_score });
+        try score_object.put(arena, "accuracy", .{ .float = score.accuracy });
+        try score_object.put(arena, "max_combo", .{ .integer = score.max_combo });
+        try score_object.put(arena, "passed", .{ .bool = score.passed });
+        try records.append(.{ .object = score_object });
+        const token_object = switch (tokens.items[bound_token_index]) {
+            .object => |*object| object,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        try token_object.put(arena, "score_id", .{ .integer = score.score_id });
+
+        const realtime = switch (root.get("category") orelse return error.InvalidMultiplayerArchive) {
+            .string => |category| if (std.mem.eql(u8, category, "realtime"))
+                true
+            else if (std.mem.eql(u8, category, "normal"))
+                false
+            else
+                return error.InvalidMultiplayerArchive,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        const snapshot = try self.allocator.create(Room);
+        defer self.allocator.destroy(snapshot);
+        snapshot.* = .{ .id = room_id, .settings = .{}, .host_id = archive.owner_id };
+        snapshot.settings.match_type = if (realtime) 1 else 0;
+        defer snapshot.deinit(self.allocator);
+        const participants = switch (root.get("recent_participants") orelse return error.InvalidMultiplayerArchive) {
+            .array => |array| array,
+            else => return error.InvalidMultiplayerArchive,
+        };
+        if (participants.items.len > max_room_participants) return error.InvalidMultiplayerArchive;
+        for (participants.items) |value| snapshot.rememberParticipant(try roomUserFromJson(value));
+        if (snapshot.participantIndex(user_id) == null) return error.MultiplayerPermissionDenied;
+        try snapshot.scores.ensureTotalCapacity(self.allocator, records.items.len);
+        for (records.items) |value| snapshot.scores.appendAssumeCapacity(archivedScoreRecord(value) orelse return error.InvalidMultiplayerArchive);
+
+        var room_output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer room_output.deinit();
+        std.json.Stringify.value(parsed.value, .{}, &room_output.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        var leaderboard_output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer leaderboard_output.deinit();
+        writeRoomLeaderboardJson(&leaderboard_output.writer, snapshot, 0) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        try store.updateLazerMultiplayerRoomArchive(room_id, room_output.written(), leaderboard_output.written());
+    }
+
     pub fn recordRoomScore(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, score: RoomScoreResult) !void {
         var recipients: [max_connections]*Connection = undefined;
         var state_event: ?[]u8 = null;
@@ -3340,8 +4927,12 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         const room = self.roomByIdLocked(room_id) orelse {
             self.mutex.unlock(self.io);
-            return error.MultiplayerRoomNotFound;
+            return self.recordArchivedRoomScore(user_id, room_id, playlist_item_id, score);
         };
+        if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds())) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerRoomNotFound;
+        }
         if (room.userIndex(user_id) == null or room.itemIndex(playlist_item_id) == null) {
             self.mutex.unlock(self.io);
             return error.MultiplayerPermissionDenied;
@@ -3355,42 +4946,80 @@ pub const Manager = struct {
             .max_combo = score.max_combo,
             .passed = score.passed,
         };
-        if (room.score_count < room.scores.len) {
-            room.scores[room.score_count] = record;
-            room.score_count += 1;
-        } else {
-            room.scores[room.score_cursor] = record;
-            room.score_cursor = (room.score_cursor + 1) % room.scores.len;
+        for (room.scores.items) |existing| if (existing.score_id == score.score_id) {
+            if (existing.user_id != user_id or existing.playlist_item_id != playlist_item_id) {
+                self.mutex.unlock(self.io);
+                return error.InvalidMultiplayerRoomScore;
+            }
+            if (score.token_id) |token_id| if (room.scoreTokenIndex(token_id, user_id, playlist_item_id)) |index| {
+                if (room.score_tokens.items[index].score_id != score.score_id) {
+                    self.mutex.unlock(self.io);
+                    return error.InvalidMultiplayerScoreToken;
+                }
+            } else {
+                self.mutex.unlock(self.io);
+                return error.InvalidMultiplayerScoreToken;
+            };
+            self.mutex.unlock(self.io);
+            return;
+        };
+        const token_index: ?usize = if (score.token_id) |token_id|
+            room.scoreTokenIndex(token_id, user_id, playlist_item_id) orelse {
+                self.mutex.unlock(self.io);
+                return error.InvalidMultiplayerScoreToken;
+            }
+        else
+            null;
+        if (token_index) |index| if (room.score_tokens.items[index].score_id != null) {
+            self.mutex.unlock(self.io);
+            return error.InvalidMultiplayerScoreToken;
+        };
+        if (room.scores.items.len >= max_room_scores) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerScoreLimit;
         }
+        room.scores.append(self.allocator, record) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
         if (room.ranked_play) |*ranked| {
             if (ranked.gameplay_item != playlist_item_id or ranked.current_round == 0) {
+                if (token_index) |index| room.score_tokens.items[index].score_id = score.score_id;
                 self.mutex.unlock(self.io);
                 return;
             }
             const user_index = ranked.userIndex(user_id) orelse {
+                room.scores.items.len -= 1;
                 self.mutex.unlock(self.io);
                 return error.MultiplayerPermissionDenied;
             };
+            const user_before = ranked.users[user_index].?;
             ranked.users[user_index].?.total_score = score.total_score;
             ranked.users[user_index].?.submitted = true;
             const count = self.recipientsLocked(room_id, null, &recipients);
             defer releaseRecipients(recipients[0..count]);
             state_event = eventMatchStateOwned(self.allocator, room) catch |err| {
+                ranked.users[user_index] = user_before;
+                room.scores.items.len -= 1;
                 self.mutex.unlock(self.io);
                 return err;
             };
+            if (token_index) |index| room.score_tokens.items[index].score_id = score.score_id;
             self.mutex.unlock(self.io);
             sendRecipients(recipients[0..count], state_event.?);
             return;
         }
         if (room.matchmaking == null or room.matchmaking.?.gameplay_item != playlist_item_id or room.matchmaking.?.current_round == 0) {
+            if (token_index) |index| room.score_tokens.items[index].score_id = score.score_id;
             self.mutex.unlock(self.io);
             return;
         }
         const user_index = room.matchmaking.?.userIndex(user_id) orelse {
+            room.scores.items.len -= 1;
             self.mutex.unlock(self.io);
             return error.MultiplayerPermissionDenied;
         };
+        const matchmaking_before = room.matchmaking.?;
         const round_index = room.matchmaking.?.current_round - 1;
         room.matchmaking.?.users[user_index].?.rounds[round_index] = .{
             .round = room.matchmaking.?.current_round,
@@ -3403,9 +5032,12 @@ pub const Manager = struct {
         const count = self.recipientsLocked(room_id, null, &recipients);
         defer releaseRecipients(recipients[0..count]);
         state_event = eventMatchStateOwned(self.allocator, room) catch |err| {
+            room.matchmaking = matchmaking_before;
+            room.scores.items.len -= 1;
             self.mutex.unlock(self.io);
             return err;
         };
+        if (token_index) |index| room.score_tokens.items[index].score_id = score.score_id;
         self.mutex.unlock(self.io);
         sendRecipients(recipients[0..count], state_event.?);
     }
@@ -3422,6 +5054,48 @@ fn defaultRoomUser(user_id: i32, name: []const u8, country: [2]u8) !RoomUser {
     user.mods.bytes[0] = 0x90;
     user.mods.len = 1;
     return user;
+}
+
+fn nextTeamId(room: *const Room) i32 {
+    var red: usize = 0;
+    var blue: usize = 0;
+    for (room.users) |entry| if (entry) |user| {
+        if (user.team_id == 0) red += 1 else if (user.team_id == 1) blue += 1;
+    };
+    return if (red <= blue) 0 else 1;
+}
+
+fn nextPlaylistOrder(room: *const Room) ?u16 {
+    var highest: ?u16 = null;
+    for (room.playlist) |entry| {
+        if (entry) |item| highest = if (highest) |value| @max(value, item.order) else item.order;
+    }
+    return if (highest) |value| std.math.add(u16, value, 1) catch null else 0;
+}
+
+fn advanceRoomPlaylist(room: *Room) PlaylistAdvance {
+    const current_index = room.itemIndex(room.settings.playlist_item_id) orelse return .{};
+    var result: PlaylistAdvance = .{};
+    if (!room.playlist[current_index].?.expired) {
+        room.playlist[current_index].?.expired = true;
+        result.expired = room.playlist[current_index].?;
+    }
+
+    var next: ?PlaylistItem = null;
+    for (room.playlist) |entry| if (entry) |item| {
+        if (item.expired) continue;
+        if (next == null or item.order < next.?.order or (item.order == next.?.order and item.id < next.?.id)) next = item;
+    };
+    if (next) |item| {
+        if (room.settings.playlist_item_id != item.id) {
+            room.settings.playlist_item_id = item.id;
+            result.next_item_id = item.id;
+        }
+    }
+    for (&room.users) |*entry| {
+        if (entry.*) |*user| user.voted_skip = false;
+    }
+    return result;
 }
 
 fn jsonString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
@@ -3503,13 +5177,57 @@ fn jsonValueMessagePack(pack: MessagePackWriter, value: std.json.Value, depth: u
 fn setJsonMessagePack(comptime capacity: usize, destination: *FixedRaw(capacity), value: std.json.Value, allocator: std.mem.Allocator) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try jsonValueMessagePack(.{ .writer = &output.writer }, value, 0);
+    jsonValueMessagePack(.{ .writer = &output.writer }, value, 0) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
     try destination.set(output.written());
 }
 
-fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const u8) !*Room {
-    if (body.len == 0 or body.len > 128 * 1024) return error.InvalidMultiplayerRoom;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidMultiplayerRoom;
+fn roomUserFromJson(value: std.json.Value) !RoomUser {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidMultiplayerRoom,
+    };
+    const id_value = jsonInteger(object.get("id")) orelse return error.InvalidMultiplayerRoom;
+    const name = try jsonString(object, "username");
+    const country = try jsonString(object, "country_code");
+    if (id_value <= 0 or id_value > std.math.maxInt(i32) or name.len == 0 or name.len > 64 or country.len != 2) return error.InvalidMultiplayerRoom;
+    return defaultRoomUser(@intCast(id_value), name, .{ std.ascii.toUpper(country[0]), std.ascii.toUpper(country[1]) });
+}
+
+fn restoreRoomCheckpoint(allocator: std.mem.Allocator, room_json: []const u8, now_seconds: i64) !?*Room {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, room_json, .{}) catch return error.InvalidMultiplayerRoom;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidMultiplayerRoom,
+    };
+    if (!(try jsonOptionalBool(object, "zigcho_resumable", false))) return null;
+    const host = switch (object.get("host") orelse return error.InvalidMultiplayerRoom) {
+        .object => |host| host,
+        else => return error.InvalidMultiplayerRoom,
+    };
+    const host_id = jsonInteger(host.get("id")) orelse return error.InvalidMultiplayerRoom;
+    const host_name = try jsonString(host, "username");
+    const country_code = try jsonString(host, "country_code");
+    if (host_id <= 0 or host_id > std.math.maxInt(i32) or host_name.len == 0 or country_code.len != 2) return error.InvalidMultiplayerRoom;
+    const user: domain.User = .{
+        .id = @intCast(host_id),
+        .name = host_name,
+        .safe_name = host_name,
+        .country = .{ std.ascii.toUpper(country_code[0]), std.ascii.toUpper(country_code[1]) },
+    };
+    return try parseRestRoom(allocator, user, room_json, now_seconds, true);
+}
+
+fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const u8, now_seconds: i64, allow_checkpoint: bool) !*Room {
+    const max_body: usize = if (allow_checkpoint) 8 * 1024 * 1024 else 128 * 1024;
+    if (body.len == 0 or body.len > max_body) return error.InvalidMultiplayerRoom;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidMultiplayerRoom,
+    };
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |value| value,
@@ -3517,7 +5235,9 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
     };
     const name = try jsonString(object, "name");
     if (name.len == 0 or name.len > 128 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidMultiplayerRoom;
-    const password = if (object.get("password")) |value| switch (value) {
+    const resumable = allow_checkpoint and try jsonOptionalBool(object, "zigcho_resumable", false);
+    const password_field = if (resumable) "zigcho_password" else "password";
+    const password = if (object.get(password_field)) |value| switch (value) {
         .null => "",
         .string => |string| string,
         else => return error.InvalidMultiplayerRoom,
@@ -3549,6 +5269,18 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
         if (value < 1 or value > max_users) return error.InvalidMultiplayerRoom;
         break :blk @intCast(value);
     } else null;
+    const duration_raw = if (resumable) @as(?i64, 1) else try jsonOptionalInteger(object, "duration");
+    const duration_minutes: ?i64 = if (duration_raw) |value| blk: {
+        if (value <= 0 or value > 31 * 3 * 24 * 60) return error.InvalidMultiplayerRoom;
+        break :blk value;
+    } else null;
+    if (match_type == 0 and (duration_minutes == null or now_seconds < 0)) return error.InvalidMultiplayerRoom;
+    if (resumable and match_type != 0) return error.InvalidMultiplayerRoom;
+    const max_attempts_raw = try jsonOptionalInteger(object, "max_attempts");
+    const max_attempts: ?i32 = if (max_attempts_raw) |value| blk: {
+        if (value <= 0 or value > 1000) return error.InvalidMultiplayerRoom;
+        break :blk @intCast(value);
+    } else null;
     const auto_start_raw = try jsonOptionalInteger(object, "auto_start_duration");
     const auto_start: i64 = auto_start_raw orelse 0;
     if (auto_start < 0 or auto_start > std.math.maxInt(u16)) return error.InvalidMultiplayerRoom;
@@ -3559,9 +5291,24 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
     };
     if (playlist.items.len == 0 or playlist.items.len > max_playlist) return error.InvalidMultiplayerRoom;
 
+    const initial_ends_at = if (duration_minutes) |minutes|
+        std.math.add(i64, now_seconds, std.math.mul(i64, minutes, 60) catch return error.InvalidMultiplayerRoom) catch return error.InvalidMultiplayerRoom
+    else
+        0;
     const room = try allocator.create(Room);
-    errdefer allocator.destroy(room);
-    room.* = .{ .id = 0, .settings = .{}, .host_id = user.id, .host_country = user.country };
+    errdefer {
+        room.deinit(allocator);
+        allocator.destroy(room);
+    }
+    room.* = .{
+        .id = 0,
+        .settings = .{},
+        .starts_at = if (duration_minutes != null) now_seconds else 0,
+        .ends_at = initial_ends_at,
+        .max_attempts = max_attempts,
+        .host_id = user.id,
+        .host_country = publicCountry(user),
+    };
     try room.settings.name.set(name);
     try room.settings.password.set(password);
     room.settings.match_type = match_type;
@@ -3570,10 +5317,11 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
     room.settings.max_participants = max_participants;
     var auto_start_output: std.Io.Writer.Allocating = .init(allocator);
     defer auto_start_output.deinit();
-    try (MessagePackWriter{ .writer = &auto_start_output.writer }).integer(auto_start);
+    (MessagePackWriter{ .writer = &auto_start_output.writer }).integer(auto_start * timespan_ticks_per_second) catch return error.OutOfMemory;
     try room.settings.auto_start.set(auto_start_output.written());
     try room.host_name.set(user.name);
-    room.users[0] = try defaultRoomUser(user.id, user.name, user.country);
+    room.users[0] = try defaultRoomUser(user.id, user.name, publicCountry(user));
+    if (match_type == 2) room.users[0].?.team_id = 0;
     room.user_count = 1;
     room.rememberParticipant(room.users[0].?);
 
@@ -3601,6 +5349,7 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
             .order = @intCast(order_raw),
             .freestyle = try jsonOptionalBool(item_object, "freestyle", false),
         };
+        item.expired = try jsonOptionalBool(item_object, "expired", false);
         item.required_mods.bytes[0] = 0x90;
         item.required_mods.len = 1;
         item.allowed_mods.bytes[0] = 0x90;
@@ -3651,6 +5400,82 @@ fn parseRestRoom(allocator: std.mem.Allocator, user: domain.User, body: []const 
         room.playlist_count += 1;
     }
     room.settings.playlist_item_id = room.playlist[0].?.id;
+    if (resumable) {
+        const room_id = (try jsonOptionalInteger(object, "id")) orelse return error.InvalidMultiplayerRoom;
+        const starts_at = (try jsonOptionalInteger(object, "zigcho_starts_at")) orelse return error.InvalidMultiplayerRoom;
+        const ends_at = (try jsonOptionalInteger(object, "zigcho_ends_at")) orelse return error.InvalidMultiplayerRoom;
+        const current_item_id = (try jsonOptionalInteger(object, "zigcho_current_playlist_item_id")) orelse return error.InvalidMultiplayerRoom;
+        if (room_id <= 0 or starts_at <= 0 or ends_at <= starts_at or room.itemIndex(current_item_id) == null) return error.InvalidMultiplayerRoom;
+        room.id = room_id;
+        room.starts_at = starts_at;
+        room.ends_at = ends_at;
+        room.settings.playlist_item_id = current_item_id;
+        room.channel_id = @intCast(lazer.roomChannelId(room.id) orelse return error.InvalidMultiplayerRoom);
+
+        room.users = [_]?RoomUser{null} ** max_users;
+        room.user_count = 0;
+        const active_users = switch (object.get("zigcho_active_users") orelse return error.InvalidMultiplayerRoom) {
+            .array => |array| array,
+            else => return error.InvalidMultiplayerRoom,
+        };
+        if (active_users.items.len > max_users) return error.InvalidMultiplayerRoom;
+        for (active_users.items, 0..) |value, index| {
+            const restored = try roomUserFromJson(value);
+            if (room.userIndex(restored.id) != null) return error.InvalidMultiplayerRoom;
+            room.users[index] = restored;
+            room.user_count += 1;
+        }
+
+        room.participants = [_]?RoomParticipant{null} ** max_room_participants;
+        room.participant_count = 0;
+        const participants = switch (object.get("zigcho_participants") orelse return error.InvalidMultiplayerRoom) {
+            .array => |array| array,
+            else => return error.InvalidMultiplayerRoom,
+        };
+        if (participants.items.len > max_room_participants) return error.InvalidMultiplayerRoom;
+        for (participants.items) |value| {
+            const restored = try roomUserFromJson(value);
+            room.rememberParticipant(restored);
+        }
+
+        if (object.get("zigcho_score_tokens")) |token_value| {
+            const token_values = switch (token_value) {
+                .array => |array| array,
+                else => return error.InvalidMultiplayerRoom,
+            };
+            if (token_values.items.len > max_room_scores) return error.InvalidMultiplayerRoom;
+            var token_ids = std.AutoHashMap(i64, void).init(allocator);
+            defer token_ids.deinit();
+            try room.score_tokens.ensureTotalCapacity(allocator, token_values.items.len);
+            for (token_values.items) |value| {
+                const token = archivedScoreTokenRecord(value) orelse return error.InvalidMultiplayerRoom;
+                if (room.participantIndex(token.user_id) == null or room.itemIndex(token.playlist_item_id) == null) return error.InvalidMultiplayerRoom;
+                if ((try token_ids.getOrPut(token.token_id)).found_existing) return error.InvalidMultiplayerRoom;
+                room.score_tokens.appendAssumeCapacity(token);
+            }
+        }
+
+        const score_values = switch (object.get("zigcho_score_records") orelse return error.InvalidMultiplayerRoom) {
+            .array => |array| array,
+            else => return error.InvalidMultiplayerRoom,
+        };
+        if (score_values.items.len > max_room_scores) return error.InvalidMultiplayerRoom;
+        try room.scores.ensureTotalCapacity(allocator, score_values.items.len);
+        for (score_values.items) |value| room.scores.appendAssumeCapacity(archivedScoreRecord(value) orelse return error.InvalidMultiplayerRoom);
+        var restored_scores = std.AutoHashMap(i64, RoomScoreRecord).init(allocator);
+        defer restored_scores.deinit();
+        for (room.scores.items) |score| {
+            if (restored_scores.contains(score.score_id)) return error.InvalidMultiplayerRoom;
+            try restored_scores.put(score.score_id, score);
+        }
+        var consumed_score_ids = std.AutoHashMap(i64, void).init(allocator);
+        defer consumed_score_ids.deinit();
+        for (room.score_tokens.items) |token| if (token.score_id) |score_id| {
+            if ((try consumed_score_ids.getOrPut(score_id)).found_existing) return error.InvalidMultiplayerRoom;
+            const restored = restored_scores.get(score_id) orelse return error.InvalidMultiplayerRoom;
+            if (restored.user_id != token.user_id or restored.playlist_item_id != token.playlist_item_id) return error.InvalidMultiplayerRoom;
+        };
+    }
     return room;
 }
 
@@ -3826,13 +5651,13 @@ fn parseSettings(encoded: []const u8) !Settings {
     const password = try reader.string();
     if (password.len > 50 or !std.unicode.utf8ValidateSlice(password)) return error.InvalidMultiplayerPassword;
     try settings.password.set(password);
-    settings.match_type = @intCast(try reader.integer());
+    settings.match_type = try checkedReaderInteger(u8, &reader);
     if (settings.match_type != 1 and settings.match_type != 2) return error.UnsupportedMultiplayerMatchType;
-    settings.queue_mode = @intCast(try reader.integer());
+    settings.queue_mode = try checkedReaderInteger(u8, &reader);
     if (settings.queue_mode > 2) return error.InvalidMultiplayerQueueMode;
     try settings.auto_start.set(try reader.raw());
     settings.auto_skip = try reader.boolean();
-    settings.max_participants = if (try reader.nullableInteger()) |value| @intCast(value) else null;
+    settings.max_participants = try checkedNullableInteger(u8, try reader.nullableInteger());
     if (settings.max_participants) |limit| if (limit < 2 or limit > max_users) return error.InvalidMultiplayerParticipantLimit;
     return settings;
 }
@@ -3842,18 +5667,18 @@ fn parsePlaylistItem(encoded: []const u8) !PlaylistItem {
     if (try reader.arrayLen() < 12) return error.InvalidMultiplayerPlaylistItem;
     var item: PlaylistItem = .{};
     item.id = try reader.integer();
-    item.owner_id = @intCast(try reader.integer());
-    item.beatmap_id = @intCast(try reader.integer());
+    item.owner_id = try checkedReaderInteger(i32, &reader);
+    item.beatmap_id = try checkedReaderInteger(i32, &reader);
     if (item.beatmap_id <= 0) return error.InvalidMultiplayerBeatmap;
     const checksum = try reader.string();
     if (checksum.len > 64) return error.InvalidMultiplayerBeatmap;
     try item.checksum.set(checksum);
-    item.ruleset_id = @intCast(try reader.integer());
+    item.ruleset_id = try checkedReaderInteger(u8, &reader);
     if (item.ruleset_id > 3) return error.InvalidMultiplayerRuleset;
     try item.required_mods.set(try reader.raw());
     try item.allowed_mods.set(try reader.raw());
     item.expired = try reader.boolean();
-    item.order = @intCast(try reader.integer());
+    item.order = try checkedReaderInteger(u16, &reader);
     try item.played_at.set(try reader.raw());
     const star_raw = try reader.raw();
     var star_reader: MessagePackReader = .{ .data = star_raw };
@@ -3868,6 +5693,7 @@ fn parsePlaylistItem(encoded: []const u8) !PlaylistItem {
         },
         else => @floatFromInt(try star_reader.integer()),
     };
+    if (!std.math.isFinite(item.star_rating) or item.star_rating < 0 or item.star_rating > 100) return error.InvalidMultiplayerBeatmap;
     item.freestyle = try reader.boolean();
     return item;
 }
@@ -3894,6 +5720,7 @@ fn parseRoom(allocator: std.mem.Allocator, encoded: []const u8, connection: *Con
     };
     try room.host_name.set(connection.user_name.slice());
     room.users[0] = try defaultRoomUser(connection.user_id, connection.user_name.slice(), connection.user_country);
+    if (settings.match_type == 2) room.users[0].?.team_id = 0;
     room.user_count = 1;
     room.rememberParticipant(room.users[0].?);
     for (0..playlist_len) |index| {
@@ -3929,7 +5756,13 @@ fn writeUser(pack: MessagePackWriter, user: RoomUser) !void {
     try pack.integer(user.state);
     try pack.raw(user.availability.slice());
     try pack.raw(user.mods.slice());
-    try pack.nil();
+    if (user.team_id) |team_id| {
+        // MatchUserState union key 0 is TeamVersusUserState.
+        try pack.array(2);
+        try pack.integer(0);
+        try pack.array(1);
+        try pack.integer(team_id);
+    } else try pack.nil();
     if (user.ruleset_id) |ruleset_id| try pack.integer(ruleset_id) else try pack.nil();
     if (user.beatmap_id) |beatmap_id| try pack.integer(beatmap_id) else try pack.nil();
     try pack.boolean(user.voted_skip);
@@ -4048,17 +5881,20 @@ fn writeMatchState(pack: MessagePackWriter, room: *const Room) !void {
         try pack.integer(1);
         try pack.string("Team Blue");
     } else try pack.nil();
-    try pack.boolean(false);
+    try pack.boolean(room.locked);
     if (room.settings.max_participants) |limit| {
         try pack.array(limit);
-        var written: usize = 0;
-        for (room.users) |entry| if (entry) |user| {
-            if (written == limit) break;
-            try pack.integer(user.id);
-            written += 1;
-        };
-        while (written < limit) : (written += 1) try pack.nil();
+        for (room.users[0..limit]) |entry| if (entry) |user| try pack.integer(user.id) else try pack.nil();
     } else try pack.nil();
+}
+
+fn writeMatchStartCountdown(pack: MessagePackWriter, countdown: MatchStartCountdownState, now_ms: i64) !void {
+    // MultiplayerCountdown union key 0 is MatchStartCountdown.
+    try pack.array(2);
+    try pack.integer(0);
+    try pack.array(2);
+    try pack.integer(countdown.id);
+    try pack.integer(countdown.remainingTicks(now_ms));
 }
 
 fn writeRankedStageCountdown(pack: MessagePackWriter, countdown: RankedStageCountdown, now_ms: i64) !void {
@@ -4093,6 +5929,9 @@ fn writeRoom(pack: MessagePackWriter, room: *const Room, now_ms: i64) !void {
         try writeRankedStageCountdown(pack, countdown, now_ms);
     } else {
         try pack.array(0);
+    } else if (room.match_start_countdown) |countdown| {
+        try pack.array(1);
+        try writeMatchStartCountdown(pack, countdown, now_ms);
     } else {
         try pack.array(0);
     }
@@ -4186,6 +6025,63 @@ fn writeRoomModeJson(writer: *std.Io.Writer, room: *const Room) !void {
     try writer.writeByte('}');
 }
 
+fn writeMessagePackJsonValue(writer: *std.Io.Writer, reader: *MessagePackReader, depth: u8) !void {
+    if (depth >= 16 or reader.pos >= reader.data.len) return error.InvalidMultiplayerJsonValue;
+    const tag = reader.data[reader.pos];
+    if (tag == 0xc0) {
+        reader.pos += 1;
+        return writer.writeAll("null");
+    }
+    if (tag == 0xc2 or tag == 0xc3) return writer.writeAll(if (try reader.boolean()) "true" else "false");
+    if (tag <= 0x7f or tag >= 0xe0 or (tag >= 0xcc and tag <= 0xd3)) return writer.print("{d}", .{try reader.integer()});
+    if (tag == 0xca) {
+        _ = try reader.byte();
+        const value: f32 = @bitCast(try reader.readUnsigned(u32));
+        if (!std.math.isFinite(value)) return error.InvalidMultiplayerJsonValue;
+        return writer.print("{d}", .{value});
+    }
+    if (tag == 0xcb) {
+        _ = try reader.byte();
+        const value: f64 = @bitCast(try reader.readUnsigned(u64));
+        if (!std.math.isFinite(value)) return error.InvalidMultiplayerJsonValue;
+        return writer.print("{d}", .{value});
+    }
+    if ((tag >= 0xa0 and tag <= 0xbf) or tag == 0xd9 or tag == 0xda or tag == 0xdb) {
+        const value = try reader.string();
+        if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidMultiplayerJsonValue;
+        return std.json.Stringify.value(value, .{}, writer);
+    }
+    if ((tag >= 0x90 and tag <= 0x9f) or tag == 0xdc or tag == 0xdd) {
+        const len = try reader.arrayLen();
+        try writer.writeByte('[');
+        for (0..len) |index| {
+            if (index != 0) try writer.writeByte(',');
+            try writeMessagePackJsonValue(writer, reader, depth + 1);
+        }
+        return writer.writeByte(']');
+    }
+    if ((tag >= 0x80 and tag <= 0x8f) or tag == 0xde or tag == 0xdf) {
+        const len = try reader.mapLen();
+        try writer.writeByte('{');
+        for (0..len) |index| {
+            if (index != 0) try writer.writeByte(',');
+            const key = try reader.string();
+            if (!std.unicode.utf8ValidateSlice(key)) return error.InvalidMultiplayerJsonValue;
+            try std.json.Stringify.value(key, .{}, writer);
+            try writer.writeByte(':');
+            try writeMessagePackJsonValue(writer, reader, depth + 1);
+        }
+        return writer.writeByte('}');
+    }
+    return error.InvalidMultiplayerJsonValue;
+}
+
+fn writeMessagePackJson(writer: *std.Io.Writer, encoded: []const u8) !void {
+    var reader: MessagePackReader = .{ .data = encoded };
+    try writeMessagePackJsonValue(writer, &reader, 0);
+    if (reader.pos != reader.data.len) return error.InvalidMultiplayerJsonValue;
+}
+
 fn writePlaylistItemJson(writer: *std.Io.Writer, item: PlaylistItem) !void {
     const mode: []const u8 = switch (item.ruleset_id) {
         0 => "osu",
@@ -4199,7 +6095,11 @@ fn writePlaylistItemJson(writer: *std.Io.Writer, item: PlaylistItem) !void {
     const version = if (item.version.len != 0) item.version.slice() else "online difficulty";
     const creator = if (item.creator.len != 0) item.creator.slice() else "unknown";
     const status = beatmapStatusName(item.status);
-    try writer.print("{{\"id\":{d},\"owner_id\":{d},\"ruleset_id\":{d},\"expired\":{s},\"playlist_order\":{d},\"played_at\":null,\"allowed_mods\":[],\"required_mods\":[],\"beatmap_id\":{d},\"beatmap\":{{\"id\":{d},\"beatmapset_id\":{d},\"mode\":", .{ item.id, item.owner_id, item.ruleset_id, if (item.expired) "true" else "false", item.order, item.beatmap_id, item.beatmap_id, set_id });
+    try writer.print("{{\"id\":{d},\"owner_id\":{d},\"ruleset_id\":{d},\"expired\":{s},\"playlist_order\":{d},\"played_at\":null,\"allowed_mods\":", .{ item.id, item.owner_id, item.ruleset_id, if (item.expired) "true" else "false", item.order });
+    try writeMessagePackJson(writer, item.allowed_mods.slice());
+    try writer.writeAll(",\"required_mods\":");
+    try writeMessagePackJson(writer, item.required_mods.slice());
+    try writer.print(",\"beatmap_id\":{d},\"beatmap\":{{\"id\":{d},\"beatmapset_id\":{d},\"mode\":", .{ item.beatmap_id, item.beatmap_id, set_id });
     try std.json.Stringify.value(mode, .{}, writer);
     try writer.writeAll(",\"status\":");
     try std.json.Stringify.value(status, .{}, writer);
@@ -4223,14 +6123,64 @@ fn writePlaylistItemJson(writer: *std.Io.Writer, item: PlaylistItem) !void {
     try writer.print(",\"covers\":{{\"cover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover.jpg\",\"cover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/cover@2x.jpg\",\"card\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card.jpg\",\"card@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/card@2x.jpg\",\"list\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list.jpg\",\"list@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/list@2x.jpg\",\"slimcover\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover.jpg\",\"slimcover@2x\":\"https://assets.kai.ovh/beatmaps/{d}/covers/slimcover@2x.jpg\"}},\"preview_url\":\"https://b.kai.ovh/preview/{d}.mp3\"}}}},\"freestyle\":{s}}}", .{ set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, set_id, if (item.freestyle) "true" else "false" });
 }
 
-fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
+fn writeIsoTimestamp(writer: *std.Io.Writer, unix_seconds: i64) !void {
+    if (unix_seconds < 0) return error.InvalidMultiplayerTimestamp;
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(unix_seconds) };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    try writer.print("\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z\"", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
+
+fn autoStartSeconds(settings: Settings) i64 {
+    var reader: MessagePackReader = .{ .data = settings.auto_start.slice() };
+    const ticks = reader.integer() catch return 0;
+    if (reader.pos != reader.data.len or ticks <= 0) return 0;
+    return @divFloor(ticks, timespan_ticks_per_second);
+}
+
+fn roomHasEnded(room: *const Room, now_seconds: i64) bool {
+    return room.ended or (room.ends_at > 0 and now_seconds >= room.ends_at);
+}
+
+fn writeCurrentUserScore(writer: *std.Io.Writer, room: *const Room, requester_id: i32) !void {
+    if (requester_id <= 0 or room.userIndex(requester_id) == null) return writer.writeAll("null");
+    try writer.writeAll("{\"playlist_item_attempts\":[");
+    var written: usize = 0;
+    for (room.playlist) |entry| if (entry) |item| {
+        var attempts: usize = 0;
+        var passed = false;
+        for (room.scores.items) |score| if (score.user_id == requester_id and score.playlist_item_id == item.id) {
+            attempts += 1;
+            passed = passed or score.passed;
+        };
+        if (attempts == 0) continue;
+        if (written != 0) try writer.writeByte(',');
+        try writer.print("{{\"id\":{d},\"attempts\":{d},\"passed\":{s}}}", .{ item.id, attempts, if (passed) "true" else "false" });
+        written += 1;
+    };
+    try writer.writeAll("]}");
+}
+
+fn writeRoomJson(writer: *std.Io.Writer, room: *const Room, requester_id: i32, now_seconds: i64, persistence: RoomPersistence) !void {
     try writer.print("{{\"id\":{d},\"name\":", .{room.id});
     try std.json.Stringify.value(room.settings.name.slice(), .{}, writer);
     try writer.print(",\"description\":null,\"has_password\":{s},\"host\":", .{if (room.settings.password.len != 0) "true" else "false"});
     try writeApiUserJson(writer, room.host_id, room.host_name.slice(), room.host_country);
     try writer.writeAll(",\"category\":");
     try std.json.Stringify.value(if (room.settings.match_type == 0) "normal" else "realtime", .{}, writer);
-    try writer.writeAll(",\"duration\":null,\"starts_at\":null,\"ends_at\":null,\"max_participants\":");
+    try writer.writeAll(",\"duration\":null,\"starts_at\":");
+    if (room.starts_at > 0) try writeIsoTimestamp(writer, room.starts_at) else try writer.writeAll("null");
+    try writer.writeAll(",\"ends_at\":");
+    if (room.ends_at > 0) try writeIsoTimestamp(writer, room.ends_at) else try writer.writeAll("null");
+    try writer.writeAll(",\"max_participants\":");
     if (room.settings.max_participants) |limit| try writer.print("{d}", .{limit}) else try writer.writeAll("null");
     try writer.print(",\"participant_count\":{d},\"recent_participants\":[", .{if (room.ended) room.participant_count else room.user_count});
     var users_written: usize = 0;
@@ -4259,7 +6209,9 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
         2 => "all_players_round_robin",
         else => "host_only",
     };
-    try writer.writeAll("],\"max_attempts\":null,\"playlist\":[");
+    try writer.writeAll("],\"max_attempts\":");
+    if (room.max_attempts) |limit| try writer.print("{d}", .{limit}) else try writer.writeAll("null");
+    try writer.writeAll(",\"playlist\":[");
     var playlist_written: usize = 0;
     var active_playlist_items: usize = 0;
     for (room.playlist) |entry| if (entry) |item| {
@@ -4272,10 +6224,46 @@ fn writeRoomJson(writer: *std.Io.Writer, room: *const Room) !void {
     try std.json.Stringify.value(match_type, .{}, writer);
     try writer.writeAll(",\"queue_mode\":");
     try std.json.Stringify.value(queue_mode, .{}, writer);
-    try writer.print(",\"auto_skip\":{s},\"auto_start_duration\":0,\"current_user_score\":null,\"current_playlist_item\":", .{if (room.settings.auto_skip) "true" else "false"});
+    try writer.print(",\"auto_skip\":{s},\"auto_start_duration\":{d},\"current_user_score\":", .{ if (room.settings.auto_skip) "true" else "false", autoStartSeconds(room.settings) });
+    try writeCurrentUserScore(writer, room, requester_id);
+    try writer.writeAll(",\"current_playlist_item\":");
     const current = room.playlist[room.itemIndex(room.settings.playlist_item_id) orelse 0] orelse return error.MultiplayerPlaylistItemNotFound;
     try writePlaylistItemJson(writer, current);
-    try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false", .{ room.channel_id, if (room.ended) "ended" else if (room.state == 0) "idle" else "playing" });
+    try writer.print(",\"channel_id\":{d},\"status\":\"{s}\",\"pinned\":false", .{ room.channel_id, if (roomHasEnded(room, now_seconds)) "ended" else if (room.state == 0) "idle" else "playing" });
+    if (persistence != .none) {
+        try writer.writeAll(",\"zigcho_score_records\":[");
+        var score_written: usize = 0;
+        for (room.scores.items) |score| {
+            if (score_written != 0) try writer.writeByte(',');
+            try writer.print("{{\"score_id\":{d},\"user_id\":{d},\"playlist_item_id\":{d},\"total_score\":{d},\"accuracy\":{d},\"max_combo\":{d},\"passed\":{s}}}", .{ score.score_id, score.user_id, score.playlist_item_id, score.total_score, score.accuracy, score.max_combo, if (score.passed) "true" else "false" });
+            score_written += 1;
+        }
+        try writer.writeAll("],\"zigcho_score_tokens\":[");
+        for (room.score_tokens.items, 0..) |token, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.print("{{\"token_id\":{d},\"user_id\":{d},\"playlist_item_id\":{d},\"score_id\":", .{ token.token_id, token.user_id, token.playlist_item_id });
+            if (token.score_id) |score_id| try writer.print("{d}", .{score_id}) else try writer.writeAll("null");
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    if (persistence == .checkpoint) {
+        try writer.writeAll(",\"zigcho_resumable\":true,\"zigcho_password\":");
+        try std.json.Stringify.value(room.settings.password.slice(), .{}, writer);
+        try writer.print(",\"zigcho_starts_at\":{d},\"zigcho_ends_at\":{d},\"zigcho_current_playlist_item_id\":{d},\"zigcho_active_users\":[", .{ room.starts_at, room.ends_at, room.settings.playlist_item_id });
+        var active_written: usize = 0;
+        for (room.users) |entry| if (entry) |user| {
+            if (active_written != 0) try writer.writeByte(',');
+            try writeApiUserJson(writer, user.id, user.name.slice(), user.country);
+            active_written += 1;
+        };
+        try writer.writeAll("],\"zigcho_participants\":[");
+        for (room.participants[0..room.participant_count], 0..) |entry, index| if (entry) |participant| {
+            if (index != 0) try writer.writeByte(',');
+            try writeApiUserJson(writer, participant.id, participant.name.slice(), participant.country);
+        };
+        try writer.writeByte(']');
+    }
     try writeRoomModeJson(writer, room);
     try writer.writeByte('}');
 }
@@ -4290,7 +6278,7 @@ fn writeRoomLeaderboardJson(writer: *std.Io.Writer, room: *const Room, requester
     };
     var aggregates: [max_room_participants]?Aggregate = [_]?Aggregate{null} ** max_room_participants;
     var aggregate_count: usize = 0;
-    for (room.scores) |entry| if (entry) |score| {
+    for (room.scores.items) |score| {
         const participant_index = room.participantIndex(score.user_id) orelse continue;
         var aggregate_index: ?usize = null;
         for (aggregates[0..aggregate_count], 0..) |candidate, index| if (candidate.?.user.id == score.user_id) {
@@ -4308,7 +6296,7 @@ fn writeRoomLeaderboardJson(writer: *std.Io.Writer, room: *const Room, requester
         aggregate.completed += @intFromBool(score.passed);
         aggregate.total_score += score.total_score;
         aggregate.accuracy_total += score.accuracy;
-    };
+    }
     std.mem.sort(?Aggregate, aggregates[0..aggregate_count], {}, struct {
         fn lessThan(_: void, left: ?Aggregate, right: ?Aggregate) bool {
             if (left.?.total_score != right.?.total_score) return left.?.total_score > right.?.total_score;
@@ -4336,6 +6324,30 @@ fn writeRoomLeaderboardJson(writer: *std.Io.Writer, room: *const Room, requester
         try writer.print(",\"position\":{d}}}", .{index + 1});
     } else try writer.writeAll("null");
     try writer.writeByte('}');
+}
+
+fn writeRoomScorePage(writer: *std.Io.Writer, scores: []const []const u8, sort: []const u8) !void {
+    try writer.writeAll("{\"scores\":[");
+    for (scores, 0..) |score, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll(score);
+    }
+    try writer.print("],\"params\":{{\"limit\":{d},\"sort\":", .{room_score_around_limit});
+    try std.json.Stringify.value(sort, .{}, writer);
+    try writer.writeAll("},\"cursor\":null}");
+}
+
+/// Add the fields consumed by PlaylistItemResultsScreen to a stored lazer
+/// score. `higher` is ordered nearest-first because the pinned client assigns
+/// positions by walking away from the selected score.
+pub fn writeRoomScoreDetailJson(writer: *std.Io.Writer, score_json: []const u8, position: usize, higher: []const []const u8, lower: []const []const u8) !void {
+    if (score_json.len < 2 or score_json[0] != '{' or score_json[score_json.len - 1] != '}') return error.InvalidRoomScoreJson;
+    try writer.writeAll(score_json[0 .. score_json.len - 1]);
+    try writer.print(",\"position\":{d},\"scores_around\":{{\"higher\":", .{position});
+    try writeRoomScorePage(writer, higher, "score_asc");
+    try writer.writeAll(",\"lower\":");
+    try writeRoomScorePage(writer, lower, "score_desc");
+    try writer.writeAll("}}");
 }
 
 pub fn frameOwned(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -4565,6 +6577,20 @@ fn eventRankedCountdownStartedOwned(allocator: std.mem.Allocator, countdown: Ran
     return allocatingFrame(allocator, &output);
 }
 
+fn eventMatchStartCountdownOwned(allocator: std.mem.Allocator, countdown: MatchStartCountdownState, now_ms: i64) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchEvent", 1);
+    // MatchServerEvent union key 0 is CountdownStartedEvent.
+    try pack.array(2);
+    try pack.integer(0);
+    try pack.array(1);
+    try writeMatchStartCountdown(pack, countdown, now_ms);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
 fn eventRankedCountdownStoppedOwned(allocator: std.mem.Allocator, countdown_id: i32) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -4575,6 +6601,76 @@ fn eventRankedCountdownStoppedOwned(allocator: std.mem.Allocator, countdown_id: 
     try pack.integer(1);
     try pack.array(1);
     try pack.integer(countdown_id);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventMatchRoomStateOwned(allocator: std.mem.Allocator, room: *const Room) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchRoomStateChanged", 1);
+    try writeMatchState(pack, room);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventTeamStateOwned(allocator: std.mem.Allocator, user_id: i32, team_id: i32) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchUserStateChanged", 2);
+    try pack.integer(user_id);
+    try pack.array(2);
+    try pack.integer(0);
+    try pack.array(1);
+    try pack.integer(team_id);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventRollOwned(allocator: std.mem.Allocator, user_id: i32, max: i64, result: i64) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchEvent", 1);
+    // MatchServerEvent union key 4 is RollEvent.
+    try pack.array(2);
+    try pack.integer(4);
+    try pack.array(3);
+    try pack.integer(user_id);
+    try pack.integer(max);
+    try pack.integer(result);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventMatchmakingAvatarActionOwned(allocator: std.mem.Allocator, user_id: i32, action: i64) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchEvent", 1);
+    // MatchServerEvent union key 2 is MatchmakingAvatarActionEvent.
+    try pack.array(2);
+    try pack.integer(2);
+    try pack.array(2);
+    try pack.integer(user_id);
+    try pack.integer(action);
+    try endEvent(pack);
+    return allocatingFrame(allocator, &output);
+}
+
+fn eventRankedHandReplayOwned(allocator: std.mem.Allocator, user_id: i32, frames: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const pack: MessagePackWriter = .{ .writer = &output.writer };
+    try beginEvent(pack, "MatchEvent", 1);
+    // MatchServerEvent union key 3 is RankedPlayCardHandReplayEvent.
+    try pack.array(2);
+    try pack.integer(3);
+    try pack.array(2);
+    try pack.integer(user_id);
+    try pack.raw(frames);
     try endEvent(pack);
     return allocatingFrame(allocator, &output);
 }
@@ -4808,12 +6904,646 @@ test "lazer multiplayer REST room paths cover leaderboard and user scores" {
     try std.testing.expectError(error.InvalidRoomListFilter, roomListFilter(4, "open", null, "made_up"));
 }
 
+test "multiplayer never serializes a hidden local country" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/room-country-privacy.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("hidden host", "hidden-host@example.invalid", "00000000000000000000000000000000");
+    try store.updateCountry(user_id, .{ 'A', 'U' });
+    try store.updateSiteProfile(user_id, .{ .bio = "", .title = "", .pronouns = "", .location = "", .website = "", .accent = .pink, .preferred_mode = 0, .profile_source = .all, .avatar_key = 1, .show_country = false, .show_profile_stats = true, .show_recent_scores = true });
+    const archived = try std.fmt.allocPrint(std.testing.allocator, "{{\"id\":99,\"host\":{{\"id\":{d},\"username\":\"hidden host\",\"country_code\":\"AU\"}},\"recent_participants\":[{{\"id\":{d},\"username\":\"hidden host\",\"country_code\":\"AU\"}}],\"playlist\":[]}}", .{ user_id, user_id });
+    defer std.testing.allocator.free(archived);
+    const archived_leaderboard = try std.fmt.allocPrint(std.testing.allocator, "{{\"leaderboard\":[{{\"user\":{{\"id\":{d},\"username\":\"hidden host\",\"country_code\":\"AU\"}}}}],\"user_score\":{{\"user\":{{\"id\":{d},\"username\":\"hidden host\",\"country_code\":\"AU\"}}}}}}", .{ user_id, user_id });
+    defer std.testing.allocator.free(archived_leaderboard);
+    try store.saveLazerMultiplayerRoomArchive(99, user_id, "realtime", archived, archived_leaderboard, "[]");
+
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    const user = (try store.userById(std.testing.allocator, user_id)).?;
+    defer std.testing.allocator.free(user.name);
+    defer std.testing.allocator.free(user.safe_name);
+    try std.testing.expect(!user.show_country);
+
+    const archived_json = (try manager.roomsJson(std.testing.allocator, 99, null, 0)).?;
+    defer std.testing.allocator.free(archived_json);
+    try std.testing.expect(std.mem.indexOf(u8, archived_json, "\"country_code\":\"AU\"") == null);
+    try std.testing.expect(std.mem.count(u8, archived_json, "\"country_code\":\"XX\"") == 2);
+    const leaderboard_json = (try manager.roomLeaderboardJson(std.testing.allocator, user_id, 99)).?;
+    defer std.testing.allocator.free(leaderboard_json);
+    try std.testing.expect(std.mem.indexOf(u8, leaderboard_json, "\"country_code\":\"AU\"") == null);
+    try std.testing.expect(std.mem.count(u8, leaderboard_json, "\"country_code\":\"XX\"") == 2);
+
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(user, fake_socket);
+    connection.socket = null;
+    try std.testing.expectEqualSlices(u8, "XX", &connection.user_country);
+    const created = try manager.restCreateRoom(std.testing.allocator, user,
+        \\{"name":"private country","type":"head_to_head","playlist":[{"id":8,"owner_id":0,"beatmap_id":75,"ruleset_id":0}]}
+    );
+    defer std.testing.allocator.free(created);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"country_code\":\"AU\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"country_code\":\"XX\"") != null);
+    try manager.restCloseRoom(user_id, 100);
+    manager.disconnect(connection);
+}
+
+test "playlist score detail follows pinned position and scores around JSON" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const higher = [_][]const u8{
+        "{\"id\":12,\"total_score\":900}",
+        "{\"id\":11,\"total_score\":1000}",
+    };
+    const lower = [_][]const u8{"{\"id\":14,\"total_score\":700}"};
+    try writeRoomScoreDetailJson(&output.writer, "{\"id\":13,\"total_score\":800}", 3, &higher, &lower);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("position").?.integer);
+    const around = parsed.value.object.get("scores_around").?.object;
+    const higher_page = around.get("higher").?.object;
+    try std.testing.expectEqual(@as(i64, 12), higher_page.get("scores").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, room_score_around_limit), higher_page.get("params").?.object.get("limit").?.integer);
+    try std.testing.expectEqualStrings("score_asc", higher_page.get("params").?.object.get("sort").?.string);
+    try std.testing.expect(std.meta.activeTag(higher_page.get("cursor").?) == .null);
+    const lower_page = around.get("lower").?.object;
+    try std.testing.expectEqual(@as(i64, 14), lower_page.get("scores").?.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqualStrings("score_desc", lower_page.get("params").?.object.get("sort").?.string);
+    try std.testing.expectError(error.InvalidRoomScoreJson, writeRoomScoreDetailJson(&output.writer, "[]", 1, &.{}, &.{}));
+}
+
+test "playlist score ordering is deterministic across score ties" {
+    var scores = [_]RoomScoreRecord{
+        .{ .score_id = 14, .user_id = 4, .playlist_item_id = 8, .total_score = 900, .accuracy = 1, .max_combo = 1, .passed = true },
+        .{ .score_id = 11, .user_id = 7, .playlist_item_id = 8, .total_score = 1000, .accuracy = 1, .max_combo = 1, .passed = true },
+        .{ .score_id = 12, .user_id = 9, .playlist_item_id = 8, .total_score = 900, .accuracy = 1, .max_combo = 1, .passed = true },
+    };
+    sortRoomScores(&scores);
+    try std.testing.expectEqual(@as(i64, 11), scores[0].score_id);
+    try std.testing.expectEqual(@as(i64, 12), scores[1].score_id);
+    try std.testing.expectEqual(@as(i64, 14), scores[2].score_id);
+}
+
+test "playlist and realtime rooms promote the same failed score differently" {
+    const failed: RoomScoreRecord = .{
+        .score_id = 15,
+        .user_id = 4,
+        .playlist_item_id = 8,
+        .total_score = 900,
+        .accuracy = 0.75,
+        .max_combo = 25,
+        .passed = false,
+    };
+    const zero_pass: RoomScoreRecord = .{
+        .score_id = 16,
+        .user_id = 7,
+        .playlist_item_id = 8,
+        .total_score = 0,
+        .accuracy = 1,
+        .max_combo = 1,
+        .passed = true,
+    };
+    var normal: std.ArrayList(RoomScoreRecord) = .empty;
+    defer normal.deinit(std.testing.allocator);
+    try considerHighScore(std.testing.allocator, &normal, failed, false);
+    try considerHighScore(std.testing.allocator, &normal, zero_pass, false);
+    try std.testing.expectEqual(@as(usize, 0), normal.items.len);
+
+    var realtime: std.ArrayList(RoomScoreRecord) = .empty;
+    defer realtime.deinit(std.testing.allocator);
+    try considerHighScore(std.testing.allocator, &realtime, failed, true);
+    try considerHighScore(std.testing.allocator, &realtime, zero_pass, true);
+    try std.testing.expectEqual(@as(usize, 1), realtime.items.len);
+    try std.testing.expectEqual(failed.score_id, realtime.items[0].score_id);
+}
+
+test "reconnect shutdown and invitation expiry use pinned no-argument hub events" {
+    for ([_][]const u8{ "DisconnectRequested", "ServerShuttingDown", "MatchmakingQueueLeft" }) |target| {
+        const frame = try eventNoArgsOwned(std.testing.allocator, target);
+        defer std.testing.allocator.free(frame);
+        var prefix_len: usize = 0;
+        while (frame[prefix_len] & 0x80 != 0) prefix_len += 1;
+        prefix_len += 1;
+        var reader: MessagePackReader = .{ .data = frame[prefix_len..] };
+        try std.testing.expectEqual(@as(usize, 6), try reader.arrayLen());
+        try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+        try std.testing.expectEqual(@as(usize, 0), try reader.mapLen());
+        try reader.skip(0);
+        try std.testing.expectEqualStrings(target, try reader.string());
+        try std.testing.expectEqual(@as(usize, 0), try reader.arrayLen());
+        try std.testing.expectEqual(@as(usize, 0), try reader.arrayLen());
+        try std.testing.expectEqual(reader.data.len, reader.pos);
+    }
+}
+
+test "one websocket identity rebinds room and queue state without duplicate membership" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const old = try manager.connect(host, fake_socket);
+    old.socket = null;
+    const room_body =
+        \\{"name":"reconnect","type":"head_to_head","playlist":[{"id":8,"owner_id":4,"beatmap_id":75,"ruleset_id":0}]}
+    ;
+    const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
+    defer std.testing.allocator.free(created);
+    try std.testing.expectEqual(@as(?i64, 1), old.room_id);
+
+    const replacement = try manager.connect(host, fake_socket);
+    replacement.socket = null;
+    try std.testing.expect(!old.alive.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, null), old.room_id);
+    try std.testing.expectEqual(@as(?i64, 1), replacement.room_id);
+    try std.testing.expectEqual(@as(usize, 1), manager.connections.items.len);
+    try std.testing.expect(manager.connections.items[0] == replacement);
+    try manager.joinRoom(replacement, "1", 1, "");
+    try std.testing.expectEqual(@as(usize, 1), manager.rooms[0].?.user_count);
+    try std.testing.expectError(error.ConnectionClose, manager.handleHubMessage(old, &.{}));
+    manager.disconnect(old);
+
+    try manager.leaveRoom(replacement, null);
+    replacement.lobby_pool_id = 100;
+    replacement.queue_pool_id = 100;
+    replacement.pending_match_id = 7;
+    manager.pending_matches[0] = .{ .id = 7, .pool_id = 100, .users = .{ host.id, 7 }, .created_at = 0 };
+    const queued_replacement = try manager.connect(host, fake_socket);
+    queued_replacement.socket = null;
+    try std.testing.expectEqual(@as(?i32, 100), queued_replacement.lobby_pool_id);
+    try std.testing.expectEqual(@as(?i32, 100), queued_replacement.queue_pool_id);
+    try std.testing.expectEqual(@as(?u32, 7), queued_replacement.pending_match_id);
+    try std.testing.expectEqual(@as(usize, 1), manager.connections.items.len);
+    manager.disconnect(replacement);
+    try std.testing.expectEqual(@as(usize, 0), manager.expirePendingMatches(pending_match_timeout_seconds - 1));
+    try std.testing.expectEqual(@as(usize, 1), manager.expirePendingMatches(pending_match_timeout_seconds));
+    try std.testing.expectEqual(@as(?i32, null), queued_replacement.queue_pool_id);
+    try std.testing.expectEqual(@as(?u32, null), queued_replacement.pending_match_id);
+    try std.testing.expect(manager.pending_matches[0] == null);
+}
+
+test "cross client disconnect stops invocations and is idempotent" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const user: domain.User = .{ .id = 4, .name = "takeover", .safe_name = "takeover", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(user, fake_socket);
+    connection.socket = null;
+    const created = try manager.restCreateRoom(std.testing.allocator, user,
+        \\{"name":"takeover room","type":"head_to_head","playlist":[{"id":8,"owner_id":4,"beatmap_id":75,"ruleset_id":0}]}
+    );
+    defer std.testing.allocator.free(created);
+    try std.testing.expectEqual(@as(?i64, 1), connection.room_id);
+
+    const Takeover = struct {
+        manager: *Manager,
+        user_id: i32,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        disconnected: bool = false,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.disconnected = context.manager.disconnectUser(context.user_id);
+            context.done.store(true, .release);
+        }
+    };
+    connection.invocation_mutex.lockUncancelable(std.testing.io);
+    var takeover: Takeover = .{ .manager = &manager, .user_id = user.id };
+    const takeover_thread = try std.Thread.spawn(.{}, Takeover.run, .{&takeover});
+    while (!takeover.started.load(.acquire)) std.Thread.yield() catch {};
+    _ = std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!takeover.done.load(.acquire));
+    // This is the final mutation committed by the already-running invocation.
+    // The takeover must wait for it and synchronously clear it before return.
+    connection.lobby_pool_id = 101;
+    connection.queue_pool_id = 101;
+    connection.invocation_mutex.unlock(std.testing.io);
+    takeover_thread.join();
+
+    try std.testing.expect(takeover.disconnected);
+    try std.testing.expect(!connection.alive.load(.acquire));
+    try std.testing.expect(!connection.accepting_invocations.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, null), connection.room_id);
+    try std.testing.expectEqual(@as(?i32, null), connection.lobby_pool_id);
+    try std.testing.expectEqual(@as(?i32, null), connection.queue_pool_id);
+    try std.testing.expectEqual(@as(usize, 0), manager.connections.items.len);
+    for (manager.rooms) |entry| try std.testing.expect(entry == null);
+    try std.testing.expect(!manager.disconnectUser(user.id));
+    try std.testing.expectError(error.ConnectionClose, manager.handleHubMessage(connection, &.{}));
+    // The real websocket handler owns the final reference until its blocked
+    // read observes the close frame. This direct-manager fixture releases it
+    // explicitly after making the same deferred disconnect call.
+    manager.disconnect(connection);
+}
+
+test "connection replacement waits only for the old identity invocation boundary" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const old = try manager.connect(host, fake_socket);
+    old.socket = null;
+
+    const Replacement = struct {
+        manager: *Manager,
+        user: domain.User,
+        socket: *std.http.Server.WebSocket,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        result: ?*Connection = null,
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.result = context.manager.connect(context.user, context.socket) catch |err| failed: {
+                context.failure = err;
+                break :failed null;
+            };
+            context.done.store(true, .release);
+        }
+    };
+
+    old.invocation_mutex.lockUncancelable(std.testing.io);
+    var replacement_context: Replacement = .{ .manager = &manager, .user = host, .socket = fake_socket };
+    const replacement_thread = try std.Thread.spawn(.{}, Replacement.run, .{&replacement_context});
+    while (!replacement_context.started.load(.acquire)) std.Thread.yield() catch {};
+    _ = std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    const crossed_boundary = replacement_context.done.load(.acquire);
+    const guest: domain.User = .{ .id = 7, .name = "other room", .safe_name = "other_room", .country = .{ 'G', 'B' } };
+    const unrelated = try manager.connect(guest, fake_socket);
+    unrelated.socket = null;
+    try std.testing.expectEqual(@as(usize, 2), manager.connections.items.len);
+    manager.disconnect(unrelated);
+    // This assignment stands in for the final state committed by the old
+    // invocation while the replacement is waiting at the gate.
+    old.room_id = 77;
+    old.invocation_mutex.unlock(std.testing.io);
+    replacement_thread.join();
+
+    try std.testing.expect(!crossed_boundary);
+    try std.testing.expect(replacement_context.failure == null);
+    const replacement = replacement_context.result.?;
+    replacement.socket = null;
+    try std.testing.expectEqual(@as(?i64, 77), replacement.room_id);
+    try std.testing.expect(!old.alive.load(.acquire));
+    manager.disconnect(old);
+}
+
+const HostileInvocationHarness = struct {
+    fn expectRejected(manager: *Manager, connection: *Connection, target: []const u8, argument_count: usize, encoded: []const u8) !void {
+        var reader: MessagePackReader = .{ .data = encoded };
+        try std.testing.expectError(error.InvalidMultiplayerArguments, manager.handleInvocation(connection, null, target, argument_count, &reader));
+    }
+
+    fn writeSettings(output: *std.Io.Writer.Allocating, match_type: i64, queue_mode: i64, max_participants: i64) !void {
+        output.clearRetainingCapacity();
+        const pack: MessagePackWriter = .{ .writer = &output.writer };
+        try pack.array(8);
+        try pack.string("hostile");
+        try pack.integer(1);
+        try pack.string("");
+        try pack.integer(match_type);
+        try pack.integer(queue_mode);
+        try pack.nil();
+        try pack.boolean(false);
+        try pack.integer(max_participants);
+    }
+
+    fn writePlaylistItem(output: *std.Io.Writer.Allocating, owner_id: i64, beatmap_id: i64, ruleset_id: i64, order: i64, star_rating: f64) !void {
+        output.clearRetainingCapacity();
+        const pack: MessagePackWriter = .{ .writer = &output.writer };
+        try pack.array(12);
+        try pack.integer(1);
+        try pack.integer(owner_id);
+        try pack.integer(beatmap_id);
+        try pack.string("");
+        try pack.integer(ruleset_id);
+        try pack.array(0);
+        try pack.array(0);
+        try pack.boolean(false);
+        try pack.integer(order);
+        try pack.nil();
+        try pack.float64(star_rating);
+        try pack.boolean(false);
+    }
+};
+
+test "hostile multiplayer integers never trap narrow invocation or model fields" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    var connection: Connection = .{
+        .allocator = std.testing.allocator,
+        .user_id = 4,
+        .user_country = .{ 'A', 'U' },
+        .io = std.testing.io,
+        .socket = null,
+    };
+    try connection.user_name.set("hostile");
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    const direct_targets = [_][]const u8{
+        "TransferHost",
+        "KickUser",
+        "ChangeState",
+        "InvitePlayer",
+        "GetMatchmakingPoolsOfType",
+        "MatchmakingJoinQueue",
+    };
+    for ([_]i64{ std.math.minInt(i64), std.math.maxInt(i64) }) |extreme| {
+        for (direct_targets) |target| {
+            encoded.clearRetainingCapacity();
+            try (MessagePackWriter{ .writer = &encoded.writer }).integer(extreme);
+            try HostileInvocationHarness.expectRejected(&manager, &connection, target, 1, encoded.written());
+        }
+
+        encoded.clearRetainingCapacity();
+        var pack: MessagePackWriter = .{ .writer = &encoded.writer };
+        try pack.integer(extreme);
+        try pack.nil();
+        try HostileInvocationHarness.expectRejected(&manager, &connection, "ChangeUserStyle", 2, encoded.written());
+        encoded.clearRetainingCapacity();
+        pack = .{ .writer = &encoded.writer };
+        try pack.nil();
+        try pack.integer(extreme);
+        try HostileInvocationHarness.expectRejected(&manager, &connection, "ChangeUserStyle", 2, encoded.written());
+
+        encoded.clearRetainingCapacity();
+        pack = .{ .writer = &encoded.writer };
+        try pack.array(1);
+        try pack.integer(extreme);
+        try HostileInvocationHarness.expectRejected(&manager, &connection, "MatchmakingJoinLobbyWithParams", 1, encoded.written());
+        encoded.clearRetainingCapacity();
+        pack = .{ .writer = &encoded.writer };
+        try pack.array(2);
+        try pack.integer(extreme);
+        try pack.integer(1);
+        try HostileInvocationHarness.expectRejected(&manager, &connection, "MatchmakingIssueDuel", 1, encoded.written());
+        encoded.clearRetainingCapacity();
+        pack = .{ .writer = &encoded.writer };
+        try pack.array(2);
+        try pack.integer(1);
+        try pack.integer(extreme);
+        try HostileInvocationHarness.expectRejected(&manager, &connection, "MatchmakingIssueDuel", 1, encoded.written());
+
+        try HostileInvocationHarness.writeSettings(&encoded, extreme, 0, 2);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parseSettings(encoded.written()));
+        try HostileInvocationHarness.writeSettings(&encoded, 1, extreme, 2);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parseSettings(encoded.written()));
+        try HostileInvocationHarness.writeSettings(&encoded, 1, 0, extreme);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parseSettings(encoded.written()));
+
+        try HostileInvocationHarness.writePlaylistItem(&encoded, extreme, 75, 0, 0, 5);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parsePlaylistItem(encoded.written()));
+        try HostileInvocationHarness.writePlaylistItem(&encoded, 4, extreme, 0, 0, 5);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parsePlaylistItem(encoded.written()));
+        try HostileInvocationHarness.writePlaylistItem(&encoded, 4, 75, extreme, 0, 5);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parsePlaylistItem(encoded.written()));
+        try HostileInvocationHarness.writePlaylistItem(&encoded, 4, 75, 0, extreme, 5);
+        try std.testing.expectError(error.InvalidMultiplayerArguments, parsePlaylistItem(encoded.written()));
+    }
+
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |non_finite| {
+        try HostileInvocationHarness.writePlaylistItem(&encoded, 4, 75, 0, 0, non_finite);
+        try std.testing.expectError(error.InvalidMultiplayerBeatmap, parsePlaylistItem(encoded.written()));
+    }
+}
+
+test "typed match requests follow pinned countdown team slot roll and lock contracts" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const room = try std.testing.allocator.create(Room);
+    room.* = .{
+        .id = 1,
+        .settings = .{},
+        .host_id = 4,
+        .host_country = .{ 'A', 'U' },
+    };
+    room.settings.match_type = 2;
+    room.settings.max_participants = 4;
+    try room.settings.name.set("typed requests");
+    try room.host_name.set("raya");
+    room.users[0] = try defaultRoomUser(4, "raya", .{ 'A', 'U' });
+    room.users[0].?.team_id = 0;
+    room.users[1] = try defaultRoomUser(7, "guest", .{ 'G', 'B' });
+    room.users[1].?.team_id = 1;
+    room.user_count = 2;
+    manager.rooms[0] = room;
+
+    var host: Connection = .{
+        .allocator = std.testing.allocator,
+        .user_id = 4,
+        .user_country = .{ 'A', 'U' },
+        .room_id = 1,
+        .io = std.testing.io,
+    };
+    try host.user_name.set("raya");
+    var guest: Connection = .{
+        .allocator = std.testing.allocator,
+        .user_id = 7,
+        .user_country = .{ 'G', 'B' },
+        .room_id = 1,
+        .io = std.testing.io,
+    };
+    try guest.user_name.set("guest");
+
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    const pack: MessagePackWriter = .{ .writer = &encoded.writer };
+
+    // MatchUserRequest union key 0: ChangeTeamRequest { TeamID = 0 }.
+    try pack.array(2);
+    try pack.integer(0);
+    try pack.array(1);
+    try pack.integer(0);
+    try manager.sendMatchRequest(&guest, null, encoded.written());
+    try std.testing.expectEqual(@as(?i32, 0), room.users[1].?.team_id);
+
+    // MatchUserRequest union key 1: StartMatchCountdownRequest { Duration = 5 seconds }.
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(1);
+    try pack.array(1);
+    try pack.integer(5 * timespan_ticks_per_second);
+    try manager.sendMatchRequest(&host, null, encoded.written());
+    const countdown = room.match_start_countdown.?;
+    try std.testing.expectEqual(@as(i32, 1), countdown.id);
+    try std.testing.expectEqual(@as(i64, 2 * timespan_ticks_per_second), countdown.remainingTicks(countdown.deadline_ms - 2 * std.time.ms_per_s));
+
+    // MatchUserRequest union key 2: StopCountdownRequest { ID = 1 }.
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(2);
+    try pack.array(1);
+    try pack.integer(countdown.id);
+    try manager.sendMatchRequest(&host, null, encoded.written());
+    try std.testing.expect(room.match_start_countdown == null);
+
+    // MatchUserRequest union key 5: SetLockStateRequest { Locked = true }.
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(5);
+    try pack.array(1);
+    try pack.boolean(true);
+    try manager.sendMatchRequest(&host, null, encoded.written());
+    try std.testing.expect(room.locked);
+
+    // MatchUserRequest union key 7: ChangeSlotRequest. Players cannot move while
+    // locked, and occupied destinations are never swapped with the requester.
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(7);
+    try pack.array(1);
+    try pack.integer(2);
+    try std.testing.expectError(error.MultiplayerPermissionDenied, manager.sendMatchRequest(&guest, null, encoded.written()));
+    try std.testing.expectEqual(@as(i32, 7), room.users[1].?.id);
+
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(5);
+    try pack.array(1);
+    try pack.boolean(false);
+    try manager.sendMatchRequest(&host, null, encoded.written());
+
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(7);
+    try pack.array(1);
+    try pack.integer(2);
+    try manager.sendMatchRequest(&guest, null, encoded.written());
+    try std.testing.expect(room.users[1] == null);
+    try std.testing.expectEqual(@as(i32, 7), room.users[2].?.id);
+
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(7);
+    try pack.array(1);
+    try pack.integer(0);
+    try std.testing.expectError(error.MultiplayerPermissionDenied, manager.sendMatchRequest(&guest, null, encoded.written()));
+    try std.testing.expectEqual(@as(i32, 4), room.users[0].?.id);
+    try std.testing.expectEqual(@as(i32, 7), room.users[2].?.id);
+
+    // MatchUserRequest union key 6: RollRequest { Max = 20 }. The request is
+    // accepted and the emitted event retains the pinned RollEvent union shape.
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(6);
+    try pack.array(1);
+    try pack.integer(20);
+    try manager.sendMatchRequest(&guest, null, encoded.written());
+
+    const roll_frame = try eventRollOwned(std.testing.allocator, guest.user_id, 20, 7);
+    defer std.testing.allocator.free(roll_frame);
+    var frame_pos: usize = 0;
+    var body_len: usize = 0;
+    var shift: u6 = 0;
+    while (true) {
+        const byte_value = roll_frame[frame_pos];
+        frame_pos += 1;
+        body_len |= @as(usize, byte_value & 0x7f) << shift;
+        if (byte_value & 0x80 == 0) break;
+        shift += 7;
+    }
+    try std.testing.expectEqual(roll_frame.len - frame_pos, body_len);
+    var event_reader: MessagePackReader = .{ .data = roll_frame[frame_pos..] };
+    try std.testing.expectEqual(@as(usize, 6), try event_reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 1), try event_reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try event_reader.mapLen());
+    try event_reader.skip(0);
+    try std.testing.expectEqualStrings("MatchEvent", try event_reader.string());
+    try std.testing.expectEqual(@as(usize, 1), try event_reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 2), try event_reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 4), try event_reader.integer());
+    try std.testing.expectEqual(@as(usize, 3), try event_reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, guest.user_id), try event_reader.integer());
+    try std.testing.expectEqual(@as(i64, 20), try event_reader.integer());
+    try std.testing.expectEqual(@as(i64, 7), try event_reader.integer());
+    try std.testing.expectEqual(@as(usize, 0), try event_reader.arrayLen());
+    try std.testing.expectEqual(event_reader.data.len, event_reader.pos);
+
+    // MessagePack-CSharp request objects have exactly one keyed field. Reject
+    // extra fields instead of accepting a malformed union and ignoring data.
+    encoded.clearRetainingCapacity();
+    try pack.array(2);
+    try pack.integer(6);
+    try pack.array(2);
+    try pack.integer(20);
+    try pack.integer(21);
+    try std.testing.expectError(error.InvalidMultiplayerArguments, manager.sendMatchRequest(&guest, null, encoded.written()));
+
+    // The room-state response keeps the pinned TeamVersusRoomState union,
+    // including lock state and the exact sparse slot array.
+    encoded.clearRetainingCapacity();
+    try writeMatchState(pack, room);
+    var state_reader: MessagePackReader = .{ .data = encoded.written() };
+    try std.testing.expectEqual(@as(usize, 2), try state_reader.arrayLen());
+    try std.testing.expectEqual(@as(i64, 0), try state_reader.integer());
+    try std.testing.expectEqual(@as(usize, 3), try state_reader.arrayLen());
+    try std.testing.expectEqual(@as(usize, 2), try state_reader.arrayLen());
+    try state_reader.skip(0);
+    try state_reader.skip(0);
+    try std.testing.expect(!(try state_reader.boolean()));
+    try std.testing.expectEqual(@as(usize, 4), try state_reader.arrayLen());
+    try std.testing.expectEqual(@as(?i64, 4), try state_reader.nullableInteger());
+    try std.testing.expectEqual(@as(?i64, null), try state_reader.nullableInteger());
+    try std.testing.expectEqual(@as(?i64, 7), try state_reader.nullableInteger());
+    try std.testing.expectEqual(@as(?i64, null), try state_reader.nullableInteger());
+    try std.testing.expectEqual(state_reader.data.len, state_reader.pos);
+}
+
+fn restRoomAllocationRun(allocator: std.mem.Allocator) !void {
+    var manager = Manager.init(allocator, std.testing.io);
+    // Avoid the deliberately best-effort shutdown serializer swallowing the
+    // injected allocation failure after the operation under test has ended.
+    defer {
+        manager.shutting_down = true;
+        manager.deinit();
+    }
+    const host: domain.User = .{ .id = 4, .name = "allocation host", .safe_name = "allocation_host", .country = .{ 'A', 'U' } };
+    const guest: domain.User = .{ .id = 7, .name = "allocation guest", .safe_name = "allocation_guest", .country = .{ 'G', 'B' } };
+    const room_body =
+        \\{"name":"allocation room","type":"head_to_head","playlist":[{"id":8,"owner_id":4,"beatmap_id":75,"ruleset_id":0}]}
+    ;
+    const created = manager.restCreateRoom(allocator, host, room_body) catch |err| {
+        for (manager.rooms) |entry| try std.testing.expect(entry == null);
+        return err;
+    };
+    defer allocator.free(created);
+    const room = manager.rooms[0].?;
+    try std.testing.expectEqual(@as(usize, 1), room.user_count);
+
+    const joined = manager.restJoinRoom(allocator, guest, room.id, "") catch |err| {
+        try std.testing.expect(room.userIndex(guest.id) == null);
+        try std.testing.expect(room.participantIndex(guest.id) == null);
+        try std.testing.expectEqual(@as(usize, 1), room.user_count);
+        return err;
+    };
+    defer allocator.free(joined);
+    try std.testing.expect(room.userIndex(guest.id) != null);
+    try std.testing.expect(room.participantIndex(guest.id) != null);
+    try std.testing.expectEqual(@as(usize, 2), room.user_count);
+    manager.bindRoomScoreToken(host.id, room.id, 8, 9001) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), room.score_tokens.items.len);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), room.score_tokens.items.len);
+    try std.testing.expect(manager.scoreSubmissionContext(host.id, room.id, 8, 9001) != null);
+    try std.testing.expect(manager.scoreSubmissionContext(guest.id, room.id, 8, 9001) == null);
+}
+
+test "REST room create and join roll back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, restRoomAllocationRun, .{});
+}
+
 test "lazer playlist creation assigns zero owner ids to the authenticated user" {
     var manager = Manager.init(std.testing.allocator, std.testing.io);
     defer manager.deinit();
     const host: domain.User = .{ .id = 4, .name = "raya", .safe_name = "raya", .country = .{ 'A', 'U' } };
     const client_body =
-        \\{"id":null,"name":"raya's awesome playlist","description":null,"password":null,"host":null,"category":"normal","duration":30,"starts_at":null,"ends_at":null,"max_participants":null,"participant_count":0,"recent_participants":[],"max_attempts":null,"playlist":[{"owner_id":0,"ruleset_id":0,"expired":false,"playlist_order":null,"played_at":null,"allowed_mods":[],"required_mods":[],"beatmap_id":1000000003,"freestyle":false}],"playlist_item_stats":null,"difficulty_range":null,"type":"playlists","queue_mode":"host_only","auto_skip":false,"auto_start_duration":0,"current_user_score":null,"current_playlist_item":null,"channel_id":0,"status":"idle","pinned":false}
+        \\{"id":null,"name":"raya's awesome playlist","description":null,"password":null,"host":null,"category":"normal","duration":30,"starts_at":null,"ends_at":null,"max_participants":null,"participant_count":0,"recent_participants":[],"max_attempts":3,"playlist":[{"owner_id":0,"ruleset_id":0,"expired":false,"playlist_order":null,"played_at":null,"allowed_mods":[],"required_mods":[],"beatmap_id":1000000003,"freestyle":false}],"playlist_item_stats":null,"difficulty_range":null,"type":"playlists","queue_mode":"host_only","auto_skip":false,"auto_start_duration":0,"current_user_score":null,"current_playlist_item":null,"channel_id":0,"status":"idle","pinned":false}
     ;
     const created = try manager.restCreateRoom(std.testing.allocator, host, client_body);
     defer std.testing.allocator.free(created);
@@ -4822,8 +7552,39 @@ test "lazer playlist creation assigns zero owner ids to the authenticated user" 
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("playlists", parsed.value.object.get("type").?.string);
     try std.testing.expectEqualStrings("normal", parsed.value.object.get("category").?.string);
+    try std.testing.expect(std.meta.activeTag(parsed.value.object.get("starts_at").?) == .string);
+    try std.testing.expect(std.meta.activeTag(parsed.value.object.get("ends_at").?) == .string);
+    try std.testing.expect(!std.mem.eql(u8, parsed.value.object.get("starts_at").?.string, parsed.value.object.get("ends_at").?.string));
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("max_attempts").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("current_user_score").?.object.get("playlist_item_attempts").?.array.items.len);
     try std.testing.expectEqual(@as(i64, host.id), parsed.value.object.get("playlist").?.array.items[0].object.get("owner_id").?.integer);
     try std.testing.expectEqual(@as(i64, host.id), parsed.value.object.get("current_playlist_item").?.object.get("owner_id").?.integer);
+
+    try manager.recordRoomScore(host.id, 1, 1, .{ .score_id = 9001, .total_score = 100, .accuracy = 0.5, .max_combo = 10, .passed = false });
+    try manager.recordRoomScore(host.id, 1, 1, .{ .score_id = 9002, .total_score = 200, .accuracy = 1, .max_combo = 20, .passed = true });
+    const refreshed = (try manager.roomsJson(std.testing.allocator, 1, null, host.id)).?;
+    defer std.testing.allocator.free(refreshed);
+    var parsed_refreshed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, refreshed, .{});
+    defer parsed_refreshed.deinit();
+    const attempt = parsed_refreshed.value.object.get("current_user_score").?.object.get("playlist_item_attempts").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 1), attempt.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), attempt.get("attempts").?.integer);
+    try std.testing.expect(attempt.get("passed").?.bool);
+    const playlist_high_scores = (try manager.roomScoreIds(std.testing.allocator, host.id, 1, 1)).?;
+    defer std.testing.allocator.free(playlist_high_scores);
+    try std.testing.expectEqualSlices(i64, &.{9002}, playlist_high_scores);
+    try std.testing.expect(manager.roomContainsScore(host.id, 1, 1, 9001));
+
+    try manager.restPartRoom(host.id, 1);
+    const still_open = (try manager.roomsJson(std.testing.allocator, 1, null, host.id)).?;
+    defer std.testing.allocator.free(still_open);
+    var parsed_still_open = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, still_open, .{});
+    defer parsed_still_open.deinit();
+    try std.testing.expectEqualStrings("idle", parsed_still_open.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed_still_open.value.object.get("participant_count").?.integer);
+    const rejoined = try manager.restJoinRoom(std.testing.allocator, host, 1, "");
+    defer std.testing.allocator.free(rejoined);
+    try manager.restCloseRoom(host.id, 1);
 }
 
 test "lazer multiplayer REST lifecycle owns room state and score boards" {
@@ -4839,7 +7600,13 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     var parsed_created = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
     defer parsed_created.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_created.value.object.get("id").?.integer);
+    const room_channel_id = parsed_created.value.object.get("channel_id").?.integer;
+    try std.testing.expectEqual(@as(i64, 2_000_000_001), room_channel_id);
+    try std.testing.expectEqual(@as(?i64, 1), manager.roomChannelAccess(host.id, room_channel_id));
+    try std.testing.expectEqual(@as(?i64, null), manager.roomChannelAccess(guest.id, room_channel_id));
     try std.testing.expectEqualStrings("head_to_head", parsed_created.value.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 5), parsed_created.value.object.get("auto_start_duration").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), autoStartSeconds(manager.rooms[0].?.settings));
     try std.testing.expectEqual(@as(usize, 1), parsed_created.value.object.get("playlist").?.array.items.len);
     const created_beatmap = parsed_created.value.object.get("playlist").?.array.items[0].object.get("beatmap").?.object;
     try std.testing.expectEqual(@as(i64, 750), created_beatmap.get("beatmapset_id").?.integer);
@@ -4857,29 +7624,54 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     var parsed_joined = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, joined, .{});
     defer parsed_joined.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_joined.value.object.get("recent_participants").?.array.items.len);
-    const visible_rooms = (try manager.roomsJson(std.testing.allocator, null, try roomListFilter(host.id, "open", "idle", "realtime"))).?;
+    try std.testing.expectEqual(@as(?i64, 1), manager.roomChannelAccess(guest.id, room_channel_id));
+    const room_channel_users = (try manager.roomChannelUsersJson(std.testing.allocator, guest.id, room_channel_id)).?;
+    defer std.testing.allocator.free(room_channel_users);
+    var parsed_room_channel_users = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, room_channel_users, .{});
+    defer parsed_room_channel_users.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_room_channel_users.value.array.items.len);
+    const visible_rooms = (try manager.roomsJson(std.testing.allocator, null, try roomListFilter(host.id, "open", "idle", "realtime"), host.id)).?;
     defer std.testing.allocator.free(visible_rooms);
     var parsed_visible = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, visible_rooms, .{});
     defer parsed_visible.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_visible.value.array.items.len);
-    const hidden_rooms = (try manager.roomsJson(std.testing.allocator, null, try roomListFilter(host.id, "open", "idle", "normal"))).?;
+    const hidden_rooms = (try manager.roomsJson(std.testing.allocator, null, try roomListFilter(host.id, "open", "idle", "normal"), host.id)).?;
     defer std.testing.allocator.free(hidden_rooms);
     try std.testing.expectEqualStrings("[]", hidden_rooms);
-    const guest_owned = (try manager.roomsJson(std.testing.allocator, null, try roomListFilter(guest.id, "owned", null, "realtime"))).?;
+    const guest_owned = (try manager.roomsJson(std.testing.allocator, null, try roomListFilter(guest.id, "owned", null, "realtime"), guest.id)).?;
     defer std.testing.allocator.free(guest_owned);
     try std.testing.expectEqualStrings("[]", guest_owned);
     const context = manager.scoreContext(guest.id, 1, 8).?;
     try std.testing.expectEqual(@as(i32, 75), context.beatmap_id);
     try std.testing.expectEqual(@as(u8, 0), context.ruleset_id);
 
-    try manager.recordRoomScore(host.id, 1, 8, .{ .score_id = 101, .total_score = 800_000, .accuracy = 0.98, .max_combo = 500, .passed = true });
+    try manager.bindRoomScoreToken(host.id, 1, 8, 10101);
+    try std.testing.expect(manager.scoreSubmissionContext(host.id, 1, 8, 10101) != null);
+    try std.testing.expect(manager.scoreSubmissionContext(guest.id, 1, 8, 10101) == null);
+    try std.testing.expectError(error.InvalidMultiplayerScoreToken, manager.recordRoomScore(host.id, 1, 8, .{ .token_id = 10102, .score_id = 100, .total_score = 1, .accuracy = 1, .max_combo = 1, .passed = true }));
+    try std.testing.expectEqual(@as(usize, 0), manager.rooms[0].?.scores.items.len);
+    try manager.recordRoomScore(host.id, 1, 8, .{ .token_id = 10101, .score_id = 101, .total_score = 800_000, .accuracy = 0.98, .max_combo = 500, .passed = true });
+    try std.testing.expect(manager.scoreSubmissionContext(host.id, 1, 8, 10101) != null);
+    try manager.recordRoomScore(host.id, 1, 8, .{ .token_id = 10101, .score_id = 101, .total_score = 800_000, .accuracy = 0.98, .max_combo = 500, .passed = true });
+    try std.testing.expectError(error.InvalidMultiplayerScoreToken, manager.recordRoomScore(host.id, 1, 8, .{ .token_id = 10101, .score_id = 104, .total_score = 900_000, .accuracy = 1, .max_combo = 600, .passed = true }));
     try manager.recordRoomScore(guest.id, 1, 8, .{ .score_id = 102, .total_score = 900_000, .accuracy = 0.99, .max_combo = 600, .passed = true });
     try manager.recordRoomScore(host.id, 1, 8, .{ .score_id = 103, .total_score = 850_000, .accuracy = 0.985, .max_combo = 550, .passed = true });
     try std.testing.expectEqual(@as(?i64, 103), manager.roomScoreIdForUser(host.id, 1, 8, host.id));
     try std.testing.expect(manager.roomContainsScore(guest.id, 1, 8, 102));
+    try std.testing.expect(manager.roomContainsScore(host.id, 1, 8, 101));
     const ids = (try manager.roomScoreIds(std.testing.allocator, host.id, 1, 8)).?;
     defer std.testing.allocator.free(ids);
-    try std.testing.expectEqualSlices(i64, &.{ 101, 102, 103 }, ids);
+    // The index and showUser paths expose one high score per user. The older
+    // host attempt remains addressable through the exact score route.
+    try std.testing.expectEqualSlices(i64, &.{ 102, 103 }, ids);
+    const best_detail = (try manager.roomScoreRanking(std.testing.allocator, host.id, 1, 8, 103)).?;
+    try std.testing.expectEqual(@as(usize, 2), best_detail.position);
+    try std.testing.expectEqualSlices(i64, &.{102}, best_detail.higher_ids[0..best_detail.higher_count]);
+    try std.testing.expectEqual(@as(usize, 0), best_detail.lower_count);
+    const older_detail = (try manager.roomScoreRanking(std.testing.allocator, host.id, 1, 8, 101)).?;
+    try std.testing.expectEqual(@as(usize, 3), older_detail.position);
+    try std.testing.expectEqualSlices(i64, &.{102}, older_detail.higher_ids[0..older_detail.higher_count]);
+    try std.testing.expectEqual(@as(usize, 0), older_detail.lower_count);
 
     const leaderboard = (try manager.roomLeaderboardJson(std.testing.allocator, guest.id, 1)).?;
     defer std.testing.allocator.free(leaderboard);
@@ -4892,10 +7684,502 @@ test "lazer multiplayer REST lifecycle owns room state and score boards" {
     try std.testing.expectEqual(@as(i64, 7), parsed_board.value.object.get("user_score").?.object.get("user_id").?.integer);
 
     try manager.restPartRoom(guest.id, 1);
+    try std.testing.expectEqual(@as(?i64, null), manager.roomChannelAccess(guest.id, room_channel_id));
     try std.testing.expect(manager.scoreContext(guest.id, 1, 8) == null);
     try std.testing.expectError(error.MultiplayerPermissionDenied, manager.restCloseRoom(guest.id, 1));
     try manager.restCloseRoom(host.id, 1);
-    try std.testing.expect((try manager.roomsJson(std.testing.allocator, 1, null)) == null);
+    try std.testing.expect((try manager.roomsJson(std.testing.allocator, 1, null, host.id)) == null);
+}
+
+test "room score history keeps every supported finite attempt and never rotates" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const room = try std.testing.allocator.create(Room);
+    room.* = .{ .id = 1, .settings = .{}, .host_id = 4 };
+    room.users[0] = try defaultRoomUser(4, "raya", .{ 'A', 'U' });
+    room.user_count = 1;
+    room.rememberParticipant(room.users[0].?);
+    room.playlist[0] = .{ .id = 8, .owner_id = 4, .beatmap_id = 75 };
+    room.playlist[0].?.required_mods.bytes[0] = 0x90;
+    room.playlist[0].?.required_mods.len = 1;
+    room.playlist[0].?.allowed_mods.bytes[0] = 0x90;
+    room.playlist[0].?.allowed_mods.len = 1;
+    room.playlist_count = 1;
+    room.settings.playlist_item_id = 8;
+    try room.scores.ensureTotalCapacity(std.testing.allocator, max_room_scores);
+    for (0..max_room_scores) |index| room.scores.appendAssumeCapacity(.{
+        .score_id = @intCast(index + 1),
+        .user_id = 4,
+        .playlist_item_id = 8,
+        .total_score = @intCast(index),
+        .accuracy = 1,
+        .max_combo = 1,
+        .passed = true,
+    });
+    manager.rooms[0] = room;
+    try std.testing.expectError(error.MultiplayerScoreLimit, manager.recordRoomScore(4, 1, 8, .{ .score_id = max_room_scores + 1, .total_score = 1, .accuracy = 1, .max_combo = 1, .passed = true }));
+    try std.testing.expectEqual(@as(i64, 1), room.scores.items[0].score_id);
+    try std.testing.expectEqual(@as(i64, max_room_scores), room.scores.items[max_room_scores - 1].score_id);
+    var archive_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer archive_json.deinit();
+    try writeRoomJson(&archive_json.writer, room, 4, 0, .archive);
+    try std.testing.expect(archive_json.written().len <= 8 * 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, archive_json.written(), "\"score_id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive_json.written(), "\"score_id\":16000") != null);
+}
+
+fn roomArchiveListAllocationRun(allocator: std.mem.Allocator, store: *storage.Store) !void {
+    const archives = try store.lazerMultiplayerRoomArchives(allocator, 64);
+    defer {
+        for (archives) |*archive| archive.deinit();
+        allocator.free(archives);
+    }
+    try std.testing.expectEqual(@as(usize, 1), archives.len);
+    const checkpoints = try store.lazerMultiplayerRoomCheckpoints(allocator);
+    defer {
+        for (checkpoints) |*checkpoint| checkpoint.deinit();
+        allocator.free(checkpoints);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checkpoints.len);
+}
+
+test "room archive and checkpoint lists free every allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/room-archive-allocation.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const owner_id = try store.register("archive allocator", "archive-allocator@example.invalid", "00000000000000000000000000000000");
+    var participants_buf: [32]u8 = undefined;
+    const participants = try std.fmt.bufPrint(&participants_buf, "[{d}]", .{owner_id});
+    try store.saveLazerMultiplayerRoomArchive(1, owner_id, "realtime", "{}", "{\"leaderboard\":[],\"user_score\":null}", participants);
+    try store.saveLazerMultiplayerRoomArchive(2, owner_id, "normal", "{\"zigcho_resumable\":true}", "{\"leaderboard\":[],\"user_score\":null}", participants);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, roomArchiveListAllocationRun, .{&store});
+}
+
+test "failed room archive stays owned and retries without losing scores or tokens" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/archive-retry.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("archive retry", "archive-retry@example.invalid", "00000000000000000000000000000000");
+    const user: domain.User = .{ .id = user_id, .name = "archive retry", .safe_name = "archive_retry", .country = .{ 'A', 'U' } };
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    const created = try manager.restCreateRoom(std.testing.allocator, user,
+        \\{"name":"archive retry","type":"head_to_head","playlist":[{"id":8,"owner_id":0,"beatmap_id":75,"ruleset_id":0}]}
+    );
+    std.testing.allocator.free(created);
+    try manager.recordRoomScore(user_id, 1, 8, .{ .score_id = 700, .total_score = 700_000, .accuracy = 0.97, .max_combo = 400, .passed = true });
+    try manager.bindRoomScoreToken(user_id, 1, 8, 7001);
+
+    try store.exec("ALTER TABLE lazer_multiplayer_room_history RENAME TO lazer_multiplayer_room_history_unavailable");
+    try manager.restCloseRoom(user_id, 1);
+    for (manager.rooms) |entry| try std.testing.expect(entry == null);
+    const retained = manager.pending_archives[0].?;
+    try std.testing.expect(retained.ended);
+    try std.testing.expectEqual(@as(usize, 1), retained.scores.items.len);
+    try std.testing.expectEqual(@as(i64, 700), retained.scores.items[0].score_id);
+    try std.testing.expectEqual(@as(usize, 1), retained.score_tokens.items.len);
+
+    // Reuse the freed live-room slot before the archive backend recovers. The
+    // ended room remains independently owned by the retry queue.
+    const replacement = try manager.restCreateRoom(std.testing.allocator, user,
+        \\{"name":"slot reuse","type":"head_to_head","playlist":[{"id":9,"owner_id":0,"beatmap_id":76,"ruleset_id":0}]}
+    );
+    defer std.testing.allocator.free(replacement);
+    try std.testing.expectEqual(@as(i64, 2), manager.rooms[0].?.id);
+    try std.testing.expect(manager.pending_archives[0] == retained);
+
+    try store.exec("ALTER TABLE lazer_multiplayer_room_history_unavailable RENAME TO lazer_multiplayer_room_history");
+    try std.testing.expectEqual(@as(usize, 1), manager.archiveExpiredRooms(std.Io.Clock.real.now(std.testing.io).toSeconds()));
+    try std.testing.expectEqual(@as(i64, 2), manager.rooms[0].?.id);
+    for (manager.pending_archives) |entry| try std.testing.expect(entry == null);
+    var archive = (try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)).?;
+    defer archive.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "\"score_id\":700") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "\"token_id\":7001") != null);
+}
+
+const ArchivedScoreAllocationContext = struct {
+    store: *storage.Store,
+    user_id: i32,
+    room_json: []const u8,
+    participant_ids_json: []const u8,
+};
+
+fn archivedScoreAllocationRun(allocator: std.mem.Allocator, context: *ArchivedScoreAllocationContext) !void {
+    try context.store.saveLazerMultiplayerRoomArchive(1, context.user_id, "realtime", context.room_json, "{\"leaderboard\":[],\"user_score\":null}", context.participant_ids_json);
+    var manager = Manager.init(allocator, std.testing.io);
+    manager.store = context.store;
+    defer {
+        manager.shutting_down = true;
+        manager.deinit();
+    }
+    try manager.recordRoomScore(context.user_id, 1, 8, .{ .token_id = 5001, .score_id = 9001, .total_score = 500_000, .accuracy = 0.98, .max_combo = 400, .passed = true });
+    var archive = (try context.store.lazerMultiplayerRoomArchive(allocator, 1)).?;
+    defer archive.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "\"score_id\":9001") != null);
+}
+
+test "archived grace score update frees every allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/archived-score-allocation.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("archive scorer", "archive-scorer@example.invalid", "00000000000000000000000000000000");
+    const room_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id\":1,\"category\":\"realtime\",\"playlist\":[{{\"id\":8,\"beatmap_id\":75,\"ruleset_id\":0}}],\"recent_participants\":[{{\"id\":{d},\"username\":\"archive scorer\",\"country_code\":\"AU\"}}],\"zigcho_score_records\":[],\"zigcho_score_tokens\":[{{\"token_id\":5001,\"user_id\":{d},\"playlist_item_id\":8}}]}}",
+        .{ user_id, user_id },
+    );
+    defer std.testing.allocator.free(room_json);
+    const participant_ids_json = try std.fmt.allocPrint(std.testing.allocator, "[{d}]", .{user_id});
+    defer std.testing.allocator.free(participant_ids_json);
+    var context: ArchivedScoreAllocationContext = .{ .store = &store, .user_id = user_id, .room_json = room_json, .participant_ids_json = participant_ids_json };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, archivedScoreAllocationRun, .{&context});
+}
+
+test "late archived scores preserve playlist and realtime high score eligibility" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/archived-score-category.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("archive category", "archive-category@example.invalid", "00000000000000000000000000000000");
+    const participant_ids_json = try std.fmt.allocPrint(std.testing.allocator, "[{d}]", .{user_id});
+    defer std.testing.allocator.free(participant_ids_json);
+    const normal_token: i64 = 0x7f_ff_ff_00_00_00_00_01;
+    const realtime_token: i64 = 0x7f_ff_ff_00_00_00_00_03;
+    for ([_]struct { room_id: i64, category: []const u8, token_id: i64 }{
+        .{ .room_id = 1, .category = "normal", .token_id = normal_token },
+        .{ .room_id = 2, .category = "realtime", .token_id = realtime_token },
+    }) |fixture| {
+        const room_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"id\":{d},\"category\":\"{s}\",\"playlist\":[{{\"id\":8,\"beatmap_id\":75,\"ruleset_id\":0}}],\"recent_participants\":[{{\"id\":{d},\"username\":\"archive category\",\"country_code\":\"AU\"}}],\"zigcho_score_records\":[],\"zigcho_score_tokens\":[{{\"token_id\":{d},\"user_id\":{d},\"playlist_item_id\":8}}]}}",
+            .{ fixture.room_id, fixture.category, user_id, fixture.token_id, user_id },
+        );
+        defer std.testing.allocator.free(room_json);
+        try store.saveLazerMultiplayerRoomArchive(fixture.room_id, user_id, fixture.category, room_json, "{\"leaderboard\":[],\"user_score\":null}", participant_ids_json);
+    }
+
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    manager.store = &store;
+    defer {
+        manager.shutting_down = true;
+        manager.deinit();
+    }
+    const LateScore = struct {
+        manager: *Manager,
+        user_id: i32,
+        token_id: i64,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.manager.recordRoomScore(context.user_id, 1, 8, .{ .token_id = context.token_id, .score_id = 101, .total_score = 500_000, .accuracy = 0.9, .max_combo = 100, .passed = false }) catch |err| {
+                context.failure = err;
+            };
+            context.done.store(true, .release);
+        }
+    };
+    const LiveProgress = struct {
+        manager: *Manager,
+        user: domain.User,
+        socket: *std.http.Server.WebSocket,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            const connection = context.manager.connect(context.user, context.socket) catch |err| {
+                context.failure = err;
+                context.done.store(true, .release);
+                return;
+            };
+            connection.socket = null;
+            context.manager.disconnect(connection);
+            context.done.store(true, .release);
+        }
+    };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const unrelated_user: domain.User = .{ .id = user_id + 1, .name = "live progress", .safe_name = "live_progress", .country = .{ 'G', 'B' } };
+    store.mutex.lockUncancelable(std.testing.io);
+    var late_score: LateScore = .{ .manager = &manager, .user_id = user_id, .token_id = normal_token };
+    var live_progress: LiveProgress = .{ .manager = &manager, .user = unrelated_user, .socket = fake_socket };
+    const late_thread = try std.Thread.spawn(.{}, LateScore.run, .{&late_score});
+    const live_thread = try std.Thread.spawn(.{}, LiveProgress.run, .{&live_progress});
+    while (!late_score.started.load(.acquire) or !live_progress.started.load(.acquire)) std.Thread.yield() catch {};
+    _ = std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    const live_progressed_while_storage_blocked = live_progress.done.load(.acquire);
+    const archive_waited_for_storage = !late_score.done.load(.acquire);
+    store.mutex.unlock(std.testing.io);
+    late_thread.join();
+    live_thread.join();
+    try std.testing.expect(live_progressed_while_storage_blocked);
+    try std.testing.expect(archive_waited_for_storage);
+    try std.testing.expect(late_score.failure == null);
+    try std.testing.expect(live_progress.failure == null);
+
+    try manager.recordRoomScore(user_id, 2, 8, .{ .token_id = realtime_token, .score_id = 102, .total_score = 500_000, .accuracy = 0.9, .max_combo = 100, .passed = false });
+
+    const normal_ids = (try manager.roomScoreIds(std.testing.allocator, user_id, 1, 8)).?;
+    defer std.testing.allocator.free(normal_ids);
+    const realtime_ids = (try manager.roomScoreIds(std.testing.allocator, user_id, 2, 8)).?;
+    defer std.testing.allocator.free(realtime_ids);
+    try std.testing.expectEqual(@as(usize, 0), normal_ids.len);
+    try std.testing.expectEqualSlices(i64, &.{102}, realtime_ids);
+    // Both exact attempts remain addressable; only the playlist high-score
+    // projection excludes its failed result.
+    try std.testing.expect(manager.roomContainsScore(user_id, 1, 8, 101));
+    try std.testing.expect(manager.roomContainsScore(user_id, 2, 8, 102));
+}
+
+test "consumed score token recovery attaches only its canonical room score" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/consumed-room-token.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const hash = "0123456789abcdef0123456789abcdef";
+    try store.exec("INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,star_rating,total_length,hit_length) VALUES(75,750,'0123456789abcdef0123456789abcdef','fixture','retry','room','mapper',3,5.0,120,100)");
+    const user_id = try store.register("retry scorer", "retry-scorer@example.invalid", "00000000000000000000000000000000");
+    const input: lazer.ScoreInput = .{
+        .beatmap_id = 75,
+        .ruleset_id = 0,
+        .total_score = 765_432,
+        .accuracy = 0.987,
+        .max_combo = 432,
+        .passed = true,
+        .mods = null,
+        .statistics = .empty,
+        .namespace = .vanilla,
+    };
+    const solo_token_id = try store.createLazerScoreToken(user_id, 75, hash, 0, "00000000000000000000000000000000");
+    try std.testing.expect(!storage.Store.isLazerRoomScoreToken(solo_token_id));
+    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerRoomScoreToken(user_id, 75, solo_token_id, input, 123, "[]", "{}", "{}", "[]", &.{}));
+    const token_id = try store.createLazerRoomScoreToken(user_id, 75, hash, 0, "11111111111111111111111111111111");
+    try std.testing.expect(storage.Store.isLazerRoomScoreToken(token_id));
+    // A room token that could not be bound because the room closed or the
+    // manager ran out of memory is still unusable on the solo submission path.
+    try std.testing.expectError(error.InvalidLazerScoreToken, store.submitLazerScoreToken(user_id, 75, token_id, input, 123, "[]", "{}", "{}", "[]", &.{}));
+    const score_id = try store.submitLazerRoomScoreToken(user_id, 75, token_id, input, 123, "[]", "{}", "{}", "[]", &.{});
+    try std.testing.expectError(error.LazerScoreTokenUsed, store.submitLazerRoomScoreToken(user_id, 75, token_id, input, 123, "[]", "{}", "{}", "[]", &.{}));
+    const recovered = (try store.consumedLazerScoreToken(user_id, 75, token_id)).?;
+    try std.testing.expectEqual(score_id, recovered.score_id);
+    try std.testing.expectEqual(input.total_score, recovered.total_score);
+    try std.testing.expectEqual(input.accuracy, recovered.accuracy);
+    try std.testing.expectEqual(@as(i32, @intCast(input.max_combo)), recovered.max_combo);
+    try std.testing.expectEqual(input.passed, recovered.passed);
+    try std.testing.expect((try store.consumedLazerScoreToken(user_id + 1, 75, token_id)) == null);
+    try std.testing.expect((try store.consumedLazerScoreToken(user_id, 76, token_id)) == null);
+
+    const room_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id\":1,\"category\":\"realtime\",\"playlist\":[{{\"id\":8,\"beatmap_id\":75,\"ruleset_id\":0}}],\"recent_participants\":[{{\"id\":{d},\"username\":\"retry scorer\",\"country_code\":\"AU\"}}],\"zigcho_score_records\":[],\"zigcho_score_tokens\":[{{\"token_id\":{d},\"user_id\":{d},\"playlist_item_id\":8}}]}}",
+        .{ user_id, token_id, user_id },
+    );
+    defer std.testing.allocator.free(room_json);
+    const participant_ids = try std.fmt.allocPrint(std.testing.allocator, "[{d}]", .{user_id});
+    defer std.testing.allocator.free(participant_ids);
+    try store.saveLazerMultiplayerRoomArchive(1, user_id, "realtime", room_json, "{\"leaderboard\":[],\"user_score\":null}", participant_ids);
+
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    try std.testing.expect(manager.scoreSubmissionContext(user_id, 1, 8, token_id) != null);
+    try std.testing.expect(manager.scoreSubmissionContext(user_id, 1, 9, token_id) == null);
+    try std.testing.expect(manager.scoreSubmissionContext(user_id + 1, 1, 8, token_id) == null);
+    try manager.recordRoomScore(user_id, 1, 8, .{
+        .token_id = token_id,
+        .score_id = recovered.score_id,
+        .total_score = recovered.total_score,
+        .accuracy = recovered.accuracy,
+        .max_combo = recovered.max_combo,
+        .passed = recovered.passed,
+    });
+    try std.testing.expect(manager.scoreSubmissionContext(user_id, 1, 8, token_id) != null);
+    try manager.recordRoomScore(user_id, 1, 8, .{
+        .token_id = token_id,
+        .score_id = recovered.score_id,
+        .total_score = recovered.total_score,
+        .accuracy = recovered.accuracy,
+        .max_combo = recovered.max_combo,
+        .passed = recovered.passed,
+    });
+    var persisted = (try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)).?;
+    defer persisted.deinit();
+    var persisted_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, persisted.room_json, .{});
+    defer persisted_json.deinit();
+    const persisted_token = persisted_json.value.object.get("zigcho_score_tokens").?.array.items[0].object;
+    try std.testing.expectEqual(score_id, persisted_token.get("score_id").?.integer);
+
+    var restarted = Manager.init(std.testing.allocator, std.testing.io);
+    defer restarted.deinit();
+    try restarted.bindStore(&store);
+    try std.testing.expect(restarted.roomContainsScore(user_id, 1, 8, score_id));
+    try std.testing.expect(restarted.scoreSubmissionContext(user_id, 1, 8, token_id) != null);
+    const ids = (try restarted.roomScoreIds(std.testing.allocator, user_id, 1, 8)).?;
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{score_id}, ids);
+}
+
+test "planned shutdown restores long lived playlist rooms without falsely ending them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/shutdown-room.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("shutdown host", "shutdown@example.invalid", "00000000000000000000000000000000");
+    const guest_id = try store.register("shutdown guest", "shutdown-guest@example.invalid", "00000000000000000000000000000000");
+    const host: domain.User = .{ .id = user_id, .name = "shutdown host", .safe_name = "shutdown_host", .country = .{ 'A', 'U' } };
+    const guest: domain.User = .{ .id = guest_id, .name = "shutdown guest", .safe_name = "shutdown_guest", .country = .{ 'G', 'B' } };
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(host, fake_socket);
+    connection.socket = null;
+    const room_body =
+        \\{"name":"durable shutdown","password":"secret","type":"playlists","duration":30,"max_attempts":1000,"playlist":[{"id":8,"owner_id":0,"beatmap_id":75,"ruleset_id":0}]}
+    ;
+    const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
+    defer std.testing.allocator.free(created);
+    var created_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+    defer created_json.deinit();
+    const original_ends_at = created_json.value.object.get("ends_at").?.string;
+    for (0..129) |index| try manager.recordRoomScore(user_id, 1, 8, .{
+        .score_id = @intCast(501 + index),
+        .total_score = @intCast(900_000 + index),
+        .accuracy = 1,
+        .max_combo = 500,
+        .passed = true,
+    });
+    try manager.bindRoomScoreToken(user_id, 1, 8, 7001);
+    try std.testing.expect(manager.scoreSubmissionContext(user_id, 1, 8, 7001) != null);
+    manager.shutdown();
+    try std.testing.expect(!connection.alive.load(.acquire));
+    try std.testing.expect(manager.shutting_down);
+    try std.testing.expect(manager.rooms[0] == null);
+    try std.testing.expect((try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)) == null);
+    const checkpoints = try store.lazerMultiplayerRoomCheckpoints(std.testing.allocator);
+    defer {
+        for (checkpoints) |*checkpoint| checkpoint.deinit();
+        std.testing.allocator.free(checkpoints);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checkpoints.len);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoints[0].room_json, "\"zigcho_password\":\"secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoints[0].room_json, "\"score_id\":501") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoints[0].room_json, "\"score_id\":629") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoints[0].room_json, "\"token_id\":7001") != null);
+    manager.shutdown();
+    try std.testing.expectError(error.ServerShuttingDown, manager.connect(host, fake_socket));
+
+    var reopened = Manager.init(std.testing.allocator, std.testing.io);
+    defer reopened.deinit();
+    try reopened.bindStore(&store);
+    try std.testing.expect(reopened.rooms[0] != null);
+    const restored_json = (try reopened.roomsJson(std.testing.allocator, 1, null, user_id)).?;
+    defer std.testing.allocator.free(restored_json);
+    var restored = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, restored_json, .{});
+    defer restored.deinit();
+    try std.testing.expect(restored.value.object.get("zigcho_score_tokens") == null);
+    try std.testing.expectEqualStrings("idle", restored.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings(original_ends_at, restored.value.object.get("ends_at").?.string);
+    const attempt = restored.value.object.get("current_user_score").?.object.get("playlist_item_attempts").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 129), attempt.get("attempts").?.integer);
+    const score_ids = (try reopened.roomScoreIds(std.testing.allocator, user_id, 1, 8)).?;
+    defer std.testing.allocator.free(score_ids);
+    try std.testing.expectEqualSlices(i64, &.{629}, score_ids);
+    try std.testing.expect(reopened.roomContainsScore(user_id, 1, 8, 501));
+    try std.testing.expect(reopened.roomContainsScore(user_id, 1, 8, 629));
+    try std.testing.expect(reopened.scoreSubmissionContext(user_id, 1, 8, 7001) != null);
+    const archived_older_detail = (try reopened.roomScoreRanking(std.testing.allocator, user_id, 1, 8, 501)).?;
+    try std.testing.expectEqual(@as(usize, 2), archived_older_detail.position);
+    try std.testing.expectEqual(@as(usize, 0), archived_older_detail.higher_count);
+    try std.testing.expectEqual(@as(usize, 0), archived_older_detail.lower_count);
+    const restored_room = reopened.rooms[0].?;
+    try std.testing.expectEqual(@as(usize, 1), restored_room.user_count);
+    try std.testing.expectEqual(@as(usize, 1), restored_room.participant_count);
+    const fresh_connection = try reopened.connect(host, fake_socket);
+    fresh_connection.socket = null;
+    try std.testing.expectError(error.InvalidMultiplayerPassword, reopened.joinRoom(fresh_connection, "restart-wrong-password", 1, "wrong"));
+    try std.testing.expectEqual(@as(?i64, null), fresh_connection.room_id);
+    try reopened.joinRoom(fresh_connection, "restart-rebind", 1, "secret");
+    try std.testing.expectEqual(@as(?i64, 1), fresh_connection.room_id);
+    try std.testing.expectEqual(@as(usize, 1), restored_room.user_count);
+    try std.testing.expectEqual(@as(usize, 1), restored_room.participant_count);
+    try std.testing.expectError(error.InvalidMultiplayerPassword, reopened.restJoinRoom(std.testing.allocator, guest, 1, "wrong"));
+    const guest_joined = try reopened.restJoinRoom(std.testing.allocator, guest, 1, "secret");
+    std.testing.allocator.free(guest_joined);
+    try reopened.restPartRoom(guest_id, 1);
+    const remaining_checkpoints = try store.lazerMultiplayerRoomCheckpoints(std.testing.allocator);
+    defer std.testing.allocator.free(remaining_checkpoints);
+    try std.testing.expectEqual(@as(usize, 0), remaining_checkpoints.len);
+    try reopened.restCloseRoom(user_id, 1);
+    var archive = (try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)).?;
+    defer archive.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "zigcho_password") == null);
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "zigcho_resumable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "\"score_id\":501") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive.room_json, "\"score_id\":629") != null);
+}
+
+test "checkpoint hydration failure stays hidden and retries on a later restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/retry-room.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("retry host", "retry-host@example.invalid", "00000000000000000000000000000000");
+    const host: domain.User = .{ .id = user_id, .name = "retry host", .safe_name = "retry_host", .country = .{ 'A', 'U' } };
+    {
+        var manager = Manager.init(std.testing.allocator, std.testing.io);
+        defer manager.deinit();
+        try manager.bindStore(&store);
+        const room_body =
+            \\{"name":"retry hydration","type":"playlists","duration":30,"playlist":[{"id":8,"owner_id":0,"beatmap_id":75,"ruleset_id":0}]}
+        ;
+        const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
+        std.testing.allocator.free(created);
+        manager.shutdown();
+    }
+    // Force only beatmap hydration to fail after the checkpoint itself can be
+    // listed and parsed successfully.
+    try store.exec("ALTER TABLE beatmaps RENAME TO beatmaps_unavailable;");
+    var reopened = Manager.init(std.testing.allocator, std.testing.io);
+    defer reopened.deinit();
+    try reopened.bindStore(&store);
+    for (reopened.rooms) |entry| try std.testing.expect(entry == null);
+    try std.testing.expect((try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)) == null);
+    const checkpoints = try store.lazerMultiplayerRoomCheckpoints(std.testing.allocator);
+    defer {
+        for (checkpoints) |*checkpoint| checkpoint.deinit();
+        std.testing.allocator.free(checkpoints);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checkpoints.len);
+    try std.testing.expectEqual(@as(i64, 1), checkpoints[0].room_id);
 }
 
 test "completed lazer rooms and score boards survive manager restart" {
@@ -4924,6 +8208,11 @@ test "completed lazer rooms and score boards survive manager restart" {
         std.testing.allocator.free(joined);
         try manager.recordRoomScore(host_id, 1, 8, .{ .score_id = 201, .total_score = 700_000, .accuracy = 0.97, .max_combo = 400, .passed = true });
         try manager.recordRoomScore(guest_id, 1, 8, .{ .score_id = 202, .total_score = 900_000, .accuracy = 0.99, .max_combo = 500, .passed = true });
+        try std.testing.expect(manager.scoreTokenContext(host_id, 1, 8) != null);
+        try manager.bindRoomScoreToken(host_id, 1, 8, 555);
+        try manager.bindRoomScoreToken(host_id, 1, 8, 557);
+        try std.testing.expect(manager.scoreSubmissionContext(host_id, 1, 8, 555) != null);
+        try std.testing.expect(manager.scoreSubmissionContext(host_id, 1, 8, 556) == null);
         try manager.restPartRoom(guest_id, 1);
         try manager.restCloseRoom(host_id, 1);
     }
@@ -4931,7 +8220,7 @@ test "completed lazer rooms and score boards survive manager restart" {
     var reopened = Manager.init(std.testing.allocator, std.testing.io);
     defer reopened.deinit();
     try reopened.bindStore(&store);
-    const archived = (try reopened.roomsJson(std.testing.allocator, 1, null)).?;
+    const archived = (try reopened.roomsJson(std.testing.allocator, 1, null, host_id)).?;
     defer std.testing.allocator.free(archived);
     var parsed_room = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, archived, .{});
     defer parsed_room.deinit();
@@ -4943,18 +8232,52 @@ test "completed lazer rooms and score boards survive manager restart" {
     const archived_current = parsed_room.value.object.get("current_playlist_item").?.object.get("beatmap").?.object;
     try std.testing.expectEqual(@as(i64, 143), archived_current.get("total_length").?.integer);
     try std.testing.expectEqual(@as(i64, 119), archived_current.get("hit_length").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), parsed_room.value.object.get("zigcho_score_records").?.array.items.len);
+    const archived_context = reopened.scoreContext(host_id, 1, 8).?;
+    try std.testing.expectEqual(@as(i32, 75), archived_context.beatmap_id);
+    try std.testing.expectEqual(@as(u8, 0), archived_context.ruleset_id);
+    // History remains readable, new token minting stops immediately, and a
+    // pre-minted token may still complete during the official grace window.
+    try std.testing.expect(reopened.scoreTokenContext(host_id, 1, 8) == null);
+    try std.testing.expect(reopened.scoreSubmissionContext(host_id, 1, 8, 555) != null);
+    try std.testing.expect(reopened.scoreSubmissionContext(host_id, 1, 8, 557) != null);
+    try std.testing.expect(reopened.scoreSubmissionContext(host_id, 1, 8, 556) == null);
+    try std.testing.expect(reopened.scoreSubmissionContext(guest_id, 1, 8, 555) == null);
+    try std.testing.expect(reopened.scoreContext(host_id + 1000, 1, 8) == null);
+    try reopened.recordRoomScore(host_id, 1, 8, .{ .token_id = 555, .score_id = 203, .total_score = 950_000, .accuracy = 0.995, .max_combo = 550, .passed = true });
+    try std.testing.expect(reopened.roomContainsScore(host_id, 1, 8, 203));
+    try std.testing.expect(reopened.scoreSubmissionContext(host_id, 1, 8, 555) != null);
+    try reopened.recordRoomScore(host_id, 1, 8, .{ .token_id = 555, .score_id = 203, .total_score = 950_000, .accuracy = 0.995, .max_combo = 550, .passed = true });
+    var restarted = Manager.init(std.testing.allocator, std.testing.io);
+    defer restarted.deinit();
+    try restarted.bindStore(&store);
+    const restarted_score_ids = (try restarted.roomScoreIds(std.testing.allocator, host_id, 1, 8)).?;
+    defer std.testing.allocator.free(restarted_score_ids);
+    try std.testing.expectEqualSlices(i64, &.{ 203, 202 }, restarted_score_ids);
+    try std.testing.expect(restarted.scoreSubmissionContext(host_id, 1, 8, 555) != null);
+    try store.exec("UPDATE lazer_multiplayer_room_history SET ended_at=unixepoch()-301 WHERE room_id=1");
+    try std.testing.expect(restarted.scoreSubmissionContext(host_id, 1, 8, 555) == null);
+    try std.testing.expect(restarted.scoreSubmissionContext(host_id, 1, 8, 557) == null);
+    try std.testing.expectError(error.MultiplayerRoomNotFound, restarted.recordRoomScore(host_id, 1, 8, .{ .token_id = 557, .score_id = 204, .total_score = 1_000_000, .accuracy = 1, .max_combo = 600, .passed = true }));
+    const archived_score_ids = (try reopened.roomScoreIds(std.testing.allocator, guest_id, 1, 8)).?;
+    defer std.testing.allocator.free(archived_score_ids);
+    try std.testing.expectEqualSlices(i64, &.{ 203, 202 }, archived_score_ids);
+    try std.testing.expectEqual(@as(?i64, 202), reopened.roomScoreIdForUser(host_id, 1, 8, guest_id));
+    try std.testing.expect(reopened.roomContainsScore(guest_id, 1, 8, 201));
+    try std.testing.expect(!reopened.roomContainsScore(host_id + 1000, 1, 8, 201));
     const leaderboard = (try reopened.roomLeaderboardJson(std.testing.allocator, 0, 1)).?;
     defer std.testing.allocator.free(leaderboard);
     var parsed_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, leaderboard, .{});
     defer parsed_board.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_board.value.object.get("leaderboard").?.array.items.len);
-    try std.testing.expectEqual(@as(i64, guest_id), parsed_board.value.object.get("leaderboard").?.array.items[0].object.get("user_id").?.integer);
-    const ended = (try reopened.roomsJson(std.testing.allocator, null, try roomListFilter(host_id, "ended", null, "realtime"))).?;
+    try std.testing.expectEqual(@as(i64, host_id), parsed_board.value.object.get("leaderboard").?.array.items[0].object.get("user_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_650_000), parsed_board.value.object.get("leaderboard").?.array.items[0].object.get("total_score").?.integer);
+    const ended = (try reopened.roomsJson(std.testing.allocator, null, try roomListFilter(host_id, "ended", null, "realtime"), host_id)).?;
     defer std.testing.allocator.free(ended);
     var parsed_ended = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ended, .{});
     defer parsed_ended.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_ended.value.array.items.len);
-    const open = (try reopened.roomsJson(std.testing.allocator, null, .{ .requester_id = 0, .mode = .open })).?;
+    const open = (try reopened.roomsJson(std.testing.allocator, null, .{ .requester_id = 0, .mode = .open }, 0)).?;
     defer std.testing.allocator.free(open);
     try std.testing.expectEqualStrings("[]", open);
 
@@ -5019,7 +8342,7 @@ test "multiplayer room cards use stored beatmap metadata and cover ids" {
     try manager.hydrateRoom(decoded);
     var client_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer client_json.deinit();
-    try writeRoomJson(&client_json.writer, decoded);
+    try writeRoomJson(&client_json.writer, decoded, 0, 0, .none);
     var parsed_client = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, client_json.written(), .{});
     defer parsed_client.deinit();
     const client_beatmap = parsed_client.value.object.get("playlist").?.array.items[0].object.get("beatmap").?.object;
@@ -5135,6 +8458,129 @@ test "ranked play state uses the official union and damage contract" {
     try std.testing.expectEqual(@as(usize, 7), try reader.arrayLen());
     try std.testing.expectEqual(@as(i64, ranked_stage.results), try reader.integer());
     try std.testing.expectEqual(@as(i64, 1), try reader.integer());
+}
+
+test "ordinary rooms expire the played map and choose the next playlist order" {
+    var room: Room = .{ .id = 12, .settings = .{}, .host_id = 4 };
+    room.settings.playlist_item_id = 10;
+    room.users[0] = try defaultRoomUser(4, "host", .{ 'A', 'U' });
+    room.users[0].?.voted_skip = true;
+    room.user_count = 1;
+    room.playlist[0] = .{ .id = 10, .owner_id = 4, .beatmap_id = 100, .order = 0 };
+    room.playlist[2] = .{ .id = 30, .owner_id = 4, .beatmap_id = 300, .order = 2 };
+    room.playlist_count = 2;
+
+    try std.testing.expectEqual(@as(?u16, 3), nextPlaylistOrder(&room));
+    room.playlist[2].?.order = std.math.maxInt(u16);
+    try std.testing.expectEqual(@as(?u16, null), nextPlaylistOrder(&room));
+    room.playlist[2].?.order = 2;
+    const first = advanceRoomPlaylist(&room);
+    try std.testing.expectEqual(@as(?i64, 30), first.next_item_id);
+    try std.testing.expectEqual(@as(i64, 10), first.expired.?.id);
+    try std.testing.expect(room.playlist[0].?.expired);
+    try std.testing.expectEqual(@as(i64, 30), room.settings.playlist_item_id);
+    try std.testing.expect(!room.users[0].?.voted_skip);
+
+    const last = advanceRoomPlaylist(&room);
+    try std.testing.expectEqual(@as(i64, 30), last.expired.?.id);
+    try std.testing.expectEqual(@as(?i64, null), last.next_item_id);
+    try std.testing.expect(room.playlist[2].?.expired);
+}
+
+test "ranked rooms load persistent ratings and settle a room once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/ranked-room.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(10,'ranked one','ranked_one',x'00',x'00'),(11,'ranked two','ranked_two',x'00',x'00');" ++
+            "INSERT INTO lazer_ranked_ratings(user_id,ruleset_id,rating) VALUES(10,1,1700),(11,1,1400);" ++
+            "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,mode,star_rating,osu_file) VALUES(75,750,'0123456789abcdef0123456789abcdef','fixture','ranked','taiko','mapper',3,1,4.5,x'00');",
+    );
+
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    try manager.setMatchmakingMaps(1, &.{.{ .id = 75, .md5 = "0123456789abcdef0123456789abcdef".*, .mode = 1, .stars = 4.5 }});
+    const pending: PendingMatch = .{ .id = 1, .pool_id = 102, .users = .{ 10, 11 }, .created_at = 0 };
+    const room = try manager.createMatchmakingRoomLocked(pending, "secret");
+    defer std.testing.allocator.destroy(room);
+    try std.testing.expectEqual(@as(i32, 1700), room.ranked_play.?.users[0].?.rating);
+    try std.testing.expectEqual(@as(i32, 1400), room.ranked_play.?.users[1].?.rating);
+
+    room.ranked_play.?.winning_user_id = 10;
+    room.ranked_play.?.stage = ranked_stage.ended;
+    try manager.persistRankedResult(room);
+    try std.testing.expect(room.ranked_play.?.result_persisted);
+    try std.testing.expectEqual(@as(i32, 1716), room.ranked_play.?.users[0].?.rating_after);
+    try std.testing.expectEqual(@as(i32, 1384), room.ranked_play.?.users[1].?.rating_after);
+    try manager.persistRankedResult(room);
+    try std.testing.expectEqual(@as(i32, 1), (try store.lazerRankedRating(10, 1)).games_played);
+    try std.testing.expectEqual(@as(i32, 1), (try store.lazerRankedRating(11, 1)).games_played);
+}
+
+test "ranked result database settlement never holds the multiplayer manager mutex" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/ranked-result-unlocked.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(10,'ranked one','ranked_one',x'00',x'00'),(11,'ranked two','ranked_two',x'00',x'00');" ++
+            "INSERT INTO lazer_ranked_ratings(user_id,ruleset_id,rating) VALUES(10,1,1700),(11,1,1400);" ++
+            "INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,mode,star_rating,osu_file) VALUES(75,750,'0123456789abcdef0123456789abcdef','fixture','ranked','taiko','mapper',3,1,4.5,x'00');",
+    );
+
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    try manager.setMatchmakingMaps(1, &.{.{ .id = 75, .md5 = "0123456789abcdef0123456789abcdef".*, .mode = 1, .stars = 4.5 }});
+    const pending: PendingMatch = .{ .id = 1, .pool_id = 102, .users = .{ 10, 11 }, .created_at = 0 };
+    const room = try manager.createMatchmakingRoomLocked(pending, "secret");
+    room.ranked_play.?.winning_user_id = 10;
+    room.ranked_play.?.stage = ranked_stage.ended;
+    manager.rooms[0] = room;
+
+    const Settlement = struct {
+        manager: *Manager,
+        room_id: i64,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.manager.persistLiveRankedResult(context.room_id) catch |err| {
+                context.failure = err;
+            };
+            context.done.store(true, .release);
+        }
+    };
+    store.mutex.lockUncancelable(std.testing.io);
+    var settlement: Settlement = .{ .manager = &manager, .room_id = room.id };
+    const settlement_thread = try std.Thread.spawn(.{}, Settlement.run, .{&settlement});
+    while (!settlement.started.load(.acquire)) std.Thread.yield() catch {};
+    _ = std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!settlement.done.load(.acquire));
+
+    // The storage operation is deliberately blocked above. An unrelated user
+    // must still be able to enter and leave the manager immediately.
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const guest: domain.User = .{ .id = 20, .name = "unrelated", .safe_name = "unrelated", .country = .{ 'G', 'B' } };
+    const unrelated = try manager.connect(guest, fake_socket);
+    unrelated.socket = null;
+    manager.disconnect(unrelated);
+
+    store.mutex.unlock(std.testing.io);
+    settlement_thread.join();
+    try std.testing.expect(settlement.failure == null);
+    try std.testing.expect(room.ranked_play.?.result_persisted);
+    try std.testing.expectEqual(@as(i32, 1716), room.ranked_play.?.users[0].?.rating_after);
 }
 
 test "ranked pick countdown uses the pinned client union and timespan ticks" {

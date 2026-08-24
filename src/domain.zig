@@ -81,6 +81,107 @@ pub const LazerActivity = struct {
         self.* = undefined;
     }
 };
+
+pub const ProfilePresenceClient = enum { offline, stable, lazer };
+
+pub fn profilePresenceClient(stable_online: bool, lazer_online: bool) ProfilePresenceClient {
+    if (lazer_online) return .lazer;
+    if (stable_online) return .stable;
+    return .offline;
+}
+
+pub fn profilePresenceDetailsVisible(viewer_id: ?i32, profile_user_id: i32, show_recent_scores: bool) bool {
+    return show_recent_scores or (viewer_id != null and viewer_id.? == profile_user_id);
+}
+
+test "profile presence keeps the active client and owner privacy exact" {
+    try std.testing.expectEqual(ProfilePresenceClient.lazer, profilePresenceClient(true, true));
+    try std.testing.expectEqual(ProfilePresenceClient.stable, profilePresenceClient(true, false));
+    try std.testing.expectEqual(ProfilePresenceClient.offline, profilePresenceClient(false, false));
+    try std.testing.expect(profilePresenceDetailsVisible(4, 4, false));
+    try std.testing.expect(!profilePresenceDetailsVisible(null, 4, false));
+    try std.testing.expect(!profilePresenceDetailsVisible(5, 4, false));
+    try std.testing.expect(profilePresenceDetailsVisible(null, 4, true));
+}
+
+pub fn validLazerActivity(status: []const u8, detail: []const u8, beatmap_id: ?i32, ruleset_id: ?u8) bool {
+    if (status.len == 0 or status.len > 80 or detail.len > 200) return false;
+    if (!std.unicode.utf8ValidateSlice(status) or !std.unicode.utf8ValidateSlice(detail)) return false;
+    for (status) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    for (detail) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    if (beatmap_id) |id| if (id <= 0) return false;
+    if (ruleset_id) |id| if (id > 3) return false;
+    return true;
+}
+
+pub const LevelProgress = struct {
+    current: u64,
+    progress: u8,
+};
+
+fn levelScoreFormula(level: f64) f64 {
+    return 5_000.0 / 3.0 * (4.0 * level * level * level - 3.0 * level * level - level) + 1.25 * std.math.pow(f64, 1.8, level - 60.0);
+}
+
+/// Converts total score to the level contract returned by osu!'s user API.
+/// Levels through 100 use the client's rounded, cumulative score deltas; later
+/// levels use the official linear continuation.
+pub fn levelFromTotalScore(total_score: i64) LevelProgress {
+    const score: u128 = @intCast(@max(0, total_score));
+    const level_100_score: u128 = 26_931_190_827;
+    const score_per_level_after_100: u128 = 99_999_999_999;
+
+    if (score >= level_100_score) {
+        const completed = (score - level_100_score) / score_per_level_after_100;
+        const start = level_100_score + completed * score_per_level_after_100;
+        return .{
+            .current = 100 + @as(u64, @intCast(completed)),
+            .progress = @intCast((score - start) * 100 / score_per_level_after_100),
+        };
+    }
+
+    var current_level: u64 = 1;
+    var current_score: u128 = 0;
+    var previous_formula = levelScoreFormula(0);
+    for (1..101) |raw_level| {
+        const formula = levelScoreFormula(@floatFromInt(raw_level));
+        const rounded_delta: u128 = @intFromFloat(@round(formula - previous_formula));
+        const next_score = current_score + rounded_delta;
+        previous_formula = formula;
+        if (next_score > score) {
+            return .{
+                .current = current_level,
+                .progress = if (next_score == current_score) 0 else @intCast((score - current_score) * 100 / (next_score - current_score)),
+            };
+        }
+        current_level = @intCast(raw_level);
+        current_score = next_score;
+    }
+    unreachable;
+}
+
+test "lazer activity is utf8 bounded and client safe" {
+    try std.testing.expect(validLazerActivity("playing", "artist - title", 75, 0));
+    try std.testing.expect(validLazerActivity("in lazer", "", null, null));
+    try std.testing.expect(!validLazerActivity("", "", null, null));
+    try std.testing.expect(!validLazerActivity("playing\nelsewhere", "", null, null));
+    try std.testing.expect(!validLazerActivity("playing", "private\x00detail", null, null));
+    try std.testing.expect(!validLazerActivity("playing", "", 0, null));
+    try std.testing.expect(!validLazerActivity("playing", "", null, 4));
+}
+
+test "total score uses osu rounded level thresholds and post-100 continuation" {
+    try std.testing.expectEqual(LevelProgress{ .current = 1, .progress = 0 }, levelFromTotalScore(-1));
+    try std.testing.expectEqual(LevelProgress{ .current = 1, .progress = 0 }, levelFromTotalScore(0));
+    try std.testing.expectEqual(LevelProgress{ .current = 1, .progress = 99 }, levelFromTotalScore(29_999));
+    try std.testing.expectEqual(LevelProgress{ .current = 2, .progress = 0 }, levelFromTotalScore(30_000));
+    try std.testing.expectEqual(LevelProgress{ .current = 83, .progress = 84 }, levelFromTotalScore(3_896_191_620));
+    try std.testing.expectEqual(LevelProgress{ .current = 100, .progress = 0 }, levelFromTotalScore(26_931_190_827));
+    try std.testing.expectEqual(LevelProgress{ .current = 102, .progress = 88 }, levelFromTotalScore(315_143_525_692));
+    const maximum = levelFromTotalScore(std.math.maxInt(i64));
+    try std.testing.expect(maximum.current > 100);
+    try std.testing.expect(maximum.progress < 100);
+}
 pub const RankedStatus = enum(i8) { unknown = 0, unsubmitted = 1, pending = 2, ranked = 3, approved = 4, qualified = 5, loved = 6 };
 pub const BeatmapRankAction = enum { pending, qualify, rank, approve, love, veto, rollback };
 pub const BeatmapRankContext = struct {
@@ -117,6 +218,7 @@ pub const User = struct {
     name: []const u8,
     safe_name: []const u8,
     country: [2]u8 = .{ 'X', 'X' },
+    show_country: bool = true,
     privileges: u32 = 3,
     silence_end: i64 = 0,
     restricted: bool = false,
@@ -124,6 +226,81 @@ pub const User = struct {
     banner_version: i64 = 0,
     team: ?TeamSummary = null,
 };
+
+pub const ProfileSummary = struct {
+    created_at: i64 = 0,
+    last_visit: i64 = 0,
+    avatar_version: i64 = 0,
+    preferred_mode: u8 = 0,
+    show_country: bool = true,
+    show_profile_stats: bool = true,
+    show_recent_scores: bool = true,
+    title_bytes: [40]u8 = [_]u8{0} ** 40,
+    title_len: u8 = 0,
+    location_bytes: [60]u8 = [_]u8{0} ** 60,
+    location_len: u8 = 0,
+    website_bytes: [200]u8 = [_]u8{0} ** 200,
+    website_len: u8 = 0,
+    favourite_count: i32 = 0,
+    ranked_count: i32 = 0,
+    loved_count: i32 = 0,
+    pending_count: i32 = 0,
+    graveyard_count: i32 = 0,
+    nominated_count: i32 = 0,
+    guest_count: i32 = 0,
+    played_beatmap_count: i32 = 0,
+
+    pub fn init(created_at: i64, last_visit: i64, avatar_version: i64, preferred_mode: u8, profile_title: []const u8, profile_location: []const u8, profile_website: []const u8) !ProfileSummary {
+        if (preferred_mode > 3 or profile_title.len > 40 or profile_location.len > 60 or profile_website.len > 200) return error.InvalidProfileSummary;
+        if (!std.unicode.utf8ValidateSlice(profile_title) or !std.unicode.utf8ValidateSlice(profile_location) or !std.unicode.utf8ValidateSlice(profile_website)) return error.InvalidProfileSummary;
+        var result: ProfileSummary = .{
+            .created_at = @max(0, created_at),
+            .last_visit = @max(0, last_visit),
+            .avatar_version = @max(0, avatar_version),
+            .preferred_mode = preferred_mode,
+            .title_len = @intCast(profile_title.len),
+            .location_len = @intCast(profile_location.len),
+            .website_len = @intCast(profile_website.len),
+        };
+        @memcpy(result.title_bytes[0..profile_title.len], profile_title);
+        @memcpy(result.location_bytes[0..profile_location.len], profile_location);
+        @memcpy(result.website_bytes[0..profile_website.len], profile_website);
+        return result;
+    }
+
+    pub fn title(self: *const ProfileSummary) []const u8 {
+        return self.title_bytes[0..self.title_len];
+    }
+
+    pub fn location(self: *const ProfileSummary) []const u8 {
+        return self.location_bytes[0..self.location_len];
+    }
+
+    pub fn website(self: *const ProfileSummary) []const u8 {
+        return self.website_bytes[0..self.website_len];
+    }
+};
+
+pub const BatchUserVisibility = struct {
+    avatar_version: i64 = 0,
+    show_country: bool = true,
+    show_profile_stats: bool = true,
+};
+
+test "profile summary owns bounded lazer metadata" {
+    const summary = try ProfileSummary.init(1_700_000_000, 1_700_000_100, 42, 3, "mapper", "adelaide", "https://kai.ovh");
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), summary.created_at);
+    try std.testing.expectEqual(@as(i64, 1_700_000_100), summary.last_visit);
+    try std.testing.expectEqual(@as(i64, 42), summary.avatar_version);
+    try std.testing.expectEqual(@as(u8, 3), summary.preferred_mode);
+    try std.testing.expectEqualStrings("mapper", summary.title());
+    try std.testing.expectEqualStrings("adelaide", summary.location());
+    try std.testing.expectEqualStrings("https://kai.ovh", summary.website());
+    try std.testing.expectError(error.InvalidProfileSummary, ProfileSummary.init(0, 0, 0, 4, "", "", ""));
+    try std.testing.expectError(error.InvalidProfileSummary, ProfileSummary.init(0, 0, 0, 0, "x" ** 41, "", ""));
+    try std.testing.expectError(error.InvalidProfileSummary, ProfileSummary.init(0, 0, 0, 0, "", "x" ** 61, ""));
+    try std.testing.expectError(error.InvalidProfileSummary, ProfileSummary.init(0, 0, 0, 0, "", "", "x" ** 201));
+}
 
 pub const Stats = struct {
     mode: Mode = .osu,

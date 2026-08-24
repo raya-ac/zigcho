@@ -37,7 +37,9 @@ pub const Session = struct {
     away_message: [512]u8 = [_]u8{0} ** 512,
     away_message_len: usize = 0,
     queue: std.ArrayList(u8) = .empty,
+    pending_dm_reads: std.ArrayList(i64) = .empty,
     queue_overflowed: bool = false,
+    presence_suppressed: bool = false,
     is_bot: bool = false,
     joined_osu: bool = false,
     joined_announce: bool = false,
@@ -94,10 +96,26 @@ pub const Session = struct {
         if (next_len > max_queue_bytes) {
             self.queue.deinit(allocator);
             self.queue = .empty;
+            self.pending_dm_reads.clearRetainingCapacity();
             self.queue_overflowed = true;
             return;
         }
         try self.queue.appendSlice(allocator, bytes);
+    }
+    pub fn enqueueDirectMessage(self: *Session, allocator: std.mem.Allocator, message_id: i64, bytes: []const u8) !void {
+        if (self.queue_overflowed) return;
+        const next_len = std.math.add(usize, self.queue.items.len, bytes.len) catch max_queue_bytes + 1;
+        if (next_len > max_queue_bytes) {
+            self.queue.deinit(allocator);
+            self.queue = .empty;
+            self.pending_dm_reads.clearRetainingCapacity();
+            self.queue_overflowed = true;
+            return;
+        }
+        try self.queue.ensureUnusedCapacity(allocator, bytes.len);
+        try self.pending_dm_reads.ensureUnusedCapacity(allocator, 1);
+        self.queue.appendSliceAssumeCapacity(bytes);
+        self.pending_dm_reads.appendAssumeCapacity(message_id);
     }
 };
 
@@ -109,6 +127,8 @@ pub const Sessions = struct {
     by_token: std.StringHashMap(*Session),
     by_user: std.AutoHashMap(i32, *Session),
     by_safe_name: std.StringHashMap(*Session),
+    lazer_leases: std.AutoHashMap(i32, i64),
+    lazer_presence_epoch: u64 = 0,
     matches: [multiplayer.max_matches]?multiplayer.Match = [_]?multiplayer.Match{null} ** multiplayer.max_matches,
 
     pub fn init(a: std.mem.Allocator, io: std.Io) Sessions {
@@ -118,6 +138,7 @@ pub const Sessions = struct {
             .by_token = std.StringHashMap(*Session).init(a),
             .by_user = std.AutoHashMap(i32, *Session).init(a),
             .by_safe_name = std.StringHashMap(*Session).init(a),
+            .lazer_leases = std.AutoHashMap(i32, i64).init(a),
         };
     }
     pub fn deinit(self: *Sessions) void {
@@ -125,6 +146,7 @@ pub const Sessions = struct {
         for (self.items.items) |s| {
             s.friend_ids.deinit(self.allocator);
             s.queue.deinit(self.allocator);
+            s.pending_dm_reads.deinit(self.allocator);
             self.allocator.free(s.user.name);
             self.allocator.free(s.user.safe_name);
             self.allocator.destroy(s);
@@ -133,6 +155,7 @@ pub const Sessions = struct {
         self.by_token.deinit();
         self.by_user.deinit();
         self.by_safe_name.deinit();
+        self.lazer_leases.deinit();
     }
     pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
         const s = try self.allocator.create(Session);
@@ -187,11 +210,19 @@ pub const Sessions = struct {
     pub fn byUser(self: *Sessions, id: i32) ?*Session {
         return self.by_user.get(id);
     }
+    pub fn onlineByUser(self: *Sessions, id: i32) ?*Session {
+        const session = self.byUser(id) orelse return null;
+        return if (session.presence_suppressed) null else session;
+    }
     pub fn byName(self: *Sessions, name: []const u8) ?*Session {
         var safe_buffer: [96]u8 = undefined;
         if (name.len == 0 or name.len > safe_buffer.len) return null;
         for (name, 0..) |char, index| safe_buffer[index] = if (char == ' ') '_' else std.ascii.toLower(char);
         return self.by_safe_name.get(safe_buffer[0..name.len]);
+    }
+    pub fn onlineByName(self: *Sessions, name: []const u8) ?*Session {
+        const session = self.byName(name) orelse return null;
+        return if (session.presence_suppressed) null else session;
     }
     pub fn matchById(self: *Sessions, id: u16) ?*multiplayer.Match {
         if (id >= self.matches.len) return null;
@@ -207,9 +238,10 @@ pub const Sessions = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.byToken(present_token)) |session| {
+            if (session.presence_suppressed) return .offline;
             return if (session.user.id == user_id) .exact else .foreign_live;
         }
-        return if (self.byUser(user_id) != null) .stale_online else .offline;
+        return if (self.onlineByUser(user_id) != null) .stale_online else .offline;
     }
     pub fn remove(self: *Sessions, target: *Session) void {
         for (self.items.items) |session| {
@@ -234,6 +266,7 @@ pub const Sessions = struct {
             _ = self.items.swapRemove(i);
             s.friend_ids.deinit(self.allocator);
             s.queue.deinit(self.allocator);
+            s.pending_dm_reads.deinit(self.allocator);
             self.allocator.free(s.user.name);
             self.allocator.free(s.user.safe_name);
             self.allocator.destroy(s);
@@ -241,11 +274,11 @@ pub const Sessions = struct {
         };
     }
     pub fn broadcast(self: *Sessions, bytes: []const u8, except: ?*Session) !void {
-        for (self.items.items) |s| if (s != except and !s.is_bot) try s.enqueue(self.allocator, bytes);
+        for (self.items.items) |s| if (s != except and !s.is_bot and !s.presence_suppressed) try s.enqueue(self.allocator, bytes);
     }
     pub fn humanCount(self: *const Sessions) usize {
         var count: usize = 0;
-        for (self.items.items) |s| if (!s.is_bot) {
+        for (self.items.items) |s| if (!s.is_bot and !s.presence_suppressed) {
             count += 1;
         };
         return count;
@@ -256,14 +289,14 @@ pub const Sessions = struct {
         var ids: std.ArrayList(i32) = .empty;
         errdefer ids.deinit(allocator);
         try ids.ensureTotalCapacity(allocator, self.items.items.len);
-        for (self.items.items) |session| ids.appendAssumeCapacity(session.user.id);
+        for (self.items.items) |session| if (!session.presence_suppressed) ids.appendAssumeCapacity(session.user.id);
         return ids.toOwnedSlice(allocator);
     }
     pub fn publicPresence(self: *Sessions, user_id: i32) ?PublicPresence {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const session = self.byUser(user_id) orelse return null;
-        if (session.is_bot or session.user.restricted) return null;
+        if (session.is_bot or session.user.restricted or session.presence_suppressed) return null;
         return .{
             .action = session.action,
             .mode = session.mode,
@@ -275,7 +308,7 @@ pub const Sessions = struct {
     }
     pub fn channelCount(self: *const Sessions, name: []const u8) usize {
         var count: usize = 0;
-        for (self.items.items) |s| if (s.joined(name)) {
+        for (self.items.items) |s| if (!s.presence_suppressed and s.joined(name)) {
             count += 1;
         };
         return count;
@@ -306,7 +339,7 @@ pub const Sessions = struct {
             session.joined_lobby_channel = false;
     }
     pub fn broadcastChannel(self: *Sessions, name: []const u8, bytes: []const u8, except: ?*Session) !void {
-        for (self.items.items) |s| if (s != except and !s.is_bot and s.joined(name)) {
+        for (self.items.items) |s| if (s != except and !s.is_bot and !s.presence_suppressed and s.joined(name)) {
             try s.enqueue(self.allocator, bytes);
         };
     }
@@ -327,6 +360,8 @@ test "session indices follow replacement and removal" {
     try std.testing.expect(sessions.byUser(10) == first);
     try std.testing.expect(sessions.byName("raya player") == first);
     try std.testing.expect(sessions.byName("RAYA_PLAYER") == first);
+    first.presence_suppressed = true;
+    try std.testing.expectEqual(@as(usize, 0), sessions.humanCount());
 
     const replacement = try sessions.create(.{
         .id = 10,
@@ -336,6 +371,8 @@ test "session indices follow replacement and removal" {
     try std.testing.expect(sessions.byToken(&stale_token) == null);
     try std.testing.expect(sessions.byUser(10) == replacement);
     try std.testing.expect(sessions.byName("raya player") == replacement);
+    try std.testing.expect(!replacement.presence_suppressed);
+    try std.testing.expectEqual(@as(usize, 1), sessions.humanCount());
 
     const replacement_token = replacement.token;
     sessions.remove(replacement);
@@ -383,4 +420,55 @@ test "public presence copies Stable client activity without borrowing a session"
     try std.testing.expectEqual(@as(u8, 2), presence.action);
     try std.testing.expectEqual(@as(i32, 75), presence.map_id);
     try std.testing.expectEqualStrings("playing", presence.info());
+}
+
+test "superseded Stable sessions stay connected only long enough to receive their kick" {
+    const allocator = std.testing.allocator;
+    var sessions = Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    const session = try sessions.create(.{
+        .id = 4,
+        .name = try allocator.dupe(u8, "ari"),
+        .safe_name = try allocator.dupe(u8, "ari"),
+    }, 0, 0, 0);
+    session.action = 2;
+    session.map_id = 75;
+    session.joined_osu = true;
+    const token = session.token;
+    session.presence_suppressed = true;
+
+    try std.testing.expect(sessions.byUser(4) == session);
+    try std.testing.expect(sessions.onlineByUser(4) == null);
+    try std.testing.expect(sessions.onlineByName("ari") == null);
+    try std.testing.expect(sessions.publicPresence(4) == null);
+    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&token, 4));
+    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale", 4));
+    try std.testing.expectEqual(@as(usize, 0), sessions.channelCount("#osu"));
+    try sessions.broadcast("presence", null);
+    try sessions.broadcastChannel("#osu", "chat", null);
+    try std.testing.expectEqual(@as(usize, 0), session.queue.items.len);
+    const ids = try sessions.onlineUserIds(allocator);
+    defer allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "direct-message queue owns exact unread rows and drops them with discarded bytes" {
+    const allocator = std.testing.allocator;
+    var sessions = Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    const session = try sessions.create(.{
+        .id = 4,
+        .name = try allocator.dupe(u8, "ari"),
+        .safe_name = try allocator.dupe(u8, "ari"),
+    }, 0, 0, 0);
+    try session.enqueueDirectMessage(allocator, 71, "message");
+    try std.testing.expectEqualStrings("message", session.queue.items);
+    try std.testing.expectEqualSlices(i64, &.{71}, session.pending_dm_reads.items);
+
+    const fill = try allocator.alloc(u8, max_queue_bytes);
+    defer allocator.free(fill);
+    @memset(fill, 1);
+    try session.enqueue(allocator, fill);
+    try std.testing.expect(session.queue_overflowed);
+    try std.testing.expectEqual(@as(usize, 0), session.pending_dm_reads.items.len);
 }

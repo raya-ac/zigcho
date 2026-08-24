@@ -385,7 +385,7 @@ ALTER TABLE direct_messages
 
 CREATE TABLE lazer_channel_reads (
     user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    channel_id smallint NOT NULL CHECK(channel_id BETWEEN 1 AND 4),
+    channel_id bigint NOT NULL CHECK(channel_id BETWEEN 1 AND 4 OR channel_id BETWEEN 2000000001 AND 2147483647),
     last_read_id bigint NOT NULL DEFAULT 0,
     updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
     PRIMARY KEY(user_id, channel_id)
@@ -496,6 +496,33 @@ CREATE TABLE lazer_multiplayer_room_history (
 );
 CREATE INDEX lazer_multiplayer_room_history_owner ON lazer_multiplayer_room_history(owner_id,ended_at DESC,room_id DESC);
 CREATE INDEX lazer_multiplayer_room_history_time ON lazer_multiplayer_room_history(ended_at DESC,room_id DESC);
+
+CREATE TABLE lazer_ranked_ratings (
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ruleset_id smallint NOT NULL CHECK(ruleset_id BETWEEN 0 AND 3),
+    rating integer NOT NULL DEFAULT 1500,
+    games_played integer NOT NULL DEFAULT 0 CHECK(games_played >= 0),
+    wins integer NOT NULL DEFAULT 0 CHECK(wins >= 0),
+    losses integer NOT NULL DEFAULT 0 CHECK(losses >= 0),
+    updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    PRIMARY KEY(user_id, ruleset_id),
+    CHECK(games_played = wins + losses)
+);
+CREATE INDEX lazer_ranked_ratings_board ON lazer_ranked_ratings(ruleset_id, rating DESC, games_played DESC, user_id);
+
+CREATE TABLE lazer_ranked_matches (
+    room_id bigint PRIMARY KEY CHECK(room_id > 0),
+    ruleset_id smallint NOT NULL CHECK(ruleset_id BETWEEN 0 AND 3),
+    winner_id integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    loser_id integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    winner_rating_before integer NOT NULL,
+    winner_rating_after integer NOT NULL,
+    loser_rating_before integer NOT NULL,
+    loser_rating_after integer NOT NULL,
+    completed_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())::bigint),
+    CHECK(winner_id != loser_id)
+);
+CREATE INDEX lazer_ranked_matches_users ON lazer_ranked_matches(winner_id,loser_id,completed_at DESC,room_id DESC);
 
 CREATE TABLE user_achievements (
     user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -677,4 +704,4 @@ SELECT setval(pg_get_serial_sequence('users','id'),3,true);
 INSERT INTO chat_channels(name,topic,write_privileges)
 VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multiplayer lobby',1),('#lazer','lazer chat',1);
 
-INSERT INTO schema_migrations(version) VALUES (38);
+INSERT INTO schema_migrations(version) VALUES (40);

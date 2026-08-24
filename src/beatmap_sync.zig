@@ -1216,6 +1216,7 @@ test "official osu api mapper fixture becomes a real lazer profile" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"avatar_url\":\"https://a.ppy.sh/4452992\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"global_rank\":50128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"level\":{\"current\":100,\"progress\":64}") != null);
     try std.testing.expectError(error.InvalidUpstreamUser, profileFromV1(parsed.value[0], 0, 99, &join_date));
 }
 

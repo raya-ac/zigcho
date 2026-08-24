@@ -105,7 +105,7 @@ pub fn handleCommand(allocator: std.mem.Allocator, store: *storage.Store, sessio
         };
         defer freeUser(allocator, &target);
         var buf: [320]u8 = undefined;
-        const message = try std.fmt.bufPrint(&buf, "{s} ({d}) | country {s} | priv {d} | restricted {any} | silence ends {d} | online {any}", .{ target.name, target.id, &target.country, target.privileges, target.restricted, target.silence_end, sessions.byUser(target.id) != null });
+        const message = try std.fmt.bufPrint(&buf, "{s} ({d}) | country {s} | priv {d} | restricted {any} | silence ends {d} | online {any}", .{ target.name, target.id, &target.country, target.privileges, target.restricted, target.silence_end, sessions.onlineByUser(target.id) != null });
         try reply(allocator, sessions, sender, reply_target, out, message);
         return .handled;
     }

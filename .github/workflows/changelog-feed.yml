@@ -1,0 +1,30 @@
+name: changelog feed
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - updates/**
+      - tools/changelog-manifest.py
+      - .github/workflows/changelog-feed.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: changelog-feed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify raw feed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check out zigcho
+        uses: actions/checkout@v6
+
+      - name: verify every update and digest
+        run: python3 tools/changelog-manifest.py --check

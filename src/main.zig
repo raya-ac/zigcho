@@ -17,6 +17,7 @@ const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
 const server_control = @import("server_control.zig");
 const server_control_route = @import("server_control_route.zig");
+const account_roles = @import("account_roles.zig");
 const achievements = @import("achievements.zig");
 const changelog = @import("changelog");
 const lazer_wiki = @import("lazer_wiki.zig");
@@ -303,15 +304,46 @@ const App = struct {
         };
     }
 
+    fn observeStableSignal(self: *App, user_id: i32, source: storage.AnticheatSource, signal: anticheat_evidence.Signal) void {
+        const host = if (self.anticheat) |*loaded| loaded else {
+            self.persistHostAnticheatObservation(user_id, source, null, signal.fallback);
+            return;
+        };
+        const decision = host.evaluate(signal.event) catch |err| {
+            std.log.warn("event=anticheat_module_evaluation_failed module={s} source={s} error={t}", .{ host.name(), source.text(), err });
+            self.persistHostAnticheatObservation(user_id, source, null, signal.fallback);
+            return;
+        };
+        if (decision.action == anticheat_abi.Action.allow) {
+            self.persistHostAnticheatObservation(user_id, source, null, signal.fallback);
+            return;
+        }
+        _ = self.store.recordAnticheatObservation(user_id, .{
+            .source = source,
+            .module = host.name(),
+            .action = decision.action,
+            .reason = decision.reason,
+            .risk_score = decision.risk_score,
+            .confidence_bps = decision.confidence_bps,
+            .evidence = signal.event.evidence,
+            .decision_flags = decision.flags,
+            .rule_revision = decision.rule_revision,
+        }) catch |err| {
+            std.log.warn("event=anticheat_observation_write_failed module={s} source={s} user_id={d} score_id=0 error={t}", .{ host.name(), source.text(), user_id, err });
+            return;
+        };
+        std.log.warn("event=anticheat_observation module={s} source={s} mode=observe proposed_action={d} reason={d} risk={d} confidence_bps={d}", .{ host.name(), source.text(), decision.action, decision.reason, decision.risk_score, decision.confidence_bps });
+    }
+
     fn observeStableLogin(self: *App, result: bancho.LoginResult) void {
         if (result.user_id <= 0) return;
-        const observation = anticheat_evidence.stableLogin(result.hardware_match_count, result.running_under_wine) orelse return;
-        self.persistHostAnticheatObservation(result.user_id, .stable_login, null, observation);
+        const signal = anticheat_evidence.stableLoginSignal(result.hardware_match_count, result.running_under_wine) orelse return;
+        self.observeStableSignal(result.user_id, .stable_login, signal);
     }
 
     fn observeStableLastFmFlags(self: *App, user_id: i32, flags: u32) void {
-        const observation = anticheat_evidence.stableLastFm(flags) orelse return;
-        self.persistHostAnticheatObservation(user_id, .stable_lastfm, null, observation);
+        const signal = anticheat_evidence.stableLastFmSignal(flags) orelse return;
+        self.observeStableSignal(user_id, .stable_lastfm, signal);
     }
 
     const StableGameplayObservation = union(enum) {
@@ -2472,6 +2504,57 @@ const App = struct {
                 defer self.allocator.free(json);
                 return respond(req, .ok, "application/json", json, &no_store);
             }
+            if (std.mem.eql(u8, path, "/api/v1/staff/roles")) {
+                if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const user_text = queryField(target, "user") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player id required\"}", &no_store);
+                    const target_id = std.fmt.parseInt(i32, user_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player id\"}", &no_store);
+                    if (target_id <= 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player id\"}", &no_store);
+                    const json = (try self.store.staffRolesJson(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const user_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"user_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                    defer self.allocator.free(user_text);
+                    const role_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"role"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"role required\"}", &no_store);
+                    defer self.allocator.free(role_text);
+                    const state_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"state"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"state required\"}", &no_store);
+                    defer self.allocator.free(state_text);
+                    const reason_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &no_store);
+                    defer self.allocator.free(reason_value);
+                    const target_id = std.fmt.parseInt(i32, user_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid player\"}", &no_store);
+                    const role = account_roles.Role.parse(role_text) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"unknown role\"}", &no_store);
+                    const grant = if (std.mem.eql(u8, state_text, "grant")) true else if (std.mem.eql(u8, state_text, "revoke")) false else return respond(req, .bad_request, "application/json", "{\"error\":\"state must be grant or revoke\"}", &no_store);
+                    const reason = std.mem.trim(u8, reason_value, " \t\r\n");
+                    if (target_id <= 0 or !account_roles.validReason(reason)) return respond(req, .bad_request, "application/json", "{\"error\":\"reason must be between 3 and 500 characters\"}", &no_store);
+                    const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                    defer freeUser(self.allocator, target_user);
+                    if (!web_auth.canManage(staff_user, target_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"bot and self role changes are blocked\"}", &no_store);
+                    const transition = self.gameSessionMutex(target_id);
+                    transition.lockUncancelable(self.store.io);
+                    defer transition.unlock(self.store.io);
+                    const result = self.store.changeRole(staff_user.id, target_id, role, grant, reason) catch |err| switch (err) {
+                        error.RoleStateUnchanged => return respond(req, .conflict, "application/json", "{\"error\":\"player already has that role state\"}", &no_store),
+                        error.InvalidRoleChange => return respond(req, .bad_request, "application/json", "{\"error\":\"invalid role change\"}", &no_store),
+                        else => return err,
+                    };
+                    self.sessions.mutex.lockUncancelable(self.sessions.io);
+                    defer self.sessions.mutex.unlock(self.sessions.io);
+                    if (self.sessions.byUser(target_id)) |online| {
+                        online.user.privileges = result.privileges;
+                        var packet = protocol.Writer.init(self.allocator);
+                        defer packet.deinit();
+                        try packet.packetInt(.privileges, stableClientPrivileges(result.privileges));
+                        try online.enqueue(self.allocator, packet.bytes());
+                    }
+                    std.log.warn("event=staff_role_change actor_id={d} target_id={d} role={s} state={s} staff_sessions_revoked={}", .{ staff_user.id, target_id, @tagName(role), state_text, result.staff_sessions_revoked });
+                    var response_buf: [128]u8 = undefined;
+                    const response = try std.fmt.bufPrint(&response_buf, "{{\"ok\":true,\"privileges\":{d},\"staff_sessions_revoked\":{}}}", .{ result.privileges, result.staff_sessions_revoked });
+                    return respond(req, .ok, "application/json", response, &no_store);
+                }
+                return respond(req, .method_not_allowed, "application/json", "{\"error\":\"method not allowed\"}", &no_store);
+            }
             if (std.mem.eql(u8, path, "/api/v1/staff/users") and req.head.method == .GET) {
                 if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
                 const encoded_query = queryField(target, "q") orelse return respond(req, .bad_request, "application/json", "{\"error\":\"search text required\"}", &no_store);
@@ -2612,23 +2695,6 @@ const App = struct {
                             self.sessions.mutex.lockUncancelable(self.sessions.io);
                             defer self.sessions.mutex.unlock(self.sessions.io);
                             if (self.sessions.byUser(target_id)) |online| online.user.restricted = false;
-                        }
-                    } else if (std.mem.eql(u8, action, "add_privilege") or std.mem.eql(u8, action, "remove_privilege")) {
-                        if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
-                        const bits_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"bits"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"privilege bits required\"}", &no_store);
-                        defer self.allocator.free(bits_text);
-                        const bits = std.fmt.parseInt(u32, bits_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid privilege bits\"}", &no_store);
-                        const allowed_bits: u32 = 1 | 2 | (1 << 4) | (1 << 5) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14);
-                        if (bits == 0 or bits & ~allowed_bits != 0) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid privilege bits\"}", &no_store);
-                        const privileges = try self.store.changePrivileges(staff_user.id, target_id, bits, std.mem.eql(u8, action, "add_privilege"));
-                        self.sessions.mutex.lockUncancelable(self.sessions.io);
-                        defer self.sessions.mutex.unlock(self.sessions.io);
-                        if (self.sessions.byUser(target_id)) |online| {
-                            online.user.privileges = privileges;
-                            var packet = protocol.Writer.init(self.allocator);
-                            defer packet.deinit();
-                            try packet.packetInt(.privileges, stableClientPrivileges(privileges));
-                            try online.enqueue(self.allocator, packet.bytes());
                         }
                     } else return respond(req, .bad_request, "application/json", "{\"error\":\"invalid moderation action\"}", &no_store);
                     std.log.info("event=staff_moderation_action actor_id={d} target_id={d} action={s}", .{ staff_user.id, target_id, action });
@@ -4678,9 +4744,12 @@ const App = struct {
                     return respond(req, .ok, "text/plain", "error: no", &.{});
                 },
             }
-            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return rejectStableScore(req, "checksum_mismatch", body.len);
+            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) {
+                self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .checksum_mismatch));
+                return rejectStableScore(req, "checksum_mismatch", body.len);
+            }
             if (passed_score_missing_replay) {
-                self.persistHostAnticheatObservation(user.id, .stable_score, null, anticheat_evidence.stableReplay(.missing, 0));
+                self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .required_replay_missing));
                 return rejectStableScore(req, "passed_score_missing_replay", body.len);
             }
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});

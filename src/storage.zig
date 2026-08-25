@@ -14,6 +14,8 @@ const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
 const upstream_user = @import("upstream_user.zig");
 const server_control = @import("server_control.zig");
+const account_roles = @import("account_roles.zig");
+const anticheat_review = @import("anticheat_review.zig");
 const database_sql = @import("database_sql");
 pub const is_postgres = false;
 
@@ -238,7 +240,7 @@ pub const AnticheatObservation = struct {
 pub fn validateAnticheatObservation(user_id: i32, observation: AnticheatObservation) !void {
     if (user_id <= 0 or observation.module.len == 0 or observation.module.len > 64 or !std.unicode.utf8ValidateSlice(observation.module)) return error.InvalidAnticheatObservation;
     if (observation.score_id) |score_id| if (score_id <= 0) return error.InvalidAnticheatObservation;
-    if ((observation.source == .stable_score) != (observation.score_id != null)) return error.InvalidAnticheatObservation;
+    if (observation.source != .stable_score and observation.score_id != null) return error.InvalidAnticheatObservation;
     if (observation.action > 3 or observation.sample_weight == 0 or observation.sample_weight > 100_000 or observation.risk_score > 1000 or observation.confidence_bps > 10_000 or observation.replay_match_count > 100_000) return error.InvalidAnticheatObservation;
     if (observation.evidence > std.math.maxInt(i64) or observation.decision_flags > std.math.maxInt(i64)) return error.InvalidAnticheatObservation;
     if (observation.matched_clicks > observation.objects_checked or observation.snap_events > observation.objects_checked or observation.exact_timing_bps > 10_000 or observation.center_hits_bps > 10_000 or observation.key_hold_count > observation.key_press_count or observation.alternation_bps > 10_000) return error.InvalidAnticheatObservation;
@@ -3737,27 +3739,44 @@ pub const Store = struct {
     }
 
     pub fn changePrivileges(self: *Store, actor_id: i32, target_id: i32, bits: u32, add: bool) !u32 {
+        const role = account_roles.Role.fromBit(bits) orelse return error.InvalidRoleChange;
+        return (try self.changeRole(actor_id, target_id, role, add, "legacy typed role command")).privileges;
+    }
+
+    pub fn changeRole(self: *Store, actor_id: i32, target_id: i32, role: account_roles.Role, grant: bool, reason: []const u8) !account_roles.ChangeResult {
+        if (actor_id <= 0 or target_id <= 0 or !account_roles.validReason(reason)) return error.InvalidRoleChange;
+        const definition = role.definition();
+        const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.exec("BEGIN IMMEDIATE");
         errdefer self.exec("ROLLBACK") catch {};
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = if (add)
-            "UPDATE users SET privileges=privileges | ?1 WHERE id=?2 AND id!=3 RETURNING privileges"
+        const sql = if (grant)
+            "UPDATE users SET privileges=privileges | ?1 WHERE id=?2 AND id!=3 AND (privileges & ?1)=0 RETURNING privileges"
         else
-            "UPDATE users SET privileges=privileges & ~?1 WHERE id=?2 AND id!=3 RETURNING privileges";
+            "UPDATE users SET privileges=privileges & ~?1 WHERE id=?2 AND id!=3 AND (privileges & ?1)!=0 RETURNING privileges";
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, bits);
+        _ = c.sqlite3_bind_int64(stmt, 1, definition.bit);
         _ = c.sqlite3_bind_int(stmt, 2, target_id);
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.InvalidModerationTarget;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.RoleStateUnchanged;
         const privileges: u32 = @intCast(c.sqlite3_column_int64(stmt, 0));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        var detail_buf: [64]u8 = undefined;
-        const detail = try std.fmt.bufPrint(&detail_buf, "{s} bits:{d}", .{ if (add) "add" else "remove", bits });
-        try self.insertAuditLocked(actor_id, "account.privileges", target_id, detail);
+        var staff_sessions_revoked = false;
+        if (!account_roles.isStaff(privileges)) {
+            var revoke: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE user_id=?1 AND scopes='web:staff' AND revoked_at IS NULL AND expires_at>unixepoch()", -1, &revoke, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(revoke);
+            _ = c.sqlite3_bind_int(revoke, 1, target_id);
+            if (c.sqlite3_step(revoke) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            staff_sessions_revoked = c.sqlite3_changes(self.db) != 0;
+        }
+        const detail = try std.fmt.allocPrint(self.allocator, "{s} role:{s} bit:{d} permanent:{} reason:{s}", .{ if (grant) "grant" else "revoke", @tagName(role), definition.bit, definition.permanent, trimmed_reason });
+        defer self.allocator.free(detail);
+        try self.insertAuditLocked(actor_id, "account.role", target_id, detail);
         try self.exec("COMMIT");
-        return privileges;
+        return .{ .privileges = privileges, .staff_sessions_revoked = staff_sessions_revoked };
     }
 
     pub fn addModerationNote(self: *Store, actor_id: i32, target_id: i32, note: []const u8) !void {
@@ -3877,7 +3896,9 @@ pub const Store = struct {
         defer _ = c.sqlite3_finalize(stmt);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try output.writer.print("{{\"pending\":{d},\"observations\":[", .{pending});
+        try output.writer.print("{{\"pending\":{d},\"policy\":", .{pending});
+        try anticheat_review.writePolicyJson(&output.writer);
+        try output.writer.writeAll(",\"observations\":[");
         var first = true;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             if (!first) try output.writer.writeByte(',');
@@ -3898,6 +3919,35 @@ pub const Store = struct {
                 c.sqlite3_column_int64(stmt, 30),
             });
             try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 31)), .{}, &output.writer);
+            try output.writer.writeAll(",\"meaning\":");
+            try anticheat_review.writeObservationJson(&output.writer, .{
+                .action = @intCast(c.sqlite3_column_int64(stmt, 6)),
+                .reason = @intCast(c.sqlite3_column_int64(stmt, 8)),
+                .risk_score = @intCast(c.sqlite3_column_int64(stmt, 9)),
+                .confidence_bps = @intCast(c.sqlite3_column_int64(stmt, 10)),
+                .evidence = @intCast(c.sqlite3_column_int64(stmt, 11)),
+                .decision_flags = @intCast(c.sqlite3_column_int64(stmt, 12)),
+                .rule_revision = @intCast(c.sqlite3_column_int64(stmt, 13)),
+                .metrics = .{
+                    .objects_checked = @intCast(c.sqlite3_column_int64(stmt, 14)),
+                    .matched_clicks = @intCast(c.sqlite3_column_int64(stmt, 15)),
+                    .mean_abs_timing_error_milli = @intCast(c.sqlite3_column_int64(stmt, 16)),
+                    .timing_stddev_milli = @intCast(c.sqlite3_column_int64(stmt, 17)),
+                    .exact_timing_bps = @intCast(c.sqlite3_column_int64(stmt, 18)),
+                    .center_hits_bps = @intCast(c.sqlite3_column_int64(stmt, 19)),
+                    .mean_center_distance_milli = @intCast(c.sqlite3_column_int64(stmt, 20)),
+                    .snap_events = @intCast(c.sqlite3_column_int64(stmt, 21)),
+                    .replay_match_count = @intCast(c.sqlite3_column_int64(stmt, 22)),
+                    .key_press_count = @intCast(c.sqlite3_column_int64(stmt, 23)),
+                    .key_hold_count = @intCast(c.sqlite3_column_int64(stmt, 24)),
+                    .mean_hold_duration_milli = @intCast(c.sqlite3_column_int64(stmt, 25)),
+                    .hold_duration_stddev_milli = @intCast(c.sqlite3_column_int64(stmt, 26)),
+                    .alternation_bps = @intCast(c.sqlite3_column_int64(stmt, 27)),
+                    .target_distance_stddev_milli = @intCast(c.sqlite3_column_int64(stmt, 28)),
+                    .velocity_spike_count = @intCast(c.sqlite3_column_int64(stmt, 29)),
+                    .movement_velocity_stddev_milli = @intCast(c.sqlite3_column_int64(stmt, 30)),
+                },
+            });
             try output.writer.writeAll(",\"reviewer\":");
             try std.json.Stringify.value(std.mem.span(c.sqlite3_column_text(stmt, 32)), .{}, &output.writer);
             try output.writer.writeAll(",\"review_note\":");
@@ -4064,6 +4114,45 @@ pub const Store = struct {
         };
         try output.writer.writeByte(']');
         return output.toOwnedSlice();
+    }
+
+    pub fn staffRolesJson(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var user: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT id,name,country,privileges,restricted,created_at,coalesce(last_login,0) FROM users WHERE id=?1 AND id!=3", -1, &user, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(user);
+        _ = c.sqlite3_bind_int(user, 1, user_id);
+        if (c.sqlite3_step(user) != c.SQLITE_ROW) return null;
+        const privileges: u32 = @intCast(c.sqlite3_column_int64(user, 3));
+        var audit: ?*c.sqlite3_stmt = null;
+        var target_buf: [24]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "user:{d}", .{user_id});
+        if (c.sqlite3_prepare_v2(self.db, "SELECT a.id,coalesce(actor.name,'system'),coalesce(a.detail,''),a.created_at FROM audit_log a LEFT JOIN users actor ON actor.id=a.actor_id WHERE a.target=?1 AND a.action='account.role' ORDER BY a.id DESC LIMIT 100", -1, &audit, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(audit);
+        _ = c.sqlite3_bind_text(audit, 1, target.ptr, @intCast(target.len), null);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"user\":{{\"id\":{d},\"name\":", .{c.sqlite3_column_int(user, 0)});
+        try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 1)));
+        try output.writer.writeAll(",\"country\":");
+        try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(user, 2)));
+        try output.writer.print(",\"privileges\":{d},\"restricted\":{},\"created_at\":{d},\"last_login\":{d}}},\"roles\":", .{ privileges, c.sqlite3_column_int(user, 4) != 0, c.sqlite3_column_int64(user, 5), c.sqlite3_column_int64(user, 6) });
+        try account_roles.writeCatalogJson(&output.writer, privileges);
+        try output.writer.writeAll(",\"audit\":[");
+        var first = true;
+        while (c.sqlite3_step(audit) == c.SQLITE_ROW) {
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{{\"id\":{d},\"actor\":", .{c.sqlite3_column_int64(audit, 0)});
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(audit, 1)));
+            try output.writer.writeAll(",\"detail\":");
+            try jsonString(&output.writer, std.mem.span(c.sqlite3_column_text(audit, 2)));
+            try output.writer.print(",\"created_at\":{d}}}", .{c.sqlite3_column_int64(audit, 3)});
+        }
+        try output.writer.writeAll("]}");
+        const owned = try output.toOwnedSlice();
+        return owned;
     }
 
     pub fn lazerUserSearchIds(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: u8) ![]i32 {

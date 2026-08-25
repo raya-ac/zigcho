@@ -17,7 +17,9 @@ const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
 const upstream_user = @import("upstream_user.zig");
 const server_control = @import("server_control.zig");
+const account_roles = @import("account_roles.zig");
 const anticheat_evidence = @import("anticheat_evidence.zig");
+const anticheat_review = @import("anticheat_review.zig");
 const database_sql = @import("database_sql");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
@@ -4855,27 +4857,44 @@ pub const Store = struct {
     }
 
     pub fn changePrivileges(self: *Store, actor_id: i32, target_id: i32, bits: u32, add: bool) !u32 {
+        const role = account_roles.Role.fromBit(bits) orelse return error.InvalidRoleChange;
+        return (try self.changeRole(actor_id, target_id, role, add, "legacy typed role command")).privileges;
+    }
+
+    pub fn changeRole(self: *Store, actor_id: i32, target_id: i32, role: account_roles.Role, grant: bool, reason: []const u8) !account_roles.ChangeResult {
+        if (actor_id <= 0 or target_id <= 0 or !account_roles.validReason(reason)) return error.InvalidRoleChange;
+        const definition = role.definition();
+        const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
+        var actor_buf: [24]u8 = undefined;
         var target_buf: [24]u8 = undefined;
-        var bits_buf: [24]u8 = undefined;
+        var bit_buf: [24]u8 = undefined;
+        const actor = try std.fmt.bufPrint(&actor_buf, "{d}", .{actor_id});
         const target = try std.fmt.bufPrint(&target_buf, "{d}", .{target_id});
-        const bit_text = try std.fmt.bufPrint(&bits_buf, "{d}", .{bits});
+        const bit = try std.fmt.bufPrint(&bit_buf, "{d}", .{definition.bit});
         var lease = self.pool.acquire();
         defer lease.release();
         try postgres.exec(lease.conn, "BEGIN");
         errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
-        const sql = if (add)
-            "UPDATE zigcho.users SET privileges=privileges | $1::bigint WHERE id=$2 AND id!=3 RETURNING privileges"
+        const sql = if (grant)
+            "UPDATE zigcho.users SET privileges=privileges | $1::bigint WHERE id=$2 AND id!=3 AND (privileges & $1::bigint)=0 RETURNING privileges"
         else
-            "UPDATE zigcho.users SET privileges=privileges & ~$1::bigint WHERE id=$2 AND id!=3 RETURNING privileges";
-        var update = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ bit_text, target });
+            "UPDATE zigcho.users SET privileges=privileges & ~$1::bigint WHERE id=$2 AND id!=3 AND (privileges & $1::bigint)!=0 RETURNING privileges";
+        var update = try postgres.queryParams(self.allocator, lease.conn, sql, &.{ bit, target });
         defer update.deinit();
-        if (update.rows() == 0) return error.InvalidModerationTarget;
+        if (update.rows() == 0) return error.RoleStateUnchanged;
         const privileges = try update.int(u32, 0, 0);
-        var detail_buf: [64]u8 = undefined;
-        const detail = try std.fmt.bufPrint(&detail_buf, "{s} bits:{d}", .{ if (add) "add" else "remove", bits });
-        try insertAudit(self.allocator, lease.conn, actor_id, "account.privileges", target_id, detail);
+        var staff_sessions_revoked = false;
+        if (!account_roles.isStaff(privileges)) {
+            var revoke = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.oauth_tokens SET revoked_at=extract(epoch FROM clock_timestamp())::bigint WHERE user_id=$1 AND scopes='web:staff' AND revoked_at IS NULL AND expires_at>extract(epoch FROM clock_timestamp())::bigint RETURNING token_hash", &.{target});
+            defer revoke.deinit();
+            staff_sessions_revoked = revoke.rows() != 0;
+        }
+        const detail = try std.fmt.allocPrint(self.allocator, "{s} role:{s} bit:{d} permanent:{} reason:{s}", .{ if (grant) "grant" else "revoke", @tagName(role), definition.bit, definition.permanent, trimmed_reason });
+        defer self.allocator.free(detail);
+        var audit = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.audit_log(actor_id,action,target,detail) VALUES($1,'account.role','user:'||$2,$3)", &.{ actor, target, detail });
+        audit.deinit();
         try postgres.exec(lease.conn, "COMMIT");
-        return privileges;
+        return .{ .privileges = privileges, .staff_sessions_revoked = staff_sessions_revoked };
     }
 
     pub fn addModerationNote(self: *Store, actor_id: i32, target_id: i32, note: []const u8) !void {
@@ -4978,7 +4997,9 @@ pub const Store = struct {
         defer pending_result.deinit();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try output.writer.print("{{\"pending\":{d},\"observations\":[", .{try pending_result.int(i64, 0, 0)});
+        try output.writer.print("{{\"pending\":{d},\"policy\":", .{try pending_result.int(i64, 0, 0)});
+        try anticheat_review.writePolicyJson(&output.writer);
+        try output.writer.writeAll(",\"observations\":[");
         for (0..result.rows()) |row| {
             if (row != 0) try output.writer.writeByte(',');
             try output.writer.print("{{\"id\":{d},\"user_id\":{d},\"user\":", .{ try result.int(i64, row, 0), try result.int(i32, row, 1) });
@@ -4997,6 +5018,35 @@ pub const Store = struct {
                 try result.int(i32, row, 30),
             });
             try jsonString(&output.writer, result.value(row, 31));
+            try output.writer.writeAll(",\"meaning\":");
+            try anticheat_review.writeObservationJson(&output.writer, .{
+                .action = try result.int(u32, row, 6),
+                .reason = try result.int(u32, row, 8),
+                .risk_score = try result.int(u32, row, 9),
+                .confidence_bps = try result.int(u32, row, 10),
+                .evidence = try result.int(u64, row, 11),
+                .decision_flags = try result.int(u64, row, 12),
+                .rule_revision = try result.int(u32, row, 13),
+                .metrics = .{
+                    .objects_checked = try result.int(u32, row, 14),
+                    .matched_clicks = try result.int(u32, row, 15),
+                    .mean_abs_timing_error_milli = try result.int(u32, row, 16),
+                    .timing_stddev_milli = try result.int(u32, row, 17),
+                    .exact_timing_bps = try result.int(u32, row, 18),
+                    .center_hits_bps = try result.int(u32, row, 19),
+                    .mean_center_distance_milli = try result.int(u32, row, 20),
+                    .snap_events = try result.int(u32, row, 21),
+                    .replay_match_count = try result.int(u32, row, 22),
+                    .key_press_count = try result.int(u32, row, 23),
+                    .key_hold_count = try result.int(u32, row, 24),
+                    .mean_hold_duration_milli = try result.int(u32, row, 25),
+                    .hold_duration_stddev_milli = try result.int(u32, row, 26),
+                    .alternation_bps = try result.int(u32, row, 27),
+                    .target_distance_stddev_milli = try result.int(u32, row, 28),
+                    .velocity_spike_count = try result.int(u32, row, 29),
+                    .movement_velocity_stddev_milli = try result.int(u32, row, 30),
+                },
+            });
             try output.writer.writeAll(",\"reviewer\":");
             try jsonString(&output.writer, result.value(row, 32));
             try output.writer.writeAll(",\"review_note\":");
@@ -5119,6 +5169,41 @@ pub const Store = struct {
         }
         try output.writer.writeByte(']');
         return output.toOwnedSlice();
+    }
+
+    pub fn staffRolesJson(self: *Store, allocator: std.mem.Allocator, user_id: i32) !?[]u8 {
+        var id_buf: [24]u8 = undefined;
+        var target_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        const target = try std.fmt.bufPrint(&target_buf, "user:{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        var user = try postgres.queryParams(allocator, lease.conn, "SELECT id,name,country,privileges,restricted,created_at,coalesce(last_login,0) FROM zigcho.users WHERE id=$1 AND id!=3", &.{id});
+        defer user.deinit();
+        if (user.rows() == 0) return null;
+        const privileges = try user.int(u32, 0, 3);
+        var audit = try postgres.queryParams(allocator, lease.conn, "SELECT a.id,coalesce(actor.name,'system'),coalesce(a.detail,''),a.created_at FROM zigcho.audit_log a LEFT JOIN zigcho.users actor ON actor.id=a.actor_id WHERE a.target=$1 AND a.action='account.role' ORDER BY a.id DESC LIMIT 100", &.{target});
+        defer audit.deinit();
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.print("{{\"user\":{{\"id\":{d},\"name\":", .{try user.int(i32, 0, 0)});
+        try jsonString(&output.writer, user.value(0, 1));
+        try output.writer.writeAll(",\"country\":");
+        try jsonString(&output.writer, user.value(0, 2));
+        try output.writer.print(",\"privileges\":{d},\"restricted\":{},\"created_at\":{d},\"last_login\":{d}}},\"roles\":", .{ privileges, try user.boolean(0, 4), try user.int(i64, 0, 5), try user.int(i64, 0, 6) });
+        try account_roles.writeCatalogJson(&output.writer, privileges);
+        try output.writer.writeAll(",\"audit\":[");
+        for (0..audit.rows()) |row| {
+            if (row != 0) try output.writer.writeByte(',');
+            try output.writer.print("{{\"id\":{d},\"actor\":", .{try audit.int(i64, row, 0)});
+            try jsonString(&output.writer, audit.value(row, 1));
+            try output.writer.writeAll(",\"detail\":");
+            try jsonString(&output.writer, audit.value(row, 2));
+            try output.writer.print(",\"created_at\":{d}}}", .{try audit.int(i64, row, 3)});
+        }
+        try output.writer.writeAll("]}");
+        const owned = try output.toOwnedSlice();
+        return owned;
     }
 
     pub fn lazerUserSearchIds(self: *Store, allocator: std.mem.Allocator, query: []const u8, limit: u8) ![]i32 {
@@ -9213,6 +9298,52 @@ test "postgres credential and restriction commits revoke matching token families
     }
 }
 
+test "postgres developer role changes preserve unrelated bits and revoke final staff sessions" {
+    const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_STORE_URL") orelse return error.SkipZigTest;
+    var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
+    defer store.close();
+    try store.migrate();
+    const actor_id = try store.register("pg role developer", "pg-role-developer@example.test", "44444444444444444444444444444444");
+    const target_id = try store.register("pg role target", "pg-role-target@example.test", "55555555555555555555555555555555");
+    var actor_buf: [24]u8 = undefined;
+    var target_buf: [24]u8 = undefined;
+    const actor = try std.fmt.bufPrint(&actor_buf, "{d}", .{actor_id});
+    const target = try std.fmt.bufPrint(&target_buf, "{d}", .{target_id});
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var roles = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.users SET privileges=CASE id WHEN $1 THEN 16387 ELSE 4115 END WHERE id IN($1,$2) RETURNING id", &.{ actor, target });
+        defer roles.deinit();
+        try std.testing.expectEqual(@as(usize, 2), roles.rows());
+    }
+    const staff_token = try store.issueToken(target_id, "web:staff", 3600);
+    const premium = try store.changeRole(actor_id, target_id, .premium, true, "postgres permanent premium grant");
+    try std.testing.expectEqual(@as(u32, 4147), premium.privileges);
+    try std.testing.expect(!premium.staff_sessions_revoked);
+    try std.testing.expectError(error.InvalidRoleChange, store.changePrivileges(actor_id, target_id, 3, false));
+    try std.testing.expectError(error.InvalidRoleChange, store.changePrivileges(actor_id, target_id, (1 << 4) | (1 << 5), false));
+    const admin = try store.changeRole(actor_id, target_id, .administrator, true, "postgres move onto admin access");
+    try std.testing.expectEqual(@as(u32, 12_339), admin.privileges);
+    const downgraded = try store.changeRole(actor_id, target_id, .moderator, false, "postgres moderation role replaced");
+    try std.testing.expectEqual(@as(u32, 8_243), downgraded.privileges);
+    try std.testing.expect(!downgraded.staff_sessions_revoked);
+    const refreshed = (try store.authenticateToken(std.testing.allocator, &staff_token, "web:staff")).?;
+    defer {
+        std.testing.allocator.free(refreshed.name);
+        std.testing.allocator.free(refreshed.safe_name);
+    }
+    try std.testing.expect(refreshed.privileges & (1 << 13) != 0);
+    try std.testing.expect(refreshed.privileges & (1 << 12) == 0);
+    const removed = try store.changeRole(actor_id, target_id, .administrator, false, "postgres admin access ended");
+    try std.testing.expectEqual(@as(u32, 51), removed.privileges);
+    try std.testing.expect(removed.staff_sessions_revoked);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &staff_token, "web:staff")) == null);
+    const roles_json = (try store.staffRolesJson(std.testing.allocator, target_id)).?;
+    defer std.testing.allocator.free(roles_json);
+    try std.testing.expect(std.mem.indexOf(u8, roles_json, "\"key\":\"premium\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roles_json, "permanent premium grant") != null);
+}
+
 test "postgres anticheat hardware and flags stay review only" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_STORE_URL") orelse return error.SkipZigTest;
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -9299,6 +9430,24 @@ test "postgres anticheat hardware and flags stay review only" {
         .confidence_bps = 8000,
         .evidence = 8,
     });
+    const rejected_score_observation = try store.recordAnticheatObservation(second_id, .{
+        .source = .stable_score,
+        .module = anticheat_evidence.module_name,
+        .action = 1,
+        .reason = 2006,
+        .risk_score = 200,
+        .confidence_bps = 10_000,
+        .evidence = 16,
+    });
+    try std.testing.expectEqual(rejected_score_observation, try store.recordAnticheatObservation(second_id, .{
+        .source = .stable_score,
+        .module = anticheat_evidence.module_name,
+        .action = 1,
+        .reason = 2006,
+        .risk_score = 200,
+        .confidence_bps = 10_000,
+        .evidence = 16,
+    }));
     try store.reviewAnticheatObservation(first_id, score_observation_id, .uncertain, "retain postgres score evidence");
     {
         var score_buf: [24]u8 = undefined;
@@ -9339,6 +9488,7 @@ test "postgres anticheat hardware and flags stay review only" {
     defer std.testing.allocator.free(review);
     try std.testing.expect(std.mem.indexOf(u8, review, "\"module\":\"zigcho-host\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, review, "\"source\":\"stable_lastfm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review, "\"display\":\"required replay missing (2006)\"") != null);
     var first_target_buf: [32]u8 = undefined;
     var second_target_buf: [32]u8 = undefined;
     const first_target = try std.fmt.bufPrint(&first_target_buf, "user:{d}", .{first_id});

@@ -2,6 +2,12 @@ pub const version: u32 = 1;
 
 pub const Status = struct {
     pub const ok: u32 = 0;
+    pub const null_event: u32 = 1;
+    pub const null_decision: u32 = 2;
+    pub const unsupported_version: u32 = 3;
+    pub const event_too_small: u32 = 4;
+    pub const invalid_gameplay_data: u32 = 5;
+    pub const invalid_event_data: u32 = 6;
 };
 
 pub const EventKind = struct {
@@ -58,11 +64,34 @@ pub const Action = struct {
 };
 
 pub const Reason = struct {
+    pub const none: u32 = 0;
+    pub const known_cheat_signature: u32 = 1001;
+    pub const client_integrity_mismatch: u32 = 1002;
     pub const high_confidence_client_flag: u32 = 1003;
     pub const exact_hardware_match: u32 = 1004;
+    pub const impossible_accuracy: u32 = 2001;
+    pub const impossible_hit_totals: u32 = 2002;
+    pub const impossible_combo: u32 = 2003;
+    pub const checksum_mismatch: u32 = 2004;
+    pub const replay_hash_reused: u32 = 2005;
     pub const required_replay_missing: u32 = 2006;
+    pub const combined_anomalies: u32 = 2007;
     pub const invalid_replay_payload: u32 = 2008;
+    pub const timing_outlier: u32 = 3001;
+    pub const pp_outlier: u32 = 3002;
+    pub const multiaccount_cluster: u32 = 3003;
+    pub const rate_anomaly: u32 = 3004;
     pub const registry_remnant: u32 = 3005;
+    pub const duplicate_score: u32 = 3006;
+    pub const relax_keyless_play: u32 = 4001;
+    pub const relax_timing_lock: u32 = 4002;
+    pub const relax_hold_lock: u32 = 4003;
+    pub const relax_alternation_lock: u32 = 4004;
+    pub const aim_center_lock: u32 = 4101;
+    pub const aim_snap_pattern: u32 = 4102;
+    pub const aim_radial_lock: u32 = 4103;
+    pub const aim_velocity_pattern: u32 = 4104;
+    pub const combined_gameplay_anomalies: u32 = 4201;
 };
 
 pub const DecisionFlag = struct {
@@ -109,7 +138,7 @@ pub const DecisionV1 = extern struct {
     abi_version: u32 = version,
     struct_size: u32 = @sizeOf(DecisionV1),
     action: u32 = Action.allow,
-    reason: u32 = 0,
+    reason: u32 = Reason.none,
     risk_score: u32 = 0,
     confidence_bps: u32 = 0,
     flags: u64 = 0,

@@ -209,7 +209,7 @@ expect_status "$code" 200 staff_report_resolve
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/anticheat" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_anticheat
-jq -e ".pending == 1 and (.observations[] | select(.id == $anticheat_observation_id and .score_id == $score_id and .action == 0 and .sample_weight == 100 and .review_label == \"pending\"))" "$response" >/dev/null || fail invalid_anticheat_queue
+jq -e ".pending == 1 and .policy.mode == \"observe_only\" and (.observations[] | select(.id == $anticheat_observation_id and .score_id == $score_id and .action == 0 and .sample_weight == 100 and .review_label == \"pending\" and .meaning.action.display == \"allow (0)\" and .meaning.reason.display == \"none (0)\" and .meaning.observe_only == true))" "$response" >/dev/null || fail invalid_anticheat_queue
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat" \
   --header "Cookie: $cookie" --header "Origin: $origin" --header 'X-CSRF-Token: wrong' \

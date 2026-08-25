@@ -145,10 +145,15 @@ jobs:
                 "feature gate" \
                 "room score writes require" \
                 "anticheat null signals coalesce" \
+                "review decoder" \
+                "rejected scores cross the module boundary" \
+                "rejected stable score evidence" \
+                "staff anticheat renders" \
                 "exact stable hardware matches remain" \
                 "ranked stable PP is stored" \
                 "official osu api beatmapset fallback" \
                 "developer server controls persist" \
+                "developer role workspace" \
                 "website home leads with playable clients" \
                 "public name history follows" \
                 "lazer spectator v2 accepts" \
@@ -181,7 +186,8 @@ jobs:
                 "postgres staff announcements persist chat and audit atomically" \
                 "postgres credential and restriction commits revoke matching token families" \
                 "postgres custom lazer plays update local map counters" \
-                "postgres unbound room score tokens can be discarded"
+                "postgres unbound room score tokens can be discarded" \
+                "postgres developer role changes preserve unrelated bits"
               do
                 ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_TRANSITIONS_URL" zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done

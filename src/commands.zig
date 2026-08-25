@@ -7,6 +7,7 @@ const sessions_mod = @import("sessions.zig");
 const protocol = @import("protocol.zig");
 const stable_score = @import("stable_score.zig");
 const stable_mods = @import("stable_mods.zig");
+const account_roles = @import("account_roles.zig");
 
 pub const PpResult = struct {
     pp: f64,
@@ -527,23 +528,26 @@ fn kickCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *s
     return .handled;
 }
 
-fn privilegeBits(args: []const u8) ?u32 {
-    var bits: u32 = 0;
-    var values = std.mem.splitScalar(u8, args, ' ');
-    while (values.next()) |value| {
-        if (value.len == 0) continue;
-        bits |= if (std.ascii.eqlIgnoreCase(value, "normal")) unrestricted else if (std.ascii.eqlIgnoreCase(value, "supporter")) supporter else if (std.ascii.eqlIgnoreCase(value, "premium")) premium else if (std.ascii.eqlIgnoreCase(value, "tournament")) tournament else if (std.ascii.eqlIgnoreCase(value, "nominator")) nominator else if (std.ascii.eqlIgnoreCase(value, "mod")) moderator else if (std.ascii.eqlIgnoreCase(value, "admin")) administrator else if (std.ascii.eqlIgnoreCase(value, "developer")) developer else return null;
-    }
-    return if (bits == 0) null else bits;
+fn privilegeRole(args: []const u8) ?account_roles.Role {
+    const value = std.mem.trim(u8, args, " \t");
+    if (std.ascii.eqlIgnoreCase(value, "supporter")) return .supporter;
+    if (std.ascii.eqlIgnoreCase(value, "premium")) return .premium;
+    if (std.ascii.eqlIgnoreCase(value, "alumni")) return .alumni;
+    if (std.ascii.eqlIgnoreCase(value, "tournament")) return .tournament;
+    if (std.ascii.eqlIgnoreCase(value, "nominator") or std.ascii.eqlIgnoreCase(value, "bn")) return .nominator;
+    if (std.ascii.eqlIgnoreCase(value, "mod") or std.ascii.eqlIgnoreCase(value, "gmt")) return .moderator;
+    if (std.ascii.eqlIgnoreCase(value, "admin")) return .administrator;
+    if (std.ascii.eqlIgnoreCase(value, "developer") or std.ascii.eqlIgnoreCase(value, "dev")) return .developer;
+    return null;
 }
 
 fn privilegeCommand(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, sender: *sessions_mod.Session, args: []const u8, reply_target: []const u8, out: *protocol.Writer, add: bool) !CommandResult {
     const parsed = splitTargetReason(args) orelse {
-        try reply(allocator, sessions, sender, reply_target, out, if (add) "usage: !addpriv <name> <roles>" else "usage: !rmpriv <name> <roles>");
+        try reply(allocator, sessions, sender, reply_target, out, if (add) "usage: !addpriv <name> <one role>" else "usage: !rmpriv <name> <one role>");
         return .handled;
     };
-    const bits = privilegeBits(parsed.rest) orelse {
-        try reply(allocator, sessions, sender, reply_target, out, "unknown role");
+    const role = privilegeRole(parsed.rest) orelse {
+        try reply(allocator, sessions, sender, reply_target, out, "use one named role; base account access cannot be changed here");
         return .handled;
     };
     var target = (try store.userByName(allocator, parsed.name)) orelse {
@@ -552,7 +556,14 @@ fn privilegeCommand(allocator: std.mem.Allocator, store: *storage.Store, session
     };
     defer freeUser(allocator, &target);
     if (!canManage(sender, target)) return try protected(allocator, sessions, sender, reply_target, out);
-    const privileges = try store.changePrivileges(sender.user.id, target.id, bits, add);
+    const result = store.changeRole(sender.user.id, target.id, role, add, "in-game developer role command") catch |err| switch (err) {
+        error.RoleStateUnchanged => {
+            try reply(allocator, sessions, sender, reply_target, out, "player already has that role state");
+            return .handled;
+        },
+        else => return err,
+    };
+    const privileges = result.privileges;
     if (sessions.byUser(target.id)) |online| {
         online.user.privileges = privileges;
         var packet = protocol.Writer.init(allocator);

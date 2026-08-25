@@ -24,6 +24,43 @@ pub fn main(init: std.process.Init) !void {
         .evidence = abi.Evidence.exact_hardware_match,
         .hardware_match_count = 1,
     });
+    const client_signal_decision = try host.evaluate(.{
+        .event_kind = abi.EventKind.heartbeat,
+        .client_family = abi.ClientFamily.stable,
+        .evidence = abi.Evidence.high_confidence_client_flag | abi.Evidence.registry_remnant,
+    });
+    const missing_replay_decision = try host.evaluate(.{
+        .event_kind = abi.EventKind.score,
+        .client_family = abi.ClientFamily.stable,
+        .ruleset = 0,
+        .namespace = abi.Namespace.vanilla,
+        .event_flags = abi.EventFlag.passed | abi.EventFlag.replay_required,
+        .evidence = abi.Evidence.required_replay_missing,
+        .n300 = 80,
+        .n100 = 10,
+        .n50 = 2,
+        .nmiss = 1,
+    });
+    const checksum_decision = try host.evaluate(.{
+        .event_kind = abi.EventKind.score,
+        .client_family = abi.ClientFamily.stable,
+        .ruleset = 0,
+        .namespace = abi.Namespace.vanilla,
+        .event_flags = abi.EventFlag.passed | abi.EventFlag.replay_required,
+        .evidence = abi.Evidence.checksum_mismatch,
+        .n300 = 80,
+        .n100 = 10,
+        .n50 = 2,
+        .nmiss = 1,
+    });
+    if (login_decision.action != abi.Action.audit or login_decision.reason != abi.Reason.exact_hardware_match or
+        login_decision.flags & abi.DecisionFlag.disconnect_session != 0 or login_decision.rule_revision == 0) return error.UnexpectedLoginDecision;
+    if (client_signal_decision.action != abi.Action.audit or client_signal_decision.reason != abi.Reason.high_confidence_client_flag or
+        client_signal_decision.flags & abi.DecisionFlag.disconnect_session != 0 or client_signal_decision.rule_revision != login_decision.rule_revision) return error.UnexpectedClientSignalDecision;
+    if (missing_replay_decision.action != abi.Action.challenge or missing_replay_decision.reason != abi.Reason.required_replay_missing or
+        missing_replay_decision.flags & abi.DecisionFlag.hold_score == 0 or missing_replay_decision.rule_revision != login_decision.rule_revision) return error.UnexpectedMissingReplayDecision;
+    if (checksum_decision.action != abi.Action.challenge or checksum_decision.reason != abi.Reason.checksum_mismatch or
+        checksum_decision.flags & abi.DecisionFlag.hold_score == 0 or checksum_decision.rule_revision != login_decision.rule_revision) return error.UnexpectedChecksumDecision;
     var frames: [240]abi.ReplayFrameV1 = undefined;
     var objects: [80]abi.HitObjectV1 = undefined;
     for (0..80) |index| {
@@ -53,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
         .objects = &objects,
         .object_count = objects.len,
     });
-    std.debug.print("module={s} abi={d} action={d} login_action={d} gameplay_action={d} reason={d} objects={d} clicks={d} exact_bps={d} center_bps={d}\n", .{
-        host.name(), abi.version, decision.action, login_decision.action, gameplay.decision.action, gameplay.decision.reason, gameplay.objects_checked, gameplay.matched_clicks, gameplay.exact_timing_bps, gameplay.center_hits_bps,
+    std.debug.print("module={s} abi={d} action={d} login_action={d} client_signal_action={d} missing_replay_action={d} missing_replay_reason={d} checksum_action={d} checksum_reason={d} gameplay_action={d} gameplay_reason={d} objects={d} clicks={d} exact_bps={d} center_bps={d}\n", .{
+        host.name(), abi.version, decision.action, login_decision.action, client_signal_decision.action, missing_replay_decision.action, missing_replay_decision.reason, checksum_decision.action, checksum_decision.reason, gameplay.decision.action, gameplay.decision.reason, gameplay.objects_checked, gameplay.matched_clicks, gameplay.exact_timing_bps, gameplay.center_hits_bps,
     });
 }

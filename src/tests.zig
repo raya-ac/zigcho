@@ -44,11 +44,13 @@ const avatar_cache = @import("avatar_cache.zig");
 const r2 = @import("r2.zig");
 const site_replay = @import("site_replay.zig");
 const server_control = @import("server_control.zig");
+const account_roles = @import("account_roles.zig");
 const server_control_route = @import("server_control_route.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
 const anticheat_evidence = @import("anticheat_evidence.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
+const anticheat_review = @import("anticheat_review.zig");
 const achievements = @import("achievements.zig");
 const changelog = @import("changelog");
 const lazer_route_manifest = @import("lazer_route_manifest.zig");
@@ -77,6 +79,7 @@ comptime {
     _ = anticheat_evidence;
     _ = anticheat_plugin;
     _ = anticheat_replay;
+    _ = anticheat_review;
     _ = achievements;
     _ = changelog;
     _ = lazer_route_manifest;
@@ -707,7 +710,7 @@ test "anticheat observations stay structured reviewable and non enforcing" {
         .center_hits_bps = 2_500,
         .mean_center_distance_milli = 8_000,
     });
-    try std.testing.expectError(error.InvalidAnticheatObservation, store.recordAnticheatObservation(player_id, .{ .source = .stable_score, .module = "private-test", .action = 1, .reason = 1, .risk_score = 1, .confidence_bps = 1 }));
+    try std.testing.expectError(error.InvalidAnticheatObservation, store.recordAnticheatObservation(player_id, .{ .source = .stable_login, .module = "private-test", .score_id = 42, .action = 1, .reason = 1, .risk_score = 1, .confidence_bps = 1 }));
 
     var stmt: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,review_label FROM anticheat_observations WHERE id=?1", -1, &stmt, null));
@@ -726,6 +729,9 @@ test "anticheat observations stay structured reviewable and non enforcing" {
 
     const pending = try store.staffAnticheatJson(std.testing.allocator);
     defer std.testing.allocator.free(pending);
+    const pending_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pending, .{});
+    defer pending_parsed.deinit();
+    try std.testing.expect(pending_parsed.value.object.get("policy") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"pending\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"score_id\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"score_id\":43") != null);
@@ -734,6 +740,11 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"replay_match_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"alternation_bps\":9900") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "\"velocity_spike_count\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"mode\":\"observe_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"display\":\"challenge (2)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"display\":\"aim centre lock (4101)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"display\":\"670 / 1000 · high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"display\":\"2500 px/s\"") != null);
 
     var replay_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("identical compressed replay", &replay_digest, .{});
@@ -782,6 +793,57 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     defer std.testing.allocator.free(player.name);
     defer std.testing.allocator.free(player.safe_name);
     try std.testing.expect(!player.restricted);
+}
+
+test "staff anticheat renders canonical backend meanings as observe only proposals" {
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "staffAnticheatDecoded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "proposed ${esc(action.display)}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "${esc(reason.description)}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "rule confidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "anticheatMetricFacts(m.metrics)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "action ${o.action} · reason ${o.reason}") == null);
+}
+
+test "rejected stable score evidence stays reviewable without a score row" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/anticheat-rejected-score.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("rejected score", "rejected-score@example.invalid", "00000000000000000000000000000000");
+    const missing = anticheat_evidence.stableReplay(.missing, 0);
+    const observation_id = try store.recordAnticheatObservation(user_id, .{
+        .source = .stable_score,
+        .module = anticheat_evidence.module_name,
+        .action = missing.action,
+        .reason = missing.reason,
+        .risk_score = missing.risk_score,
+        .confidence_bps = missing.confidence_bps,
+        .evidence = missing.evidence,
+        .decision_flags = missing.decision_flags,
+        .rule_revision = missing.rule_revision,
+    });
+    try std.testing.expectEqual(observation_id, try store.recordAnticheatObservation(user_id, .{
+        .source = .stable_score,
+        .module = anticheat_evidence.module_name,
+        .action = missing.action,
+        .reason = missing.reason,
+        .risk_score = missing.risk_score,
+        .confidence_bps = missing.confidence_bps,
+        .evidence = missing.evidence,
+        .decision_flags = missing.decision_flags,
+        .rule_revision = missing.rule_revision,
+    }));
+    const json = try store.staffAnticheatJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"score_id\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"display\":\"required replay missing (2006)\"") != null);
+    const user = (try store.userById(std.testing.allocator, user_id)).?;
+    defer std.testing.allocator.free(user.name);
+    defer std.testing.allocator.free(user.safe_name);
+    try std.testing.expect(!user.restricted);
 }
 
 test "anticheat null signals coalesce without deleting score evidence" {
@@ -1650,13 +1712,16 @@ test "credential and restriction commits revoke the matching token family atomic
     }
 }
 
-test "website name history is shared by profile and player links" {
+test "website name history is an explicit profile-only dropdown" {
     try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/users/") != null);
     try std.testing.expect(std.mem.indexOf(u8, server_source, "/name-history") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "name-history-tooltip") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-name-history") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "a[href^=\"/u/\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "role','tooltip") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-name-history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "name-history-tooltip") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-name-history") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "bindProfileNameHistory(identifier)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "show previous usernames") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, ".profile-name-cluster{width:100%}.profile-name-history{position:static}.profile-name-history-menu{left:0;right:0;width:auto}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "document.querySelector('.profile-view')!==view") != null);
 }
 
 test "developer server controls persist fixed gates and audit every change" {
@@ -3166,6 +3231,81 @@ test "staff web data keeps appeals and moderation actions auditable" {
     defer std.testing.allocator.free(channels);
     try std.testing.expect(std.mem.indexOf(u8, channels, "\"name\":\"#announce\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, channels, "\"name\":\"#lazer\"") != null);
+}
+
+test "developer role workspace changes one named bit and revokes the final staff session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/staff-roles.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const actor_id = try store.register("role developer", "role-developer@example.invalid", "00000000000000000000000000000000");
+    const target_id = try store.register("role target", "role-target@example.invalid", "11111111111111111111111111111111");
+    try store.exec("UPDATE users SET privileges=16387 WHERE id=4; UPDATE users SET privileges=4115 WHERE id=5;");
+    const staff_token = try store.issueToken(target_id, web_auth.scope, 3600);
+
+    const premium = try store.changeRole(actor_id, target_id, .premium, true, "grant permanent premium for mapper access");
+    try std.testing.expectEqual(@as(u32, 4147), premium.privileges);
+    try std.testing.expect(!premium.staff_sessions_revoked);
+    try std.testing.expectError(error.RoleStateUnchanged, store.changeRole(actor_id, target_id, .premium, true, "do not duplicate the same grant"));
+    try std.testing.expectError(error.InvalidRoleChange, store.changePrivileges(actor_id, target_id, 3, false));
+    try std.testing.expectError(error.InvalidRoleChange, store.changePrivileges(actor_id, target_id, (1 << 4) | (1 << 5), false));
+
+    const live_staff = (try store.authenticateToken(std.testing.allocator, &staff_token, web_auth.scope)).?;
+    defer {
+        std.testing.allocator.free(live_staff.name);
+        std.testing.allocator.free(live_staff.safe_name);
+    }
+    try std.testing.expect(live_staff.privileges & account_roles.Role.premium.definition().bit != 0);
+
+    const admin = try store.changeRole(actor_id, target_id, .administrator, true, "move this account onto admin access");
+    try std.testing.expectEqual(@as(u32, 12_339), admin.privileges);
+    const downgraded = try store.changeRole(actor_id, target_id, .moderator, false, "moderation role replaced by admin access");
+    try std.testing.expectEqual(@as(u32, 8_243), downgraded.privileges);
+    try std.testing.expect(!downgraded.staff_sessions_revoked);
+    const refreshed_staff = (try store.authenticateToken(std.testing.allocator, &staff_token, web_auth.scope)).?;
+    defer {
+        std.testing.allocator.free(refreshed_staff.name);
+        std.testing.allocator.free(refreshed_staff.safe_name);
+    }
+    try std.testing.expect(refreshed_staff.privileges & (1 << 13) != 0);
+    try std.testing.expect(refreshed_staff.privileges & (1 << 12) == 0);
+    const removed = try store.changeRole(actor_id, target_id, .administrator, false, "admin access has ended");
+    try std.testing.expectEqual(@as(u32, 51), removed.privileges);
+    try std.testing.expect(removed.staff_sessions_revoked);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &staff_token, web_auth.scope)) == null);
+    try std.testing.expect(removed.privileges & 3 == 3);
+    try std.testing.expect(removed.privileges & (1 << 4) != 0);
+    try std.testing.expect(removed.privileges & (1 << 5) != 0);
+
+    const json = (try store.staffRolesJson(std.testing.allocator, target_id)).?;
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const roles = parsed.value.object.get("roles").?.array.items;
+    try std.testing.expectEqual(account_roles.definitions.len, roles.len);
+    var saw_premium = false;
+    for (roles) |entry| {
+        if (!std.mem.eql(u8, entry.object.get("key").?.string, "premium")) continue;
+        saw_premium = true;
+        try std.testing.expect(entry.object.get("granted").?.bool);
+        try std.testing.expect(entry.object.get("permanent").?.bool);
+        try std.testing.expectEqual(@as(i64, 32), entry.object.get("bit").?.integer);
+    }
+    try std.testing.expect(saw_premium);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("audit").?.array.items.len);
+}
+
+test "developer role workspace removes raw privilege masks from the website" {
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/staff/roles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "account_roles.Role.parse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "staff_sessions_revoked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "add_privilege") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "add privilege bits") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "permanent until a developer explicitly revokes it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-role-key") != null);
 }
 
 test "Akatsuki archives only yield the exact MD5 map" {

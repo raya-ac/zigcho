@@ -1612,6 +1612,44 @@ test "public name history follows account renames without exposing restricted us
     try std.testing.expect((try store.siteNameHistoryJson(std.testing.allocator, 3)) == null);
 }
 
+test "credential and restriction commits revoke the matching token family atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/account-token-transition.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    const password_id = try store.register("password target", "password-target@example.invalid", "00000000000000000000000000000000");
+    const password_game = try store.issueGameTokenPair(password_id, 60, 60, false);
+    const password_web = try store.issueToken(password_id, web_auth.player_scope, 60);
+    try store.updateAccountPassword(password_id, "11111111111111111111111111111111");
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &password_game.access, "identify")) == null);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &password_game.refresh, "")) == null);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &password_web, web_auth.player_scope)) == null);
+
+    const username_id = try store.register("username target", "username-target@example.invalid", "00000000000000000000000000000000");
+    const username_game = try store.issueGameTokenPair(username_id, 60, 60, false);
+    const username_web = try store.issueToken(username_id, web_auth.player_scope, 60);
+    try store.updateAccountUsername(username_id, "renamed target");
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &username_game.access, "identify")) == null);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &username_game.refresh, "")) == null);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &username_web, web_auth.player_scope)) == null);
+
+    const restricted_id = try store.register("restricted target", "restricted-target@example.invalid", "00000000000000000000000000000000");
+    const restricted_game = try store.issueGameTokenPair(restricted_id, 60, 60, false);
+    const restricted_web = try store.issueToken(restricted_id, web_auth.player_scope, 60);
+    try store.setRestricted(3, restricted_id, true, "token transition fixture");
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &restricted_game.access, "identify")) == null);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &restricted_game.refresh, "")) == null);
+    const appeal_session = (try store.authenticateToken(std.testing.allocator, &restricted_web, web_auth.player_scope)).?;
+    defer {
+        std.testing.allocator.free(appeal_session.name);
+        std.testing.allocator.free(appeal_session.safe_name);
+    }
+}
+
 test "website name history is shared by profile and player links" {
     try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/users/") != null);
     try std.testing.expect(std.mem.indexOf(u8, server_source, "/name-history") != null);
@@ -4309,6 +4347,35 @@ test "stable channel permissions and locks survive in storage" {
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 0));
 }
 
+test "staff announcements persist chat and audit atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/staff-announcement-atomic.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const actor_id = try store.register("announce admin", "announce-admin@example.invalid", "00000000000000000000000000000000");
+    try store.recordStaffAnnouncement(actor_id, "the server is back", "planned maintenance finished");
+
+    var committed: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT count(*) FROM chat_messages WHERE sender_id=3 AND target='#announce' AND message='the server is back'),(SELECT count(*) FROM audit_log WHERE actor_id=?1 AND action='infra.announcement' AND target='server' AND detail='planned maintenance finished')", -1, &committed, null));
+    _ = storage.c.sqlite3_bind_int(committed, 1, actor_id);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(committed));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(committed, 0));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(committed, 1));
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_finalize(committed));
+
+    try store.exec("ALTER TABLE audit_log RENAME TO audit_log_unavailable");
+    try std.testing.expectError(error.DatabaseQueryFailed, store.recordStaffAnnouncement(actor_id, "must roll back", "broken audit write"));
+    var rolled_back: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM chat_messages WHERE message='must roll back'", -1, &rolled_back, null));
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(rolled_back));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(rolled_back, 0));
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_finalize(rolled_back));
+    try store.exec("ALTER TABLE audit_log_unavailable RENAME TO audit_log");
+}
+
 test "stable ranking commands enforce bn and admin boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4512,7 +4579,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 13), builds.len);
+    try std.testing.expectEqual(@as(usize, 14), builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);
@@ -6113,6 +6180,85 @@ test "lazer storage only accepts the typed score input" {
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(stmt, 6));
     try std.testing.expectEqualStrings("custom", std.mem.span(storage.c.sqlite3_column_text(stmt, 7)));
     try std.testing.expectEqualStrings("2026.811.0", std.mem.span(storage.c.sqlite3_column_text(stmt, 8)));
+}
+
+test "custom lazer plays update local map counters without touching player stats" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/custom-lazer-counters.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'custom counter','custom_counter',x'00',x'00');" ++
+            "INSERT INTO stats(user_id,mode) VALUES(1,0)",
+    );
+    const map_md5 = "75757575757575757575757575757575";
+    try store.upsertBeatmapMeta(.{
+        .id = 75,
+        .set_id = 70,
+        .artist = "counter artist",
+        .title = "counter title",
+        .version = "counter difficulty",
+        .creator = "counter mapper",
+        .total_length = 120,
+    }, map_md5, 3, 4.5, 500);
+
+    const raw = "{\"beatmap_id\":75,\"ruleset_id\":0,\"total_score\":123456,\"accuracy\":0.8,\"max_combo\":40,\"passed\":false,\"rank\":\"F\",\"mods\":[{\"acronym\":\"WIGGLE\"}],\"statistics\":{\"great\":4,\"miss\":1}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const mods_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "mods", "[]");
+    defer std.testing.allocator.free(mods_json);
+    const statistics_json = try lazer.jsonField(std.testing.allocator, parsed.value.object, "statistics", "{}");
+    defer std.testing.allocator.free(statistics_json);
+    const failed_input = try lazer.parseScore(parsed.value);
+    try std.testing.expectEqual(lazer.Namespace.custom, failed_input.namespace);
+    try std.testing.expect(lazer.statsMode(failed_input) == null);
+    const stats_before = (try store.statsForUser(1, 0)).?;
+
+    _ = try store.insertLazerScore(1, failed_input, 0, mods_json, statistics_json, "{}", "[]", &.{});
+    const after_fail = (try store.beatmapForScore(map_md5)).?;
+    try std.testing.expectEqual(@as(i32, 1), after_fail.plays);
+    try std.testing.expectEqual(@as(i32, 0), after_fail.passes);
+
+    var passed_input = failed_input;
+    passed_input.passed = true;
+    passed_input.rank = "A";
+    passed_input.total_score = 654_321;
+    _ = try store.insertLazerScore(1, passed_input, 999, mods_json, statistics_json, "{}", "[]", &.{});
+    const after_pass = (try store.beatmapForScore(map_md5)).?;
+    try std.testing.expectEqual(@as(i32, 2), after_pass.plays);
+    try std.testing.expectEqual(@as(i32, 1), after_pass.passes);
+    try std.testing.expectEqualDeep(stats_before, (try store.statsForUser(1, 0)).?);
+
+    const set_json = (try store.lazerBeatmapSet(std.testing.allocator, 70, null)).?;
+    defer std.testing.allocator.free(set_json);
+    var set = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, set_json, .{});
+    defer set.deinit();
+    try std.testing.expectEqual(@as(i64, 2), set.value.object.get("play_count").?.integer);
+    const map = set.value.object.get("beatmaps").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 2), map.get("playcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), map.get("passcount").?.integer);
+}
+
+test "unbound room score tokens are discarded without touching solo tokens" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/room-score-token-discard.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("room token owner", "room-token-owner@example.invalid", "00000000000000000000000000000000");
+    const map_md5 = "76767676767676767676767676767676";
+    try store.upsertBeatmapMeta(.{ .id = 76, .set_id = 71, .artist = "token artist", .title = "token title", .version = "token difficulty", .creator = "token mapper" }, map_md5, 3, 4, 100);
+    const room_token = try store.createLazerRoomScoreToken(user_id, 76, map_md5, 0, "11111111111111111111111111111111");
+    try std.testing.expect(storage.Store.isLazerRoomScoreToken(room_token));
+    try std.testing.expect(try store.discardUnusedLazerRoomScoreToken(user_id, room_token));
+    try std.testing.expect(!try store.discardUnusedLazerRoomScoreToken(user_id, room_token));
+    const solo_token = try store.createLazerScoreToken(user_id, 76, map_md5, 0, "22222222222222222222222222222222");
+    try std.testing.expect(!try store.discardUnusedLazerRoomScoreToken(user_id, solo_token));
 }
 
 test "official lazer solo score paths match the pinned client contract" {

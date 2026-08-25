@@ -1524,6 +1524,16 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 2, user_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE or c.sqlite3_changes(self.db) != 1) return error.UserNotFound;
         try self.insertAuditLocked(user_id, "account.password", user_id, "password changed");
+        var revoke: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE user_id=?1 AND revoked_at IS NULL", -1, &revoke, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(revoke);
+        _ = c.sqlite3_bind_int(revoke, 1, user_id);
+        if (c.sqlite3_step(revoke) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        var clear: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM lazer_presence WHERE user_id=?1", -1, &clear, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(clear);
+        _ = c.sqlite3_bind_int(clear, 1, user_id);
+        if (c.sqlite3_step(clear) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         try self.exec("COMMIT");
     }
 
@@ -1560,6 +1570,16 @@ pub const Store = struct {
         _ = c.sqlite3_bind_text(history, 3, new_name.ptr, @intCast(new_name.len), null);
         if (c.sqlite3_step(history) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         try self.insertAuditLocked(user_id, "account.username", user_id, "username changed");
+        var revoke: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE user_id=?1 AND revoked_at IS NULL", -1, &revoke, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(revoke);
+        _ = c.sqlite3_bind_int(revoke, 1, user_id);
+        if (c.sqlite3_step(revoke) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        var clear: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM lazer_presence WHERE user_id=?1", -1, &clear, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(clear);
+        _ = c.sqlite3_bind_int(clear, 1, user_id);
+        if (c.sqlite3_step(clear) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
         try self.exec("COMMIT");
     }
 
@@ -2813,6 +2833,25 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
     }
 
+    pub fn recordStaffAnnouncement(self: *Store, actor_id: i32, message: []const u8, reason: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        var chat: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO chat_messages(sender_id,target,message) VALUES(3,'#announce',?1)", -1, &chat, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(chat);
+        _ = c.sqlite3_bind_text(chat, 1, message.ptr, @intCast(message.len), null);
+        if (c.sqlite3_step(chat) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        var audit: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "INSERT INTO audit_log(actor_id,action,target,detail) VALUES(?1,'infra.announcement','server',?2)", -1, &audit, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(audit);
+        _ = c.sqlite3_bind_int(audit, 1, actor_id);
+        _ = c.sqlite3_bind_text(audit, 2, reason.ptr, @intCast(reason.len), null);
+        if (c.sqlite3_step(audit) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        try self.exec("COMMIT");
+    }
+
     pub fn recordLazerPublicMessage(self: *Store, allocator: std.mem.Allocator, sender_id: i32, target: []const u8, message: []const u8, is_action: bool, uuid: []const u8) !LazerChatWrite {
         const channel_id = lazer.channelId(target) orelse return error.UnknownChannel;
         self.mutex.lockUncancelable(self.io);
@@ -3680,6 +3719,19 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(stmt, 2, target_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE or c.sqlite3_changes(self.db) == 0) return error.InvalidModerationTarget;
         try self.insertAuditLocked(actor_id, if (restricted) "account.restrict" else "account.unrestrict", target_id, reason);
+        if (restricted) {
+            var revoke: ?*c.sqlite3_stmt = null;
+            const revoke_sql = "UPDATE oauth_tokens SET revoked_at=unixepoch() WHERE user_id=?1 AND revoked_at IS NULL AND expires_at>unixepoch() AND ((instr(' '||scopes||' ',' identify ')>0 AND instr(' '||scopes||' ',' scores:write ')>0) OR instr(' '||scopes||' ',' game:refresh ')>0)";
+            if (c.sqlite3_prepare_v2(self.db, revoke_sql, -1, &revoke, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(revoke);
+            _ = c.sqlite3_bind_int(revoke, 1, target_id);
+            if (c.sqlite3_step(revoke) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+            var clear: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM lazer_presence WHERE user_id=?1", -1, &clear, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(clear);
+            _ = c.sqlite3_bind_int(clear, 1, target_id);
+            if (c.sqlite3_step(clear) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
         try self.recordAllStatsHistoryCurrentLocked();
         try self.exec("COMMIT");
     }
@@ -6138,7 +6190,6 @@ pub const Store = struct {
     }
 
     fn updateLazerStatsLocked(self: *Store, user_id: i32, input: lazer.ScoreInput) !void {
-        const stats_mode = lazer.statsMode(input) orelse return;
         var map: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "SELECT md5,status,max(total_length,0) FROM beatmaps WHERE id=?1", -1, &map, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
         defer _ = c.sqlite3_finalize(map);
@@ -6146,23 +6197,24 @@ pub const Store = struct {
         if (c.sqlite3_step(map) != c.SQLITE_ROW) return;
         const map_status = c.sqlite3_column_int(map, 1);
         const play_time = c.sqlite3_column_int64(map, 2);
-        const namespace = @tagName(input.namespace);
-        const legacy_score = lazer.classicTotalScore(input);
-        const hits = lazer.totalHits(input);
 
-        var update: ?*c.sqlite3_stmt = null;
-        const update_sql = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?2,plays=plays+1,play_time=play_time+?3,total_hits=total_hits+?4,max_combo=CASE WHEN ?5=1 THEN max(max_combo,?6) ELSE max_combo END WHERE user_id=?7 AND mode=?8";
-        if (c.sqlite3_prepare_v2(self.db, update_sql, -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
-        defer _ = c.sqlite3_finalize(update);
-        _ = c.sqlite3_bind_int64(update, 1, legacy_score);
-        _ = c.sqlite3_bind_int64(update, 2, 0);
-        _ = c.sqlite3_bind_int64(update, 3, play_time);
-        _ = c.sqlite3_bind_int64(update, 4, hits);
-        _ = c.sqlite3_bind_int(update, 5, @intFromBool(input.passed and map_status >= 3));
-        _ = c.sqlite3_bind_int64(update, 6, input.max_combo);
-        _ = c.sqlite3_bind_int(update, 7, user_id);
-        _ = c.sqlite3_bind_int(update, 8, stats_mode);
-        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        if (lazer.statsMode(input)) |stats_mode| {
+            const legacy_score = lazer.classicTotalScore(input);
+            const hits = lazer.totalHits(input);
+            var update: ?*c.sqlite3_stmt = null;
+            const update_sql = "UPDATE stats SET total_score=total_score+?1,ranked_score=ranked_score+?2,plays=plays+1,play_time=play_time+?3,total_hits=total_hits+?4,max_combo=CASE WHEN ?5=1 THEN max(max_combo,?6) ELSE max_combo END WHERE user_id=?7 AND mode=?8";
+            if (c.sqlite3_prepare_v2(self.db, update_sql, -1, &update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+            defer _ = c.sqlite3_finalize(update);
+            _ = c.sqlite3_bind_int64(update, 1, legacy_score);
+            _ = c.sqlite3_bind_int64(update, 2, 0);
+            _ = c.sqlite3_bind_int64(update, 3, play_time);
+            _ = c.sqlite3_bind_int64(update, 4, hits);
+            _ = c.sqlite3_bind_int(update, 5, @intFromBool(input.passed and map_status >= 3));
+            _ = c.sqlite3_bind_int64(update, 6, input.max_combo);
+            _ = c.sqlite3_bind_int(update, 7, user_id);
+            _ = c.sqlite3_bind_int(update, 8, stats_mode);
+            if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        }
 
         var map_update: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "UPDATE beatmaps SET plays=plays+1,passes=passes+?1 WHERE id=?2", -1, &map_update, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -6170,7 +6222,9 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int(map_update, 1, @intFromBool(input.passed));
         _ = c.sqlite3_bind_int64(map_update, 2, input.beatmap_id);
         if (c.sqlite3_step(map_update) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
-        if (input.passed and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceLocked(user_id, @intCast(input.ruleset_id), stats_mode, namespace);
+        if (lazer.statsMode(input)) |stats_mode| {
+            if (input.passed and (map_status == 3 or map_status == 4)) try self.rebuildCombinedPerformanceLocked(user_id, @intCast(input.ruleset_id), stats_mode, @tagName(input.namespace));
+        }
     }
 
     fn rebuildCombinedPerformanceLocked(self: *Store, user_id: i32, ruleset_id: u8, stats_mode: u8, namespace: []const u8) !void {
@@ -6226,6 +6280,19 @@ pub const Store = struct {
 
     pub fn createLazerRoomScoreToken(self: *Store, user_id: i32, beatmap_id: i32, beatmap_hash: []const u8, ruleset_id: i64, version_hash: []const u8) !i64 {
         return self.createLazerScoreTokenScoped(user_id, beatmap_id, beatmap_hash, ruleset_id, version_hash, true);
+    }
+
+    pub fn discardUnusedLazerRoomScoreToken(self: *Store, user_id: i32, token_id: i64) !bool {
+        if (!isLazerRoomScoreToken(token_id)) return false;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM lazer_score_tokens WHERE id=?1 AND user_id=?2 AND consumed_at IS NULL AND score_id IS NULL", -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, token_id);
+        _ = c.sqlite3_bind_int(stmt, 2, user_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseQueryFailed;
+        return c.sqlite3_changes(self.db) == 1;
     }
 
     fn createLazerScoreTokenScoped(self: *Store, user_id: i32, beatmap_id: i32, beatmap_hash: []const u8, ruleset_id: i64, version_hash: []const u8, room_scoped: bool) !i64 {

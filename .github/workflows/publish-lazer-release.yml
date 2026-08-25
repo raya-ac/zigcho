@@ -60,9 +60,11 @@ jobs:
       - name: verify every package and checksum
         env:
           CLIENT_VERSION: ${{ inputs.version }}
+          SOURCE_REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
           cd artifacts/lazer
+          test "$(tr -d '\r\n' < ../../client/lazer/client-version.txt)" = "$CLIENT_VERSION"
           test -f "zigcho-lazer-${CLIENT_VERSION}-windows-x64.zip"
           test -f "zigcho-lazer-${CLIENT_VERSION}-macos-arm64.zip"
           test -f "zigcho-lazer-${CLIENT_VERSION}-linux-x64.zip"
@@ -72,6 +74,20 @@ jobs:
             sha256sum --check "$checksum"
           done
           test "$(find . -maxdepth 1 -type f -name '*.sha256' | awk 'END { print NR }')" = 5
+          for runtime in windows-x64 macos-arm64 linux-x64; do
+            metadata=$(unzip -p "zigcho-lazer-${CLIENT_VERSION}-${runtime}.zip" '*/VERSION.txt')
+            printf '%s\n' "$metadata" | grep -Fqx "client_version=${CLIENT_VERSION}"
+            printf '%s\n' "$metadata" | grep -Fqx "zigcho_revision=${SOURCE_REVISION}"
+          done
+          for package in \
+            "zigcho-lazer-${CLIENT_VERSION}-android-arm64.apk" \
+            "zigcho-lazer-${CLIENT_VERSION}-ios-arm64.ipa"
+          do
+            metadata="${package}.metadata.txt"
+            test -f "$metadata"
+            grep -Fqx "client_version=${CLIENT_VERSION}" "$metadata"
+            grep -Fqx "zigcho_revision=${SOURCE_REVISION}" "$metadata"
+          done
 
       - name: publish the prerelease
         env:

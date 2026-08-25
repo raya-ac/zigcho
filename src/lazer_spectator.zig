@@ -48,6 +48,15 @@ const SpectatorUser = struct {
     name: Text64,
 };
 
+const DisconnectEffects = struct {
+    user_id: i32 = 0,
+    watchers: [max_connections]*Connection = undefined,
+    watcher_count: usize = 0,
+    watched_hosts: [max_subscriptions]*Connection = undefined,
+    host_count: usize = 0,
+    active: ?ActivePlay = null,
+};
+
 const Connection = struct {
     allocator: std.mem.Allocator,
     references: std.atomic.Value(usize) = .init(1),
@@ -230,11 +239,12 @@ pub const Manager = struct {
             count += 1;
         }
         self.mutex.unlock(self.io);
+        var disconnected = false;
         for (targets[0..count]) |connection| {
-            connection.close();
+            if (self.retireConnectionAtInvocationBoundary(connection, true)) disconnected = true;
             connection.release();
         }
-        return count != 0;
+        return disconnected;
     }
 
     fn connect(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !*Connection {
@@ -245,29 +255,33 @@ pub const Manager = struct {
         connection.* = .{ .allocator = self.allocator, .user_id = user.id, .io = self.io, .socket = socket };
         try connection.user_name.set(user.name);
 
-        var replaced: ?*Connection = null;
-        self.mutex.lockUncancelable(self.io);
-        if (!self.isEnabled()) {
+        while (true) {
+            var replaced: ?*Connection = null;
+            self.mutex.lockUncancelable(self.io);
+            if (!self.isEnabled()) {
+                self.mutex.unlock(self.io);
+                return error.SpectatorDisabled;
+            }
+            if (self.latestConnectionByUserLocked(user.id)) |old| {
+                old.retain();
+                replaced = old;
+            } else {
+                if (self.connections.items.len >= max_connections) {
+                    self.mutex.unlock(self.io);
+                    return error.SpectatorConnectionLimit;
+                }
+                self.connections.append(self.allocator, connection) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+            }
             self.mutex.unlock(self.io);
-            return error.SpectatorDisabled;
-        }
-        if (self.connections.items.len >= max_connections) {
-            self.mutex.unlock(self.io);
-            return error.SpectatorConnectionLimit;
-        }
-        if (self.connectionByUserLocked(user.id)) |old| {
-            old.retain();
-            replaced = old;
-        }
-        self.connections.append(self.allocator, connection) catch |err| {
-            if (replaced) |old| old.release();
-            self.mutex.unlock(self.io);
-            return err;
-        };
-        self.mutex.unlock(self.io);
-        if (replaced) |old| {
-            old.close();
-            old.release();
+            if (replaced) |old| {
+                _ = self.retireConnectionAtInvocationBoundary(old, false);
+                old.release();
+                continue;
+            }
+            break;
         }
         return connection;
     }
@@ -275,6 +289,64 @@ pub const Manager = struct {
     fn removeConnectionLocked(self: *Manager, connection: *Connection) void {
         const index = std.mem.indexOfScalar(*Connection, self.connections.items, connection) orelse return;
         _ = self.connections.swapRemove(index);
+    }
+
+    /// Stops a connection at the same boundary used to serialize hub
+    /// invocations. Once this returns, the connection is no longer visible to
+    /// the manager and no invocation which was already parsed can mutate its
+    /// play or subscription state.
+    fn retireConnectionAtInvocationBoundary(self: *Manager, connection: *Connection, notify: bool) bool {
+        var effects: DisconnectEffects = .{};
+        connection.invocation_mutex.lockUncancelable(self.io);
+        self.mutex.lockUncancelable(self.io);
+        const still_connected = std.mem.indexOfScalar(*Connection, self.connections.items, connection) != null;
+        if (still_connected) {
+            connection.accepting_invocations.store(false, .release);
+            self.detachConnectionLocked(connection, &effects, notify);
+        }
+        self.mutex.unlock(self.io);
+        connection.invocation_mutex.unlock(self.io);
+        if (still_connected) {
+            connection.close();
+            self.finishDisconnect(&effects);
+        }
+        return still_connected;
+    }
+
+    fn detachConnectionLocked(self: *Manager, connection: *Connection, effects: *DisconnectEffects, notify: bool) void {
+        if (notify) {
+            effects.user_id = connection.user_id;
+            if (self.latestConnectionByUserLocked(connection.user_id) == connection) {
+                effects.active = connection.active;
+                effects.watcher_count = self.watchersLocked(connection.user_id, &effects.watchers);
+            }
+            for (connection.subscriptions[0..connection.subscription_count]) |host_id| {
+                if (self.connectionByUserLocked(host_id)) |host| {
+                    host.retain();
+                    effects.watched_hosts[effects.host_count] = host;
+                    effects.host_count += 1;
+                }
+            }
+        }
+        connection.active = null;
+        @memset(&connection.subscriptions, 0);
+        connection.subscription_count = 0;
+        connection.frame_window_second = 0;
+        connection.frame_bundle_count = 0;
+        self.removeConnectionLocked(connection);
+    }
+
+    fn finishDisconnect(self: *Manager, effects: *DisconnectEffects) void {
+        defer releaseConnections(effects.watchers[0..effects.watcher_count]);
+        defer releaseConnections(effects.watched_hosts[0..effects.host_count]);
+        if (effects.active) |play| if (eventStateOwned(self.allocator, "UserFinishedPlaying", effects.user_id, play, 5)) |frame| {
+            defer self.allocator.free(frame);
+            sendConnections(effects.watchers[0..effects.watcher_count], frame);
+        } else |_| {};
+        if (effects.host_count != 0) if (eventIntegerOwned(self.allocator, "UserEndedWatching", effects.user_id)) |frame| {
+            defer self.allocator.free(frame);
+            sendConnections(effects.watched_hosts[0..effects.host_count], frame);
+        } else |_| {};
     }
 
     fn disconnect(self: *Manager, connection: *Connection) void {
@@ -298,6 +370,11 @@ pub const Manager = struct {
                 host_count += 1;
             }
         }
+        connection.active = null;
+        @memset(&connection.subscriptions, 0);
+        connection.subscription_count = 0;
+        connection.frame_window_second = 0;
+        connection.frame_bundle_count = 0;
         self.removeConnectionLocked(connection);
         self.mutex.unlock(self.io);
 
@@ -888,6 +965,121 @@ test "spectator feature gate drains sessions at the invocation boundary and reop
     manager.disconnect(connection);
     manager.disconnect(stale);
     manager.disconnect(reopened);
+}
+
+test "cross client spectator disconnect waits for the invocation boundary and clears session state" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const user: domain.User = .{ .id = 4, .name = "takeover", .safe_name = "takeover", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(user, fake_socket);
+    connection.socket = null;
+    const state_raw = [_]u8{ 0x95, 75, 0, 0x90, 1, 0x80 };
+    connection.active = try parseState(&state_raw, 42);
+    connection.subscriptions[0] = 7;
+    connection.subscription_count = 1;
+
+    const Takeover = struct {
+        manager: *Manager,
+        user_id: i32,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        disconnected: bool = false,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.disconnected = context.manager.disconnectUser(context.user_id);
+            context.done.store(true, .release);
+        }
+    };
+    connection.invocation_mutex.lockUncancelable(std.testing.io);
+    var takeover: Takeover = .{ .manager = &manager, .user_id = user.id };
+    const thread = try std.Thread.spawn(.{}, Takeover.run, .{&takeover});
+    while (!takeover.started.load(.acquire)) std.Thread.yield() catch {};
+    while (connection.references.load(.acquire) == 1) std.Thread.yield() catch {};
+    try std.testing.expect(!takeover.done.load(.acquire));
+    // Model the last mutations made by an invocation which was already in
+    // progress when the cross-client takeover began.
+    connection.subscriptions[1] = 8;
+    connection.subscription_count = 2;
+    connection.active = try parseState(&state_raw, 84);
+    connection.invocation_mutex.unlock(std.testing.io);
+    thread.join();
+
+    try std.testing.expect(takeover.disconnected);
+    try std.testing.expect(!connection.alive.load(.acquire));
+    try std.testing.expect(!connection.accepting_invocations.load(.acquire));
+    try std.testing.expectEqual(@as(?ActivePlay, null), connection.active);
+    try std.testing.expectEqual(@as(usize, 0), connection.subscription_count);
+    try std.testing.expectEqualSlices(i32, &([_]i32{0} ** max_subscriptions), &connection.subscriptions);
+    try std.testing.expectEqual(@as(usize, 0), manager.connections.items.len);
+    try std.testing.expect(!manager.disconnectUser(user.id));
+    try std.testing.expectError(error.ConnectionClose, manager.handleHubMessage(connection, &.{}));
+    // A real websocket handler owns this final reference until its blocked
+    // read observes the close frame.
+    manager.disconnect(connection);
+}
+
+test "spectator replacement retires the old session before publishing the new one" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const user: domain.User = .{ .id = 4, .name = "replacement", .safe_name = "replacement", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const old = try manager.connect(user, fake_socket);
+    old.socket = null;
+    const state_raw = [_]u8{ 0x95, 75, 0, 0x90, 1, 0x80 };
+    old.active = try parseState(&state_raw, 42);
+    old.subscriptions[0] = 7;
+    old.subscription_count = 1;
+
+    const Replacement = struct {
+        manager: *Manager,
+        user: domain.User,
+        socket: *std.http.Server.WebSocket,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        connection: ?*Connection = null,
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.connection = context.manager.connect(context.user, context.socket) catch |err| {
+                context.failure = err;
+                context.done.store(true, .release);
+                return;
+            };
+            context.done.store(true, .release);
+        }
+    };
+    old.invocation_mutex.lockUncancelable(std.testing.io);
+    var replacement: Replacement = .{ .manager = &manager, .user = user, .socket = fake_socket };
+    const thread = try std.Thread.spawn(.{}, Replacement.run, .{&replacement});
+    while (!replacement.started.load(.acquire)) std.Thread.yield() catch {};
+    while (old.references.load(.acquire) == 1) std.Thread.yield() catch {};
+    try std.testing.expect(!replacement.done.load(.acquire));
+    old.subscriptions[1] = 8;
+    old.subscription_count = 2;
+    old.active = try parseState(&state_raw, 84);
+    old.invocation_mutex.unlock(std.testing.io);
+    thread.join();
+
+    try std.testing.expect(replacement.failure == null);
+    const current = replacement.connection.?;
+    current.socket = null;
+    try std.testing.expect(!old.alive.load(.acquire));
+    try std.testing.expect(!old.accepting_invocations.load(.acquire));
+    try std.testing.expectEqual(@as(?ActivePlay, null), old.active);
+    try std.testing.expectEqual(@as(usize, 0), old.subscription_count);
+    try std.testing.expectEqualSlices(i32, &([_]i32{0} ** max_subscriptions), &old.subscriptions);
+    try std.testing.expectEqual(@as(usize, 1), manager.connections.items.len);
+    try std.testing.expect(manager.connections.items[0] == current);
+    try std.testing.expectError(error.ConnectionClose, manager.handleHubMessage(old, &.{}));
+    // Deferred cleanup for the replaced socket must not rediscover the old
+    // subscriptions and emit stale UserEndedWatching events.
+    manager.disconnect(old);
+    try std.testing.expectEqual(@as(usize, 1), manager.connections.items.len);
+    try std.testing.expect(manager.connections.items[0] == current);
+    manager.disconnect(current);
 }
 
 test "lazer spectator v2 accepts canonical and shipped payload-first argument order" {

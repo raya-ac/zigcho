@@ -799,15 +799,19 @@ index 0000000000..bc77d49cab
 +}
 diff --git a/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
 new file mode 100644
-index 0000000000..756a04d4eb
+index 0000000000..b50115c57a
 --- /dev/null
 +++ b/osu.Game.Tests/ZigchoRealtimeServicePolicyTest.cs
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,79 @@
 +// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
 +// See the LICENCE file in the official osu! source tree for full licence text.
 +
++using System;
++using System.Collections.Generic;
++using System.Threading.Tasks;
 +using NUnit.Framework;
 +using osu.Game.Online.API;
++using osu.Game.Online.Multiplayer;
 +
 +namespace osu.Game.Online.Tests
 +{
@@ -840,6 +844,41 @@ index 0000000000..756a04d4eb
 +            var endpoints = createEndpoints();
 +            endpoints.RealtimeServicesAvailable = true;
 +            Assert.That(ZigchoRealtimeServicePolicy.AllowsHub(endpoints, endpoints.SpectatorUrl), Is.True);
++        }
++
++        [Test]
++        public async Task TestShutdownLeavesRoomBeforeReconnect()
++        {
++            var calls = new List<string>();
++
++            await MultiplayerClientExtensions.LeaveRoomAndReconnect(
++                () =>
++                {
++                    calls.Add("leave");
++                    return Task.CompletedTask;
++                },
++                () =>
++                {
++                    calls.Add("reconnect");
++                    return Task.CompletedTask;
++                });
++
++            Assert.That(calls, Is.EqualTo(new[] { "leave", "reconnect" }));
++        }
++
++        [Test]
++        public void TestShutdownReconnectsWhenLeaveLosesServerRace()
++        {
++            bool reconnected = false;
++
++            Assert.ThrowsAsync<InvalidOperationException>(async () => await MultiplayerClientExtensions.LeaveRoomAndReconnect(
++                () => throw new InvalidOperationException("server already closed"),
++                () =>
++                {
++                    reconnected = true;
++                    return Task.CompletedTask;
++                }));
++            Assert.That(reconnected, Is.True);
 +        }
 +    }
 +}
@@ -3272,3 +3311,49 @@ index 8d9985d279..0b5ea20180 100644
  				<string>osu</string>
  				<string>osump</string>
  			</array>
+diff --git a/osu.Game/Online/Multiplayer/MultiplayerClient.cs b/osu.Game/Online/Multiplayer/MultiplayerClient.cs
+index 7f2cb69e1f..9496ea1279 100644
+--- a/osu.Game/Online/Multiplayer/MultiplayerClient.cs
++++ b/osu.Game/Online/Multiplayer/MultiplayerClient.cs
+@@ -1251,7 +1251,11 @@ Task IStatefulUserHubClient.DisconnectRequested()
+ 
+         Task IStatefulUserHubClient.ServerShuttingDown()
+         {
+-            this.ReconnectWhenReady(IsConnected, () => room == null, Reconnect);
++            Schedule(() =>
++            {
++                Func<Task>? leaveRoom = room == null ? null : LeaveRoom;
++                MultiplayerClientExtensions.LeaveRoomAndReconnect(leaveRoom, Reconnect).FireAndForget();
++            });
+             return Task.CompletedTask;
+         }
+ 
+diff --git a/osu.Game/Online/Multiplayer/MultiplayerClientExtensions.cs b/osu.Game/Online/Multiplayer/MultiplayerClientExtensions.cs
+index 71dd527d00..1be24a4377 100644
+--- a/osu.Game/Online/Multiplayer/MultiplayerClientExtensions.cs
++++ b/osu.Game/Online/Multiplayer/MultiplayerClientExtensions.cs
+@@ -82,6 +82,24 @@ public static void ReconnectWhenReady(this IStatefulUserHubClient client, IBinda
+             }).FireAndForget();
+         }
+ 
++        /// <summary>
++        /// Immediately leaves any local room state before reconnecting after a
++        /// server shutdown. Reconnection still runs if the leave request loses
++        /// the race with the closing server.
++        /// </summary>
++        public static async Task LeaveRoomAndReconnect(Func<Task>? leaveRoomFunction, Func<Task> reconnectFunction)
++        {
++            try
++            {
++                if (leaveRoomFunction != null)
++                    await leaveRoomFunction().ConfigureAwait(false);
++            }
++            finally
++            {
++                await reconnectFunction().ConfigureAwait(false);
++            }
++        }
++
+         public static string? GetHubExceptionMessage(this Exception exception)
+         {
+             if (exception is HubException hubException)

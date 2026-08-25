@@ -426,12 +426,15 @@ fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sess
     return capture;
 }
 
-pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !LoginResult {
+fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32, expected_user_id: ?i32) !LoginResult {
     var lines = std.mem.splitScalar(u8, body, '\n');
     const name = std.mem.trim(u8, lines.next() orelse "", "\r");
     const password = std.mem.trim(u8, lines.next() orelse "", "\r");
     const details = std.mem.trim(u8, lines.next() orelse "", "\r");
-    if (name.len < 2 or password.len != 32) {
+    // Existing accounts may have a staff-approved one-character username.
+    // Registration keeps the public two-character minimum; login only needs
+    // a non-empty name which resolves to a real stored account.
+    if (name.len == 0 or password.len != 32) {
         return loginFailure(allocator, "invalid-request", "Invalid login request.");
     }
     const parsed = parseStableLoginDetails(details) catch {
@@ -444,6 +447,9 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     defer if (!user_transferred) {
         allocator.free(user.name);
         allocator.free(user.safe_name);
+    };
+    if (expected_user_id) |expected| if (user.id != expected) {
+        return loginFailure(allocator, "no", "Incorrect credentials.");
     };
     if (login_country) |value| {
         try store.updateCountry(user.id, value);
@@ -562,6 +568,14 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         .hardware_match_count = @intCast(@min(hardware_evidence.matched_user_ids.len, std.math.maxInt(u32))),
         .running_under_wine = parsed.hardware.running_under_wine,
     };
+}
+
+pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !LoginResult {
+    return loginInternal(allocator, store, sessions, body, login_country, longitude, latitude, null);
+}
+
+pub fn loginExpectedUser(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32, expected_user_id: i32) !LoginResult {
+    return loginInternal(allocator, store, sessions, body, login_country, longitude, latitude, expected_user_id);
 }
 
 fn queuePacket(target: *sessions_mod.Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -790,10 +804,13 @@ fn attachSpectatorLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.S
 fn clearSpectatorsForHostLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, host: *sessions_mod.Session) void {
     var kick = protocol.Writer.init(allocator);
     defer kick.deinit();
-    kick.packetString(.channel_kick, "#spectator") catch return;
+    const has_kick = blk: {
+        kick.packetString(.channel_kick, "#spectator") catch break :blk false;
+        break :blk true;
+    };
     for (sessions.items.items) |other| if (other.spectating_user_id == host.user.id) {
         other.spectating_user_id = null;
-        other.enqueue(allocator, kick.bytes()) catch {};
+        if (has_kick) other.enqueue(allocator, kick.bytes()) catch {};
     };
 }
 
@@ -1752,27 +1769,52 @@ pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions
     return result;
 }
 
-pub fn suppressForTakeover(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, message: []const u8) !bool {
+pub const PreparedSuppression = struct {
+    allocator: std.mem.Allocator,
+    queue: std.ArrayList(u8),
+
+    pub fn deinit(self: *PreparedSuppression) void {
+        self.queue.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareSuppression(allocator: std.mem.Allocator, message: []const u8) !PreparedSuppression {
     var packet = protocol.Writer.init(allocator);
-    defer packet.deinit();
+    errdefer packet.deinit();
     try packet.packetString(.notification, message);
     try packet.packetInt(.restart, 0);
     if (packet.bytes().len > sessions_mod.max_queue_bytes) return error.SessionQueueOverflow;
+    const queue = packet.list;
+    packet.list = .empty;
+    return .{ .allocator = allocator, .queue = queue };
+}
+
+/// Applies a preallocated kick without any fallible allocation after a durable
+/// credential, restriction or token transition has committed.
+pub fn suppressPrepared(sessions: *sessions_mod.Sessions, user_id: i32, prepared: *PreparedSuppression) bool {
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     const session = sessions.onlineByUser(user_id) orelse return false;
-    try session.queue.ensureTotalCapacity(allocator, packet.bytes().len);
+    const allocator = prepared.allocator;
     closeLobbyLocked(allocator, sessions, session, null) catch {};
     leaveMatchLocked(allocator, sessions, session, null);
     detachSpectatorLocked(allocator, sessions, session) catch {};
     clearSpectatorsForHostLocked(allocator, sessions, session);
-    session.queue.clearRetainingCapacity();
+    session.queue.deinit(allocator);
+    session.queue = prepared.queue;
+    prepared.queue = .empty;
     session.pending_dm_reads.clearRetainingCapacity();
     session.queue_overflowed = false;
-    session.queue.appendSliceAssumeCapacity(packet.bytes());
     broadcastLogoutLocked(allocator, sessions, session);
     session.presence_suppressed = true;
     return true;
+}
+
+pub fn suppressForTakeover(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, message: []const u8) !bool {
+    var prepared = try prepareSuppression(allocator, message);
+    defer prepared.deinit();
+    return suppressPrepared(sessions, user_id, &prepared);
 }
 
 /// Roll back only the Stable session created by a login result whose
@@ -1990,6 +2032,60 @@ test "lazer logout invalidates authenticate then publish presence" {
     try publishLazerLogout(std.testing.allocator, &sessions, user_id);
     try publishLazerPresenceAtEpoch(std.testing.allocator, &store, &sessions, user, auth_epoch);
     try std.testing.expect(!sessions.lazer_leases.contains(user_id));
+}
+
+test "Stable login accepts an existing one character username" {
+    if (storage.is_postgres) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-one-character-login.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("r", "r@example.invalid", "00000000000000000000000000000000");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const login_body = "r\n00000000000000000000000000000000\nb20260811|0|0|11111111111111111111111111111111:1.2.3.:22222222222222222222222222222222:33333333333333333333333333333333:44444444444444444444444444444444:|0";
+    var result = try login(std.testing.allocator, &store, &sessions, login_body, .{ 'A', 'U' }, 0, 0);
+    defer result.deinit();
+    try std.testing.expectEqual(user_id, result.user_id);
+    try std.testing.expect(sessions.byToken(result.token) != null);
+}
+
+test "expected Stable login owner mismatch never creates a ghost session" {
+    if (storage.is_postgres) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-expected-owner.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const expected_id = try store.register("first owner", "first-owner@example.invalid", "00000000000000000000000000000000");
+    const actual_id = try store.register("second owner", "second-owner@example.invalid", "11111111111111111111111111111111");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const login_body = "second owner\n11111111111111111111111111111111\nb20260811|0|0|55555555555555555555555555555555:1.2.3.:66666666666666666666666666666666:77777777777777777777777777777777:88888888888888888888888888888888:|0";
+    var result = try loginExpectedUser(std.testing.allocator, &store, &sessions, login_body, .{ 'A', 'U' }, 0, 0, expected_id);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i32, 0), result.user_id);
+    try std.testing.expect(sessions.byUser(actual_id) == null);
+    try std.testing.expect(sessions.byUser(expected_id) == null);
+}
+
+test "suppression clears host spectator relationships when notifications cannot allocate" {
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const host = try sessions.create(.{ .id = 40, .name = try std.testing.allocator.dupe(u8, "host"), .safe_name = try std.testing.allocator.dupe(u8, "host") }, 0, 0, 0);
+    const watcher = try sessions.create(.{ .id = 41, .name = try std.testing.allocator.dupe(u8, "watcher"), .safe_name = try std.testing.allocator.dupe(u8, "watcher") }, 0, 0, 0);
+    watcher.spectating_user_id = host.user.id;
+    var empty: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&empty);
+    sessions.mutex.lockUncancelable(std.testing.io);
+    clearSpectatorsForHostLocked(failing.allocator(), &sessions, host);
+    sessions.mutex.unlock(std.testing.io);
+    try std.testing.expect(watcher.spectating_user_id == null);
 }
 
 test "failed Stable takeover rolls back only its login-owned session" {

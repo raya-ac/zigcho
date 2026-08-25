@@ -467,6 +467,7 @@ def main():
         initial_countdowns = two.ranked_countdowns_started()
         if not initial_countdowns or initial_countdowns[-1][1] <= 0 or initial_countdowns[-1][2] != 4:
             raise RuntimeError(f"ranked pick countdown was not started: {initial_countdowns}")
+        active_countdown = initial_countdowns[-1][0]
 
         for round_number in (1, 2):
             state_events = two.event_arguments("MatchRoomStateChanged")
@@ -475,10 +476,11 @@ def main():
             active_card = ranked_state[3][active_user_id][2][0]
             active = one if active_user_id == one_user_id else two
             passive = two if active is one else one
-            active_countdown = active.ranked_countdowns_started()[-1][0]
             active.invoke(110 + round_number * 20, "PlayCard", [active_card])
             if active_countdown not in active.countdowns_stopped():
                 raise RuntimeError(f"ranked pick countdown {active_countdown} was not stopped")
+            one.invoke(120 + round_number * 20, "ChangeBeatmapAvailability", [[4, None]])
+            two.invoke(121 + round_number * 20, "ChangeBeatmapAvailability", [[4, None]])
             passive.invoke(111 + round_number * 20, "ChangeState", [1])
             active.invoke(112 + round_number * 20, "ChangeState", [1])
             ranked_stages = one.ranked_stages() + two.ranked_stages()
@@ -518,6 +520,11 @@ def main():
                 raise RuntimeError(f"ranked round {round_number} did not reach results: {two.ranked_stages()}")
             one.invoke(115 + round_number * 20, "ChangeState", [0])
             two.invoke(115 + round_number * 20, "ChangeState", [0])
+            if round_number == 1:
+                next_countdowns = two.ranked_countdowns_started()
+                if not next_countdowns or next_countdowns[-1][0] == active_countdown:
+                    raise RuntimeError(f"ranked next-pick countdown was not started: {next_countdowns}")
+                active_countdown = next_countdowns[-1][0]
 
         if 9 not in two.ranked_stages():
             raise RuntimeError(f"ranked match did not end: {two.ranked_stages()}")

@@ -13,10 +13,13 @@ $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "../..")).Path
 $CheckoutPath = (Resolve-Path $Checkout).Path
 $Version = (Get-Content -Raw (Join-Path $ScriptDir "client-version.txt")).Trim()
 $OsuRevision = (Get-Content -Raw (Join-Path $ScriptDir "upstream-commit.txt")).Trim()
-$ZigchoRevision = (& git -C $RepoRoot rev-parse --short=8 HEAD).Trim()
+$ZigchoRevision = (& git -C $RepoRoot rev-parse HEAD).Trim()
 
-if ($LASTEXITCODE -ne 0) {
+if ($LASTEXITCODE -ne 0 -or $ZigchoRevision -notmatch "^[0-9a-f]{40}$") {
     throw "could not read the zigcho revision"
+}
+if ($env:GITHUB_SHA -and $env:GITHUB_SHA -ne $ZigchoRevision) {
+    throw "checked out zigcho revision does not match GITHUB_SHA"
 }
 
 $Dotnet = if ($env:ZIGCHO_DOTNET) { $env:ZIGCHO_DOTNET } else { "dotnet" }
@@ -44,7 +47,7 @@ try {
         "-p:Version=$Version" `
         "-p:FileVersion=$NumericVersion" `
         "-p:AssemblyVersion=$NumericVersion" `
-        "-p:InformationalVersion=$Version+zigcho.$ZigchoRevision.osu.$($OsuRevision.Substring(0, 8))" `
+        "-p:InformationalVersion=$Version+zigcho.$($ZigchoRevision.Substring(0, 8)).osu.$($OsuRevision.Substring(0, 8))" `
         -p:DebugType=None -p:DebugSymbols=false
     if ($LASTEXITCODE -ne 0) { throw "Windows publish failed" }
 

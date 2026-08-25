@@ -1044,6 +1044,11 @@ const DisconnectEffects = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    transition_mutex: std.Io.Mutex = .init,
+    lifecycle_mutex: std.Io.Mutex = .init,
+    mutations_drained: std.Io.Condition = .init,
+    active_mutations: usize = 0,
+    terminal_shutdown: bool = false,
     archive_mutex: std.Io.Mutex = .init,
     store: ?*storage.Store = null,
     map_sync: ?*beatmap_sync.Sync = null,
@@ -1058,6 +1063,7 @@ pub const Manager = struct {
     next_pending_match_id: u32 = 1,
     next_countdown_id: i32 = 1,
     enabled: std.atomic.Value(bool) = .init(true),
+    quiescing: bool = false,
     shutting_down: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
@@ -1124,42 +1130,145 @@ pub const Manager = struct {
         return self.enabled.load(.acquire);
     }
 
-    /// Apply the live multiplayer gate as well as the HTTP gate. Turning the
-    /// feature off closes every existing hub connection before returning, and
-    /// the atomic check prevents a connection which raced the toggle from
-    /// joining after that sweep.
+    const Mutation = struct {
+        manager: *Manager,
+        active: bool = true,
+
+        fn deinit(self: *Mutation) void {
+            if (!self.active) return;
+            const manager = self.manager;
+            manager.lifecycle_mutex.lockUncancelable(manager.io);
+            std.debug.assert(manager.active_mutations != 0);
+            manager.active_mutations -= 1;
+            if (manager.active_mutations == 0) manager.mutations_drained.broadcast(manager.io);
+            manager.lifecycle_mutex.unlock(manager.io);
+            self.active = false;
+        }
+    };
+
+    /// REST and maintenance mutations are not tied to a websocket invocation
+    /// mutex. Track them explicitly so disable and shutdown can stop accepting
+    /// new work, wait for already-accepted work, and only then drain/snapshot.
+    fn beginMutation(self: *Manager) !Mutation {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
+        if (self.terminal_shutdown) return error.ServerShuttingDown;
+        if (!self.isEnabled()) return error.MultiplayerDisabled;
+        self.active_mutations += 1;
+        return .{ .manager = self };
+    }
+
+    fn waitForMutationsLocked(self: *Manager) void {
+        while (self.active_mutations != 0) self.mutations_drained.waitUncancelable(self.io, &self.lifecycle_mutex);
+    }
+
+    fn mutationAllowedLocked(self: *const Manager) bool {
+        return !self.quiescing and !self.shutting_down and self.isEnabled();
+    }
+
+    const MutationGateError = error{ MultiplayerDisabled, ServerShuttingDown };
+
+    fn blockedMutationErrorLocked(self: *const Manager) MutationGateError {
+        return if (self.shutting_down) error.ServerShuttingDown else error.MultiplayerDisabled;
+    }
+
+    const DrainMode = enum { disable, shutdown };
+
+    /// Apply the live multiplayer gate as well as the HTTP gate. The transition
+    /// mutex remains held across the entire drain; Condition.wait deliberately
+    /// releases lifecycle_mutex, so that mutex alone cannot serialize a racing
+    /// re-enable or terminal shutdown.
     pub fn setEnabled(self: *Manager, enabled: bool) void {
-        self.enabled.store(enabled, .release);
+        self.transition_mutex.lockUncancelable(self.io);
+        defer self.transition_mutex.unlock(self.io);
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        if (self.terminal_shutdown or self.isEnabled() == enabled) {
+            self.lifecycle_mutex.unlock(self.io);
+            return;
+        }
+        if (!enabled) {
+            // Publish quiescing and the closed admission gate while holding the
+            // manager mutex, so deferred socket teardown cannot detach a room
+            // into an untracked gap between those two state changes.
+            self.mutex.lockUncancelable(self.io);
+            self.quiescing = true;
+            self.enabled.store(false, .release);
+            self.mutex.unlock(self.io);
+        } else self.enabled.store(true, .release);
+        self.lifecycle_mutex.unlock(self.io);
         if (enabled) return;
+        self.drain(.disable);
+    }
+
+    fn drain(self: *Manager, mode: DrainMode) void {
         var targets: [max_connections]*Connection = undefined;
         var count: usize = 0;
         self.mutex.lockUncancelable(self.io);
         for (self.connections.items) |connection| {
             if (count == targets.len) break;
+            connection.accepting_invocations.store(false, .release);
             connection.retain();
             targets[count] = connection;
             count += 1;
         }
         self.mutex.unlock(self.io);
-        const disconnect_frame = eventNoArgsOwned(self.allocator, "DisconnectRequested") catch null;
+
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        self.waitForMutationsLocked();
+        self.lifecycle_mutex.unlock(self.io);
+
+        for (targets[0..count]) |connection| {
+            connection.invocation_mutex.lockUncancelable(self.io);
+            connection.invocation_mutex.unlock(self.io);
+        }
+
+        const event_name = if (mode == .shutdown) "ServerShuttingDown" else "DisconnectRequested";
+        const disconnect_frame = eventNoArgsOwned(self.allocator, event_name) catch null;
         defer if (disconnect_frame) |frame| self.allocator.free(frame);
         for (targets[0..count]) |connection| {
-            var effects: DisconnectEffects = .{};
-            connection.invocation_mutex.lockUncancelable(self.io);
+            if (connection.alive.load(.acquire)) if (disconnect_frame) |frame| connection.send(frame);
+            connection.close();
+        }
+
+        var rooms: [max_rooms + max_pending_archives]*Room = undefined;
+        var room_count: usize = 0;
+        self.archive_mutex.lockUncancelable(self.io);
+        self.mutex.lockUncancelable(self.io);
+        for (&self.rooms) |*entry| if (entry.*) |room| {
+            entry.* = null;
+            room.ended = mode == .disable or room.settings.match_type != 0 or roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds());
+            rooms[room_count] = room;
+            room_count += 1;
+        };
+        for (&self.pending_archives) |*entry| if (entry.*) |room| {
+            entry.* = null;
+            if (std.mem.indexOfScalar(*Room, rooms[0..room_count], room) == null) {
+                rooms[room_count] = room;
+                room_count += 1;
+            }
+        };
+        for (targets[0..count]) |connection| {
+            connection.room_id = null;
+            connection.lobby_pool_id = null;
+            connection.queue_pool_id = null;
+            connection.pending_match_id = null;
+        }
+        if (mode == .disable) self.connections.clearRetainingCapacity();
+        self.pending_matches = [_]?PendingMatch{null} ** max_rooms;
+        self.mutex.unlock(self.io);
+        for (rooms[0..room_count]) |room| {
+            if (mode == .shutdown and room.settings.match_type == 0 and !room.ended)
+                self.checkpointPlaylistRoom(room)
+            else
+                self.archiveRoomUnderGate(room);
+        }
+        self.archive_mutex.unlock(self.io);
+        for (targets[0..count]) |connection| connection.release();
+
+        if (mode == .disable) {
             self.mutex.lockUncancelable(self.io);
-            const still_current = std.mem.indexOfScalar(*Connection, self.connections.items, connection) != null;
-            if (still_current) {
-                connection.accepting_invocations.store(false, .release);
-                self.detachConnectionLocked(connection, &effects);
-            }
+            self.quiescing = false;
             self.mutex.unlock(self.io);
-            connection.invocation_mutex.unlock(self.io);
-            if (still_current) {
-                if (disconnect_frame) |frame| connection.send(frame);
-                connection.close();
-                self.finishDisconnect(&effects);
-            }
-            connection.release();
         }
     }
 
@@ -1378,57 +1487,35 @@ pub const Manager = struct {
     /// every active room before the process gives up its sockets. This is
     /// idempotent so both the server shutdown path and deinit may call it.
     pub fn shutdown(self: *Manager) void {
-        self.archive_mutex.lockUncancelable(self.io);
-        defer self.archive_mutex.unlock(self.io);
-        var connections: [max_connections]*Connection = undefined;
-        var connection_count: usize = 0;
-        var rooms: [max_rooms + max_pending_archives]*Room = undefined;
-        var room_count: usize = 0;
-        self.mutex.lockUncancelable(self.io);
-        if (self.shutting_down) {
-            self.mutex.unlock(self.io);
+        self.transition_mutex.lockUncancelable(self.io);
+        defer self.transition_mutex.unlock(self.io);
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        if (self.terminal_shutdown) {
+            self.lifecycle_mutex.unlock(self.io);
             return;
         }
-        self.shutting_down = true;
-        const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
-        for (self.connections.items) |connection| {
-            if (!connection.alive.load(.acquire) or connection_count == connections.len) continue;
-            connection.room_id = null;
-            connection.lobby_pool_id = null;
-            connection.queue_pool_id = null;
-            connection.pending_match_id = null;
-            connection.retain();
-            connections[connection_count] = connection;
-            connection_count += 1;
-        }
-        for (&self.rooms) |*entry| if (entry.*) |room| {
-            entry.* = null;
-            room.ended = room.settings.match_type != 0 or roomHasEnded(room, now_seconds);
-            rooms[room_count] = room;
-            room_count += 1;
-        };
-        for (&self.pending_archives) |*entry| if (entry.*) |room| {
-            entry.* = null;
-            rooms[room_count] = room;
-            room_count += 1;
-        };
-        self.pending_matches = [_]?PendingMatch{null} ** max_rooms;
+        // Allocation-failure fixtures deliberately mark the manager as already
+        // shutting down so deinit only frees its in-memory ownership and does
+        // not introduce best-effort serializer allocations outside the tested
+        // operation. Preserve that established cleanup contract.
+        self.mutex.lockUncancelable(self.io);
+        const externally_quiesced = self.shutting_down;
         self.mutex.unlock(self.io);
-
-        const frame = eventNoArgsOwned(self.allocator, "ServerShuttingDown") catch null;
-        defer if (frame) |owned| self.allocator.free(owned);
-        for (connections[0..connection_count]) |connection| {
-            if (frame) |owned| connection.send(owned);
-            connection.close();
-            connection.release();
+        if (externally_quiesced) {
+            self.terminal_shutdown = true;
+            self.enabled.store(false, .release);
+            self.lifecycle_mutex.unlock(self.io);
+            return;
         }
-        for (rooms[0..room_count]) |room| {
-            if (room.settings.match_type == 0 and !room.ended)
-                self.checkpointPlaylistRoom(room)
-            else
-                self.archiveRoomUnderGate(room);
-        }
-        std.log.info("event=lazer_multiplayer_shutdown connections={d} rooms={d}", .{ connection_count, room_count });
+        self.terminal_shutdown = true;
+        self.mutex.lockUncancelable(self.io);
+        self.quiescing = true;
+        self.shutting_down = true;
+        self.enabled.store(false, .release);
+        self.mutex.unlock(self.io);
+        self.lifecycle_mutex.unlock(self.io);
+        self.drain(.shutdown);
+        std.log.info("event=lazer_multiplayer_shutdown", .{});
     }
 
     fn nowMs(self: *const Manager) i64 {
@@ -1713,11 +1800,17 @@ pub const Manager = struct {
     }
 
     pub fn archiveExpiredRooms(self: *Manager, now_seconds: i64) usize {
+        var mutation = self.beginMutation() catch return 0;
+        defer mutation.deinit();
         self.archive_mutex.lockUncancelable(self.io);
         defer self.archive_mutex.unlock(self.io);
         var expired: [max_rooms + max_pending_archives]*Room = undefined;
         var expired_count: usize = 0;
         self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            self.mutex.unlock(self.io);
+            return 0;
+        }
         for (&self.rooms) |*entry| if (entry.*) |room| {
             if (!room.ended and (room.ends_at <= 0 or now_seconds < room.ends_at)) continue;
             entry.* = null;
@@ -1738,12 +1831,18 @@ pub const Manager = struct {
     }
 
     pub fn expirePendingMatches(self: *Manager, now_seconds: i64) usize {
+        var mutation = self.beginMutation() catch return 0;
+        defer mutation.deinit();
         var targets: [max_connections]*Connection = undefined;
         var target_count: usize = 0;
         var pools: [max_rooms]i32 = undefined;
         var pool_count: usize = 0;
         var expired_count: usize = 0;
         self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            self.mutex.unlock(self.io);
+            return 0;
+        }
         for (&self.pending_matches) |*entry| if (entry.*) |pending| {
             if (now_seconds < pending.created_at or now_seconds - pending.created_at < pending_match_timeout_seconds) continue;
             for (pending.users, 0..) |user_id, index| {
@@ -1773,6 +1872,8 @@ pub const Manager = struct {
     }
 
     pub fn disconnectUser(self: *Manager, user_id: i32) bool {
+        var mutation_optional: ?Mutation = self.beginMutation() catch null;
+        defer if (mutation_optional) |*mutation| mutation.deinit();
         var targets: [max_connections]*Connection = undefined;
         var count: usize = 0;
         self.mutex.lockUncancelable(self.io);
@@ -1798,7 +1899,10 @@ pub const Manager = struct {
                 // returns. A frame parsed concurrently will fail its second
                 // accepting_invocations check when the gate is released.
                 connection.accepting_invocations.store(false, .release);
-                self.detachConnectionLocked(connection, &effects);
+                if (self.quiescing)
+                    self.detachConnectionForDrainLocked(connection)
+                else
+                    self.detachConnectionLocked(connection, &effects);
                 disconnected = true;
             }
             self.mutex.unlock(self.io);
@@ -1832,6 +1936,8 @@ pub const Manager = struct {
     }
 
     pub fn restCreateRoom(self: *Manager, allocator: std.mem.Allocator, user: domain.User, body: []const u8) ![]u8 {
+        var mutation = try self.beginMutation();
+        defer mutation.deinit();
         const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
         const room = try parseRestRoom(self.allocator, user, body, now_seconds, false);
         errdefer {
@@ -1841,6 +1947,7 @@ pub const Manager = struct {
         try self.hydrateRoom(room);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!self.mutationAllowedLocked()) return self.blockedMutationErrorLocked();
         for (self.rooms) |entry| if (entry) |existing| if (existing.userIndex(user.id) != null) return error.AlreadyInMultiplayerRoom;
         const slot = self.roomSlotLocked() orelse return error.MultiplayerRoomLimit;
         room.id = self.next_room_id;
@@ -1862,8 +1969,11 @@ pub const Manager = struct {
     }
 
     pub fn restJoinRoom(self: *Manager, allocator: std.mem.Allocator, user: domain.User, room_id: i64, password: []const u8) ![]u8 {
+        var mutation = try self.beginMutation();
+        defer mutation.deinit();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!self.mutationAllowedLocked()) return self.blockedMutationErrorLocked();
         var added_slot: ?usize = null;
         errdefer if (added_slot) |slot| {
             const room = self.roomByIdLocked(room_id) orelse unreachable;
@@ -1903,7 +2013,14 @@ pub const Manager = struct {
     }
 
     pub fn restPartRoom(self: *Manager, user_id: i32, room_id: i64) !void {
+        var mutation = try self.beginMutation();
+        defer mutation.deinit();
         self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            const err = self.blockedMutationErrorLocked();
+            self.mutex.unlock(self.io);
+            return err;
+        }
         const room = self.roomByIdLocked(room_id) orelse {
             self.mutex.unlock(self.io);
             return error.MultiplayerRoomNotFound;
@@ -1938,7 +2055,14 @@ pub const Manager = struct {
     }
 
     pub fn restCloseRoom(self: *Manager, user_id: i32, room_id: i64) !void {
+        var mutation = try self.beginMutation();
+        defer mutation.deinit();
         self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            const err = self.blockedMutationErrorLocked();
+            self.mutex.unlock(self.io);
+            return err;
+        }
         const room = self.roomByIdLocked(room_id) orelse {
             self.mutex.unlock(self.io);
             return error.MultiplayerRoomNotFound;
@@ -2016,7 +2140,12 @@ pub const Manager = struct {
     }
 
     fn connect(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !*Connection {
-        if (!self.isEnabled()) return error.MultiplayerDisabled;
+        if (!self.isEnabled()) {
+            self.mutex.lockUncancelable(self.io);
+            const terminal = self.shutting_down;
+            self.mutex.unlock(self.io);
+            return if (terminal) error.ServerShuttingDown else error.MultiplayerDisabled;
+        }
         if (user.name.len == 0 or user.name.len > 64) return error.InvalidMultiplayerUser;
         const connection = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(connection);
@@ -2063,11 +2192,12 @@ pub const Manager = struct {
             existing.invocation_mutex.lockUncancelable(self.io);
             self.mutex.lockUncancelable(self.io);
             const index = std.mem.indexOfScalar(*Connection, self.connections.items, existing);
-            if (self.shutting_down) {
+            if (self.shutting_down or self.quiescing or !self.isEnabled()) {
+                const terminal = self.shutting_down;
                 self.mutex.unlock(self.io);
                 existing.invocation_mutex.unlock(self.io);
                 existing.release();
-                return error.ServerShuttingDown;
+                return if (terminal) error.ServerShuttingDown else error.MultiplayerDisabled;
             }
             if (index == null or !existing.alive.load(.acquire) or existing.user_id != user.id) {
                 self.mutex.unlock(self.io);
@@ -2178,6 +2308,17 @@ pub const Manager = struct {
         self.removeConnectionLocked(connection);
     }
 
+    /// The active lifecycle transition owns the final room snapshot. A socket
+    /// read which wakes after that boundary may remove its connection object,
+    /// but must not erase the participant or archive the room ahead of it.
+    fn detachConnectionForDrainLocked(self: *Manager, connection: *Connection) void {
+        connection.room_id = null;
+        connection.lobby_pool_id = null;
+        connection.queue_pool_id = null;
+        connection.pending_match_id = null;
+        self.removeConnectionLocked(connection);
+    }
+
     fn finishDisconnect(self: *Manager, effects: *DisconnectEffects) void {
         defer releaseRecipients(effects.recipients[0..effects.recipient_count]);
         defer if (effects.queue_peer) |peer| peer.release();
@@ -2217,12 +2358,18 @@ pub const Manager = struct {
     }
 
     fn disconnect(self: *Manager, connection: *Connection) void {
+        var mutation_optional: ?Mutation = self.beginMutation() catch null;
+        defer if (mutation_optional) |*mutation| mutation.deinit();
         connection.close();
         var effects: DisconnectEffects = .{};
         self.mutex.lockUncancelable(self.io);
-        self.detachConnectionLocked(connection, &effects);
+        const quiescing = self.quiescing;
+        if (quiescing)
+            self.detachConnectionForDrainLocked(connection)
+        else
+            self.detachConnectionLocked(connection, &effects);
         self.mutex.unlock(self.io);
-        self.finishDisconnect(&effects);
+        if (!quiescing) self.finishDisconnect(&effects);
         std.log.info("event=lazer_multiplayer_disconnected user_id={d}", .{connection.user_id});
         connection.release();
     }
@@ -2326,8 +2473,10 @@ pub const Manager = struct {
 
     /// New score tokens may only be minted while the room is live.
     pub fn scoreTokenContext(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64) ?RoomScoreContext {
+        if (!self.isEnabled()) return null;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!self.mutationAllowedLocked()) return null;
         const room = self.roomByIdLocked(room_id) orelse return null;
         if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds()) or room.userIndex(user_id) == null) return null;
         const item_index = room.itemIndex(playlist_item_id) orelse return null;
@@ -2340,9 +2489,12 @@ pub const Manager = struct {
     /// snapshot so an already-issued token can finish across a graceful
     /// restart or after the room is archived.
     pub fn bindRoomScoreToken(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, token_id: i64) !void {
+        var mutation = try self.beginMutation();
+        defer mutation.deinit();
         if (token_id <= 0) return error.InvalidMultiplayerScoreToken;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!self.mutationAllowedLocked()) return self.blockedMutationErrorLocked();
         const room = self.roomByIdLocked(room_id) orelse return error.MultiplayerRoomNotFound;
         if (roomHasEnded(room, std.Io.Clock.real.now(self.io).toSeconds())) return error.MultiplayerRoomNotFound;
         if (room.userIndex(user_id) == null or room.itemIndex(playlist_item_id) == null) return error.MultiplayerPermissionDenied;
@@ -2358,9 +2510,14 @@ pub const Manager = struct {
     /// bounded five-minute grace period. The participant and playlist checks
     /// remain identical to archived score reads.
     pub fn scoreSubmissionContext(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, token_id: i64) ?RoomScoreContext {
+        if (!self.isEnabled()) return null;
         const now_seconds = std.Io.Clock.real.now(self.io).toSeconds();
         _ = self.archiveExpiredRooms(now_seconds);
         self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            self.mutex.unlock(self.io);
+            return null;
+        }
         if (self.roomByIdLocked(room_id)) |room| {
             if (!roomHasEnded(room, now_seconds) and room.userIndex(user_id) != null and room.scoreTokenIndex(token_id, user_id, playlist_item_id) != null) {
                 const item = room.playlist[
@@ -2632,8 +2789,9 @@ pub const Manager = struct {
         const argument_count = try reader.arrayLen();
         connection.invocation_mutex.lockUncancelable(self.io);
         // The connection may have been replaced while this frame was parsed
-        // and waiting for the invocation gate.
-        if (!connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) {
+        // and waiting for the invocation gate, or multiplayer may have crossed
+        // its disable/shutdown boundary in the meantime.
+        if (!self.isEnabled() or !connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) {
             connection.invocation_mutex.unlock(self.io);
             return error.ConnectionClose;
         }
@@ -2802,6 +2960,18 @@ pub const Manager = struct {
         try self.hydrateRoom(room);
         var response: []u8 = undefined;
         self.mutex.lockUncancelable(self.io);
+        if (self.shutting_down) {
+            self.mutex.unlock(self.io);
+            return error.ServerShuttingDown;
+        }
+        if (!self.isEnabled()) {
+            self.mutex.unlock(self.io);
+            return error.MultiplayerDisabled;
+        }
+        if (!connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) {
+            self.mutex.unlock(self.io);
+            return error.ConnectionClose;
+        }
         const slot = self.roomSlotLocked() orelse {
             self.mutex.unlock(self.io);
             return error.MultiplayerRoomLimit;
@@ -4858,6 +5028,8 @@ pub const Manager = struct {
     }
 
     pub fn advanceExpiredMatchCountdowns(self: *Manager, now_ms: i64) !usize {
+        var mutation = self.beginMutation() catch return 0;
+        defer mutation.deinit();
         var advanced: usize = 0;
         while (true) {
             var recipients: [max_connections]*Connection = undefined;
@@ -4865,6 +5037,10 @@ pub const Manager = struct {
             var countdown_id: i32 = 0;
             var room_id: i64 = 0;
             self.mutex.lockUncancelable(self.io);
+            if (!self.mutationAllowedLocked()) {
+                self.mutex.unlock(self.io);
+                return advanced;
+            }
             const room = expired: {
                 for (self.rooms) |entry| if (entry) |candidate| {
                     const countdown = candidate.match_start_countdown orelse continue;
@@ -4896,6 +5072,8 @@ pub const Manager = struct {
     }
 
     pub fn advanceExpiredRankedPicks(self: *Manager, now_ms: i64) !usize {
+        var mutation = self.beginMutation() catch return 0;
+        defer mutation.deinit();
         var advanced: usize = 0;
         while (true) {
             var recipients: [max_connections]*Connection = undefined;
@@ -4906,6 +5084,10 @@ pub const Manager = struct {
             var active_user_id: i32 = 0;
 
             self.mutex.lockUncancelable(self.io);
+            if (!self.mutationAllowedLocked()) {
+                self.mutex.unlock(self.io);
+                return advanced;
+            }
             const room = expired: {
                 for (self.rooms) |entry| if (entry) |candidate| {
                     if (candidate.ranked_play) |ranked| {
@@ -5022,6 +5204,13 @@ pub const Manager = struct {
         // manager-wide state mutex while storage and JSON work completes.
         self.archive_mutex.lockUncancelable(self.io);
         defer self.archive_mutex.unlock(self.io);
+        self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            const err = self.blockedMutationErrorLocked();
+            self.mutex.unlock(self.io);
+            return err;
+        }
+        self.mutex.unlock(self.io);
         const store = self.store orelse return error.StoreUnavailable;
         var archive = (try store.lazerMultiplayerRoomArchive(self.allocator, room_id)) orelse return error.MultiplayerRoomNotFound;
         defer archive.deinit();
@@ -5123,10 +5312,17 @@ pub const Manager = struct {
     }
 
     pub fn recordRoomScore(self: *Manager, user_id: i32, room_id: i64, playlist_item_id: i64, score: RoomScoreResult) !void {
+        var mutation = try self.beginMutation();
+        defer mutation.deinit();
         var recipients: [max_connections]*Connection = undefined;
         var state_event: ?[]u8 = null;
         defer if (state_event) |event| self.allocator.free(event);
         self.mutex.lockUncancelable(self.io);
+        if (!self.mutationAllowedLocked()) {
+            const err = self.blockedMutationErrorLocked();
+            self.mutex.unlock(self.io);
+            return err;
+        }
         const room = self.roomByIdLocked(room_id) orelse {
             self.mutex.unlock(self.io);
             return self.recordArchivedRoomScore(user_id, room_id, playlist_item_id, score);
@@ -7377,6 +7573,166 @@ test "multiplayer feature gate drains sessions at the invocation boundary and re
     manager.disconnect(connection);
     manager.disconnect(stale);
     manager.disconnect(reopened);
+}
+
+test "disabled multiplayer rejects REST room creation and reopens idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/multiplayer-disable.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const user_id = try store.register("rest gate", "rest-gate@example.invalid", "00000000000000000000000000000000");
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    const user: domain.User = .{ .id = user_id, .name = "rest gate", .safe_name = "rest_gate", .country = .{ 'A', 'U' } };
+    const room_body =
+        \\{"name":"rest gate room","type":"playlists","duration":30,"playlist":[{"id":8,"owner_id":0,"beatmap_id":75,"ruleset_id":0}]}
+    ;
+
+    const Toggle = struct {
+        manager: *Manager,
+        enabled: bool,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.manager.setEnabled(context.enabled);
+            context.done.store(true, .release);
+        }
+    };
+    var admitted = try manager.beginMutation();
+    var disable: Toggle = .{ .manager = &manager, .enabled = false };
+    const disable_thread = try std.Thread.spawn(.{}, Toggle.run, .{&disable});
+    while (manager.isEnabled()) std.Thread.yield() catch {};
+    var enable: Toggle = .{ .manager = &manager, .enabled = true };
+    const enable_thread = try std.Thread.spawn(.{}, Toggle.run, .{&enable});
+    while (!enable.started.load(.acquire)) std.Thread.yield() catch {};
+    _ = std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!disable.done.load(.acquire));
+    try std.testing.expect(!enable.done.load(.acquire));
+    admitted.deinit();
+    disable_thread.join();
+    enable_thread.join();
+    try std.testing.expect(manager.isEnabled());
+
+    manager.setEnabled(false);
+    try std.testing.expectError(error.MultiplayerDisabled, manager.restCreateRoom(std.testing.allocator, user, room_body));
+    for (manager.rooms) |entry| try std.testing.expect(entry == null);
+
+    manager.setEnabled(true);
+    manager.setEnabled(true);
+    const created = try manager.restCreateRoom(std.testing.allocator, user, room_body);
+    defer std.testing.allocator.free(created);
+    try std.testing.expect(manager.rooms[0] != null);
+
+    manager.setEnabled(false);
+    for (manager.rooms) |entry| try std.testing.expect(entry == null);
+    var archived = (try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)).?;
+    const first_ended_at = archived.ended_at;
+    archived.deinit();
+    manager.setEnabled(false);
+    var unchanged = (try store.lazerMultiplayerRoomArchive(std.testing.allocator, 1)).?;
+    defer unchanged.deinit();
+    try std.testing.expectEqual(first_ended_at, unchanged.ended_at);
+    manager.setEnabled(true);
+    const recreated = try manager.restCreateRoom(std.testing.allocator, user, room_body);
+    defer std.testing.allocator.free(recreated);
+    try std.testing.expect(manager.rooms[0] != null);
+    try std.testing.expectEqual(@as(i64, 2), manager.rooms[0].?.id);
+}
+
+test "shutdown rejects delayed websocket creation and checkpoints each room once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/multiplayer-boundary.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const host_id = try store.register("checkpoint host", "checkpoint-host@example.invalid", "00000000000000000000000000000000");
+    const late_user_id = try store.register("late websocket", "late-websocket@example.invalid", "00000000000000000000000000000000");
+
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try manager.bindStore(&store);
+    const host: domain.User = .{ .id = host_id, .name = "checkpoint host", .safe_name = "checkpoint_host", .country = .{ 'A', 'U' } };
+    const late_user: domain.User = .{ .id = late_user_id, .name = "late websocket", .safe_name = "late_websocket", .country = .{ 'G', 'B' } };
+    const room_body =
+        \\{"name":"checkpoint once","type":"playlists","duration":30,"playlist":[{"id":8,"owner_id":0,"beatmap_id":75,"ruleset_id":0}]}
+    ;
+    const created = try manager.restCreateRoom(std.testing.allocator, host, room_body);
+    defer std.testing.allocator.free(created);
+
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(late_user, fake_socket);
+    connection.socket = null;
+    var client_room: Room = .{ .id = 0, .settings = .{}, .host_id = late_user.id, .host_country = late_user.country };
+    try client_room.settings.name.set("too late");
+    client_room.settings.match_type = 1;
+    client_room.settings.playlist_item_id = 9;
+    try client_room.settings.auto_start.set(&.{0xc0});
+    try client_room.host_name.set(late_user.name);
+    var item: PlaylistItem = .{ .id = 9, .owner_id = late_user.id, .beatmap_id = 76 };
+    try item.required_mods.set(&.{0x90});
+    try item.allowed_mods.set(&.{0x90});
+    try item.played_at.set(&.{0xc0});
+    client_room.playlist[0] = item;
+    client_room.playlist_count = 1;
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try writeRoom(.{ .writer = &encoded.writer }, &client_room, 0);
+
+    const DelayedCreate = struct {
+        manager: *Manager,
+        connection: *Connection,
+        encoded: []const u8,
+        proceed: std.atomic.Value(bool) = .init(false),
+        rejected: bool = false,
+        unexpected_error: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            while (!context.proceed.load(.acquire)) std.Thread.yield() catch {};
+            context.manager.createRoom(context.connection, "late", context.encoded) catch |err| {
+                if (err == error.ServerShuttingDown) context.rejected = true else context.unexpected_error = err;
+                return;
+            };
+        }
+    };
+    const Stop = struct {
+        manager: *Manager,
+        fn run(value: *@This()) void {
+            value.manager.shutdown();
+        }
+    };
+    var delayed: DelayedCreate = .{ .manager = &manager, .connection = connection, .encoded = encoded.written() };
+    var stop: Stop = .{ .manager = &manager };
+    const delayed_thread = try std.Thread.spawn(.{}, DelayedCreate.run, .{&delayed});
+    const shutdown_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    while (manager.isEnabled()) std.Thread.yield() catch {};
+    delayed.proceed.store(true, .release);
+    delayed_thread.join();
+    shutdown_thread.join();
+
+    try std.testing.expect(delayed.rejected);
+    try std.testing.expectEqual(@as(?anyerror, null), delayed.unexpected_error);
+    for (manager.rooms) |entry| try std.testing.expect(entry == null);
+    const checkpoints = try store.lazerMultiplayerRoomCheckpoints(std.testing.allocator);
+    defer {
+        for (checkpoints) |*checkpoint| checkpoint.deinit();
+        std.testing.allocator.free(checkpoints);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checkpoints.len);
+    try std.testing.expectEqual(@as(i64, 1), checkpoints[0].room_id);
+    manager.shutdown();
+    const repeated = try store.lazerMultiplayerRoomCheckpoints(std.testing.allocator);
+    defer {
+        for (repeated) |*checkpoint| checkpoint.deinit();
+        std.testing.allocator.free(repeated);
+    }
+    try std.testing.expectEqual(@as(usize, 1), repeated.len);
 }
 
 test "one websocket identity rebinds room and queue state without duplicate membership" {

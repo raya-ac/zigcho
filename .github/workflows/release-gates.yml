@@ -132,10 +132,12 @@ jobs:
           createdb -h 127.0.0.1 -U zigcho zigcho_migrate
           createdb -h 127.0.0.1 -U zigcho zigcho_store
           createdb -h 127.0.0.1 -U zigcho zigcho_anticheat
+          createdb -h 127.0.0.1 -U zigcho zigcho_transitions
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_ANTICHEAT_URL=host=127.0.0.1 port=5432 dbname=zigcho_anticheat user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_TRANSITIONS_URL=host=127.0.0.1 port=5432 dbname=zigcho_transitions user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             sh -c '
               set -eu
@@ -159,8 +161,30 @@ jobs:
               do
                 zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done
+              for filter in \
+                "disabled multiplayer rejects REST room creation" \
+                "shutdown rejects delayed websocket creation" \
+                "cross client spectator disconnect waits" \
+                "spectator replacement retires" \
+                "expected Stable login owner mismatch" \
+                "suppression clears host spectator relationships" \
+                "unbound room score tokens are discarded" \
+                "credential and restriction commits revoke" \
+                "staff announcements persist chat and audit atomically" \
+                "custom lazer plays update local map counters"
+              do
+                env -u ZIGCHO_TEST_POSTGRES_STORE_URL zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
+              done
               zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres account auth stats and token slice"
               ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_ANTICHEAT_URL" zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres anticheat hardware and flags stay review only"
+              for filter in \
+                "postgres staff announcements persist chat and audit atomically" \
+                "postgres credential and restriction commits revoke matching token families" \
+                "postgres custom lazer plays update local map counters" \
+                "postgres unbound room score tokens can be discarded"
+              do
+                ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_TRANSITIONS_URL" zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
+              done
               zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through server controls schema forty five"
             '
 

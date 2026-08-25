@@ -241,6 +241,8 @@ fn announceLazerScore(allocator: std.mem.Allocator, store: *storage.Store, sessi
     try bancho.publishAnnouncement(allocator, sessions, text);
 }
 
+const game_session_lock_count = 64;
+
 const App = struct {
     allocator: std.mem.Allocator,
     store: storage.Store,
@@ -260,6 +262,8 @@ const App = struct {
     changelog_feed: changelog.Feed,
     started_at: i64,
     irc_clients: std.atomic.Value(u32) = .init(0),
+    game_session_mutexes: [game_session_lock_count]std.Io.Mutex = [_]std.Io.Mutex{.init} ** game_session_lock_count,
+    server_control_mutex: std.Io.Mutex = .init,
 
     fn anticheatNamespace(mods: i32) u32 {
         if (mods & stable_mods.autopilot != 0) return anticheat_abi.Namespace.autopilot;
@@ -766,24 +770,41 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
-    fn disconnectUser(self: *App, user_id: i32, message: []const u8) !void {
-        {
-            self.sessions.mutex.lockUncancelable(self.sessions.io);
-            defer self.sessions.mutex.unlock(self.sessions.io);
-            if (self.sessions.byUser(user_id)) |online| {
-                var packet = protocol.Writer.init(self.allocator);
-                defer packet.deinit();
-                try packet.packetString(.notification, message);
-                try packet.packetInt(.restart, 0);
-                try online.enqueue(self.allocator, packet.bytes());
-            }
-        }
-        _ = try self.store.revokeAllTokensForUser(user_id);
-        _ = self.lazer_multiplayer.disconnectUser(user_id);
-        _ = self.lazer_spectator.disconnectUser(user_id);
+    fn gameSessionMutex(self: *App, user_id: i32) *std.Io.Mutex {
+        std.debug.assert(user_id > 0);
+        const index: usize = @intCast(@mod(user_id, game_session_lock_count));
+        return &self.game_session_mutexes[index];
     }
 
-    fn takeOverGameSessions(self: *App, user_id: i32, entering_client: []const u8) !void {
+    const DisconnectScope = enum { game, all };
+
+    fn finishDisconnectPrepared(self: *App, user_id: i32, prepared: *bancho.PreparedSuppression) bool {
+        const stable = bancho.suppressPrepared(&self.sessions, user_id, prepared);
+        const multiplayer = self.lazer_multiplayer.disconnectUser(user_id);
+        const spectator = self.lazer_spectator.disconnectUser(user_id);
+        return stable or multiplayer or spectator;
+    }
+
+    fn disconnectUserLocked(self: *App, user_id: i32, message: []const u8, scope: DisconnectScope) !bool {
+        var prepared = try bancho.prepareSuppression(self.allocator, message);
+        defer prepared.deinit();
+        const revoked = switch (scope) {
+            .game => try self.store.revokeGameTokensForUser(user_id),
+            .all => try self.store.revokeAllTokensForUser(user_id),
+        };
+        return self.finishDisconnectPrepared(user_id, &prepared) or revoked != 0;
+    }
+
+    fn disconnectUser(self: *App, user_id: i32, message: []const u8, scope: DisconnectScope) !bool {
+        const mutex = self.gameSessionMutex(user_id);
+        mutex.lockUncancelable(self.store.io);
+        defer mutex.unlock(self.store.io);
+        return self.disconnectUserLocked(user_id, message, scope);
+    }
+
+    /// The caller owns the per-user game-session mutex across authentication's
+    /// commit point, token issuance, takeover and presence publication.
+    fn takeOverGameSessionsLocked(self: *App, user_id: i32, entering_client: []const u8) !void {
         if (std.mem.eql(u8, entering_client, "stable")) {
             _ = try self.store.revokeGameTokensForUser(user_id);
             bancho.forgetLazerPresence(&self.sessions, user_id);
@@ -794,6 +815,49 @@ const App = struct {
             _ = try bancho.suppressForTakeover(self.allocator, &self.sessions, user_id, "This account signed in from lazer, so this client has been disconnected.");
         }
         std.log.info("event=cross_client_session_takeover user_id={d} entering_client={s}", .{ user_id, entering_client });
+    }
+
+    fn stableLoginAndTakeover(self: *App, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !bancho.LoginResult {
+        const line_end = std.mem.findScalar(u8, body, '\n') orelse body.len;
+        const name = std.mem.trim(u8, body[0..line_end], "\r");
+        const existing = if (name.len == 0) null else try self.store.userByName(self.allocator, name);
+        if (existing) |user| {
+            const user_id = user.id;
+            freeUser(self.allocator, user);
+            const mutex = self.gameSessionMutex(user_id);
+            mutex.lockUncancelable(self.store.io);
+            defer mutex.unlock(self.store.io);
+            var result = try bancho.loginExpectedUser(self.allocator, &self.store, &self.sessions, body, login_country, longitude, latitude, user_id);
+            errdefer result.deinit();
+            if (result.user_id > 0) {
+                self.takeOverGameSessionsLocked(result.user_id, "stable") catch |err| {
+                    _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
+                    return err;
+                };
+            }
+            return result;
+        }
+
+        // A registration can commit between the lookup and authentication.
+        // If that rare race succeeds, discard its unguarded session and repeat
+        // the login under the newly known user's transition lock.
+        var first = try bancho.login(self.allocator, &self.store, &self.sessions, body, login_country, longitude, latitude);
+        if (first.user_id <= 0) return first;
+        const user_id = first.user_id;
+        _ = bancho.rollbackLogin(self.allocator, &self.sessions, user_id, first.token);
+        first.deinit();
+        const mutex = self.gameSessionMutex(user_id);
+        mutex.lockUncancelable(self.store.io);
+        defer mutex.unlock(self.store.io);
+        var result = try bancho.loginExpectedUser(self.allocator, &self.store, &self.sessions, body, login_country, longitude, latitude, user_id);
+        errdefer result.deinit();
+        if (result.user_id > 0) {
+            self.takeOverGameSessionsLocked(result.user_id, "stable") catch |err| {
+                _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
+                return err;
+            };
+        }
+        return result;
     }
 
     fn issueLazerOAuthTokens(self: *App, user_id: i32, replace_existing: bool) !storage.Store.GameTokenPair {
@@ -1177,23 +1241,14 @@ const App = struct {
     }
 
     fn setFeatureControl(self: *App, actor_id: i32, feature: server_control.Feature, enabled: bool, reason: []const u8) !void {
-        const multiplayer_before = self.lazer_multiplayer.isEnabled();
-        const spectator_before = self.lazer_spectator.isEnabled();
-        if (!enabled) switch (feature) {
-            .lazer_multiplayer => self.lazer_multiplayer.setEnabled(false),
-            .spectator => self.lazer_spectator.setEnabled(false),
+        self.server_control_mutex.lockUncancelable(self.store.io);
+        defer self.server_control_mutex.unlock(self.store.io);
+        try self.store.setServerControl(actor_id, feature, enabled, reason);
+        switch (feature) {
+            .lazer_multiplayer => self.lazer_multiplayer.setEnabled(enabled),
+            .spectator => self.lazer_spectator.setEnabled(enabled),
             else => {},
-        };
-        self.store.setServerControl(actor_id, feature, enabled, reason) catch |err| {
-            if (feature == .lazer_multiplayer) self.lazer_multiplayer.setEnabled(multiplayer_before);
-            if (feature == .spectator) self.lazer_spectator.setEnabled(spectator_before);
-            return err;
-        };
-        if (enabled) switch (feature) {
-            .lazer_multiplayer => self.lazer_multiplayer.setEnabled(true),
-            .spectator => self.lazer_spectator.setEnabled(true),
-            else => {},
-        };
+        }
     }
 
     fn requestRule(req: *const std.http.Server.Request, path: []const u8) ?rate_limit.Rule {
@@ -1510,6 +1565,7 @@ const App = struct {
                 error.InvalidMultiplayerRoom, error.MultiplayerPayloadTooLarge => respond(req, .unprocessable_entity, "application/json", "{\"error\":\"invalid room\"}", &.{}),
                 error.AlreadyInMultiplayerRoom => respond(req, .conflict, "application/json", "{\"error\":\"already in a room\"}", &.{}),
                 error.MultiplayerRoomLimit => respond(req, .service_unavailable, "application/json", "{\"error\":\"room limit reached\"}", &.{}),
+                error.MultiplayerDisabled, error.ServerShuttingDown => featureUnavailable(req, .lazer_multiplayer),
                 else => return err,
             };
             defer self.allocator.free(json);
@@ -1524,6 +1580,7 @@ const App = struct {
             if (req.head.method == .DELETE) {
                 self.lazer_multiplayer.restPartRoom(user.id, room_user_path.room_id) catch |err| return switch (err) {
                     error.MultiplayerRoomNotFound, error.NotInMultiplayerRoom => respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{}),
+                    error.MultiplayerDisabled, error.ServerShuttingDown => featureUnavailable(req, .lazer_multiplayer),
                 };
                 return respond(req, .no_content, "application/json", "", &.{.{ .name = "cache-control", .value = "no-store" }});
             }
@@ -1540,6 +1597,7 @@ const App = struct {
                 error.MultiplayerPermissionDenied => respond(req, .forbidden, "application/json", "{\"error\":\"room access denied\"}", &.{}),
                 error.AlreadyInMultiplayerRoom => respond(req, .conflict, "application/json", "{\"error\":\"already in a room\"}", &.{}),
                 error.MultiplayerRoomFull => respond(req, .conflict, "application/json", "{\"error\":\"room is full\"}", &.{}),
+                error.MultiplayerDisabled, error.ServerShuttingDown => featureUnavailable(req, .lazer_multiplayer),
                 else => return err,
             };
             defer self.allocator.free(json);
@@ -1552,6 +1610,7 @@ const App = struct {
                 self.lazer_multiplayer.restCloseRoom(user.id, room_id) catch |err| return switch (err) {
                     error.MultiplayerRoomNotFound => respond(req, .not_found, "application/json", "{\"error\":\"room not found\"}", &.{}),
                     error.MultiplayerPermissionDenied => respond(req, .forbidden, "application/json", "{\"error\":\"only the host can close this room\"}", &.{}),
+                    error.MultiplayerDisabled, error.ServerShuttingDown => featureUnavailable(req, .lazer_multiplayer),
                 };
                 return respond(req, .no_content, "application/json", "", &.{.{ .name = "cache-control", .value = "no-store" }});
             }
@@ -1686,8 +1745,15 @@ const App = struct {
                 const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &no_store);
                 defer self.allocator.free(password);
                 const password_md5 = web_auth.passwordCredential(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                const existing = (try self.store.userByName(self.allocator, name)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                const user_id = existing.id;
+                freeUser(self.allocator, existing);
+                const mutex = self.gameSessionMutex(user_id);
+                mutex.lockUncancelable(self.store.io);
+                defer mutex.unlock(self.store.io);
                 const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
                 defer freeUser(self.allocator, user);
+                if (user.id != user_id) return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
                 if (user.id == 3) return respond(req, .forbidden, "application/json", "{\"error\":\"account login unavailable\"}", &no_store);
                 const token = try self.store.issueToken(user.id, web_auth.player_scope, web_auth.player_lifetime_seconds);
                 const csrf = web_auth.csrfToken(&token);
@@ -1906,6 +1972,9 @@ const App = struct {
                 const current_password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"current_password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"current password required\"}", &no_store);
                 defer self.allocator.free(current_password);
                 const current_md5 = web_auth.passwordCredential(current_password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"current password is wrong\"}", &no_store);
+                const mutex = self.gameSessionMutex(user.id);
+                mutex.lockUncancelable(self.store.io);
+                defer mutex.unlock(self.store.io);
                 const verified = (try self.store.authenticate(self.allocator, user.name, &current_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"current password is wrong\"}", &no_store);
                 defer freeUser(self.allocator, verified);
                 if (verified.id != user.id) return respond(req, .unauthorized, "application/json", "{\"error\":\"current password is wrong\"}", &no_store);
@@ -1925,8 +1994,10 @@ const App = struct {
                     defer self.allocator.free(new_password);
                     if (!registration.validPassword(new_password)) return respond(req, .bad_request, "application/json", "{\"error\":\"use 8-32 characters with more than 3 unique characters\"}", &no_store);
                     const password_md5 = web_auth.passwordCredential(new_password) catch return respond(req, .bad_request, "application/json", "{\"error\":\"new password is not valid\"}", &no_store);
+                    var prepared = try bancho.prepareSuppression(self.allocator, "your password changed. sign in again.");
+                    defer prepared.deinit();
                     try self.store.updateAccountPassword(user.id, &password_md5);
-                    try self.disconnectUser(user.id, "your password changed. sign in again.");
+                    _ = self.finishDisconnectPrepared(user.id, &prepared);
                     std.log.info("event=website_password_updated user_id={d}", .{user.id});
                     return respond(req, .ok, "application/json", "{\"ok\":true,\"reauthenticate\":true}", &.{
                         .{ .name = "set-cookie", .value = "__Host-kai-account=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" },
@@ -1937,12 +2008,14 @@ const App = struct {
                 defer self.allocator.free(username_value);
                 const username = std.mem.trim(u8, username_value, " \t\r\n");
                 if (!registration.validUsername(username)) return respond(req, .bad_request, "application/json", "{\"error\":\"use 2-15 allowed username characters\"}", &no_store);
+                var prepared = try bancho.prepareSuppression(self.allocator, "your username changed. sign in again with the new name.");
+                defer prepared.deinit();
                 self.store.updateAccountUsername(user.id, username) catch |err| return switch (err) {
                     error.UsernameExists => respond(req, .conflict, "application/json", "{\"error\":\"that username is already in use\"}", &no_store),
                     error.PremiumRequired => respond(req, .payment_required, "application/json", "{\"error\":\"the free username change was already used; premium is required for another\"}", &no_store),
                     else => respond(req, .internal_server_error, "application/json", "{\"error\":\"username could not be changed\"}", &no_store),
                 };
-                try self.disconnectUser(user.id, "your username changed. sign in again with the new name.");
+                _ = self.finishDisconnectPrepared(user.id, &prepared);
                 std.log.info("event=website_username_updated user_id={d}", .{user.id});
                 return respond(req, .ok, "application/json", "{\"ok\":true,\"reauthenticate\":true}", &.{
                     .{ .name = "set-cookie", .value = "__Host-kai-account=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" },
@@ -2269,9 +2342,16 @@ const App = struct {
                 const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"password"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"password required\"}", &no_store);
                 defer self.allocator.free(password);
                 const password_md5 = web_auth.passwordCredential(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                const existing = (try self.store.userByName(self.allocator, name)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
+                const user_id = existing.id;
+                freeUser(self.allocator, existing);
+                const mutex = self.gameSessionMutex(user_id);
+                mutex.lockUncancelable(self.store.io);
+                defer mutex.unlock(self.store.io);
                 const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
                 defer self.allocator.free(user.name);
                 defer self.allocator.free(user.safe_name);
+                if (user.id != user_id) return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid credentials\"}", &no_store);
                 if (!web_auth.allowed(user)) return respond(req, .forbidden, "application/json", "{\"error\":\"staff access required\"}", &no_store);
                 const token = try self.store.issueToken(user.id, web_auth.scope, web_auth.lifetime_seconds);
                 std.log.info("event=staff_session_created user_id={d}", .{user.id});
@@ -2361,9 +2441,9 @@ const App = struct {
                         defer self.allocator.free(message_value);
                         const message = std.mem.trim(u8, message_value, " \t\r\n");
                         if (!validWebText(message, 3, 500)) return respond(req, .bad_request, "application/json", "{\"error\":\"announcement must be between 3 and 500 characters\"}", &no_store);
-                        try self.store.recordPublicMessage(3, "#announce", message);
-                        try bancho.publishAnnouncement(self.allocator, &self.sessions, message);
-                        try self.store.recordAudit(staff_user.id, "infra.announcement", "server", reason);
+                        try self.store.recordStaffAnnouncement(staff_user.id, message, reason);
+                        bancho.publishAnnouncement(self.allocator, &self.sessions, message) catch |err|
+                            std.log.warn("event=staff_announcement_live_delivery_failed actor_id={d} error={t}", .{ staff_user.id, err });
                     } else if (std.mem.eql(u8, operation, "refresh_changelog")) {
                         self.changelog_feed.refresh() catch return respond(req, .bad_gateway, "application/json", "{\"error\":\"changelog refresh failed\"}", &no_store);
                         try self.store.recordAudit(staff_user.id, "infra.refresh_changelog", "server", reason);
@@ -2469,7 +2549,7 @@ const App = struct {
                     const trimmed_reason = std.mem.trim(u8, reason, " \t\r\n");
                     if (std.mem.eql(u8, action, "revoke_sessions")) {
                         if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
-                        try self.disconnectUser(target_id, trimmed_reason);
+                        _ = try self.disconnectUser(target_id, trimmed_reason, .all);
                         try self.store.recordModerationAction(staff_user.id, target_id, "account.sessions_revoke", trimmed_reason);
                     } else if (std.mem.eql(u8, action, "reset_avatar") or std.mem.eql(u8, action, "reset_banner")) {
                         if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
@@ -2487,21 +2567,7 @@ const App = struct {
                         }
                         try self.store.recordModerationAction(staff_user.id, target_id, if (is_avatar) "account.avatar_reset" else "account.banner_reset", trimmed_reason);
                     } else if (std.mem.eql(u8, action, "kick")) {
-                        var stable_kicked = false;
-                        self.sessions.mutex.lockUncancelable(self.sessions.io);
-                        if (self.sessions.byUser(target_id)) |online| {
-                            var packet = protocol.Writer.init(self.allocator);
-                            defer packet.deinit();
-                            try packet.packetString(.notification, trimmed_reason);
-                            try packet.packetInt(.restart, 0);
-                            try online.enqueue(self.allocator, packet.bytes());
-                            stable_kicked = true;
-                        }
-                        self.sessions.mutex.unlock(self.sessions.io);
-                        const revoked = try self.store.revokeGameTokensForUser(target_id);
-                        const multiplayer_kicked = self.lazer_multiplayer.disconnectUser(target_id);
-                        const spectator_kicked = self.lazer_spectator.disconnectUser(target_id);
-                        if (!stable_kicked and revoked == 0 and !multiplayer_kicked and !spectator_kicked) return respond(req, .conflict, "application/json", "{\"error\":\"player is not online\"}", &no_store);
+                        if (!try self.disconnectUser(target_id, trimmed_reason, .game)) return respond(req, .conflict, "application/json", "{\"error\":\"player is not online\"}", &no_store);
                         try self.store.recordModerationAction(staff_user.id, target_id, "account.kick", trimmed_reason);
                     } else if (std.mem.eql(u8, action, "note")) {
                         try self.store.addModerationNote(staff_user.id, target_id, trimmed_reason);
@@ -2533,32 +2599,19 @@ const App = struct {
                         if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"admin access required\"}", &no_store);
                         const restricted = std.mem.eql(u8, action, "restrict");
                         if (target_user.restricted == restricted) return respond(req, .conflict, "application/json", "{\"error\":\"player already has that state\"}", &no_store);
-                        try self.store.setRestricted(staff_user.id, target_id, restricted, trimmed_reason);
-                        {
+                        const mutex = self.gameSessionMutex(target_id);
+                        mutex.lockUncancelable(self.store.io);
+                        defer mutex.unlock(self.store.io);
+                        if (restricted) {
+                            var prepared = try bancho.prepareSuppression(self.allocator, trimmed_reason);
+                            defer prepared.deinit();
+                            try self.store.setRestricted(staff_user.id, target_id, true, trimmed_reason);
+                            _ = self.finishDisconnectPrepared(target_id, &prepared);
+                        } else {
+                            try self.store.setRestricted(staff_user.id, target_id, false, trimmed_reason);
                             self.sessions.mutex.lockUncancelable(self.sessions.io);
                             defer self.sessions.mutex.unlock(self.sessions.io);
-                            if (self.sessions.byUser(target_id)) |online| {
-                                online.user.restricted = restricted;
-                                var packet = protocol.Writer.init(self.allocator);
-                                defer packet.deinit();
-                                if (restricted) {
-                                    try packet.packetEmpty(.account_restricted);
-                                    var visibility = protocol.Writer.init(self.allocator);
-                                    defer visibility.deinit();
-                                    const start = try visibility.begin(.user_logout);
-                                    try visibility.int(i32, target_id);
-                                    try visibility.byte(0);
-                                    visibility.finish(start);
-                                    try self.sessions.broadcast(visibility.bytes(), online);
-                                }
-                                try packet.packetInt(.restart, 0);
-                                try online.enqueue(self.allocator, packet.bytes());
-                            }
-                        }
-                        if (restricted) {
-                            _ = try self.store.revokeGameTokensForUser(target_id);
-                            _ = self.lazer_multiplayer.disconnectUser(target_id);
-                            _ = self.lazer_spectator.disconnectUser(target_id);
+                            if (self.sessions.byUser(target_id)) |online| online.user.restricted = false;
                         }
                     } else if (std.mem.eql(u8, action, "add_privilege") or std.mem.eql(u8, action, "remove_privilege")) {
                         if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
@@ -2955,8 +3008,14 @@ const App = struct {
             if (std.mem.eql(u8, grant, "refresh_token")) {
                 const refresh = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"refresh_token"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
                 defer self.allocator.free(refresh);
+                const owner = (try self.store.authenticateToken(self.allocator, refresh, "")) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
+                defer freeUser(self.allocator, owner);
+                const mutex = self.gameSessionMutex(owner.id);
+                mutex.lockUncancelable(self.store.io);
+                defer mutex.unlock(self.store.io);
                 const rotated = (try self.store.rotateGameTokenPair(self.allocator, refresh, lazer_access_lifetime_seconds, lazer_refresh_lifetime_seconds)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
                 defer freeUser(self.allocator, rotated.user);
+                if (rotated.user.id != owner.id) return error.TokenOwnerChanged;
                 return self.respondLazerOAuthTokens(req, rotated.tokens);
             }
             if (!std.mem.eql(u8, grant, "password")) return respond(req, .bad_request, "application/json", "{\"error\":\"unsupported_grant_type\"}", &.{});
@@ -2965,11 +3024,18 @@ const App = struct {
             const password = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{ "password_md5", "password" })) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid_request\"}", &.{});
             defer self.allocator.free(password);
             const password_md5 = form_urlencoded.credentialMd5(password) catch return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
+            const existing = (try self.store.userByName(self.allocator, name)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
+            const user_id = existing.id;
+            freeUser(self.allocator, existing);
+            const mutex = self.gameSessionMutex(user_id);
+            mutex.lockUncancelable(self.store.io);
+            defer mutex.unlock(self.store.io);
             const user = (try self.store.authenticate(self.allocator, name, &password_md5)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"invalid_grant\"}", &.{});
             defer freeUser(self.allocator, user);
+            if (user.id != user_id) return error.LoginUserChanged;
             const tokens = try self.issueLazerOAuthTokens(user.id, true);
             errdefer rollbackFailedLazerLogin(self.allocator, &self.store, &self.sessions, user.id, tokens);
-            try self.takeOverGameSessions(user.id, "lazer");
+            try self.takeOverGameSessionsLocked(user.id, "lazer");
             try bancho.publishLazerPresence(self.allocator, &self.store, &self.sessions, user);
             return self.respondLazerOAuthTokens(req, tokens);
         }
@@ -2981,11 +3047,19 @@ const App = struct {
             // refresh-token logout also removes its published presence.
             const user = try self.store.authenticateToken(self.allocator, token, "");
             defer if (user) |value| freeUser(self.allocator, value);
-            const revoked = try self.store.revokeToken(token);
-            if (revoked) if (user) |value| {
+            if (user) |value| {
+                const mutex = self.gameSessionMutex(value.id);
+                mutex.lockUncancelable(self.store.io);
+                defer mutex.unlock(self.store.io);
+                const revoked = try self.store.revokeToken(token);
+                if (!revoked) return respond(req, .ok, "application/json", "{}", &.{});
                 const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
-                if (!try self.store.lazerUserOnline(value.id, cutoff)) try bancho.publishLazerLogout(self.allocator, &self.sessions, value.id);
-            };
+                if (!try self.store.lazerUserOnline(value.id, cutoff)) {
+                    _ = self.lazer_multiplayer.disconnectUser(value.id);
+                    _ = self.lazer_spectator.disconnectUser(value.id);
+                    try bancho.publishLazerLogout(self.allocator, &self.sessions, value.id);
+                }
+            } else _ = try self.store.revokeToken(token);
             return respond(req, .ok, "application/json", "{}", &.{});
         }
         if (std.mem.eql(u8, path, "/api/v2/mods")) return respond(req, .ok, "application/json", "{\"mods\":[{\"acronym\":\"RX\",\"name\":\"Relax\",\"description\":\"server accepted; separate relax leaderboard\",\"ranked\":true,\"score_multiplier\":0.0,\"settings\":{}},{\"acronym\":\"AP\",\"name\":\"Autopilot\",\"description\":\"server accepted; separate autopilot leaderboard\",\"ranked\":true,\"score_multiplier\":0.0,\"settings\":{}},{\"acronym\":\"CL\",\"name\":\"Classic\",\"description\":\"Stable score leaderboard\",\"ranked\":true,\"score_multiplier\":1.0,\"settings\":{}}],\"custom_mod_contract\":{\"acronym\":\"2-8 uppercase ASCII characters\",\"settings\":\"arbitrary JSON object\",\"leaderboard\":\"custom namespace\",\"ranked\":true}}", &.{});
@@ -3971,6 +4045,7 @@ const App = struct {
             return respond(req, .ok, "application/json", json, &.{.{ .name = "cache-control", .value = "no-store" }});
         }
         if (lazer_multiplayer.parseRoomScorePath(path)) |room_score_path| {
+            if (!self.lazer_multiplayer.isEnabled()) return featureUnavailable(req, .lazer_multiplayer);
             const required_scope: []const u8 = if (req.head.method == .GET) "identify" else "scores:write";
             const user = (try self.lazerUser(auth_owned, required_scope)) orelse return respond(req, .unauthorized, "application/json", "{\"error\":\"unauthorized\"}", &.{});
             defer freeUser(self.allocator, user);
@@ -4030,7 +4105,15 @@ const App = struct {
                 const token_id = self.store.createLazerRoomScoreToken(user.id, beatmap_id, beatmap_hash, ruleset_id, version_hash) catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"score token unavailable\"}", &.{});
                 self.lazer_multiplayer.bindRoomScoreToken(user.id, room_score_path.room_id, room_score_path.playlist_item_id, token_id) catch |err| {
                     std.log.warn("event=lazer_room_score_token_bind_failed room_id={d} playlist_item_id={d} user_id={d} token_id={d} error={t}", .{ room_score_path.room_id, room_score_path.playlist_item_id, user.id, token_id, err });
-                    return respond(req, .internal_server_error, "application/json", "{\"error\":\"score token unavailable\"}", &.{});
+                    const discarded = self.store.discardUnusedLazerRoomScoreToken(user.id, token_id) catch |discard_err| {
+                        std.log.err("event=lazer_room_score_token_discard_failed user_id={d} token_id={d} error={t}", .{ user.id, token_id, discard_err });
+                        return respond(req, .internal_server_error, "application/json", "{\"error\":\"score token cleanup failed\"}", &.{});
+                    };
+                    if (!discarded) std.log.err("event=lazer_room_score_token_discard_missing user_id={d} token_id={d}", .{ user.id, token_id });
+                    return switch (err) {
+                        error.MultiplayerDisabled, error.ServerShuttingDown => featureUnavailable(req, .lazer_multiplayer),
+                        else => respond(req, .internal_server_error, "application/json", "{\"error\":\"score token unavailable\"}", &.{}),
+                    };
                 };
                 var out: [96]u8 = undefined;
                 const json = try std.fmt.bufPrint(&out, "{{\"id\":{d}}}", .{token_id});
@@ -4099,7 +4182,10 @@ const App = struct {
                     .passed = room_passed,
                 }) catch |err| {
                     std.log.err("event=lazer_multiplayer_score_archive_failed room_id={d} playlist_item_id={d} user_id={d} score_id={d} error={t}", .{ room_score_path.room_id, room_score_path.playlist_item_id, user.id, score_id, err });
-                    return respond(req, .internal_server_error, "application/json", "{\"error\":\"multiplayer score persistence failed\"}", &.{});
+                    return switch (err) {
+                        error.MultiplayerDisabled, error.ServerShuttingDown => featureUnavailable(req, .lazer_multiplayer),
+                        else => respond(req, .internal_server_error, "application/json", "{\"error\":\"multiplayer score persistence failed\"}", &.{}),
+                    };
                 };
                 if (recovered) {
                     const json = try self.lazerScoreResponse(user.id, score_id, null);
@@ -4248,12 +4334,8 @@ const App = struct {
                 return respond(req, .ok, "application/octet-stream", bytes, &.{});
             }
             const geo = if (client_ip_owned) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
-            var result = try bancho.login(self.allocator, &self.store, &self.sessions, body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
+            var result = try self.stableLoginAndTakeover(body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
             defer result.deinit();
-            if (result.user_id > 0) self.takeOverGameSessions(result.user_id, "stable") catch |err| {
-                _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
-                return err;
-            };
             self.observeStableLogin(result);
             const token_headers = [_]std.http.Header{
                 .{ .name = "cho-token", .value = result.token },

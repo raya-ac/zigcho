@@ -131,9 +131,11 @@ jobs:
           set -euo pipefail
           createdb -h 127.0.0.1 -U zigcho zigcho_migrate
           createdb -h 127.0.0.1 -U zigcho zigcho_store
+          createdb -h 127.0.0.1 -U zigcho zigcho_anticheat
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_ANTICHEAT_URL=host=127.0.0.1 port=5432 dbname=zigcho_anticheat user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             sh -c '
               set -eu
@@ -149,17 +151,17 @@ jobs:
                 "public name history follows" \
                 "lazer spectator v2 accepts" \
                 "dynamic changelog" \
-                "postgres anticheat hardware and flags stay review only" \
-                "postgres account auth stats and token slice" \
                 "official lazer score bodies" \
                 "lazer solo score tokens" \
                 "stable and lazer share one ranked performance result per map" \
                 "lazer profile JSON owns" \
-                "website profile plays keep" \
-                "postgres runtime migrates through server controls schema forty five"
+                "website profile plays keep"
               do
                 zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done
+              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres account auth stats and token slice"
+              ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_ANTICHEAT_URL" zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres anticheat hardware and flags stay review only"
+              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through server controls schema forty five"
             '
 
       - name: boot the exact binary on PostgreSQL

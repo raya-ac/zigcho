@@ -9056,10 +9056,10 @@ test "postgres account auth stats and token slice" {
     try store.setRestricted(user_id, second_id, true, "fixture restrict");
     try store.setRestricted(user_id, second_id, false, "fixture unrestrict");
     const hardware: ClientHardware = .{
-        .osu_path_md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .adapters_md5 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        .uninstall_md5 = "cccccccccccccccccccccccccccccccc",
-        .disk_signature_md5 = "dddddddddddddddddddddddddddddddd",
+        .osu_path_md5 = "acacacacacacacacacacacacacacacac",
+        .adapters_md5 = "bdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbd",
+        .uninstall_md5 = "cececececececececececececececece",
+        .disk_signature_md5 = "dfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdf",
         .client_version = "b20260811",
         .running_under_wine = false,
         .actionable = true,

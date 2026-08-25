@@ -182,6 +182,11 @@ def main():
         replacement.invoke(2, "EndPlaySessionV2", [4343, 5])
         require_event(watcher_hub.wait_event("UserFinishedPlaying"), "UserFinishedPlaying", [one_id, [75, 0, [], 5, {}]])
 
+        replacement.invoke(3, "BeginPlaySessionV2", [state, 4443])
+        require_event(watcher_hub.wait_event("UserBeganPlaying"), "UserBeganPlaying", [one_id, state])
+        replacement.invoke(4, "EndPlaySessionV2", [5, 4443])
+        require_event(watcher_hub.wait_event("UserFinishedPlaying"), "UserFinishedPlaying", [one_id, [75, 0, [], 5, {}]])
+
         watcher_hub.invoke(2, "EndWatchingUser", [one_id])
         require_event(replacement.wait_event("UserEndedWatching"), "UserEndedWatching", [two_id])
         print(f"lazer_spectator_ws_smoke_ok host_id={one_id} watcher_id={two_id}")

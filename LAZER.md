@@ -39,6 +39,6 @@ there are 86 mapped request targets in the pinned player client, with no missing
 
 ## after this release
 
-there is no installer or signing todo. the five portable GitHub packages are the alpha.14 release boundary. any real-player bug after that reopens its exact row above; it does not hold this release behind an installer we do not want.
+there is no installer or signing todo. the five portable GitHub packages are the alpha.15 release boundary. any real-player bug after that reopens its exact row above; it does not hold this release behind an installer we do not want.
 
 changelog and news content comes from the bounded raw GitHub feed in `updates/changelog.json`. the server keeps the complete checked-in history as its no-network fallback and caches the last valid remote copy. adding a Markdown entry and updating that manifest on main does not rebuild the server or any client.

@@ -43,7 +43,10 @@ const profile_avatar = @import("profile_avatar.zig");
 const avatar_cache = @import("avatar_cache.zig");
 const r2 = @import("r2.zig");
 const site_replay = @import("site_replay.zig");
+const server_control = @import("server_control.zig");
+const server_control_route = @import("server_control_route.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
+const anticheat_evidence = @import("anticheat_evidence.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
 const achievements = @import("achievements.zig");
@@ -56,6 +59,7 @@ const server_source = @embedFile("main.zig");
 
 comptime {
     _ = postgres;
+    _ = server_control_route;
     _ = migrate_postgres;
     _ = postgres_store;
     _ = web_auth;
@@ -70,6 +74,7 @@ comptime {
     _ = r2;
     _ = site_replay;
     _ = anticheat_abi;
+    _ = anticheat_evidence;
     _ = anticheat_plugin;
     _ = anticheat_replay;
     _ = achievements;
@@ -652,6 +657,10 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     try store.exec(clean_sample_sql);
     const copied_score_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(44,{d},'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',0,0,777777,130,0.99,620,325,8,0,0,0,0,1,1,x'00','ffffffffffffffffffffffffffffffff','vanilla',1,71000)", .{reviewer_id});
     try store.exec(copied_score_sql);
+    const failed_copy_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(45,{d},'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,0,1000,0,0.50,10,1,0,0,1,0,0,0,0,x'00','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','vanilla',0,1000)", .{reviewer_id});
+    try store.exec(failed_copy_sql);
+    const same_map_copy_sql = try std.fmt.bufPrintZ(&score_sql_buf, "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed) VALUES(46,{d},'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,16,888888,140,0.99,630,330,7,0,0,0,0,1,1,x'00','cccccccccccccccccccccccccccccccc','vanilla',1,72000)", .{reviewer_id});
+    try store.exec(same_map_copy_sql);
     const observation_id = try store.recordAnticheatObservation(player_id, .{
         .source = .stable_score,
         .module = "private-test",
@@ -730,15 +739,40 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     std.crypto.hash.sha2.Sha256.hash("identical compressed replay", &replay_digest, .{});
     try store.recordReplayFingerprint(player_id, 42, &replay_digest);
     try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(player_id, &replay_digest));
-    try std.testing.expectEqual(@as(u32, 1), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
+    try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
     try store.recordReplayFingerprint(reviewer_id, 44, &replay_digest);
+    try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(player_id, &replay_digest));
+    try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
+    try store.recordReplayFingerprint(reviewer_id, 45, &replay_digest);
+    try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(player_id, &replay_digest));
+    try std.testing.expectEqual(@as(u32, 0), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
+    try store.recordReplayFingerprint(reviewer_id, 46, &replay_digest);
     try std.testing.expectEqual(@as(u32, 1), try store.crossAccountReplayMatches(player_id, &replay_digest));
     try std.testing.expectEqual(@as(u32, 1), try store.crossAccountReplayMatches(reviewer_id, &replay_digest));
+
+    const replay_issue = anticheat_evidence.stableReplay(.missing, 0);
+    const replay_review_id = try store.recordAnticheatObservation(reviewer_id, .{
+        .source = .stable_score,
+        .module = anticheat_evidence.module_name,
+        .score_id = 46,
+        .action = replay_issue.action,
+        .reason = replay_issue.reason,
+        .risk_score = replay_issue.risk_score,
+        .confidence_bps = replay_issue.confidence_bps,
+        .evidence = replay_issue.evidence,
+        .decision_flags = replay_issue.decision_flags,
+        .rule_revision = replay_issue.rule_revision,
+    });
+    const replay_review = try store.staffAnticheatJson(std.testing.allocator);
+    defer std.testing.allocator.free(replay_review);
+    try std.testing.expect(std.mem.indexOf(u8, replay_review, "\"module\":\"zigcho-host\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay_review, "\"reason\":2006") != null);
 
     try std.testing.expectError(error.InvalidAnticheatReview, store.reviewAnticheatObservation(reviewer_id, observation_id, .clean, "x"));
     try std.testing.expectError(error.AnticheatObservationNotFound, store.reviewAnticheatObservation(reviewer_id, 9999, .dismissed, "not this finding"));
     try store.reviewAnticheatObservation(reviewer_id, observation_id, .clean, "verified clean replay fixture");
     try store.reviewAnticheatObservation(reviewer_id, clean_sample_id, .clean, "verified ordinary sampled play");
+    try store.reviewAnticheatObservation(reviewer_id, replay_review_id, .dismissed, "missing replay retained for review");
     const reviewed = try store.staffAnticheatJson(std.testing.allocator);
     defer std.testing.allocator.free(reviewed);
     try std.testing.expect(std.mem.indexOf(u8, reviewed, "\"pending\":0") != null);
@@ -748,6 +782,89 @@ test "anticheat observations stay structured reviewable and non enforcing" {
     defer std.testing.allocator.free(player.name);
     defer std.testing.allocator.free(player.safe_name);
     try std.testing.expect(!player.restricted);
+}
+
+test "anticheat null signals coalesce without deleting score evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/anticheat-retention.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES" ++
+            "(60,'signal','signal',x'00',x'00'),(61,'reviewer','reviewer',x'00',x'00');" ++
+            "INSERT INTO scores(id,user_id,map_md5,mode,mods,score,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed) " ++
+            "VALUES(600,60,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,0,123456,0.98,100,100,0,0,0,0,0,1,1)",
+    );
+
+    const base: storage.AnticheatObservation = .{
+        .source = .stable_login,
+        .module = "retention-test",
+        .action = 1,
+        .reason = 100,
+        .risk_score = 250,
+        .confidence_bps = 7000,
+        .evidence = 4,
+        .objects_checked = 1,
+    };
+    const first_id = try store.recordAnticheatObservation(60, base);
+    try std.testing.expectEqual(first_id, try store.recordAnticheatObservation(60, base));
+    var changed = base;
+    changed.movement_velocity_stddev_milli = 1;
+    const changed_id = try store.recordAnticheatObservation(60, changed);
+    try std.testing.expect(changed_id != first_id);
+
+    const score_id = try store.recordAnticheatObservation(60, .{
+        .source = .stable_score,
+        .module = "retention-test",
+        .score_id = 600,
+        .action = 1,
+        .reason = 101,
+        .risk_score = 300,
+        .confidence_bps = 8000,
+        .evidence = 8,
+    });
+    try store.reviewAnticheatObservation(61, score_id, .uncertain, "retain score-linked evidence");
+
+    try store.recordLastFmFlag(60, 123);
+    try store.recordLastFmFlag(60, 123);
+    var audit: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM audit_log WHERE action='stable.lastfm_flag' AND target='user:60' AND detail='flags:123'", -1, &audit, null));
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(audit));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(audit, 0));
+    _ = storage.c.sqlite3_finalize(audit);
+
+    try store.exec(
+        "UPDATE anticheat_observations SET created_at=1 WHERE id IN (SELECT id FROM anticheat_observations WHERE source='stable_login' ORDER BY id LIMIT 1);" ++
+            "UPDATE anticheat_observations SET created_at=1,reviewed_at=1 WHERE source='stable_score';" ++
+            "UPDATE audit_log SET created_at=1 WHERE action='anticheat.observe';" ++
+            "WITH RECURSIVE old(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM old WHERE n<130) " ++
+            "INSERT INTO audit_log(actor_id,action,target,detail,created_at) SELECT 60,'stable.lastfm_flag','user:60','old:'||n,1 FROM old;" ++
+            "DELETE FROM scores WHERE id=600",
+    );
+    try store.recordLastFmFlag(60, 124);
+    audit = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM audit_log WHERE action='stable.lastfm_flag' AND created_at=1", -1, &audit, null));
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(audit));
+    try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(audit, 0));
+    _ = storage.c.sqlite3_finalize(audit);
+
+    var newest = base;
+    newest.reason = 102;
+    _ = try store.recordAnticheatObservation(60, newest);
+    var retained: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT count(*) FROM anticheat_observations WHERE id=?1 AND source='stable_score'),(SELECT count(*) FROM anticheat_observations WHERE id=?2),(SELECT count(*) FROM audit_log WHERE action='anticheat.observe' AND detail LIKE '% score_id=600 %'),(SELECT count(*) FROM audit_log WHERE action='anticheat.observe' AND detail LIKE '% score_id=0 %' AND created_at=1),(SELECT count(*) FROM audit_log WHERE action='stable.lastfm_flag' AND created_at=1)", -1, &retained, null));
+    defer _ = storage.c.sqlite3_finalize(retained);
+    _ = storage.c.sqlite3_bind_int64(retained, 1, score_id);
+    _ = storage.c.sqlite3_bind_int64(retained, 2, first_id);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(retained));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(retained, 0));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(retained, 1));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(retained, 2));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(retained, 3));
+    try std.testing.expectEqual(@as(c_int, 0), storage.c.sqlite3_column_int(retained, 4));
 }
 
 test "beatmap hydration backoff and archive pruning stay bounded" {
@@ -1231,7 +1348,7 @@ test "stable login details require the complete client hardware contract" {
     try std.testing.expectError(error.InvalidLoginDetails, bancho.parseStableLoginDetails("b20260811|0|0|short:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:|0"));
 }
 
-test "exact stable hardware matches restrict both accounts without partial false positives" {
+test "exact stable hardware matches remain review evidence without restriction" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -1269,10 +1386,13 @@ test "exact stable hardware matches restrict both accounts without partial false
     };
     var partial_result = try store.recordClientHardware(41, partial);
     defer partial_result.deinit();
-    try std.testing.expect(!partial_result.restricted());
+    try std.testing.expectEqual(@as(usize, 0), partial_result.matched_user_ids.len);
     var second_exact = try store.recordClientHardware(41, exact);
     defer second_exact.deinit();
     try std.testing.expectEqualSlices(i32, &.{40}, second_exact.matched_user_ids);
+    var second_exact_again = try store.recordClientHardware(41, exact);
+    defer second_exact_again.deinit();
+    try std.testing.expectEqualSlices(i32, &.{40}, second_exact_again.matched_user_ids);
 
     const first_user = (try store.userById(std.testing.allocator, 40)).?;
     defer std.testing.allocator.free(first_user.name);
@@ -1280,8 +1400,14 @@ test "exact stable hardware matches restrict both accounts without partial false
     const second_user = (try store.userById(std.testing.allocator, 41)).?;
     defer std.testing.allocator.free(second_user.name);
     defer std.testing.allocator.free(second_user.safe_name);
-    try std.testing.expect(first_user.restricted);
-    try std.testing.expect(second_user.restricted);
+    try std.testing.expect(!first_user.restricted);
+    try std.testing.expect(!second_user.restricted);
+
+    var audit_stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM audit_log WHERE action='anticheat.hardware_match' AND target='user:41' AND detail LIKE 'mode=observe exact_hardware_match%'", -1, &audit_stmt, null));
+    defer _ = storage.c.sqlite3_finalize(audit_stmt);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(audit_stmt));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(audit_stmt, 0));
 
     var stmt: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT occurrences FROM client_hardware WHERE user_id=40 AND adapters_md5='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'", -1, &stmt, null));
@@ -1302,10 +1428,10 @@ test "exact stable hardware matches restrict both accounts without partial false
     common_one.deinit();
     var common_two = try store.recordClientHardware(43, common);
     defer common_two.deinit();
-    try std.testing.expect(!common_two.restricted());
+    try std.testing.expectEqual(@as(usize, 0), common_two.matched_user_ids.len);
 }
 
-test "an exact hardware login restricts both accounts and disconnects the matched session" {
+test "an exact hardware login keeps both accounts online and unrestricted" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -1331,17 +1457,23 @@ test "an exact hardware login restricts both accounts and disconnects the matche
     try std.testing.expectEqual(second_id, second_login.user_id);
     try std.testing.expectEqual(@as(u32, 1), second_login.hardware_match_count);
     try std.testing.expect(!second_login.running_under_wine);
-    try std.testing.expect(sessions.byUser(first_id) == null);
-    try std.testing.expect(sessions.byUser(second_id).?.user.restricted);
-    try expectPacket(second_login.body, .account_restricted);
+    try std.testing.expect(sessions.byUser(first_id) != null);
+    try std.testing.expect(!sessions.byUser(first_id).?.user.restricted);
+    try std.testing.expect(!sessions.byUser(second_id).?.user.restricted);
+    var response_reader: protocol.Reader = .{ .data = second_login.body };
+    while (try response_reader.next()) |packet| try std.testing.expect(@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.account_restricted));
 
     const first_user = (try store.userById(std.testing.allocator, first_id)).?;
     defer std.testing.allocator.free(first_user.name);
     defer std.testing.allocator.free(first_user.safe_name);
-    try std.testing.expect(first_user.restricted);
+    const second_user = (try store.userById(std.testing.allocator, second_id)).?;
+    defer std.testing.allocator.free(second_user.name);
+    defer std.testing.allocator.free(second_user.safe_name);
+    try std.testing.expect(!first_user.restricted);
+    try std.testing.expect(!second_user.restricted);
 }
 
-test "high confidence stable client flags restrict once while registry evidence stays audit only" {
+test "high confidence stable client flags stay review only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -1357,18 +1489,42 @@ test "high confidence stable client flags restrict once while registry evidence 
     try std.testing.expect(!registry_user.restricted);
 
     const hq_flags = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
-    try std.testing.expect(try store.restrictForClientFlag(50, hq_flags));
-    try std.testing.expect(!try store.restrictForClientFlag(50, hq_flags));
+    try store.recordLastFmFlag(50, hq_flags);
+    const observation = anticheat_evidence.stableLastFm(hq_flags).?;
+    _ = try store.recordAnticheatObservation(50, .{
+        .source = .stable_lastfm,
+        .module = anticheat_evidence.module_name,
+        .action = observation.action,
+        .reason = observation.reason,
+        .risk_score = observation.risk_score,
+        .confidence_bps = observation.confidence_bps,
+        .evidence = observation.evidence,
+        .decision_flags = observation.decision_flags,
+        .rule_revision = observation.rule_revision,
+    });
     const hq_user = (try store.userById(std.testing.allocator, 50)).?;
     defer std.testing.allocator.free(hq_user.name);
     defer std.testing.allocator.free(hq_user.safe_name);
-    try std.testing.expect(hq_user.restricted);
+    try std.testing.expect(!hq_user.restricted);
 
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
     _ = try sessions.create(try testSessionUser(std.testing.allocator, 50, "hq"), 0, 0, 0);
-    bancho.disconnectRestrictedUser(std.testing.allocator, &sessions, 50);
-    try std.testing.expect(sessions.byUser(50) == null);
+    try std.testing.expect(sessions.byUser(50) != null);
+    const review = try store.staffAnticheatJson(std.testing.allocator);
+    defer std.testing.allocator.free(review);
+    try std.testing.expect(std.mem.indexOf(u8, review, "\"module\":\"zigcho-host\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review, "\"source\":\"stable_lastfm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review, "\"review_label\":\"pending\"") != null);
+    var audit_stmt: ?*storage.c.sqlite3_stmt = null;
+    try std.testing.expectEqual(storage.c.SQLITE_OK, storage.c.sqlite3_prepare_v2(store.db, "SELECT count(*) FROM audit_log WHERE action='stable.lastfm_flag' AND target='user:50' AND detail=?1", -1, &audit_stmt, null));
+    defer _ = storage.c.sqlite3_finalize(audit_stmt);
+    var detail_buf: [32]u8 = undefined;
+    const detail = try std.fmt.bufPrint(&detail_buf, "flags:{d}", .{hq_flags});
+    _ = storage.c.sqlite3_bind_text(audit_stmt, 1, detail.ptr, @intCast(detail.len), null);
+    try std.testing.expectEqual(storage.c.SQLITE_ROW, storage.c.sqlite3_step(audit_stmt));
+    try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(audit_stmt, 0));
+    try std.testing.expect(sessions.byUser(50) != null);
 }
 
 test "owned stable submissions do not borrow decrypted request memory" {
@@ -1427,6 +1583,96 @@ test "accounts keep one assigned default avatar" {
     try std.testing.expect(user_avatar == 1 or user_avatar == 2);
     try std.testing.expectEqual(user_avatar, (try store.avatarForUser(user_id)).?);
     try std.testing.expect((try store.avatarForUser(999_999)) == null);
+}
+
+test "public name history follows account renames without exposing restricted users" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/name-history.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+
+    const user_id = try store.register("old name", "name-history@example.invalid", "00000000000000000000000000000000");
+    try store.updateAccountUsername(user_id, "new name");
+    const history_json = (try store.siteNameHistoryJson(std.testing.allocator, user_id)).?;
+    defer std.testing.allocator.free(history_json);
+    var history = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, history_json, .{});
+    defer history.deinit();
+    try std.testing.expectEqual(@as(i64, user_id), history.value.object.get("id").?.integer);
+    try std.testing.expectEqualStrings("new name", history.value.object.get("name").?.string);
+    const entries = history.value.object.get("history").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("old name", entries[0].object.get("name").?.string);
+    try std.testing.expect(entries[0].object.get("changed_at").?.integer > 0);
+
+    try store.setRestricted(3, user_id, true, "name history privacy fixture");
+    try std.testing.expect((try store.siteNameHistoryJson(std.testing.allocator, user_id)) == null);
+    try std.testing.expect((try store.siteNameHistoryJson(std.testing.allocator, 3)) == null);
+}
+
+test "website name history is shared by profile and player links" {
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/users/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "/name-history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "name-history-tooltip") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-name-history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "a[href^=\"/u/\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "role','tooltip") != null);
+}
+
+test "developer server controls persist fixed gates and audit every change" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/server-controls.db", .{tmp.sub_path});
+    var actor_id: i32 = 0;
+    {
+        var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+        defer store.close();
+        try store.migrate();
+        actor_id = try store.register("infra dev", "infra-dev@example.invalid", "00000000000000000000000000000000");
+        try std.testing.expect(try store.serverControlEnabled(.stable_scores));
+        try store.setServerControl(actor_id, .stable_scores, false, "score maintenance window");
+        try std.testing.expect(!try store.serverControlEnabled(.stable_scores));
+        const json = try store.staffServerControlsJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 45), parsed.value.object.get("schema").?.integer);
+        const controls = parsed.value.object.get("controls").?.array.items;
+        try std.testing.expectEqual(server_control.definitions.len, controls.len);
+        var found = false;
+        for (controls) |control| {
+            if (!std.mem.eql(u8, control.object.get("key").?.string, "stable_scores")) continue;
+            found = true;
+            try std.testing.expect(!control.object.get("enabled").?.bool);
+            try std.testing.expectEqualStrings("score maintenance window", control.object.get("reason").?.string);
+            try std.testing.expectEqualStrings("infra dev", control.object.get("updated_by").?.string);
+        }
+        try std.testing.expect(found);
+    }
+    {
+        var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+        defer store.close();
+        try store.migrate();
+        try std.testing.expect(!try store.serverControlEnabled(.stable_scores));
+        try store.setServerControl(actor_id, .stable_scores, true, "maintenance finished");
+        try std.testing.expect(try store.serverControlEnabled(.stable_scores));
+        const audit = try store.staffAuditJson(std.testing.allocator);
+        defer std.testing.allocator.free(audit);
+        try std.testing.expect(std.mem.indexOf(u8, audit, "infra.feature") != null);
+        try std.testing.expect(std.mem.indexOf(u8, audit, "feature:stable_scores") != null);
+    }
+}
+
+test "developer operations plane stays bounded and recoverable" {
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/staff/infrastructure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "developer access required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "restart zigcho") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_source, "infra.restart") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "no shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "deploy and rollback stay outside the browser") != null);
 }
 
 test "website profile settings and private avatar metadata stay account scoped" {
@@ -1729,6 +1975,23 @@ test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "<option value=\"kick\">kick from game</option>") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "<option value=\"revoke_sessions\">revoke every session</option>") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "['reports','reports']") != null);
+}
+
+test "website home leads with playable clients instead of a service directory" {
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "kai is the front door") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "const publicServices=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "<h2>services</h2>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "play osu! on kai.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "Stable + zigcho!lazer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"home-actions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"home-client stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"home-client lazer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "https://github.com/raya-ac/zigcho/releases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "href=\"https://osu.kai.ovh/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "href=\"/api/v1/status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "aria-label=\"live server facts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "get('/api/v1/rankings?source=all&mode=0')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "playerRows(r.players,5,'all',0)") != null);
 }
 
 test "website routes keep shared language without sharing one layout" {
@@ -6563,7 +6826,7 @@ test "lazer solo score tokens are user bound expiring and single use" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "PRAGMA user_version", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(version_stmt, 0));
 }
 
 test "ranked play ratings migrate and apply each room once per ruleset" {
@@ -6584,7 +6847,7 @@ test "ranked play ratings migrate and apply each room once per ruleset" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('lazer_ranked_ratings','lazer_ranked_matches'))", -1, &version_stmt, null));
     defer _ = storage.c.sqlite3_finalize(version_stmt);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(version_stmt));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(version_stmt, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(version_stmt, 0));
     try std.testing.expectEqual(@as(c_int, 2), storage.c.sqlite3_column_int(version_stmt, 1));
 
     const initial = try store.lazerRankedRating(10, 0);
@@ -6668,7 +6931,7 @@ test "schema forty widens chat read cursors and preserves public acknowledgement
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT instr(sql,'2000000001') FROM sqlite_master WHERE type='table' AND name='lazer_channel_reads')", -1, &schema, null));
     defer _ = storage.c.sqlite3_finalize(schema);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(schema));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(schema, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(schema, 0));
     try std.testing.expect(storage.c.sqlite3_column_int(schema, 1) > 0);
 }
 
@@ -6750,7 +7013,7 @@ test "schema forty two stores constrained profile history and replay views" {
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='user_stats_history'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='user_stats_history_lookup'),(SELECT count(*) FROM user_stats_history),(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='score_replay_views'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='score_replay_views_owner'),(SELECT count(*) FROM score_replay_views),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='user_stats_history_retention'),(SELECT count(*) FROM sqlite_master WHERE type='index' AND name='friends_inbound')", -1, &schema, null));
     defer _ = storage.c.sqlite3_finalize(schema);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(schema));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(schema, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(schema, 0));
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 1));
     try std.testing.expectEqual(@as(c_int, 1), storage.c.sqlite3_column_int(schema, 2));
     try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(schema, 3));
@@ -6794,7 +7057,7 @@ test "schema forty four backfills Classic score without confusing score without 
     var migrated: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score,total_score_without_mods,legacy_total_score FROM lazer_scores WHERE id=1", -1, &migrated, null));
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(migrated));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(migrated, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(migrated, 0));
     try std.testing.expectEqual(@as(i64, 987654), storage.c.sqlite3_column_int64(migrated, 1));
     try std.testing.expectEqual(@as(i64, 900000), storage.c.sqlite3_column_int64(migrated, 2));
     try std.testing.expectEqual(@as(i64, 98765), storage.c.sqlite3_column_int64(migrated, 3));
@@ -6815,7 +7078,7 @@ test "schema forty four backfills Classic score without confusing score without 
     var repaired: ?*storage.c.sqlite3_stmt = null;
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score_without_mods,legacy_total_score,(SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'lazer_scores_%score%') FROM lazer_scores WHERE id=1", -1, &repaired, null));
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(repaired));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(repaired, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(repaired, 0));
     try std.testing.expectEqual(@as(i64, 765432), storage.c.sqlite3_column_int64(repaired, 1));
     try std.testing.expectEqual(@as(i64, 98765), storage.c.sqlite3_column_int64(repaired, 2));
     try std.testing.expectEqual(@as(c_int, 4), storage.c.sqlite3_column_int(repaired, 3));
@@ -6827,7 +7090,7 @@ test "schema forty four backfills Classic score without confusing score without 
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_OK), storage.c.sqlite3_prepare_v2(store.db, "SELECT (SELECT user_version FROM pragma_user_version),total_score_without_mods,legacy_total_score FROM lazer_scores WHERE id=1", -1, &compatible, null));
     defer _ = storage.c.sqlite3_finalize(compatible);
     try std.testing.expectEqual(@as(c_int, storage.c.SQLITE_ROW), storage.c.sqlite3_step(compatible));
-    try std.testing.expectEqual(@as(c_int, 44), storage.c.sqlite3_column_int(compatible, 0));
+    try std.testing.expectEqual(@as(c_int, 45), storage.c.sqlite3_column_int(compatible, 0));
     try std.testing.expectEqual(@as(i64, 888000), storage.c.sqlite3_column_int64(compatible, 1));
     try std.testing.expectEqual(@as(i64, 777000), storage.c.sqlite3_column_int64(compatible, 2));
 }
@@ -7956,6 +8219,7 @@ test "ranked stable PP is stored and updates normal player stats" {
         .language_id = 2,
     }, 1_787_456_000);
     try store.updateBeatmapUpstreamStats(metadata.id, 123, 45, 9);
+    try std.testing.expect(try store.addFavourite(1, metadata.set_id));
     const archive_bytes = "PK\x03\x04synthetic archive fixture";
     var archive_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(archive_bytes, &archive_digest, .{});
@@ -7971,7 +8235,10 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expectEqual(@as(i64, 900000000), parsed_set.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("ranked", parsed_set.value.object.get("status").?.string);
     try std.testing.expectEqual(@as(i64, mapper.id), parsed_set.value.object.get("user_id").?.integer);
-    try std.testing.expectEqual(@as(i64, 39), parsed_set.value.object.get("favourite_count").?.integer);
+    // Upstream popularity is retained for metadata provenance only. Every
+    // player-visible counter belongs to kai and starts from local activity.
+    try std.testing.expectEqual(@as(i64, 0), parsed_set.value.object.get("play_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_set.value.object.get("favourite_count").?.integer);
     try std.testing.expect(parsed_set.value.object.get("video").?.bool);
     try std.testing.expectEqualStrings("Rock", parsed_set.value.object.get("genre").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("English", parsed_set.value.object.get("language").?.object.get("name").?.string);
@@ -7979,8 +8246,8 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expect(!parsed_set.value.object.get("availability").?.object.get("download_disabled").?.bool);
     try std.testing.expectEqual(@as(usize, 1), parsed_set.value.object.get("beatmaps").?.array.items.len);
     const detailed_map = parsed_set.value.object.get("beatmaps").?.array.items[0].object;
-    try std.testing.expectEqual(@as(i64, 123), detailed_map.get("playcount").?.integer);
-    try std.testing.expectEqual(@as(i64, 45), detailed_map.get("passcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), detailed_map.get("playcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), detailed_map.get("passcount").?.integer);
     try std.testing.expectEqual(@as(i64, 9), detailed_map.get("hit_length").?.integer);
     try std.testing.expectEqual(@as(i64, mapper.id), detailed_map.get("owners").?.array.items[0].object.get("id").?.integer);
     const lazer_lookup = (try store.lazerBeatmapLookup(std.testing.allocator, null, &hash, null)).?;
@@ -7989,6 +8256,8 @@ test "ranked stable PP is stored and updates normal player stats" {
     defer parsed_lookup.deinit();
     try std.testing.expectEqual(@as(i64, 900000001), parsed_lookup.value.object.get("id").?.integer);
     try std.testing.expectEqualStrings("ranked", parsed_lookup.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed_lookup.value.object.get("playcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed_lookup.value.object.get("passcount").?.integer);
     try std.testing.expectEqualStrings("ranked", parsed_lookup.value.object.get("beatmapset").?.object.get("status").?.string);
     const lazer_search = try store.lazerBeatmapSearch(std.testing.allocator, "Fixture", 0, 0, null);
     defer std.testing.allocator.free(lazer_search);
@@ -8045,6 +8314,15 @@ test "ranked stable PP is stored and updates normal player stats" {
         .achievement_stars = 3.75,
     };
     const score_id = try store.insertStableScore(1, score, 26.80, "replay", 12_000);
+    const local_set = (try store.lazerBeatmapSet(std.testing.allocator, metadata.set_id, null)).?;
+    defer std.testing.allocator.free(local_set);
+    const parsed_local_set = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, local_set, .{});
+    defer parsed_local_set.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_local_set.value.object.get("play_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_local_set.value.object.get("favourite_count").?.integer);
+    const local_map = parsed_local_set.value.object.get("beatmaps").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 1), local_map.get("playcount").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), local_map.get("passcount").?.integer);
     const website_board = (try store.siteBeatmapLeaderboard(std.testing.allocator, 900000001, .all, 0)).?;
     defer std.testing.allocator.free(website_board);
     var parsed_website_board = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, website_board, .{});

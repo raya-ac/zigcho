@@ -60,8 +60,10 @@ const Connection = struct {
     frame_bundle_count: u8 = 0,
     io: std.Io,
     write_mutex: std.Io.Mutex = .init,
+    invocation_mutex: std.Io.Mutex = .init,
     socket: ?*std.http.Server.WebSocket = null,
-    alive: bool = true,
+    alive: std.atomic.Value(bool) = .init(true),
+    accepting_invocations: std.atomic.Value(bool) = .init(true),
 
     fn retain(self: *Connection) void {
         _ = self.references.fetchAdd(1, .monotonic);
@@ -77,17 +79,20 @@ const Connection = struct {
     fn send(self: *Connection, frame: []const u8) void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
-        if (!self.alive) return;
+        if (!self.alive.load(.acquire)) return;
         const socket = self.socket orelse return;
         socket.writeMessage(frame, .binary) catch {
-            self.alive = false;
+            self.accepting_invocations.store(false, .release);
+            self.alive.store(false, .release);
         };
     }
 
     fn close(self: *Connection) void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
-        self.alive = false;
+        self.accepting_invocations.store(false, .release);
+        if (self.alive.load(.acquire)) if (self.socket) |socket| socket.writeMessage("", .connection_close) catch {};
+        self.alive.store(false, .release);
         self.socket = null;
     }
 
@@ -118,6 +123,7 @@ pub const Manager = struct {
     store: ?*storage.Store = null,
     mutex: std.Io.Mutex = .init,
     connections: std.ArrayList(*Connection) = .empty,
+    enabled: std.atomic.Value(bool) = .init(true),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
         return .{ .allocator = allocator, .io = io };
@@ -125,6 +131,40 @@ pub const Manager = struct {
 
     pub fn bindStore(self: *Manager, store: *storage.Store) void {
         self.store = store;
+    }
+
+    pub fn isEnabled(self: *const Manager) bool {
+        return self.enabled.load(.acquire);
+    }
+
+    pub fn setEnabled(self: *Manager, enabled: bool) void {
+        self.enabled.store(enabled, .release);
+        if (enabled) return;
+        var targets: [max_connections]*Connection = undefined;
+        var count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (self.connections.items) |connection| {
+            if (count == targets.len) break;
+            connection.retain();
+            targets[count] = connection;
+            count += 1;
+        }
+        self.mutex.unlock(self.io);
+        for (targets[0..count]) |connection| {
+            connection.invocation_mutex.lockUncancelable(self.io);
+            self.mutex.lockUncancelable(self.io);
+            const still_current = std.mem.indexOfScalar(*Connection, self.connections.items, connection) != null;
+            if (still_current) {
+                connection.accepting_invocations.store(false, .release);
+                connection.active = null;
+                connection.subscription_count = 0;
+                self.removeConnectionLocked(connection);
+            }
+            self.mutex.unlock(self.io);
+            connection.invocation_mutex.unlock(self.io);
+            if (still_current) connection.close();
+            connection.release();
+        }
     }
 
     pub fn deinit(self: *Manager) void {
@@ -135,7 +175,7 @@ pub const Manager = struct {
     fn connectionByUserLocked(self: *Manager, user_id: i32) ?*Connection {
         var found: ?*Connection = null;
         for (self.connections.items) |connection| {
-            if (connection.alive and connection.user_id == user_id) found = connection;
+            if (connection.alive.load(.acquire) and connection.user_id == user_id) found = connection;
         }
         return found;
     }
@@ -151,7 +191,7 @@ pub const Manager = struct {
     fn watchersLocked(self: *Manager, user_id: i32, output: *[max_connections]*Connection) usize {
         var count: usize = 0;
         for (self.connections.items) |connection| {
-            if (!connection.alive or !connection.watches(user_id)) continue;
+            if (!connection.alive.load(.acquire) or !connection.watches(user_id)) continue;
             if (count == output.len) break;
             connection.retain();
             output[count] = connection;
@@ -169,12 +209,22 @@ pub const Manager = struct {
         return null;
     }
 
+    pub fn connectionCount(self: *Manager) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var count: usize = 0;
+        for (self.connections.items) |connection| if (connection.alive.load(.acquire)) {
+            count += 1;
+        };
+        return count;
+    }
+
     pub fn disconnectUser(self: *Manager, user_id: i32) bool {
         var targets: [max_connections]*Connection = undefined;
         var count: usize = 0;
         self.mutex.lockUncancelable(self.io);
         for (self.connections.items) |connection| {
-            if (!connection.alive or connection.user_id != user_id or count == targets.len) continue;
+            if (!connection.alive.load(.acquire) or connection.user_id != user_id or count == targets.len) continue;
             connection.retain();
             targets[count] = connection;
             count += 1;
@@ -188,6 +238,7 @@ pub const Manager = struct {
     }
 
     fn connect(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !*Connection {
+        if (!self.isEnabled()) return error.SpectatorDisabled;
         if (user.id <= 0 or user.name.len == 0 or user.name.len > 64) return error.InvalidSpectatorUser;
         const connection = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(connection);
@@ -196,6 +247,10 @@ pub const Manager = struct {
 
         var replaced: ?*Connection = null;
         self.mutex.lockUncancelable(self.io);
+        if (!self.isEnabled()) {
+            self.mutex.unlock(self.io);
+            return error.SpectatorDisabled;
+        }
         if (self.connections.items.len >= max_connections) {
             self.mutex.unlock(self.io);
             return error.SpectatorConnectionLimit;
@@ -265,13 +320,13 @@ pub const Manager = struct {
         try socket.writeMessage("{}\x1e", handshake.opcode);
         const connection = try self.connect(user, socket);
         defer self.disconnect(connection);
-        while (connection.alive) {
+        while (connection.alive.load(.acquire)) {
             const message = socket.readSmallMessage() catch return;
             switch (message.opcode) {
                 .ping => {
                     connection.write_mutex.lockUncancelable(connection.io);
                     defer connection.write_mutex.unlock(connection.io);
-                    if (connection.alive) try socket.writeMessage(message.data, .pong);
+                    if (connection.alive.load(.acquire)) try socket.writeMessage(message.data, .pong);
                 },
                 .binary => try self.handleFrames(connection, message.data),
                 else => {},
@@ -301,6 +356,7 @@ pub const Manager = struct {
     }
 
     fn handleHubMessage(self: *Manager, connection: *Connection, payload: []const u8) !void {
+        if (!self.isEnabled() or !connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) return error.ConnectionClose;
         var reader: signalr.MessagePackReader = .{ .data = payload };
         const count = try reader.arrayLen();
         if (count == 0) return error.InvalidSignalRMessage;
@@ -321,7 +377,14 @@ pub const Manager = struct {
         } else try reader.string();
         const target = try reader.string();
         const argument_count = try reader.arrayLen();
-        self.handleInvocation(connection, invocation_id, target, argument_count, &reader) catch |err| {
+        connection.invocation_mutex.lockUncancelable(self.io);
+        if (!self.isEnabled() or !connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) {
+            connection.invocation_mutex.unlock(self.io);
+            return error.ConnectionClose;
+        }
+        const invocation_result = self.handleInvocation(connection, invocation_id, target, argument_count, &reader);
+        connection.invocation_mutex.unlock(self.io);
+        invocation_result catch |err| {
             std.log.warn("event=lazer_spectator_invocation_failed user_id={d} target={s} error={t}", .{ connection.user_id, target, err });
             if (invocation_id) |id| {
                 const frame = signalr.completionErrorOwned(self.allocator, id, "spectator request was not accepted") catch return;
@@ -339,20 +402,21 @@ pub const Manager = struct {
     }
 
     fn handleInvocation(self: *Manager, connection: *Connection, invocation_id: ?[]const u8, target: []const u8, argument_count: usize, reader: *signalr.MessagePackReader) !void {
+        if (!self.isEnabled()) return error.ConnectionClose;
         if (std.mem.eql(u8, target, "BeginPlaySessionV2")) {
             if (argument_count != 2) return error.InvalidSpectatorArguments;
-            const token = try reader.nullableInteger();
-            return self.beginPlay(connection, invocation_id, token, try reader.raw());
+            const arguments = try tokenPayloadArguments(reader);
+            return self.beginPlay(connection, invocation_id, arguments.token, arguments.payload);
         }
         if (std.mem.eql(u8, target, "SendFrameDataV2")) {
             if (argument_count != 2) return error.InvalidSpectatorArguments;
-            const token = try reader.nullableInteger();
-            return self.sendFrames(connection, invocation_id, token, try reader.raw());
+            const arguments = try tokenPayloadArguments(reader);
+            return self.sendFrames(connection, invocation_id, arguments.token, arguments.payload);
         }
         if (std.mem.eql(u8, target, "EndPlaySessionV2")) {
             if (argument_count != 2) return error.InvalidSpectatorArguments;
-            const token = try reader.nullableInteger();
-            return self.endPlay(connection, invocation_id, token, try reader.integer());
+            const arguments = try tokenFinalStateArguments(reader);
+            return self.endPlay(connection, invocation_id, arguments.token, arguments.final_state);
         }
         if (std.mem.eql(u8, target, "StartWatchingUser")) {
             if (argument_count != 1) return error.InvalidSpectatorArguments;
@@ -550,6 +614,48 @@ pub const Manager = struct {
     }
 };
 
+const TokenPayloadArguments = struct {
+    token: ?i64,
+    payload: []const u8,
+};
+
+fn nextValueIsArray(reader: *const signalr.MessagePackReader) bool {
+    if (reader.pos >= reader.data.len) return false;
+    const tag = reader.data[reader.pos];
+    return (tag >= 0x90 and tag <= 0x9f) or tag == 0xdc or tag == 0xdd;
+}
+
+fn tokenPayloadArguments(reader: *signalr.MessagePackReader) !TokenPayloadArguments {
+    // Some shipped lazer builds used the pre-final V2 argument order. The payload is
+    // unambiguously an array, so accepting both shapes does not loosen validation.
+    if (nextValueIsArray(reader)) {
+        const payload = try reader.raw();
+        return .{ .token = try reader.nullableInteger(), .payload = payload };
+    }
+    return .{ .token = try reader.nullableInteger(), .payload = try reader.raw() };
+}
+
+const TokenFinalStateArguments = struct {
+    token: ?i64,
+    final_state: i64,
+};
+
+fn tokenFinalStateArguments(reader: *signalr.MessagePackReader) !TokenFinalStateArguments {
+    const first = try reader.nullableInteger();
+    const second = try reader.nullableInteger();
+    if (second == null) {
+        const final_state = first orelse return error.InvalidSpectatorArguments;
+        if (final_state < 3 or final_state > 5) return error.InvalidSpectatorArguments;
+        return .{ .token = null, .final_state = final_state };
+    }
+    if (first) |value| {
+        if (value >= 3 and value <= 5 and (second.? < 3 or second.? > 5)) {
+            return .{ .token = second, .final_state = value };
+        }
+    }
+    return .{ .token = first, .final_state = second.? };
+}
+
 fn castUserId(value: i64) !i32 {
     const id = std.math.cast(i32, value) orelse return error.InvalidSpectatorUser;
     return if (id > 0) id else error.InvalidSpectatorUser;
@@ -726,6 +832,108 @@ test "lazer spectator state requires an online map and a playing legacy ruleset"
     try std.testing.expectError(error.InvalidSpectatorBeatmap, parseState(&offline, null));
     const idle = [_]u8{ 0x95, 75, 0, 0x90, 0, 0x80 };
     try std.testing.expectError(error.InvalidSpectatorState, parseState(&idle, null));
+}
+
+test "spectator feature gate drains sessions at the invocation boundary and reopens" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const user: domain.User = .{ .id = 4, .name = "gate user", .safe_name = "gate_user", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(user, fake_socket);
+    connection.socket = null;
+    const stale_user: domain.User = .{ .id = 7, .name = "stale gate", .safe_name = "stale_gate", .country = .{ 'G', 'B' } };
+    const stale = try manager.connect(stale_user, fake_socket);
+    stale.socket = null;
+    stale.close();
+    try std.testing.expectEqual(@as(usize, 2), manager.connections.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.connectionCount());
+    connection.subscriptions[0] = 7;
+    connection.subscription_count = 1;
+
+    const Toggle = struct {
+        manager: *Manager,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.manager.setEnabled(false);
+            context.done.store(true, .release);
+        }
+    };
+    connection.invocation_mutex.lockUncancelable(std.testing.io);
+    var toggle: Toggle = .{ .manager = &manager };
+    const thread = try std.Thread.spawn(.{}, Toggle.run, .{&toggle});
+    while (manager.isEnabled()) std.Thread.yield() catch {};
+    try std.testing.expect(toggle.started.load(.acquire));
+    try std.testing.expect(!toggle.done.load(.acquire));
+    connection.invocation_mutex.unlock(std.testing.io);
+    thread.join();
+
+    try std.testing.expect(!manager.isEnabled());
+    try std.testing.expect(!connection.alive.load(.acquire));
+    try std.testing.expect(!connection.accepting_invocations.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), connection.subscription_count);
+    try std.testing.expectEqual(@as(usize, 0), manager.connectionCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.connections.items.len);
+    try std.testing.expectError(error.SpectatorDisabled, manager.connect(user, fake_socket));
+    try std.testing.expectError(error.ConnectionClose, manager.handleHubMessage(connection, &.{}));
+
+    manager.setEnabled(true);
+    try std.testing.expect(manager.isEnabled());
+    const reopened = try manager.connect(user, fake_socket);
+    reopened.socket = null;
+    try std.testing.expect(reopened.alive.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), manager.connectionCount());
+    manager.disconnect(connection);
+    manager.disconnect(stale);
+    manager.disconnect(reopened);
+}
+
+test "lazer spectator v2 accepts canonical and shipped payload-first argument order" {
+    var canonical: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer canonical.deinit();
+    const canonical_pack: signalr.MessagePackWriter = .{ .writer = &canonical.writer };
+    try canonical_pack.integer(42);
+    try canonical_pack.array(5);
+    try canonical_pack.integer(75);
+    try canonical_pack.integer(0);
+    try canonical_pack.array(0);
+    try canonical_pack.integer(1);
+    try canonical_pack.map(0);
+    var canonical_reader: signalr.MessagePackReader = .{ .data = canonical.written() };
+    const canonical_arguments = try tokenPayloadArguments(&canonical_reader);
+    try std.testing.expectEqual(@as(?i64, 42), canonical_arguments.token);
+    try std.testing.expectEqual(@as(i32, 75), (try parseState(canonical_arguments.payload, canonical_arguments.token)).beatmap_id);
+    try std.testing.expectEqual(canonical_reader.data.len, canonical_reader.pos);
+
+    var payload_first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer payload_first.deinit();
+    const payload_first_pack: signalr.MessagePackWriter = .{ .writer = &payload_first.writer };
+    try payload_first_pack.array(5);
+    try payload_first_pack.integer(75);
+    try payload_first_pack.integer(0);
+    try payload_first_pack.array(0);
+    try payload_first_pack.integer(1);
+    try payload_first_pack.map(0);
+    try payload_first_pack.integer(42);
+    var payload_first_reader: signalr.MessagePackReader = .{ .data = payload_first.written() };
+    const payload_first_arguments = try tokenPayloadArguments(&payload_first_reader);
+    try std.testing.expectEqual(@as(?i64, 42), payload_first_arguments.token);
+    try std.testing.expectEqual(@as(i32, 75), (try parseState(payload_first_arguments.payload, payload_first_arguments.token)).beatmap_id);
+    try std.testing.expectEqual(payload_first_reader.data.len, payload_first_reader.pos);
+
+    const canonical_end = [_]u8{ 42, 3 };
+    var canonical_end_reader: signalr.MessagePackReader = .{ .data = &canonical_end };
+    const canonical_end_arguments = try tokenFinalStateArguments(&canonical_end_reader);
+    try std.testing.expectEqual(@as(?i64, 42), canonical_end_arguments.token);
+    try std.testing.expectEqual(@as(i64, 3), canonical_end_arguments.final_state);
+
+    const state_first_end = [_]u8{ 3, 42 };
+    var state_first_end_reader: signalr.MessagePackReader = .{ .data = &state_first_end };
+    const state_first_end_arguments = try tokenFinalStateArguments(&state_first_end_reader);
+    try std.testing.expectEqual(@as(?i64, 42), state_first_end_arguments.token);
+    try std.testing.expectEqual(@as(i64, 3), state_first_end_arguments.final_state);
 }
 
 test "lazer spectator frame bundles are exact and bounded" {

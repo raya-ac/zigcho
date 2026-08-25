@@ -88,6 +88,6 @@ jobs:
           gh release create "$tag" artifacts/lazer/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$SOURCE_REVISION" \
-            --title "zigcho release 1 · zigcho!lazer ${CLIENT_VERSION}" \
+            --title "zigcho release 1.2 · zigcho!lazer ${CLIENT_VERSION}" \
             --prerelease \
-            --notes-file updates/2026-08-24-lazer-multiplayer-profiles-and-routes.md
+            --notes-file updates/2026-08-26-controls-results-and-local-maps.md

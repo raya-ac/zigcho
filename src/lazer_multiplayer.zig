@@ -1057,6 +1057,7 @@ pub const Manager = struct {
     next_room_id: i64 = 1,
     next_pending_match_id: u32 = 1,
     next_countdown_id: i32 = 1,
+    enabled: std.atomic.Value(bool) = .init(true),
     shutting_down: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Manager {
@@ -1117,6 +1118,49 @@ pub const Manager = struct {
 
     pub fn bindBeatmapSync(self: *Manager, sync: *beatmap_sync.Sync) void {
         self.map_sync = sync;
+    }
+
+    pub fn isEnabled(self: *const Manager) bool {
+        return self.enabled.load(.acquire);
+    }
+
+    /// Apply the live multiplayer gate as well as the HTTP gate. Turning the
+    /// feature off closes every existing hub connection before returning, and
+    /// the atomic check prevents a connection which raced the toggle from
+    /// joining after that sweep.
+    pub fn setEnabled(self: *Manager, enabled: bool) void {
+        self.enabled.store(enabled, .release);
+        if (enabled) return;
+        var targets: [max_connections]*Connection = undefined;
+        var count: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        for (self.connections.items) |connection| {
+            if (count == targets.len) break;
+            connection.retain();
+            targets[count] = connection;
+            count += 1;
+        }
+        self.mutex.unlock(self.io);
+        const disconnect_frame = eventNoArgsOwned(self.allocator, "DisconnectRequested") catch null;
+        defer if (disconnect_frame) |frame| self.allocator.free(frame);
+        for (targets[0..count]) |connection| {
+            var effects: DisconnectEffects = .{};
+            connection.invocation_mutex.lockUncancelable(self.io);
+            self.mutex.lockUncancelable(self.io);
+            const still_current = std.mem.indexOfScalar(*Connection, self.connections.items, connection) != null;
+            if (still_current) {
+                connection.accepting_invocations.store(false, .release);
+                self.detachConnectionLocked(connection, &effects);
+            }
+            self.mutex.unlock(self.io);
+            connection.invocation_mutex.unlock(self.io);
+            if (still_current) {
+                if (disconnect_frame) |frame| connection.send(frame);
+                connection.close();
+                self.finishDisconnect(&effects);
+            }
+            connection.release();
+        }
     }
 
     fn hydratePlaylistItem(self: *Manager, item: *PlaylistItem) !void {
@@ -1615,6 +1659,31 @@ pub const Manager = struct {
         return null;
     }
 
+    pub const RuntimeCounts = struct {
+        connections: usize,
+        rooms: usize,
+        queued: usize,
+        pending_matches: usize,
+    };
+
+    pub fn runtimeCounts(self: *Manager) RuntimeCounts {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var counts: RuntimeCounts = .{ .connections = 0, .rooms = 0, .queued = 0, .pending_matches = 0 };
+        for (self.connections.items) |connection| {
+            if (!connection.alive.load(.acquire)) continue;
+            counts.connections += 1;
+            if (connection.queue_pool_id != null or connection.pending_match_id != null) counts.queued += 1;
+        }
+        for (self.rooms) |room| if (room != null) {
+            counts.rooms += 1;
+        };
+        for (self.pending_matches) |pending| if (pending != null) {
+            counts.pending_matches += 1;
+        };
+        return counts;
+    }
+
     pub fn roomChannelAccess(self: *Manager, user_id: i32, channel_id: i64) ?i64 {
         const room_id = lazer.roomChannelRoom(channel_id) orelse return null;
         self.mutex.lockUncancelable(self.io);
@@ -1947,6 +2016,7 @@ pub const Manager = struct {
     }
 
     fn connect(self: *Manager, user: domain.User, socket: *std.http.Server.WebSocket) !*Connection {
+        if (!self.isEnabled()) return error.MultiplayerDisabled;
         if (user.name.len == 0 or user.name.len > 64) return error.InvalidMultiplayerUser;
         const connection = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(connection);
@@ -1961,9 +2031,9 @@ pub const Manager = struct {
         while (true) {
             var replaced: ?*Connection = null;
             self.mutex.lockUncancelable(self.io);
-            if (self.shutting_down) {
+            if (self.shutting_down or !self.isEnabled()) {
                 self.mutex.unlock(self.io);
-                return error.ServerShuttingDown;
+                return if (self.shutting_down) error.ServerShuttingDown else error.MultiplayerDisabled;
             }
             for (self.connections.items) |existing| {
                 if (!existing.alive.load(.acquire) or existing.user_id != user.id) continue;
@@ -2539,7 +2609,7 @@ pub const Manager = struct {
     }
 
     fn handleHubMessage(self: *Manager, connection: *Connection, payload: []const u8) !void {
-        if (!connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) return error.ConnectionClose;
+        if (!self.isEnabled() or !connection.alive.load(.acquire) or !connection.accepting_invocations.load(.acquire)) return error.ConnectionClose;
         var reader: MessagePackReader = .{ .data = payload };
         const count = try reader.arrayLen();
         if (count == 0) return error.InvalidSignalRMessage;
@@ -7251,6 +7321,62 @@ test "reconnect shutdown and invitation expiry use pinned no-argument hub events
         try std.testing.expectEqual(@as(usize, 0), try reader.arrayLen());
         try std.testing.expectEqual(reader.data.len, reader.pos);
     }
+}
+
+test "multiplayer feature gate drains sessions at the invocation boundary and reopens" {
+    var manager = Manager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    const user: domain.User = .{ .id = 4, .name = "gate user", .safe_name = "gate_user", .country = .{ 'A', 'U' } };
+    const fake_socket: *std.http.Server.WebSocket = @ptrFromInt(@alignOf(std.http.Server.WebSocket));
+    const connection = try manager.connect(user, fake_socket);
+    connection.socket = null;
+    const stale_user: domain.User = .{ .id = 7, .name = "stale gate", .safe_name = "stale_gate", .country = .{ 'G', 'B' } };
+    const stale = try manager.connect(stale_user, fake_socket);
+    stale.socket = null;
+    stale.close();
+    try std.testing.expectEqual(@as(usize, 2), manager.connections.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.runtimeCounts().connections);
+
+    const Toggle = struct {
+        manager: *Manager,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(context: *@This()) void {
+            context.started.store(true, .release);
+            context.manager.setEnabled(false);
+            context.done.store(true, .release);
+        }
+    };
+    connection.invocation_mutex.lockUncancelable(std.testing.io);
+    var toggle: Toggle = .{ .manager = &manager };
+    const thread = try std.Thread.spawn(.{}, Toggle.run, .{&toggle});
+    while (manager.isEnabled()) std.Thread.yield() catch {};
+    try std.testing.expect(toggle.started.load(.acquire));
+    try std.testing.expect(!toggle.done.load(.acquire));
+    connection.queue_pool_id = 101;
+    connection.invocation_mutex.unlock(std.testing.io);
+    thread.join();
+
+    try std.testing.expect(!manager.isEnabled());
+    try std.testing.expect(!connection.alive.load(.acquire));
+    try std.testing.expect(!connection.accepting_invocations.load(.acquire));
+    try std.testing.expectEqual(@as(?i32, null), connection.queue_pool_id);
+    try std.testing.expectEqual(@as(usize, 0), manager.connections.items.len);
+    try std.testing.expectError(error.MultiplayerDisabled, manager.connect(user, fake_socket));
+    try std.testing.expectError(error.ConnectionClose, manager.handleHubMessage(connection, &.{}));
+
+    manager.setEnabled(true);
+    try std.testing.expect(manager.isEnabled());
+    const reopened = try manager.connect(user, fake_socket);
+    reopened.socket = null;
+    try std.testing.expect(reopened.alive.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), manager.connections.items.len);
+    // The direct fixture owns the same final handler reference that serve()
+    // normally releases after its read wakes on the close frame.
+    manager.disconnect(connection);
+    manager.disconnect(stale);
+    manager.disconnect(reopened);
 }
 
 test "one websocket identity rebinds room and queue state without duplicate membership" {

@@ -130,18 +130,33 @@ jobs:
         run: |
           set -euo pipefail
           createdb -h 127.0.0.1 -U zigcho zigcho_migrate
+          createdb -h 127.0.0.1 -U zigcho zigcho_store
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_MIGRATE_URL=host=127.0.0.1 port=5432 dbname=zigcho_migrate user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             sh -c '
               set -eu
               for filter in \
+                "feature gate" \
+                "room score writes require" \
+                "anticheat null signals coalesce" \
+                "exact stable hardware matches remain" \
+                "ranked stable PP is stored" \
+                "official osu api beatmapset fallback" \
+                "developer server controls persist" \
+                "website home leads with playable clients" \
+                "public name history follows" \
+                "lazer spectator v2 accepts" \
+                "dynamic changelog" \
+                "postgres anticheat hardware and flags stay review only" \
+                "postgres account auth stats and token slice" \
                 "official lazer score bodies" \
                 "lazer solo score tokens" \
                 "stable and lazer share one ranked performance result per map" \
                 "lazer profile JSON owns" \
                 "website profile plays keep" \
-                "schema forty four"
+                "postgres runtime migrates through server controls schema forty five"
               do
                 zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done
@@ -155,7 +170,7 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 44
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 45
           test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!

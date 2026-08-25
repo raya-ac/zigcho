@@ -9,6 +9,8 @@ const max_objects = 500_000;
 const max_time_ms: i64 = 24 * 60 * 60 * 1000;
 const min_time_ms: i64 = -60_000;
 const max_coordinate: f32 = 131_072;
+const mania_max_x: f32 = (1 << 20) - 1;
+const replay_key_mask: u32 = 1 | 2 | 4 | 8 | 16;
 const easy_mod: u64 = 1 << 1;
 const hard_rock_mod: u64 = 1 << 4;
 
@@ -52,12 +54,23 @@ pub fn prepare(allocator: std.mem.Allocator, replay: []const u8, map: []const u8
     };
 }
 
+pub fn validatePayload(allocator: std.mem.Allocator, replay: []const u8, ruleset: u8) !void {
+    if (ruleset > 3 or replay.len == 0 or replay.len > 16 * 1024 * 1024) return error.InvalidReplay;
+    const decoded = try decompress(allocator, replay);
+    defer allocator.free(decoded);
+    const frames = try parseFramesWithLimit(allocator, decoded, if (ruleset == 3) mania_max_x else max_coordinate);
+    allocator.free(frames);
+}
+
 fn decompress(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
     var input = std.Io.Reader.fixed(compressed);
     const decode_buffer = try allocator.alloc(u8, 4096);
     var decoder = std.compress.lzma.Decompress.initOptions(&input, allocator, decode_buffer, .{}, max_lzma_memory) catch |err| {
         allocator.free(decode_buffer);
-        return err;
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidReplay,
+        };
     };
     defer decoder.deinit();
     return decoder.reader.allocRemaining(allocator, .limited(max_decompressed_bytes)) catch |err| switch (err) {
@@ -74,6 +87,10 @@ fn decompress(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
 }
 
 pub fn parseFrames(allocator: std.mem.Allocator, decoded: []const u8) ![]abi.ReplayFrameV1 {
+    return parseFramesWithLimit(allocator, decoded, max_coordinate);
+}
+
+fn parseFramesWithLimit(allocator: std.mem.Allocator, decoded: []const u8, max_x: f32) ![]abi.ReplayFrameV1 {
     if (decoded.len == 0 or decoded.len > max_decompressed_bytes) return error.InvalidReplay;
     var frames: std.ArrayList(abi.ReplayFrameV1) = .empty;
     errdefer frames.deinit(allocator);
@@ -101,7 +118,7 @@ pub fn parseFrames(allocator: std.mem.Allocator, decoded: []const u8) ![]abi.Rep
         const x = std.fmt.parseFloat(f32, x_text) catch return error.InvalidReplay;
         const y = std.fmt.parseFloat(f32, y_text) catch return error.InvalidReplay;
         const keys = std.fmt.parseInt(u32, keys_text, 10) catch return error.InvalidReplay;
-        if (!std.math.isFinite(x) or !std.math.isFinite(y) or x < -max_coordinate or x > max_coordinate or y < -max_coordinate or y > max_coordinate) return error.InvalidReplay;
+        if (!std.math.isFinite(x) or !std.math.isFinite(y) or x < -max_x or x > max_x or y < -max_coordinate or y > max_coordinate or keys & ~replay_key_mask != 0) return error.InvalidReplay;
         if (frames.items.len >= max_frames) return error.InvalidReplay;
         try frames.append(allocator, .{ .time_ms = total_time, .x = x, .y = y, .keys = keys });
     }
@@ -110,6 +127,10 @@ pub fn parseFrames(allocator: std.mem.Allocator, decoded: []const u8) ![]abi.Rep
     if (frames.items[1].time_ms < frames.items[0].time_ms) {
         frames.items[1].time_ms = frames.items[0].time_ms;
         frames.items[0].time_ms = 0;
+    }
+    if (frames.items.len >= 3 and frames.items[0].time_ms > frames.items[2].time_ms) {
+        frames.items[0].time_ms = frames.items[2].time_ms;
+        frames.items[1].time_ms = frames.items[2].time_ms;
     }
     var previous_time = min_time_ms;
     for (frames.items) |frame| {
@@ -161,6 +182,7 @@ fn parseMap(allocator: std.mem.Allocator, map: []const u8, mods: u64, played_to_
                 map_duration_ms = @intCast(time);
                 const kind = raw_kind & (abi.HitObjectKind.circle | abi.HitObjectKind.slider | abi.HitObjectKind.spinner);
                 if (kind == 0) continue;
+                if (kind != abi.HitObjectKind.circle and kind != abi.HitObjectKind.slider and kind != abi.HitObjectKind.spinner) return error.InvalidBeatmap;
                 if (map_object_count >= max_objects) return error.InvalidBeatmap;
                 map_object_count += 1;
                 if (time > played_to_ms + 250) continue;
@@ -181,4 +203,35 @@ fn valueFor(line: []const u8, key: []const u8) ?[]const u8 {
     const colon = std.mem.findScalar(u8, line, ':') orelse return null;
     if (!std.mem.eql(u8, std.mem.trim(u8, line[0..colon], " \t"), key)) return null;
     return std.mem.trim(u8, line[colon + 1 ..], " \t");
+}
+
+test "stable replay inputs reject unknown key state bits" {
+    const smoke = try parseFrames(std.testing.allocator, "0|0|0|0,1|0|0|16,-12345|0|0|1,");
+    defer std.testing.allocator.free(smoke);
+    try std.testing.expectEqual(@as(u32, 16), smoke[1].keys);
+    try std.testing.expectError(error.InvalidReplay, parseFrames(std.testing.allocator, "0|0|0|0,1|0|0|32,-12345|0|0|1,"));
+}
+
+test "stable replay input preserves the historical third frame repair" {
+    const frames = try parseFrames(std.testing.allocator, "5|0|0|0,1|0|0|0,-2|0|0|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(i64, 4), frames[0].time_ms);
+    try std.testing.expectEqual(@as(i64, 4), frames[1].time_ms);
+    try std.testing.expectEqual(@as(i64, 4), frames[2].time_ms);
+}
+
+test "mania replay payload bounds allow its encoded key field" {
+    const frames = try parseFramesWithLimit(std.testing.allocator, "0|1048575|0|0,1|0|0|0,-12345|0|0|1,", mania_max_x);
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(f32, 1_048_575), frames[0].x);
+    try std.testing.expectError(error.InvalidReplay, parseFrames(std.testing.allocator, "0|1048575|0|0,1|0|0|0,-12345|0|0|1,"));
+}
+
+test "stable map evidence rejects ambiguous primary object kinds" {
+    const map =
+        "osu file format v14\n" ++
+        "[General]\nMode:0\n" ++
+        "[Difficulty]\nOverallDifficulty:5\n" ++
+        "[HitObjects]\n256,192,1000,3,0,0:0:0:0:\n";
+    try std.testing.expectError(error.InvalidBeatmap, parseMap(std.testing.allocator, map, 0, 2000));
 }

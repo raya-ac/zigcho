@@ -92,7 +92,7 @@ jq -e '.backgrounds == []' "$response" >/dev/null || fail invalid_seasonal_backg
 auth_get '/api/v2/search?mode=user&query=lazer' user_search
 jq -e '.total == 2 and (.user.data | length) == 2' "$response" >/dev/null || fail invalid_user_search_contract
 auth_get /api/v2/news news
-jq -e '.news_posts[0].id == 3700 and .news_posts[0].slug == "2026-08-25-classic-score-and-profile-graphs" and .cursor == null and .news_sidebar.current_year == 2026' "$response" >/dev/null || fail invalid_news_contract
+jq -e '.news_posts[0].id == 3800 and .news_posts[0].slug == "2026-08-26-controls-results-and-local-maps" and .cursor == null and .news_sidebar.current_year == 2026' "$response" >/dev/null || fail invalid_news_contract
 auth_get /api/v2/spotlights spotlights
 jq -e '.spotlights == []' "$response" >/dev/null || fail invalid_spotlights_contract
 auth_get /api/v2/rankings/kudosu kudosu_rankings
@@ -102,7 +102,7 @@ jq -e '.ranking == [] and .spotlight.id == 1 and .spotlight.name == "zigcho!laze
 auth_get /api/v2/wiki/en/Main_page wiki
 jq -e '.layout == "wiki" and .locale == "en" and .path == "Main_page" and (.markdown | contains("](/wiki/Multiplayer)"))' "$response" >/dev/null || fail invalid_wiki_contract
 auth_get /api/v2/changelog changelog
-jq -e '(.streams | length) > 0 and (.builds | length) > 0 and .builds[0].id == 37 and .builds[0].changelog_entries[0].id == 3700 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
+jq -e '(.streams | length) > 0 and (.builds | length) > 0 and .builds[0].id == 38 and .builds[0].changelog_entries[0].id == 3800 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
 auth_get /api/v2/changelog/lazer/2026.809.0 changelog_oldest
 jq -e '(.changelog_entries | length) == 18 and .versions.next.version == "2026.810.0" and .versions.previous == null' "$response" >/dev/null || fail invalid_changelog_navigation
 auth_get /api/v2/notifications notifications
@@ -287,7 +287,7 @@ expect_status "$code" 409 reject_token_reuse
 [ "$(sqlite3 "$database" "SELECT rank_namespace FROM lazer_scores WHERE id=$score_id")" = custom ] || fail custom_namespace_missing
 [ "$(sqlite3 "$database" "SELECT total_score_without_mods FROM lazer_scores WHERE id=$score_id")" = 900000 ] || fail score_without_mods_not_stored
 [ "$(sqlite3 "$database" "SELECT legacy_total_score FROM lazer_scores WHERE id=$score_id")" = 3032606 ] || fail classic_score_not_stored
-[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 44 ] || fail schema_not_migrated
+[ "$(sqlite3 "$database" 'PRAGMA user_version')" = 45 ] || fail schema_not_migrated
 
 auth_get '/api/v2/beatmaps/75/scores?type=global&mode=osu&mods%5B%5D=WIGGLE&limit=50' custom_leaderboard
 jq -e --argjson id "$score_id" '

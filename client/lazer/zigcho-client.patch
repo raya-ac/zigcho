@@ -3065,6 +3065,15 @@ index c930783f99..5549095929 100644
          private readonly object scoreSubmissionLock = new object();
          private TaskCompletionSource<bool> scoreSubmissionSource;
  
+@@ -197,7 +202,7 @@ protected override async Task PrepareScoreForResultsAsync(Score score)
+ 
+             await submitScore(score).ConfigureAwait(false);
+             spectatorClient.EndPlaying(token, GameplayState);
+-            userStatisticsWatcher?.RegisterForStatisticsUpdateAfter(score.ScoreInfo);
++            userStatisticsWatcher?.RegisterForStatisticsUpdateAfterProcessedScore(score.ScoreInfo);
+         }
+ 
+         [Resolved]
 @@ -325,6 +330,9 @@ private Task submitScore(Score score)
                  score.ScoreInfo.OnlineID = s.ID;
                  score.ScoreInfo.Position = s.Position;
@@ -3075,6 +3084,44 @@ index c930783f99..5549095929 100644
                  scoreSubmissionSource.SetResult(true);
                  Logger.Log($"Score submission completed! (token:{token.Value} id:{s.ID})");
              };
+diff --git a/osu.Game/Online/UserStatisticsWatcher.cs b/osu.Game/Online/UserStatisticsWatcher.cs
+index 73ca3c9f53..5a92bdb2c0 100644
+--- a/osu.Game/Online/UserStatisticsWatcher.cs
++++ b/osu.Game/Online/UserStatisticsWatcher.cs
+@@ -61,6 +61,33 @@ public void RegisterForStatisticsUpdateAfter(ScoreInfo score)
+             });
+         }
+ 
++        /// <summary>
++        /// Publishes the statistics update for a score which has already been fully processed by the API.
++        /// </summary>
++        /// <remarks>
++        /// Zigcho commits score statistics before returning the submission response. Refetching here avoids
++        /// losing a synchronous <c>UserScoreProcessed</c> event before the returned online score ID is registered.
++        /// </remarks>
++        public void RegisterForStatisticsUpdateAfterProcessedScore(ScoreInfo score)
++        {
++            Schedule(() =>
++            {
++                if (!api.IsLoggedIn)
++                    return;
++
++                if (!score.Ruleset.IsLegacyRuleset() || score.OnlineID <= 0)
++                    return;
++
++                var cachedStatistics = statisticsProvider.GetStatisticsFor(score.Ruleset);
++
++                statisticsProvider.RefetchStatistics(score.Ruleset, u => Schedule(() =>
++                {
++                    var before = u.OldStatistics ?? cachedStatistics ?? u.NewStatistics;
++                    latestUpdate.Value = new ScoreBasedUserStatisticsUpdate(score, before, u.NewStatistics);
++                }));
++            });
++        }
++
+         private void userScoreProcessed(int userId, long scoreId)
+         {
+             if (userId != api.LocalUser.Value?.OnlineID)
 diff --git a/osu.Game/Users/Drawables/DrawableAvatar.cs b/osu.Game/Users/Drawables/DrawableAvatar.cs
 index bd09b95164..26033fc95b 100644
 --- a/osu.Game/Users/Drawables/DrawableAvatar.cs

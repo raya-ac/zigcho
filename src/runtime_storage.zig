@@ -4,7 +4,7 @@ const backend = if (options.postgres_runtime) @import("postgres_store.zig") else
 
 pub const Store = backend.Store;
 pub const ClientHardware = backend.ClientHardware;
-pub const HardwareEnforcement = backend.HardwareEnforcement;
+pub const HardwareEvidence = backend.HardwareEvidence;
 pub const AnticheatSource = backend.AnticheatSource;
 pub const AnticheatReviewLabel = backend.AnticheatReviewLabel;
 pub const AnticheatObservation = backend.AnticheatObservation;

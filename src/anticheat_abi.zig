@@ -12,6 +12,7 @@ pub const EventKind = struct {
 
 pub const ClientFamily = struct {
     pub const stable: u32 = 1;
+    pub const lazer: u32 = 2;
 };
 
 pub const Namespace = struct {
@@ -19,11 +20,13 @@ pub const Namespace = struct {
     pub const relax: u32 = 2;
     pub const autopilot: u32 = 3;
     pub const score_v2: u32 = 4;
+    pub const custom: u32 = 5;
 };
 
 pub const EventFlag = struct {
     pub const passed: u64 = 1 << 0;
     pub const replay_required: u64 = 1 << 1;
+    pub const known_mask: u64 = passed | replay_required;
 };
 
 pub const Evidence = struct {
@@ -44,6 +47,7 @@ pub const Evidence = struct {
     pub const duplicate_score: u64 = 1 << 14;
     pub const checksum_mismatch: u64 = 1 << 15;
     pub const rate_anomaly: u64 = 1 << 16;
+    pub const known_mask: u64 = (1 << 17) - 1;
 };
 
 pub const Action = struct {
@@ -51,6 +55,23 @@ pub const Action = struct {
     pub const audit: u32 = 1;
     pub const challenge: u32 = 2;
     pub const restrict: u32 = 3;
+};
+
+pub const Reason = struct {
+    pub const high_confidence_client_flag: u32 = 1003;
+    pub const exact_hardware_match: u32 = 1004;
+    pub const required_replay_missing: u32 = 2006;
+    pub const invalid_replay_payload: u32 = 2008;
+    pub const registry_remnant: u32 = 3005;
+};
+
+pub const DecisionFlag = struct {
+    pub const write_audit: u64 = 1 << 0;
+    pub const hold_score: u64 = 1 << 1;
+    pub const disconnect_session: u64 = 1 << 2;
+    pub const require_staff_review: u64 = 1 << 3;
+    pub const notify_player: u64 = 1 << 4;
+    pub const known_mask: u64 = (1 << 5) - 1;
 };
 
 pub const EventV1 = extern struct {

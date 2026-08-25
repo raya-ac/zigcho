@@ -15,6 +15,8 @@ const score_crypto = @import("score_crypto.zig");
 const stable_score = @import("stable_score.zig");
 const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
+const server_control = @import("server_control.zig");
+const server_control_route = @import("server_control_route.zig");
 const achievements = @import("achievements.zig");
 const changelog = @import("changelog");
 const lazer_wiki = @import("lazer_wiki.zig");
@@ -46,6 +48,7 @@ const avatar_cache = @import("avatar_cache.zig");
 const r2 = @import("r2.zig");
 const object_keys = @import("object_keys.zig");
 const anticheat_abi = @import("anticheat_abi.zig");
+const anticheat_evidence = @import("anticheat_evidence.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
 const player_routes = @import("player_routes.zig");
@@ -56,8 +59,18 @@ const lazer_refresh_lifetime_seconds: i64 = 90 * 24 * 60 * 60;
 
 var shutdown_requested: std.atomic.Value(bool) = .init(false);
 var shutdown_listener_fd: std.atomic.Value(i64) = .init(-1);
+var restart_requested: std.atomic.Value(bool) = .init(false);
 
 fn requestServerShutdown(_: if (builtin.os.tag == .windows) c_int else std.posix.SIG) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+    if (comptime builtin.os.tag != .windows) {
+        const fd = shutdown_listener_fd.load(.acquire);
+        if (fd >= 0) _ = std.c.shutdown(@intCast(fd), std.c.SHUT.RDWR);
+    }
+}
+
+fn requestServerRestart() void {
+    restart_requested.store(true, .release);
     shutdown_requested.store(true, .release);
     if (comptime builtin.os.tag != .windows) {
         const fd = shutdown_listener_fd.load(.acquire);
@@ -268,62 +281,56 @@ const App = struct {
         return stableScoreEvidence(score) | (if (replay_match_count != 0) anticheat_abi.Evidence.replay_hash_reused else 0);
     }
 
-    fn observeStableEvidence(self: *App, user_id: i32, source: storage.AnticheatSource, event: anticheat_abi.EventV1) void {
-        const host = if (self.anticheat) |*loaded| loaded else return;
-        const decision = host.evaluate(event) catch |err| {
-            std.log.warn("event=anticheat_module_evaluation_failed module={s} source={s} user_id={d} error={t}", .{ host.name(), source.text(), user_id, err });
-            return;
-        };
-        if (decision.action == anticheat_abi.Action.allow) return;
+    fn persistHostAnticheatObservation(self: *App, user_id: i32, source: storage.AnticheatSource, score_id: ?i64, observation: anticheat_evidence.Observation) void {
         _ = self.store.recordAnticheatObservation(user_id, .{
             .source = source,
-            .module = host.name(),
-            .action = decision.action,
-            .reason = decision.reason,
-            .risk_score = decision.risk_score,
-            .confidence_bps = decision.confidence_bps,
-            .evidence = event.evidence,
-            .decision_flags = decision.flags,
-            .rule_revision = decision.rule_revision,
+            .module = anticheat_evidence.module_name,
+            .score_id = score_id,
+            .action = observation.action,
+            .reason = observation.reason,
+            .risk_score = observation.risk_score,
+            .confidence_bps = observation.confidence_bps,
+            .evidence = observation.evidence,
+            .replay_match_count = observation.replay_match_count,
+            .decision_flags = observation.decision_flags,
+            .rule_revision = observation.rule_revision,
         }) catch |err| {
-            std.log.warn("event=anticheat_observation_write_failed source={s} user_id={d} error={t}", .{ source.text(), user_id, err });
+            std.log.warn("event=anticheat_observation_write_failed module={s} source={s} user_id={d} score_id={d} error={t}", .{ anticheat_evidence.module_name, source.text(), user_id, score_id orelse 0, err });
         };
     }
 
     fn observeStableLogin(self: *App, result: bancho.LoginResult) void {
         if (result.user_id <= 0) return;
-        var evidence: u64 = 0;
-        if (result.hardware_match_count != 0) evidence |= anticheat_abi.Evidence.exact_hardware_match;
-        if (result.running_under_wine) evidence |= anticheat_abi.Evidence.running_under_wine;
-        self.observeStableEvidence(result.user_id, .stable_login, .{
-            .event_kind = anticheat_abi.EventKind.login,
-            .client_family = anticheat_abi.ClientFamily.stable,
-            .evidence = evidence,
-            .hardware_match_count = result.hardware_match_count,
-        });
+        const observation = anticheat_evidence.stableLogin(result.hardware_match_count, result.running_under_wine) orelse return;
+        self.persistHostAnticheatObservation(result.user_id, .stable_login, null, observation);
     }
 
     fn observeStableLastFmFlags(self: *App, user_id: i32, flags: u32) void {
-        const hq_flags: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
-        var evidence: u64 = 0;
-        if (flags & hq_flags != 0) evidence |= anticheat_abi.Evidence.high_confidence_client_flag;
-        if (flags & (@as(u32, 1) << 19) != 0) evidence |= anticheat_abi.Evidence.registry_remnant;
-        if (evidence == 0) return;
-        self.observeStableEvidence(user_id, .stable_lastfm, .{
-            .event_kind = anticheat_abi.EventKind.heartbeat,
-            .client_family = anticheat_abi.ClientFamily.stable,
-            .evidence = evidence,
-        });
+        const observation = anticheat_evidence.stableLastFm(flags) orelse return;
+        self.persistHostAnticheatObservation(user_id, .stable_lastfm, null, observation);
     }
 
-    fn observeStableGameplay(self: *App, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32, replay_match_count: u32) ?anticheat_abi.GameplayResultV1 {
-        const host = if (self.anticheat) |*loaded| loaded else return null;
-        if (score.mode != 0 or replay.len == 0) return null;
+    const StableGameplayObservation = union(enum) {
+        none,
+        invalid_replay,
+        result: anticheat_abi.GameplayResultV1,
+    };
+
+    fn observeStableGameplay(self: *App, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32, replay_match_count: u32) StableGameplayObservation {
+        if (replay.len == 0) return .none;
+        if (score.mode != 0) {
+            anticheat_replay.validatePayload(self.allocator, replay, score.mode) catch |err| {
+                std.log.warn("event=anticheat_replay_parse_failed user_id={d} ruleset={d} error={t}", .{ user_id, score.mode, err });
+                return if (score.passed and err == error.InvalidReplay) .invalid_replay else .none;
+            };
+            return .none;
+        }
         var prepared = anticheat_replay.prepare(self.allocator, replay, map, @intCast(score.mods)) catch |err| {
             std.log.warn("event=anticheat_replay_parse_failed user_id={d} error={t}", .{ user_id, err });
-            return null;
+            return if (score.passed and err == error.InvalidReplay) .invalid_replay else .none;
         };
         defer prepared.deinit();
+        const host = if (self.anticheat) |*loaded| loaded else return .none;
         const passed_hits_i64 = @as(i64, score.n300) + @as(i64, score.n100) + @as(i64, score.n50);
         const accuracy_ppm: u32 = @intFromFloat(@round(@min(1.0, @max(0.0, score.accuracy())) * 1_000_000.0));
         const pp_milli: u64 = @intFromFloat(@round(@min(performance.pp * 1000.0, @as(f64, @floatFromInt(std.math.maxInt(u64))))));
@@ -363,12 +370,12 @@ const App = struct {
         };
         const result = host.evaluateGameplay(event) catch |err| {
             std.log.warn("event=anticheat_module_evaluation_failed module={s} error={t}", .{ host.name(), err });
-            return null;
+            return .none;
         };
         if (result.decision.action != anticheat_abi.Action.allow) std.log.warn("event=anticheat_observation module={s} action={d} reason={d} risk={d} confidence_bps={d} objects={d} clicks={d}", .{
             host.name(), result.decision.action, result.decision.reason, result.decision.risk_score, result.decision.confidence_bps, result.objects_checked, result.matched_clicks,
         });
-        return result;
+        return .{ .result = result };
     }
 
     fn persistAnticheatObservation(self: *App, user_id: i32, score_id: i64, sample_weight: u32, evidence: u64, replay_match_count: u32, result: anticheat_abi.GameplayResultV1) void {
@@ -722,6 +729,41 @@ const App = struct {
         for (stable_ids) |id| if (id != 3 and std.mem.indexOfScalar(i32, ids.items, id) == null) ids.appendAssumeCapacity(id);
         for (lazer_ids) |id| if (id != 3 and std.mem.indexOfScalar(i32, ids.items, id) == null) ids.appendAssumeCapacity(id);
         return ids.items.len;
+    }
+
+    fn staffInfrastructureJson(self: *App) ![]u8 {
+        const online = try self.combinedOnlineCount();
+        self.sessions.mutex.lockUncancelable(self.sessions.io);
+        const stable_online = self.sessions.humanCount();
+        self.sessions.mutex.unlock(self.sessions.io);
+        const cutoff = std.Io.Clock.real.now(self.store.io).toSeconds() - 120;
+        const lazer_ids = try self.store.recentOauthUserIds(self.allocator, cutoff);
+        defer self.allocator.free(lazer_ids);
+        const counts = try self.store.serverCounts();
+        const cache = try self.store.beatmapCacheStats();
+        const media_cache = try self.store.beatmapMediaCacheStats();
+        const hydration = self.map_sync.metrics();
+        const media = self.media_sync.metrics();
+        const multiplayer = self.lazer_multiplayer.runtimeCounts();
+        const spectator_connections = self.lazer_spectator.connectionCount();
+        const controls = try self.store.staffServerControlsJson(self.allocator);
+        defer self.allocator.free(controls);
+        const uptime = @max(@as(i64, 0), std.Io.Clock.real.now(self.store.io).toSeconds() - self.started_at);
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        try output.writer.print(
+            "{{\"runtime\":{{\"uptime_seconds\":{d},\"online\":{d},\"stable_online\":{d},\"lazer_online\":{d},\"irc_connections\":{d},\"multiplayer_connections\":{d},\"multiplayer_rooms\":{d},\"multiplayer_queued\":{d},\"pending_matches\":{d},\"spectator_connections\":{d},\"anticheat_loaded\":{},\"anticheat_sample_modulus\":{d},\"restart_supported\":true}},",
+            .{ uptime, online, stable_online, lazer_ids.len, self.irc_clients.load(.acquire), multiplayer.connections, multiplayer.rooms, multiplayer.queued, multiplayer.pending_matches, spectator_connections, self.anticheat != null, self.anticheat_allow_sample_modulus },
+        );
+        try output.writer.print(
+            "\"storage\":{{\"schema\":45,\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"beatmap_cache_entries\":{d},\"beatmap_cache_bytes\":{d},\"media_cache_entries\":{d},\"media_cache_bytes\":{d},\"hydration_blocked\":{d}}},",
+            .{ counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures },
+        );
+        try output.writer.print(
+            "\"pipeline\":{{\"hydration_attempts\":{d},\"hydration_successes\":{d},\"hydration_failures\":{d},\"mirror_hits\":{d},\"mirror_misses\":{d},\"mirror_fills\":{d},\"mirror_failures\":{d},\"mirror_bytes_served\":{d},\"media_attempts\":{d},\"media_successes\":{d},\"media_failures\":{d}}},\"state\":{s}}}",
+            .{ hydration.attempts, hydration.successes, hydration.failures, hydration.mirror_hits, hydration.mirror_misses, hydration.mirror_fills, hydration.mirror_failures, hydration.mirror_bytes_served, media.attempts, media.successes, media.failures, controls },
+        );
+        return output.toOwnedSlice();
     }
 
     fn disconnectUser(self: *App, user_id: i32, message: []const u8) !void {
@@ -1124,6 +1166,36 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
+    fn featureUnavailable(req: *std.http.Server.Request, feature: server_control.Feature) !void {
+        var body: [160]u8 = undefined;
+        const json = try std.fmt.bufPrint(&body, "{{\"error\":\"{s} is temporarily disabled\",\"feature\":\"{s}\"}}", .{ server_control.definition(feature).label, feature.key() });
+        const headers = [_]std.http.Header{
+            .{ .name = "retry-after", .value = "60" },
+            .{ .name = "cache-control", .value = "no-store" },
+        };
+        return respond(req, .service_unavailable, "application/json", json, &headers);
+    }
+
+    fn setFeatureControl(self: *App, actor_id: i32, feature: server_control.Feature, enabled: bool, reason: []const u8) !void {
+        const multiplayer_before = self.lazer_multiplayer.isEnabled();
+        const spectator_before = self.lazer_spectator.isEnabled();
+        if (!enabled) switch (feature) {
+            .lazer_multiplayer => self.lazer_multiplayer.setEnabled(false),
+            .spectator => self.lazer_spectator.setEnabled(false),
+            else => {},
+        };
+        self.store.setServerControl(actor_id, feature, enabled, reason) catch |err| {
+            if (feature == .lazer_multiplayer) self.lazer_multiplayer.setEnabled(multiplayer_before);
+            if (feature == .spectator) self.lazer_spectator.setEnabled(spectator_before);
+            return err;
+        };
+        if (enabled) switch (feature) {
+            .lazer_multiplayer => self.lazer_multiplayer.setEnabled(true),
+            .spectator => self.lazer_spectator.setEnabled(true),
+            else => {},
+        };
+    }
+
     fn requestRule(req: *const std.http.Server.Request, path: []const u8) ?rate_limit.Rule {
         if ((req.head.method == .PUT or req.head.method == .PATCH) and bss.parsePath(path) != null) return rate_limit.media_upload;
         if (req.head.method == .POST and std.mem.eql(u8, path, "/users")) return rate_limit.registration;
@@ -1175,6 +1247,10 @@ const App = struct {
         const raw_path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
         const path = routing.canonicalPath(raw_path);
         const trusted_proxy = proxy.trustsForwardedHeaders(peer_ip);
+        const required_features = server_control_route.required(req.head.method, path, header(req, "osu-token") != null);
+        for (required_features.slice()) |feature| {
+            if (!try self.store.serverControlEnabled(feature)) return featureUnavailable(req, feature);
+        }
         if (requestRule(req, path)) |rule| {
             const client = proxy.clientKey(peer_ip, trusted_proxy, header(req, "cf-connecting-ip"), header(req, "x-forwarded-for"), header(req, "x-real-ip"));
             const decision = self.limiter.check(client, rule) catch return respond(req, .service_unavailable, "application/json", "{\"error\":\"rate limiter unavailable\"}", &.{});
@@ -2252,6 +2328,65 @@ const App = struct {
             }
             if (req.head.method == .POST and (!web_auth.sameOrigin(origin_owned, host_owned) or !web_auth.csrfMatches(staff_token, csrf_owned))) return respond(req, .forbidden, "application/json", "{\"error\":\"invalid request\"}", &no_store);
 
+            if (std.mem.eql(u8, path, "/api/v1/staff/infrastructure")) {
+                if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    const json = try self.staffInfrastructureJson();
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const kind = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"kind"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"control kind required\"}", &no_store);
+                    defer self.allocator.free(kind);
+                    const reason_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &no_store);
+                    defer self.allocator.free(reason_value);
+                    const reason = std.mem.trim(u8, reason_value, " \t\r\n");
+                    if (!validWebText(reason, 3, 500)) return respond(req, .bad_request, "application/json", "{\"error\":\"reason must be between 3 and 500 characters\"}", &no_store);
+                    if (std.mem.eql(u8, kind, "feature")) {
+                        const feature_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"feature"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"feature required\"}", &no_store);
+                        defer self.allocator.free(feature_value);
+                        const state_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"state"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"state required\"}", &no_store);
+                        defer self.allocator.free(state_value);
+                        const feature = server_control.Feature.parse(feature_value) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"unknown feature\"}", &no_store);
+                        const enabled = if (std.mem.eql(u8, state_value, "enabled")) true else if (std.mem.eql(u8, state_value, "disabled")) false else return respond(req, .bad_request, "application/json", "{\"error\":\"state must be enabled or disabled\"}", &no_store);
+                        try self.setFeatureControl(staff_user.id, feature, enabled, reason);
+                        std.log.warn("event=staff_feature_control actor_id={d} feature={s} state={s}", .{ staff_user.id, feature.key(), state_value });
+                        return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                    }
+                    if (!std.mem.eql(u8, kind, "operation")) return respond(req, .bad_request, "application/json", "{\"error\":\"unknown control kind\"}", &no_store);
+                    const operation = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"operation"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"operation required\"}", &no_store);
+                    defer self.allocator.free(operation);
+                    if (std.mem.eql(u8, operation, "announcement")) {
+                        const message_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"message"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"announcement required\"}", &no_store);
+                        defer self.allocator.free(message_value);
+                        const message = std.mem.trim(u8, message_value, " \t\r\n");
+                        if (!validWebText(message, 3, 500)) return respond(req, .bad_request, "application/json", "{\"error\":\"announcement must be between 3 and 500 characters\"}", &no_store);
+                        try self.store.recordPublicMessage(3, "#announce", message);
+                        try bancho.publishAnnouncement(self.allocator, &self.sessions, message);
+                        try self.store.recordAudit(staff_user.id, "infra.announcement", "server", reason);
+                    } else if (std.mem.eql(u8, operation, "refresh_changelog")) {
+                        self.changelog_feed.refresh() catch return respond(req, .bad_gateway, "application/json", "{\"error\":\"changelog refresh failed\"}", &no_store);
+                        try self.store.recordAudit(staff_user.id, "infra.refresh_changelog", "server", reason);
+                    } else if (std.mem.eql(u8, operation, "refresh_matchmaking")) {
+                        self.lazer_multiplayer.refreshMatchmakingMaps() catch return respond(req, .bad_gateway, "application/json", "{\"error\":\"matchmaking refresh failed\"}", &no_store);
+                        try self.store.recordAudit(staff_user.id, "infra.refresh_matchmaking", "server", reason);
+                    } else if (std.mem.eql(u8, operation, "refresh_rank_history")) {
+                        self.store.refreshStatsHistory() catch return respond(req, .internal_server_error, "application/json", "{\"error\":\"rank history refresh failed\"}", &no_store);
+                        try self.store.recordAudit(staff_user.id, "infra.refresh_rank_history", "server", reason);
+                    } else if (std.mem.eql(u8, operation, "restart")) {
+                        const confirmation = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"confirmation"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"type restart zigcho to confirm\"}", &no_store);
+                        defer self.allocator.free(confirmation);
+                        if (!std.mem.eql(u8, std.mem.trim(u8, confirmation, " \t\r\n"), "restart zigcho")) return respond(req, .bad_request, "application/json", "{\"error\":\"type restart zigcho to confirm\"}", &no_store);
+                        try self.store.recordAudit(staff_user.id, "infra.restart", "server", reason);
+                        std.log.warn("event=staff_server_restart actor_id={d} reason={s}", .{ staff_user.id, reason });
+                        try respond(req, .accepted, "application/json", "{\"ok\":true,\"state\":\"restarting\"}", &no_store);
+                        requestServerRestart();
+                        return;
+                    } else return respond(req, .bad_request, "application/json", "{\"error\":\"unknown operation\"}", &no_store);
+                    std.log.info("event=staff_infrastructure_operation actor_id={d} operation={s}", .{ staff_user.id, operation });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+            }
             if (std.mem.eql(u8, path, "/api/v1/staff/overview") and req.head.method == .GET) {
                 const json = try self.store.staffOverviewJson(self.allocator);
                 defer self.allocator.free(json);
@@ -2538,7 +2673,8 @@ const App = struct {
                     return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
                 }
             }
-            const known_staff_path = std.mem.eql(u8, path, "/api/v1/staff/overview") or
+            const known_staff_path = std.mem.eql(u8, path, "/api/v1/staff/infrastructure") or
+                std.mem.eql(u8, path, "/api/v1/staff/overview") or
                 std.mem.eql(u8, path, "/api/v1/staff/users") or
                 std.mem.eql(u8, path, "/api/v1/staff/ranking") or
                 std.mem.eql(u8, path, "/api/v1/staff/moderation") or
@@ -2557,6 +2693,25 @@ const App = struct {
             const listing = try self.store.siteRankings(self.allocator, source, mode, offset);
             defer self.allocator.free(listing);
             return respond(req, .ok, "application/json", listing, &.{});
+        }
+        if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/users/") and std.mem.endsWith(u8, path, "/name-history")) {
+            const prefix = "/api/v1/users/";
+            const suffix = "/name-history";
+            const encoded_identifier = path[prefix.len .. path.len - suffix.len];
+            if (encoded_identifier.len == 0 or encoded_identifier.len > 96 or std.mem.indexOfScalar(u8, encoded_identifier, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const identifier_buffer = try self.allocator.dupe(u8, encoded_identifier);
+            defer self.allocator.free(identifier_buffer);
+            const identifier = std.Uri.percentDecodeInPlace(identifier_buffer);
+            if (identifier.len < 1 or identifier.len > 32 or std.mem.indexOfScalar(u8, identifier, '/') != null) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const user_id = std.fmt.parseInt(i32, identifier, 10) catch resolve: {
+                const found = (try self.store.userByName(self.allocator, identifier)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+                defer freeUser(self.allocator, found);
+                break :resolve found.id;
+            };
+            if (user_id <= 0) return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            const history = (try self.store.siteNameHistoryJson(self.allocator, user_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &.{});
+            defer self.allocator.free(history);
+            return respond(req, .ok, "application/json", history, &.{.{ .name = "cache-control", .value = "public, max-age=60" }});
         }
         if (req.head.method == .GET and std.mem.startsWith(u8, path, "/api/v1/users/")) {
             const encoded_identifier = path["/api/v1/users/".len..];
@@ -4261,13 +4416,7 @@ const App = struct {
             }
             self.observeStableLastFmFlags(user.id, flags);
             std.log.info("lastfm: user_id={d} action={s} flags={d} b={s}", .{ user.id, action, flags, beatmap_or_flag });
-            const hq_flags: u32 = (@as(u32, 1) << 17) | (@as(u32, 1) << 18);
-            if (flags & hq_flags != 0) {
-                _ = try self.store.restrictForClientFlag(user.id, flags);
-                bancho.disconnectRestrictedUser(self.allocator, &self.sessions, user.id);
-            }
-            const hq_or_registry: u32 = hq_flags | (@as(u32, 1) << 19);
-            return respond(req, .ok, "text/plain", if (flags & hq_or_registry != 0) "-3" else "", &.{});
+            return respond(req, .ok, "text/plain", "", &.{});
         }
         if (std.mem.eql(u8, path, "/web/osu-rate.php") and req.head.method == .GET) {
             const encoded_name = queryField(target, "u") orelse return respond(req, .bad_request, "text/plain", "", &.{});
@@ -4419,9 +4568,8 @@ const App = struct {
                 std.log.warn("stable score rejected: reason=score_parse_failed error={t} fields={d} plaintext_bytes={d} body_bytes={d}", .{ err, std.mem.count(u8, decrypted.score_data, ":") + 1, decrypted.score_data.len, body.len });
                 return respond(req, .bad_request, "text/plain", "error: no", &.{});
             };
-            if (!stable_score.replayLengthAccepted(score.passed, replay.data.len)) {
-                return rejectStableScore(req, if (replay.data.len == 0) "passed_score_missing_replay" else "replay_too_large", body.len);
-            }
+            if (!stable_score.replayLengthAccepted(false, replay.data.len)) return rejectStableScore(req, "replay_too_large", body.len);
+            const passed_score_missing_replay = score.passed and replay.data.len == 0;
             if (!std.mem.eql(u8, score.map_md5, updated_map_hash)) {
                 std.log.warn("stable score rejected: reason=beatmap_hash_mismatch body_bytes={d}", .{body.len});
                 return respond(req, .bad_request, "text/plain", "error: beatmap", &.{});
@@ -4449,6 +4597,10 @@ const App = struct {
                 },
             }
             if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) return rejectStableScore(req, "checksum_mismatch", body.len);
+            if (passed_score_missing_replay) {
+                self.persistHostAnticheatObservation(user.id, .stable_score, null, anticheat_evidence.stableReplay(.missing, 0));
+                return rejectStableScore(req, "passed_score_missing_replay", body.len);
+            }
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             defer self.allocator.free(map_file);
             const performance = pp.calculate(map_file, .{
@@ -4488,10 +4640,13 @@ const App = struct {
                 std.log.warn("event=anticheat_replay_match_lookup_failed user_id={d} error={t}", .{ user.id, err });
                 break :blk 0;
             } else 0;
-            const anticheat_observation = self.observeStableGameplay(user.id, score, replay.data, map_file, performance, elapsed_ms, replay_match_count);
-            if (anticheat_observation) |observation| {
-                const allow_sample = observation.decision.action == anticheat_abi.Action.allow and self.anticheat_allow_sample_modulus != 0 and @mod(score_id, @as(i64, self.anticheat_allow_sample_modulus)) == 0;
-                if (observation.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, stableGameplayEvidence(score, replay_match_count), replay_match_count, observation);
+            switch (self.observeStableGameplay(user.id, score, replay.data, map_file, performance, elapsed_ms, replay_match_count)) {
+                .none => {},
+                .invalid_replay => self.persistHostAnticheatObservation(user.id, .stable_score, score_id, anticheat_evidence.stableReplay(.invalid_payload, replay_match_count)),
+                .result => |observation| {
+                    const allow_sample = observation.decision.action == anticheat_abi.Action.allow and self.anticheat_allow_sample_modulus != 0 and @mod(score_id, @as(i64, self.anticheat_allow_sample_modulus)) == 0;
+                    if (observation.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, stableGameplayEvidence(score, replay_match_count), replay_match_count, observation);
+                },
             }
             const after_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
             const placement = try self.store.scoreLeaderboardPlacement(score_id);
@@ -5735,8 +5890,10 @@ pub fn main(init: std.process.Init) !void {
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
     try app.lazer_multiplayer.bindStore(&app.store);
     app.lazer_multiplayer.bindBeatmapSync(&app.map_sync);
+    app.lazer_multiplayer.setEnabled(try app.store.serverControlEnabled(.lazer_multiplayer));
     app.lazer_multiplayer.refreshMatchmakingMaps() catch |err| std.log.warn("event=lazer_matchmaking_pool_startup_failed error={t}", .{err});
     app.lazer_spectator.bindStore(&app.store);
+    app.lazer_spectator.setEnabled(try app.store.serverControlEnabled(.spectator));
     kai.country = .{ 'I', 'S' };
     const kai_session = try app.sessions.createBot(kai);
     kai_session.longitude = -21.9426; // reykjavik
@@ -5757,6 +5914,7 @@ pub fn main(init: std.process.Init) !void {
     var listener = try address.listen(init.io, .{ .reuse_address = true });
     defer listener.deinit(init.io);
     shutdown_requested.store(false, .release);
+    restart_requested.store(false, .release);
     shutdown_listener_fd.store(@intCast(listener.socket.handle), .release);
     defer shutdown_listener_fd.store(-1, .release);
     if (comptime builtin.os.tag != .windows and std.posix.Sigaction != void) {
@@ -5794,4 +5952,5 @@ pub fn main(init: std.process.Init) !void {
             rejected.close(init.io);
         };
     }
+    if (restart_requested.load(.acquire)) return error.ServerRestartRequested;
 }

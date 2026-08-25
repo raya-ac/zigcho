@@ -388,13 +388,12 @@ fn loginFailure(allocator: std.mem.Allocator, token_text: []const u8, notificati
     return .{ .allocator = allocator, .token = token, .body = try allocator.dupe(u8, out.bytes()) };
 }
 
-fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool, matched_user_ids: []const i32) !LoginCapture {
+fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool) !LoginCapture {
     var user_owned = true;
     errdefer if (user_owned) {
         allocator.free(user.name);
         allocator.free(user.safe_name);
     };
-    for (matched_user_ids) |matched_user_id| if (sessions.byUser(matched_user_id)) |matched| removeSessionLocked(allocator, sessions, matched);
     if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
     const session = try sessions.createWithSocial(user, utc, longitude, latitude, friend_ids, block_non_friend_dms);
     user_owned = false;
@@ -450,12 +449,9 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         try store.updateCountry(user.id, value);
         user.country = value;
     }
-    var enforcement = try store.recordClientHardware(user.id, parsed.hardware);
-    defer enforcement.deinit();
-    if (enforcement.restricted()) {
-        user.restricted = true;
-        std.log.warn("stable login restricted exact hardware match: user_id={d} matches={any}", .{ user.id, enforcement.matched_user_ids });
-    }
+    var hardware_evidence = try store.recordClientHardware(user.id, parsed.hardware);
+    defer hardware_evidence.deinit();
+    if (hardware_evidence.matched_user_ids.len != 0) std.log.warn("stable login exact hardware match observed: user_id={d} matches={any} mode=review", .{ user.id, hardware_evidence.matched_user_ids });
     const response_friend_ids = try store.friendIds(allocator, user.id);
     defer allocator.free(response_friend_ids);
     const session_friend_ids = try allocator.dupe(i32, response_friend_ids);
@@ -478,7 +474,7 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
     pruneExpiredLocked(allocator, sessions);
     user_transferred = true;
     friends_transferred = true;
-    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, session_friend_ids, parsed.pm_private, enforcement.matched_user_ids) catch |err| {
+    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, session_friend_ids, parsed.pm_private) catch |err| {
         sessions.mutex.unlock(sessions.io);
         return err;
     };
@@ -563,7 +559,7 @@ pub fn login(allocator: std.mem.Allocator, store: *storage.Store, sessions: *ses
         .token = result_token,
         .body = result_body,
         .user_id = capture.user_id,
-        .hardware_match_count = @intCast(@min(enforcement.matched_user_ids.len, std.math.maxInt(u32))),
+        .hardware_match_count = @intCast(@min(hardware_evidence.matched_user_ids.len, std.math.maxInt(u32))),
         .running_under_wine = parsed.hardware.running_under_wine,
     };
 }

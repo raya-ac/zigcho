@@ -1247,7 +1247,10 @@ test "official osu api beatmapset fallback stores every real difficulty" {
     try std.testing.expectEqual(@as(i8, 3), second.status);
     const set_json = (try store.lazerBeatmapSet(std.testing.allocator, 900_000_000, null)).?;
     defer std.testing.allocator.free(set_json);
-    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"favourite_count\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"play_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"favourite_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"playcount\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"passcount\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, set_json, "\"video\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, set_json, "2026-08-22T10:11:12Z") != null);
 }

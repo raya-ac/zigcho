@@ -611,7 +611,7 @@ pub fn parseSoloScore(value: std.json.Value, beatmap_id: i32) !ScoreInput {
     };
     if (pauses.items.len > max_pauses) return error.InvalidScore;
     for (pauses.items) |pause| switch (pause) {
-        .integer => |v| if (v < 0 or v > std.math.maxInt(i32)) return error.InvalidScore,
+        .integer => |v| if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return error.InvalidScore,
         else => return error.InvalidScore,
     };
     const namespace = modNamespace(if (mods) |*list| list else null);

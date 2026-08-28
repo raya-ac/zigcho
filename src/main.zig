@@ -518,19 +518,6 @@ const App = struct {
         var download = download_optional.?;
         defer download.deinit();
         self.map_sync.recordMirrorCacheHit(download.bytes);
-        const redirect_url = self.store.beatmapArchiveRedirectUrl(self.allocator, download) catch |err| {
-            std.log.warn("event=beatmap_archive_redirect_failed set_id={d} error={t}", .{ set_id, err });
-            return respond(req, .bad_gateway, "application/json", "{\"error\":\"beatmap mirror storage unavailable\"}", &.{});
-        };
-        if (redirect_url) |location| {
-            defer self.allocator.free(location);
-            return respond(req, .temporary_redirect, "text/plain", "", &.{
-                .{ .name = "location", .value = location },
-                .{ .name = "cache-control", .value = "private, no-store" },
-                .{ .name = "x-zigcho-mirror-cache", .value = "hit" },
-                .{ .name = "x-content-type-options", .value = "nosniff" },
-            });
-        }
         var disposition_buf: [96]u8 = undefined;
         const disposition = try std.fmt.bufPrint(&disposition_buf, "attachment; filename=\"{d}.osz\"", .{set_id});
         const headers = [_]std.http.Header{

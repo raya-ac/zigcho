@@ -4719,7 +4719,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 15), builds.len);
+    try std.testing.expectEqual(@as(usize, 16), builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);
@@ -6624,7 +6624,7 @@ test "lazer beatmap tags persist votes and expose the current user state" {
 }
 
 test "official lazer score bodies allow omitted mods and reject hostile counters" {
-    const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[1000,2000]}", .{});
+    const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"rank\":\"A\",\"total_score\":987654,\"total_score_without_mods\":900000,\"accuracy\":0.985,\"max_combo\":321,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":300,\"miss\":2},\"maximum_statistics\":{\"great\":302},\"pauses\":[-1913,2000]}", .{});
     defer valid.deinit();
     const input = try lazer.parseSoloScore(valid.value, 75);
     try std.testing.expectEqual(@as(i64, 75), input.beatmap_id);
@@ -6633,6 +6633,7 @@ test "official lazer score bodies allow omitted mods and reject hostile counters
     try std.testing.expect(input.mods == null);
     try std.testing.expectEqual(lazer.Namespace.vanilla, input.namespace);
     try std.testing.expectEqual(@as(i64, 302), input.maximum_statistics.?.get("great").?.integer);
+    try std.testing.expectEqual(@as(i64, -1913), input.pauses.?.items[0].integer);
     try std.testing.expectEqual(@as(i32, 3_032_606), lazer.classicTotalScore(input));
     var taiko = input;
     taiko.ruleset_id = 1;
@@ -6648,7 +6649,7 @@ test "official lazer score bodies allow omitted mods and reject hostile counters
         "{\"rank\":\"SSS\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[]}",
         "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"great\":100000001},\"maximum_statistics\":{},\"pauses\":[]}",
         "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{\"made_up\":1},\"maximum_statistics\":{},\"pauses\":[]}",
-        "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[-1]}",
+        "{\"rank\":\"A\",\"total_score\":1,\"total_score_without_mods\":1,\"accuracy\":1,\"max_combo\":1,\"ruleset_id\":0,\"passed\":true,\"statistics\":{},\"maximum_statistics\":{},\"pauses\":[-2147483649]}",
     };
     for (invalid) |fixture| {
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});

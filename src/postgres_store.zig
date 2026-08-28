@@ -1813,11 +1813,6 @@ pub const Store = struct {
         try writer.writeAll(download.data orelse return error.BeatmapArchiveUnavailable);
     }
 
-    pub fn beatmapArchiveRedirectUrl(self: *Store, allocator: std.mem.Allocator, download: BeatmapArchiveDownload) !?[]u8 {
-        const object_key = download.object_key orelse return null;
-        return try self.object_store.presignedGetUrl(allocator, self.io, object_key, 15 * 60);
-    }
-
     pub fn hydrationRetryAllowed(self: *Store, md5: []const u8, now: i64) !bool {
         var now_buf: [32]u8 = undefined;
         const now_text = try std.fmt.bufPrint(&now_buf, "{d}", .{now});

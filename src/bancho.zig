@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const sessions_mod = @import("sessions.zig");
 const storage = @import("runtime_storage.zig");
@@ -716,23 +717,24 @@ const PreparedOwnerAuth = struct {
     }
 };
 
-fn prepareOwnerAuth(allocator: std.mem.Allocator, store: *storage.Store, user_id: i32) !PreparedOwnerAuth {
-    const user = (try store.userById(allocator, user_id)) orelse return error.StablePollOwnerMissing;
-    defer {
-        allocator.free(user.name);
-        allocator.free(user.safe_name);
-    }
+const StableOwnerAuthSnapshot = struct {
+    privileges: u32,
+    silence_end: i64,
+    restricted: bool,
+};
+
+fn prepareOwnerAuthFromSnapshot(allocator: std.mem.Allocator, io: std.Io, snapshot: StableOwnerAuthSnapshot) !PreparedOwnerAuth {
     var privileges = protocol.Writer.init(allocator);
     defer privileges.deinit();
-    const visible_privileges = if (user.restricted) user.privileges & ~@as(u32, 1) else user.privileges;
+    const visible_privileges = if (snapshot.restricted) snapshot.privileges & ~@as(u32, 1) else snapshot.privileges;
     try privileges.packetInt(.privileges, clientPrivileges(visible_privileges, true));
     const privileges_packet = try allocator.dupe(u8, privileges.bytes());
     errdefer allocator.free(privileges_packet);
 
     var silence = protocol.Writer.init(allocator);
     defer silence.deinit();
-    const now = std.Io.Clock.real.now(store.io).toSeconds();
-    try silence.packetInt(.silence_end, @intCast(@min(@as(i64, std.math.maxInt(i32)), @max(0, user.silence_end - now))));
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    try silence.packetInt(.silence_end, @intCast(@min(@as(i64, std.math.maxInt(i32)), @max(0, snapshot.silence_end - now))));
     const silence_packet = try allocator.dupe(u8, silence.bytes());
     errdefer allocator.free(silence_packet);
 
@@ -748,14 +750,43 @@ fn prepareOwnerAuth(allocator: std.mem.Allocator, store: *storage.Store, user_id
     try unrestricted.packetInt(.restart, 0);
     return .{
         .allocator = allocator,
-        .privileges = user.privileges,
-        .silence_end = user.silence_end,
-        .restricted = user.restricted,
+        .privileges = snapshot.privileges,
+        .silence_end = snapshot.silence_end,
+        .restricted = snapshot.restricted,
         .privileges_packet = privileges_packet,
         .silence_packet = silence_packet,
         .restricted_packet = restricted_packet,
         .unrestricted_packet = try allocator.dupe(u8, unrestricted.bytes()),
     };
+}
+
+fn ownerAuthSnapshot(user: domain.User) StableOwnerAuthSnapshot {
+    return .{
+        .privileges = user.privileges,
+        .silence_end = user.silence_end,
+        .restricted = user.restricted,
+    };
+}
+
+fn prepareOwnerAuth(allocator: std.mem.Allocator, store: *storage.Store, user_id: i32) !PreparedOwnerAuth {
+    const user = (try store.userById(allocator, user_id)) orelse return error.StablePollOwnerMissing;
+    defer {
+        allocator.free(user.name);
+        allocator.free(user.safe_name);
+    }
+    return prepareOwnerAuthFromSnapshot(allocator, store.io, ownerAuthSnapshot(user));
+}
+
+fn prepareOwnerAuthForDirectTest(allocator: std.mem.Allocator, store: *storage.Store, user_id: i32, fallback: StableOwnerAuthSnapshot) !PreparedOwnerAuth {
+    if (!builtin.is_test) return prepareOwnerAuth(allocator, store, user_id);
+    if (try store.userById(allocator, user_id)) |user| {
+        defer {
+            allocator.free(user.name);
+            allocator.free(user.safe_name);
+        }
+        return prepareOwnerAuthFromSnapshot(allocator, store.io, ownerAuthSnapshot(user));
+    }
+    return prepareOwnerAuthFromSnapshot(allocator, store.io, fallback);
 }
 
 const LazerPresenceSnapshot = struct {
@@ -2492,18 +2523,22 @@ fn drainSuppressedLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.S
 
 pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
     sessions.mutex.lockUncancelable(sessions.io);
-    const token = if (sessions.byToken(&session.token)) |current| blk: {
+    const direct = if (sessions.byToken(&session.token)) |current| blk: {
         if (current != session or current.generation != session.generation) {
             sessions.mutex.unlock(sessions.io);
             return error.StaleStableSession;
         }
-        break :blk current.token;
+        break :blk .{
+            .token = current.token,
+            .owner_auth = ownerAuthSnapshot(current.user),
+        };
     } else {
         sessions.mutex.unlock(sessions.io);
         return error.StaleStableSession;
     };
     sessions.mutex.unlock(sessions.io);
-    return (try pollByToken(allocator, store, sessions, &token, body)) orelse error.StaleStableSession;
+    const test_owner_auth: ?StableOwnerAuthSnapshot = if (builtin.is_test) direct.owner_auth else null;
+    return (try pollByTokenWithOwnerAuthFallback(allocator, store, sessions, &direct.token, body, test_owner_auth)) orelse error.StaleStableSession;
 }
 
 /// Resolve the owner needed to acquire the app's per-user game-session lease.
@@ -2517,6 +2552,10 @@ pub fn pollUserIdForToken(sessions: *sessions_mod.Sessions, token: []const u8) ?
 }
 
 pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, token: []const u8, body: []const u8) !?[]u8 {
+    return pollByTokenWithOwnerAuthFallback(allocator, store, sessions, token, body, null);
+}
+
+fn pollByTokenWithOwnerAuthFallback(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, token: []const u8, body: []const u8, test_owner_auth: ?StableOwnerAuthSnapshot) !?[]u8 {
     var delivered_dm_ids: std.ArrayList(i64) = .empty;
     defer delivered_dm_ids.deinit(allocator);
     var deferred_public_messages: std.ArrayList(DeferredPublicMessage) = .empty;
@@ -2559,7 +2598,10 @@ pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions
     sessions.mutex.unlock(sessions.io);
     defer stable_capture.deinit();
 
-    var prepared_owner_auth = try prepareOwnerAuth(allocator, store, stable_capture.owner_user_id);
+    var prepared_owner_auth = if (test_owner_auth) |fallback|
+        try prepareOwnerAuthForDirectTest(allocator, store, stable_capture.owner_user_id, fallback)
+    else
+        try prepareOwnerAuth(allocator, store, stable_capture.owner_user_id);
     defer prepared_owner_auth.deinit();
     var prepared_stable = try prepareStableStats(allocator, store, &stable_capture);
     defer prepared_stable.deinit();

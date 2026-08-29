@@ -1054,7 +1054,7 @@ test "authentication and database reads make progress concurrently" {
     var context: AuthStressContext = .{ .store = &store, .failed = &failed };
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    const online = try sessions.create(.{ .id = 99, .name = try std.testing.allocator.dupe(u8, "online"), .safe_name = try std.testing.allocator.dupe(u8, "online") }, 0, 0, 0);
+    const online = try sessions.create((try store.userById(std.testing.allocator, ari_id)).?, 0, 0, 0);
     const online_token = online.token;
     var presence_payload: [@sizeOf(u16) + @sizeOf(i32)]u8 = undefined;
     std.mem.writeInt(u16, presence_payload[0..2], 1, .little);
@@ -1202,7 +1202,8 @@ test "explicit lazer logout revokes the access and refresh token family" {
     defer std.testing.allocator.free(online.safe_name);
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    const observer = try sessions.create(.{ .id = 99, .name = try std.testing.allocator.dupe(u8, "observer"), .safe_name = try std.testing.allocator.dupe(u8, "observer") }, 0, 0, 0);
+    const observer_id = try store.register("observer", "observer@example.invalid", "00000000000000000000000000000000");
+    const observer = try sessions.create((try store.userById(std.testing.allocator, observer_id)).?, 0, 0, 0);
     const observer_token = observer.token;
     try bancho.noteLazerPresence(&sessions, user_id, std.Io.Clock.real.now(std.testing.io).toSeconds());
 
@@ -3518,10 +3519,11 @@ test "cross-client takeover emits one logout and the old Stable token only drain
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(2,'raya','raya',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(2,0)");
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
     const target = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
-    const observer = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
+    const observer = try sessions.create((try store.userById(std.testing.allocator, 2)).?, 0, 0, 0);
     const hosted_spectator = try sessions.create(.{ .id = 4, .name = try std.testing.allocator.dupe(u8, "spectator"), .safe_name = try std.testing.allocator.dupe(u8, "spectator") }, 0, 0, 0);
     const target_token = target.token;
     const observer_token = observer.token;
@@ -3596,9 +3598,10 @@ test "interrupted lazer presence lease emits one Stable logout" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(2,'raya','raya',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(2,0)");
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    const observer = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
+    const observer = try sessions.create((try store.userById(std.testing.allocator, 2)).?, 0, 0, 0);
     const observer_token = observer.token;
     const now = std.Io.Clock.real.now(std.testing.io).toSeconds();
     try bancho.publishLazerPresence(std.testing.allocator, &store, &sessions, .{ .id = observer.user.id, .name = observer.user.name, .safe_name = observer.user.safe_name });
@@ -3632,10 +3635,11 @@ test "logout removes the session and tells the remaining clients" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
+    try store.exec("INSERT INTO users(id,name,safe_name,password_hash,password_salt) VALUES(1,'ari','ari',x'00',x'00'),(2,'raya','raya',x'00',x'00'); INSERT INTO stats(user_id,mode) VALUES(1,0),(2,0)");
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    const leaving = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
-    const remaining = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
+    const leaving = try sessions.create((try store.userById(std.testing.allocator, 1)).?, 0, 0, 0);
+    const remaining = try sessions.create((try store.userById(std.testing.allocator, 2)).?, 0, 0, 0);
     const leaving_token = leaving.token;
     const remaining_token = remaining.token;
     const logout = try clientEmptyPacket(std.testing.allocator, .logout);
@@ -4504,10 +4508,10 @@ test "stable chat commands enforce silence and audit staff actions" {
     const silence_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, silence);
     defer std.testing.allocator.free(silence_reply);
     try expectMessageText(silence_reply, "target was silenced");
-    try std.testing.expect(target.user.silence_end > std.Io.Clock.real.now(std.testing.io).toSeconds());
     const target_notice = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
     defer std.testing.allocator.free(target_notice);
     try expectPacket(target_notice, .silence_end);
+    try std.testing.expect(target.user.silence_end > std.Io.Clock.real.now(std.testing.io).toSeconds());
     const observer_notice = try bancho.poll(std.testing.allocator, &store, &sessions, observer, "");
     defer std.testing.allocator.free(observer_notice);
     try expectPacket(observer_notice, .user_silenced);
@@ -4543,6 +4547,9 @@ test "stable chat commands enforce silence and audit staff actions" {
     const unsilence_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, unsilence);
     defer std.testing.allocator.free(unsilence_reply);
     try expectMessageText(unsilence_reply, "target was unsilenced");
+    const target_unsilenced = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(target_unsilenced);
+    try expectPacket(target_unsilenced, .silence_end);
     try std.testing.expect(target.user.silence_end <= std.Io.Clock.real.now(std.testing.io).toSeconds());
 
     const restrict = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!restrict target repeated abuse", "kai", 10);
@@ -4622,20 +4629,20 @@ test "stable channel permissions and locks survive in storage" {
     const add_priv_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, add_priv);
     defer std.testing.allocator.free(add_priv_reply);
     try expectMessageText(add_priv_reply, "privileges updated");
-    try std.testing.expect(player.user.privileges & (1 << 4) != 0);
     const privilege_notice = try bancho.poll(std.testing.allocator, &store, &sessions, player, "");
     defer std.testing.allocator.free(privilege_notice);
     try expectPacket(privilege_notice, .privileges);
+    try std.testing.expect(player.user.privileges & (1 << 4) != 0);
 
     const remove_priv = try clientMessagePacket(std.testing.allocator, .send_private_message, "admin", "!rmpriv player supporter", "kai", 20);
     defer std.testing.allocator.free(remove_priv);
     const remove_priv_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, remove_priv);
     defer std.testing.allocator.free(remove_priv_reply);
     try expectMessageText(remove_priv_reply, "privileges updated");
-    try std.testing.expect(player.user.privileges & (1 << 4) == 0);
     const remove_notice = try bancho.poll(std.testing.allocator, &store, &sessions, player, "");
     defer std.testing.allocator.free(remove_notice);
     try expectPacket(remove_notice, .privileges);
+    try std.testing.expect(player.user.privileges & (1 << 4) == 0);
 
     const delivered = try clientMessagePacket(std.testing.allocator, .send_public_message, "player", "back again", "#osu", 21);
     defer std.testing.allocator.free(delivered);

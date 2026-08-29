@@ -41,6 +41,7 @@ pub const Manager = struct {
         if (!entry.found_existing) entry.value_ptr.* = .{};
         var sender: sessions_mod.Session = .{
             .token = [_]u8{0} ** 64,
+            .generation = 0,
             .user = user,
             .mode = entry.value_ptr.mode,
             .mods = entry.value_ptr.mods,

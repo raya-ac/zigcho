@@ -11,6 +11,8 @@ metrics_url=http://127.0.0.1:27180/metrics
 database_url=${ZIGCHO_POSTGRES_URL:-dbname=zigcho user=zigcho host=/var/run/postgresql connect_timeout=5}
 backup_dir=/var/backups/zigcho
 backup=
+backup_key=
+backup_sha256=
 service_stopped=no
 release_active=no
 
@@ -18,7 +20,7 @@ case "$release" in
   "$release_root"/*) ;;
   *) echo "usage: $0 /opt/zigcho/releases/<commit>" >&2; exit 1 ;;
 esac
-if [ ! -x "$release/zigcho" ] || [ ! -s "$release/pp-engine-version" ] || [ ! -x "$release/tools/backup-postgres.sh" ] || [ ! -x "$release/tools/restore-postgres-drill.sh" ]; then
+if [ ! -x "$release/zigcho" ] || [ ! -s "$release/pp-engine-version" ] || [ ! -x "$release/tools/backup-postgres.sh" ] || [ ! -x "$release/tools/restore-postgres-drill.sh" ] || [ ! -x "$release/tools/rollback-release.sh" ]; then
   echo "candidate release is incomplete: $release" >&2
   exit 1
 fi
@@ -95,6 +97,9 @@ runuser --user postgres -- env \
   ZIGCHO_POSTGRES_ADMIN_URL="dbname=postgres host=/var/run/postgresql connect_timeout=5" \
   ZIGCHO_EXPECTED_SCHEMA="$current_schema" \
   "$candidate/tools/restore-postgres-drill.sh" "$backup"
+backup_key="backups/postgres/$(basename "$backup")"
+backup_sha256=$(sha256sum "$backup" | cut -d ' ' -f1)
+printf '%s\n' "$backup_sha256" | grep -Eq '^[0-9a-f]{64}$' || { echo "invalid release backup digest" >&2; exit 1; }
 systemctl stop "$service"
 service_stopped=yes
 runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check
@@ -107,11 +112,11 @@ ln -sfn "$candidate" "$current"
 if systemctl start "$service" \
   && curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused "$health_url" >/dev/null \
   && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$' \
-  && (cd /var/lib/zigcho && "$candidate/zigcho" object-put "backups/postgres/$(basename "$backup")" "$backup"); then
+  && (cd /var/lib/zigcho && "$candidate/zigcho" object-put "$backup_key" "$backup"); then
   release_active=yes
   trap - EXIT HUP INT TERM
   rm -f "$backup" "$backup.sha256"
-  echo "release_active candidate=$candidate rollback=$previous pp_engine=$candidate_pp recalculated=$recalculated backup=object local_backup_removed=true"
+  echo "release_active candidate=$candidate rollback_release=$previous rollback_schema=$current_schema rollback_backup=$backup_key rollback_sha256=$backup_sha256 rollback_tool=$candidate/tools/rollback-release.sh pp_engine=$candidate_pp recalculated=$recalculated local_backup_removed=true"
   exit 0
 fi
 false

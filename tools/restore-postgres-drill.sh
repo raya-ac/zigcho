@@ -4,6 +4,7 @@ set -eu
 backup_dir=${ZIGCHO_BACKUP_DIR:-/var/backups/zigcho}
 admin_url=${ZIGCHO_POSTGRES_ADMIN_URL:-dbname=postgres}
 expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-26}
+check_binary=${ZIGCHO_CHECK_BINARY:-}
 cd /
 
 case "$backup_dir" in
@@ -70,4 +71,18 @@ if [ "$schema_version" != "$expected_schema" ] || [ "$invalid_indexes" != "0" ] 
   exit 1
 fi
 
-echo "restore_drill_ok backup=$backup schema=$schema_version counts=$counts"
+binary_checked=no
+if [ -n "$check_binary" ]; then
+  check_binary=$(readlink -f "$check_binary")
+  case "$check_binary" in
+    /opt/zigcho/releases/*/zigcho|/opt/zigcho/hotfixes/*/zigcho) ;;
+    *) echo "refusing rollback check binary outside release roots" >&2; exit 1 ;;
+  esac
+  [ -x "$check_binary" ] || { echo "rollback check binary is not executable" >&2; exit 1; }
+  ZIGCHO_POSTGRES_URL="dbname=$drill_db host=/var/run/postgresql connect_timeout=5" "$check_binary" check
+  checked_schema=$(psql --dbname="$drill_db" --tuples-only --no-align --command="SELECT max(version) FROM zigcho.schema_migrations")
+  [ "$checked_schema" = "$expected_schema" ] || { echo "rollback binary changed the restore schema: expected=$expected_schema actual=$checked_schema" >&2; exit 1; }
+  binary_checked=yes
+fi
+
+echo "restore_drill_ok backup=$backup schema=$schema_version counts=$counts binary_checked=$binary_checked"

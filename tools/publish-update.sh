@@ -79,7 +79,7 @@ repository = os.environ.get("ZIGCHO_RELEASE_REPOSITORY", "raya-ac/zigcho").strip
 release_url = os.environ.get("ZIGCHO_RELEASE_URL", "").strip()
 client_version = os.environ.get("ZIGCHO_CLIENT_VERSION", "0.1.0-alpha.15").strip()
 builds = os.environ.get("ZIGCHO_RELEASE_BUILDS", "Windows · macOS · Linux · Android · unsigned iOS").strip()
-schema = os.environ.get("ZIGCHO_SCHEMA", "45").strip()
+schema = os.environ.get("ZIGCHO_SCHEMA", "46").strip()
 state = os.environ.get("ZIGCHO_RELEASE_STATE", "live").strip()
 
 commit_value = f"`{short_commit}`"
@@ -109,7 +109,7 @@ embed = {
     "color": 15745175,
     "fields": fields,
     "thumbnail": {"url": "https://a.kai.ovh/3"},
-    "footer": {"text": f"release 1 · {client_version} · {short_commit}"},
+    "footer": {"text": f"{title} · {client_version} · {short_commit}"},
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }
 if release_url:
@@ -132,5 +132,5 @@ fi
 
 curl --fail --silent --show-error \
     --form-string "payload_json=$payload" \
-    --form "files[0]=@$update;type=text/markdown;filename=zigcho-release-1.md" \
+    --form "files[0]=@$update;type=text/markdown;filename=zigcho-release.md" \
     "$DISCORD_RELEASE_WEBHOOK"

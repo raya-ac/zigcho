@@ -3,7 +3,128 @@ const domain = @import("domain.zig");
 const multiplayer = @import("multiplayer.zig");
 
 pub const max_queue_bytes = 1024 * 1024;
-pub const ScoreTokenAuthorization = enum { exact, stale_online, foreign_live, offline, missing };
+pub const max_stable_client_hash_bytes = 4096;
+
+pub const ScoreTokenAuthorization = enum {
+    exact,
+    stale_online,
+    foreign_live,
+    offline,
+    missing,
+    client_version_mismatch,
+    client_hardware_mismatch,
+    missing_login_client_binding,
+    invalid_client_binding,
+};
+
+/// Owned, immutable evidence shared by a real Stable login and score submit.
+/// Stable login versions include the leading `b` and may include a stream,
+/// while score submissions only send the eight-digit build date. The client
+/// hash is the same five-field hardware value in both requests. We retain no
+/// raw hardware identifiers on the session.
+pub const StableClientBinding = struct {
+    version_date: [8]u8,
+    hardware_digest: [32]u8,
+
+    pub fn init(osu_version: []const u8, client_hash: []const u8) !StableClientBinding {
+        const version_date = try normalizedStableVersion(osu_version);
+        const fields = try stableClientHashFields(client_hash);
+        var digest: [32]u8 = undefined;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("zigcho-stable-client-binding-v1\x00");
+        hashBindingField(&hash, fields.osu_path_md5);
+        hashBindingField(&hash, fields.adapters);
+        hashBindingField(&hash, fields.adapters_md5);
+        hashBindingField(&hash, fields.uninstall_md5);
+        hashBindingField(&hash, fields.disk_signature_md5);
+        hash.final(&digest);
+        return .{ .version_date = version_date, .hardware_digest = digest };
+    }
+
+    fn compare(self: StableClientBinding, submitted: StableClientBinding) ?ScoreTokenAuthorization {
+        if (!std.crypto.timing_safe.eql([8]u8, self.version_date, submitted.version_date)) return .client_version_mismatch;
+        if (!std.crypto.timing_safe.eql([32]u8, self.hardware_digest, submitted.hardware_digest)) return .client_hardware_mismatch;
+        return null;
+    }
+};
+
+const StableClientHashFields = struct {
+    osu_path_md5: []const u8,
+    adapters: []const u8,
+    adapters_md5: []const u8,
+    uninstall_md5: []const u8,
+    disk_signature_md5: []const u8,
+};
+
+fn normalizedStableVersion(value: []const u8) ![8]u8 {
+    const date = if (value.len == 8) value else if (value.len >= 9 and value[0] == 'b') value[1..9] else return error.InvalidStableClientVersion;
+    for (date) |char| if (!std.ascii.isDigit(char)) return error.InvalidStableClientVersion;
+    if (value.len != 8) {
+        var remainder = value[9..];
+        if (remainder.len >= 2 and remainder[0] == '.' and std.ascii.isDigit(remainder[1])) remainder = remainder[2..];
+        if (remainder.len != 0 and
+            !std.mem.eql(u8, remainder, "beta") and
+            !std.mem.eql(u8, remainder, "cuttingedge") and
+            !std.mem.eql(u8, remainder, "dev") and
+            !std.mem.eql(u8, remainder, "tourney")) return error.InvalidStableClientVersion;
+    }
+    return date[0..8].*;
+}
+
+fn stableClientHashFields(value: []const u8) !StableClientHashFields {
+    if (value.len < 2 or value.len > max_stable_client_hash_bytes or value[value.len - 1] != ':') return error.InvalidStableClientHash;
+    var fields = std.mem.splitScalar(u8, value[0 .. value.len - 1], ':');
+    const osu_path_md5 = fields.next() orelse return error.InvalidStableClientHash;
+    const adapters = fields.next() orelse return error.InvalidStableClientHash;
+    const adapters_md5 = fields.next() orelse return error.InvalidStableClientHash;
+    const uninstall_md5 = fields.next() orelse return error.InvalidStableClientHash;
+    const disk_signature_md5 = fields.next() orelse return error.InvalidStableClientHash;
+    if (fields.next() != null or !validMd5(osu_path_md5) or !validMd5(adapters_md5) or !validMd5(uninstall_md5) or !validMd5(disk_signature_md5)) return error.InvalidStableClientHash;
+    if (std.mem.eql(u8, adapters, "runningunderwine")) return .{
+        .osu_path_md5 = osu_path_md5,
+        .adapters = adapters,
+        .adapters_md5 = adapters_md5,
+        .uninstall_md5 = uninstall_md5,
+        .disk_signature_md5 = disk_signature_md5,
+    };
+    if (adapters.len < 2 or adapters[adapters.len - 1] != '.') return error.InvalidStableClientHash;
+    var adapter_parts = std.mem.splitScalar(u8, adapters[0 .. adapters.len - 1], '.');
+    var any_adapter = false;
+    while (adapter_parts.next()) |adapter| if (adapter.len != 0) {
+        any_adapter = true;
+        for (adapter) |char| if (char == 0 or char == ':') return error.InvalidStableClientHash;
+    };
+    if (!any_adapter) return error.InvalidStableClientHash;
+    return .{
+        .osu_path_md5 = osu_path_md5,
+        .adapters = adapters,
+        .adapters_md5 = adapters_md5,
+        .uninstall_md5 = uninstall_md5,
+        .disk_signature_md5 = disk_signature_md5,
+    };
+}
+
+fn validMd5(value: []const u8) bool {
+    if (value.len != 32) return false;
+    for (value) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
+}
+
+fn hashBindingField(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var length: [4]u8 = undefined;
+    std.mem.writeInt(u32, &length, @intCast(value.len), .little);
+    hash.update(&length);
+    for (value) |char| {
+        const normalized = [1]u8{std.ascii.toLower(char)};
+        hash.update(&normalized);
+    }
+}
+
+fn scoreBindingDecision(session: *const Session, submitted_binding: ?StableClientBinding) ?ScoreTokenAuthorization {
+    const submitted = submitted_binding orelse return .invalid_client_binding;
+    const login = session.stable_client_binding orelse return .missing_login_client_binding;
+    return login.compare(submitted);
+}
 
 pub const PublicPresence = struct {
     action: u8,
@@ -20,6 +141,8 @@ pub const PublicPresence = struct {
 
 pub const Session = struct {
     token: [64]u8,
+    generation: u64,
+    stable_client_binding: ?StableClientBinding = null,
     user: domain.User,
     utc_offset: i8 = 0,
     action: u8 = 0,
@@ -129,6 +252,7 @@ pub const Sessions = struct {
     by_safe_name: std.StringHashMap(*Session),
     lazer_leases: std.AutoHashMap(i32, i64),
     lazer_presence_epoch: u64 = 0,
+    next_session_generation: u64 = 1,
     matches: [multiplayer.max_matches]?multiplayer.Match = [_]?multiplayer.Match{null} ** multiplayer.max_matches,
 
     pub fn init(a: std.mem.Allocator, io: std.Io) Sessions {
@@ -157,11 +281,17 @@ pub const Sessions = struct {
         self.by_safe_name.deinit();
         self.lazer_leases.deinit();
     }
-    pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
+    fn takeSessionGeneration(self: *Sessions) u64 {
+        const generation = self.next_session_generation;
+        self.next_session_generation +%= 1;
+        if (self.next_session_generation == 0) self.next_session_generation = 1;
+        return generation;
+    }
+    fn createWithBinding(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32, stable_client_binding: ?StableClientBinding) !*Session {
         const s = try self.allocator.create(Session);
         errdefer self.allocator.destroy(s);
         const now = std.Io.Clock.real.now(self.io).toSeconds();
-        s.* = .{ .token = undefined, .user = user, .utc_offset = utc_offset, .login_time = now, .last_seen = now, .longitude = longitude, .latitude = latitude };
+        s.* = .{ .token = undefined, .generation = self.takeSessionGeneration(), .stable_client_binding = stable_client_binding, .user = user, .utc_offset = utc_offset, .login_time = now, .last_seen = now, .longitude = longitude, .latitude = latitude };
         var random: [32]u8 = undefined;
         try std.Io.randomSecure(self.io, &random);
         _ = std.fmt.bufPrint(&s.token, "{x}", .{random}) catch unreachable;
@@ -176,9 +306,15 @@ pub const Sessions = struct {
         self.by_safe_name.putAssumeCapacityNoClobber(user.safe_name, s);
         return s;
     }
-    pub fn createWithSocial(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool) !*Session {
+    pub fn create(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32) !*Session {
+        return self.createWithBinding(user, utc_offset, longitude, latitude, null);
+    }
+    pub fn createBound(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32, stable_client_binding: StableClientBinding) !*Session {
+        return self.createWithBinding(user, utc_offset, longitude, latitude, stable_client_binding);
+    }
+    pub fn createWithSocial(self: *Sessions, user: domain.User, utc_offset: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool, stable_client_binding: StableClientBinding) !*Session {
         errdefer self.allocator.free(friend_ids);
-        const session = try self.create(user, utc_offset, longitude, latitude);
+        const session = try self.createWithBinding(user, utc_offset, longitude, latitude, stable_client_binding);
         session.friend_ids = .fromOwnedSlice(friend_ids);
         session.block_non_friend_dms = block_non_friend_dms;
         return session;
@@ -188,6 +324,7 @@ pub const Sessions = struct {
         errdefer self.allocator.destroy(s);
         s.* = .{
             .token = [_]u8{0} ** 64,
+            .generation = self.takeSessionGeneration(),
             .user = user,
             .login_time = std.math.maxInt(i64),
             .last_seen = std.math.maxInt(i64),
@@ -233,15 +370,17 @@ pub const Sessions = struct {
         for (self.matches, 0..) |entry, index| if (entry == null) return @intCast(index);
         return null;
     }
-    pub fn authorizeScoreToken(self: *Sessions, token: ?[]const u8, user_id: i32) ScoreTokenAuthorization {
-        const present_token = token orelse return .missing;
+    pub fn authorizeScoreToken(self: *Sessions, token: ?[]const u8, user_id: i32, submitted_binding: ?StableClientBinding) ScoreTokenAuthorization {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const present_token = token orelse return .missing;
         if (self.byToken(present_token)) |session| {
             if (session.presence_suppressed) return .offline;
-            return if (session.user.id == user_id) .exact else .foreign_live;
+            if (session.user.id != user_id) return .foreign_live;
+            return scoreBindingDecision(session, submitted_binding) orelse .exact;
         }
-        return if (self.onlineByUser(user_id) != null) .stale_online else .offline;
+        const online = self.onlineByUser(user_id) orelse return .offline;
+        return scoreBindingDecision(online, submitted_binding) orelse .stale_online;
     }
     pub fn remove(self: *Sessions, target: *Session) void {
         for (self.items.items) |session| {
@@ -441,8 +580,8 @@ test "superseded Stable sessions stay connected only long enough to receive thei
     try std.testing.expect(sessions.onlineByUser(4) == null);
     try std.testing.expect(sessions.onlineByName("ari") == null);
     try std.testing.expect(sessions.publicPresence(4) == null);
-    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&token, 4));
-    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale", 4));
+    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&token, 4, null));
+    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale", 4, null));
     try std.testing.expectEqual(@as(usize, 0), sessions.channelCount("#osu"));
     try sessions.broadcast("presence", null);
     try sessions.broadcastChannel("#osu", "chat", null);
@@ -471,4 +610,68 @@ test "direct-message queue owns exact unread rows and drops them with discarded 
     try session.enqueue(allocator, fill);
     try std.testing.expect(session.queue_overflowed);
     try std.testing.expectEqual(@as(usize, 0), session.pending_dm_reads.items.len);
+}
+
+test "Stable client bindings normalize only fields shared by login and score submit" {
+    const login = try StableClientBinding.init(
+        "b20260811.1cuttingedge",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:AA.BB.CC.:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD:",
+    );
+    const submit = try StableClientBinding.init(
+        "20260811",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aa.bb.cc.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:",
+    );
+    try std.testing.expectEqual(login.version_date, submit.version_date);
+    try std.testing.expectEqual(login.hardware_digest, submit.hardware_digest);
+
+    const other_hardware = try StableClientBinding.init(
+        "20260811",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:11.22.33.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:",
+    );
+    try std.testing.expect(!std.crypto.timing_safe.eql([32]u8, login.hardware_digest, other_hardware.hardware_digest));
+    try std.testing.expectError(error.InvalidStableClientVersion, StableClientBinding.init("b2026bad!", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:"));
+    try std.testing.expectError(error.InvalidStableClientVersion, StableClientBinding.init("b20260811garbage", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:"));
+    try std.testing.expectError(error.InvalidStableClientHash, StableClientBinding.init("20260811", "not-a-client-hash"));
+}
+
+test "score authorization binds exact and stale tokens to the live Stable client" {
+    const allocator = std.testing.allocator;
+    var sessions = Sessions.init(allocator, std.testing.io);
+    defer sessions.deinit();
+    const binding = try StableClientBinding.init(
+        "b20260811",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:",
+    );
+    const wrong_version = try StableClientBinding.init(
+        "20260812",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:",
+    );
+    const wrong_hardware = try StableClientBinding.init(
+        "20260811",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:4.5.6.:ffffffffffffffffffffffffffffffff:11111111111111111111111111111111:22222222222222222222222222222222:",
+    );
+    const ari = try sessions.createBound(.{
+        .id = 1,
+        .name = try allocator.dupe(u8, "ari"),
+        .safe_name = try allocator.dupe(u8, "ari"),
+    }, 0, 0, 0, binding);
+    const other = try sessions.createBound(.{
+        .id = 2,
+        .name = try allocator.dupe(u8, "other"),
+        .safe_name = try allocator.dupe(u8, "other"),
+    }, 0, 0, 0, wrong_hardware);
+    const token = ari.token;
+    const foreign_token = other.token;
+
+    try std.testing.expectEqual(ScoreTokenAuthorization.exact, sessions.authorizeScoreToken(&token, 1, binding));
+    try std.testing.expectEqual(ScoreTokenAuthorization.stale_online, sessions.authorizeScoreToken("queued-after-restart", 1, binding));
+    try std.testing.expectEqual(ScoreTokenAuthorization.client_version_mismatch, sessions.authorizeScoreToken(&token, 1, wrong_version));
+    try std.testing.expectEqual(ScoreTokenAuthorization.client_hardware_mismatch, sessions.authorizeScoreToken("queued-after-restart", 1, wrong_hardware));
+    try std.testing.expectEqual(ScoreTokenAuthorization.invalid_client_binding, sessions.authorizeScoreToken(&token, 1, null));
+    try std.testing.expectEqual(ScoreTokenAuthorization.foreign_live, sessions.authorizeScoreToken(&foreign_token, 1, binding));
+    try std.testing.expectEqual(ScoreTokenAuthorization.missing, sessions.authorizeScoreToken(null, 1, null));
+
+    ari.presence_suppressed = true;
+    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&token, 1, binding));
+    try std.testing.expectEqual(ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("queued-after-restart", 1, binding));
 }

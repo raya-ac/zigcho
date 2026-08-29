@@ -28,6 +28,7 @@ on:
       - tools/backup-postgres-object.sh
       - tools/hotfix.py
       - tools/restore-postgres-drill.sh
+      - tools/rollback-release.sh
       - hotfixes/**
       - deploy/Dockerfile.hotfix
       - build.zig
@@ -162,6 +163,8 @@ jobs:
             test "$check_line" -lt "$stop_line"
           else
             activate=artifacts/server/tools/activate-release.sh
+            test -x artifacts/server/tools/rollback-release.sh
+            sh -n artifacts/server/tools/rollback-release.sh
             stop_line=$(grep -n '^systemctl stop "$service"$' "$activate" | cut -d: -f1)
             stopped_line=$(grep -n '^service_stopped=yes$' "$activate" | tail -n 1 | cut -d: -f1)
             check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
@@ -263,7 +266,7 @@ jobs:
               do
                 ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_TRANSITIONS_URL" zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done
-              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through server controls schema forty five"
+              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through best score schema forty six"
             '
 
       - name: boot the exact binary on PostgreSQL
@@ -274,7 +277,7 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 45
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 46
           test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!

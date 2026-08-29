@@ -15,6 +15,7 @@ const stable_mods = @import("stable_mods.zig");
 const stable_response = @import("stable_response.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
+const pp_admin = @import("pp_admin.zig");
 const native_pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
 const storage = @import("runtime_storage.zig");
@@ -81,6 +82,7 @@ comptime {
     _ = anticheat_replay;
     _ = anticheat_review;
     _ = achievements;
+    _ = pp_admin;
     _ = changelog;
     _ = lazer_route_manifest;
     _ = lazer_wiki;
@@ -1384,6 +1386,31 @@ test "login ownership cleans every induced allocation failure" {
     _ = try store.storeDirectMessage(sender_id, ari_id, "allocation owned mail");
     var context: LoginAllocationContext = .{ .store = &store, .body = ari_stable_login };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, loginAllocationRun, .{&context});
+}
+
+test "a token superseded before its per-user poll lease cannot mutate storage" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stale-poll-mutation.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const owner_id = try store.register("poll owner", "poll-owner@example.invalid", "00000000000000000000000000000000");
+    const friend_id = try store.register("poll friend", "poll-friend@example.invalid", "11111111111111111111111111111111");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const original = try sessions.create((try store.userById(std.testing.allocator, owner_id)).?, 0, 0, 0);
+    const old_token = original.token;
+    try std.testing.expectEqual(owner_id, bancho.pollUserIdForToken(&sessions, &old_token).?);
+
+    _ = try sessions.create((try store.userById(std.testing.allocator, owner_id)).?, 0, 0, 0);
+    const friend_add = try clientIntPacket(std.testing.allocator, .friend_add, friend_id);
+    defer std.testing.allocator.free(friend_add);
+    try std.testing.expect((try bancho.pollByToken(std.testing.allocator, &store, &sessions, &old_token, friend_add)) == null);
+    const friends = try store.friendIds(std.testing.allocator, owner_id);
+    defer std.testing.allocator.free(friends);
+    try std.testing.expect(std.mem.indexOfScalar(i32, friends, friend_id) == null);
 }
 
 test "stable login details require the complete client hardware contract" {
@@ -3432,11 +3459,12 @@ test "poll by token survives session replacement and rejects the stale token" {
     var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
     defer store.close();
     try store.migrate();
+    const user_id = try store.register("ari", "session-replace@example.test", "00000000000000000000000000000000");
 
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
     const first = try sessions.create(.{
-        .id = 1,
+        .id = user_id,
         .name = try std.testing.allocator.dupe(u8, "ari"),
         .safe_name = try std.testing.allocator.dupe(u8, "ari"),
     }, 0, 0, 0);
@@ -3446,7 +3474,7 @@ test "poll by token survives session replacement and rejects the stale token" {
 
     sessions.mutex.lockUncancelable(sessions.io);
     const replacement = sessions.create(.{
-        .id = 1,
+        .id = user_id,
         .name = try std.testing.allocator.dupe(u8, "ari"),
         .safe_name = try std.testing.allocator.dupe(u8, "ari"),
     }, 0, 0, 0) catch |err| {
@@ -3466,19 +3494,20 @@ test "poll by token survives session replacement and rejects the stale token" {
 test "stable score token authorization keeps restart compatibility without accepting a foreign live token" {
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
-    const ari = try sessions.create(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0);
-    const raya = try sessions.create(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0);
+    const binding = try sessions_mod.StableClientBinding.init("b20260811", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:");
+    const ari = try sessions.createBound(.{ .id = 1, .name = try std.testing.allocator.dupe(u8, "ari"), .safe_name = try std.testing.allocator.dupe(u8, "ari") }, 0, 0, 0, binding);
+    const raya = try sessions.createBound(.{ .id = 2, .name = try std.testing.allocator.dupe(u8, "raya"), .safe_name = try std.testing.allocator.dupe(u8, "raya") }, 0, 0, 0, binding);
     const ari_token = ari.token;
     const raya_token = raya.token;
 
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.exact, sessions.authorizeScoreToken(&ari_token, 1));
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.foreign_live, sessions.authorizeScoreToken(&raya_token, 1));
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.stale_online, sessions.authorizeScoreToken("stale-after-restart", 1));
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale-after-restart", 99));
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.missing, sessions.authorizeScoreToken(null, 1));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.exact, sessions.authorizeScoreToken(&ari_token, 1, binding));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.foreign_live, sessions.authorizeScoreToken(&raya_token, 1, binding));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.stale_online, sessions.authorizeScoreToken("stale-after-restart", 1, binding));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale-after-restart", 99, binding));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.missing, sessions.authorizeScoreToken(null, 1, null));
     ari.presence_suppressed = true;
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&ari_token, 1));
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale-after-restart", 1));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&ari_token, 1, binding));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale-after-restart", 1, binding));
 }
 
 test "cross-client takeover emits one logout and the old Stable token only drains its kick" {
@@ -3521,7 +3550,7 @@ test "cross-client takeover emits one logout and the old Stable token only drain
     try std.testing.expect(try bancho.suppressForTakeover(std.testing.allocator, &sessions, 1, "signed in from lazer"));
     try std.testing.expect(target.presence_suppressed);
     try std.testing.expectEqual(@as(usize, 0), target.pending_dm_reads.items.len);
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&target_token, 1));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken(&target_token, 1, null));
     try std.testing.expect(!target.in_lobby and !target.joined_lobby_channel);
     try std.testing.expect(target.match_id == null);
     try std.testing.expect(target.spectating_user_id == null);
@@ -4158,6 +4187,117 @@ test "stable social packets enforce friend-only dms and away presence contracts"
     try expectPresenceUsers(presence_reply, &.{ 40, 41 }, &.{42});
 }
 
+test "restricted Stable dispatch cannot mutate social channel lobby match or spectator state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/restricted-dispatch.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try store.exec(
+        "INSERT INTO users(id,name,safe_name,password_hash,password_salt,privileges,restricted) VALUES" ++
+            "(60,'restricted player','restricted_player',x'00',x'00',2,1)," ++
+            "(61,'visible player','visible_player',x'00',x'00',3,0)",
+    );
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const restricted = try sessions.create((try store.userById(std.testing.allocator, 60)).?, 0, 0, 0);
+    const visible = try sessions.create((try store.userById(std.testing.allocator, 61)).?, 0, 0, 0);
+    try std.testing.expect(sessions.join(visible, "#osu"));
+
+    var channel_payload = protocol.Writer.init(std.testing.allocator);
+    defer channel_payload.deinit();
+    try channel_payload.string("#osu");
+    const channel_join = try clientPayloadPacket(std.testing.allocator, .channel_join, channel_payload.bytes());
+    defer std.testing.allocator.free(channel_join);
+    const friend_add = try clientIntPacket(std.testing.allocator, .friend_add, visible.user.id);
+    defer std.testing.allocator.free(friend_add);
+    const lobby_join = try clientEmptyPacket(std.testing.allocator, .join_lobby);
+    defer std.testing.allocator.free(lobby_join);
+    const spectate = try clientIntPacket(std.testing.allocator, .start_spectating, visible.user.id);
+    defer std.testing.allocator.free(spectate);
+    const create_match = try clientMatchPacket(std.testing.allocator, .create_match, restricted.user.id, "must-not-exist");
+    defer std.testing.allocator.free(create_match);
+    const public_message = try clientMessagePacket(std.testing.allocator, .send_public_message, restricted.user.name, "must not send", "#osu", restricted.user.id);
+    defer std.testing.allocator.free(public_message);
+    const privacy = try clientIntPacket(std.testing.allocator, .toggle_block_non_friend_dms, 1);
+    defer std.testing.allocator.free(privacy);
+
+    var denied_packets: std.ArrayList(u8) = .empty;
+    defer denied_packets.deinit(std.testing.allocator);
+    for ([_][]const u8{ channel_join, friend_add, lobby_join, spectate, create_match, public_message, privacy }) |packet| try denied_packets.appendSlice(std.testing.allocator, packet);
+    const denied_reply = try bancho.poll(std.testing.allocator, &store, &sessions, restricted, denied_packets.items);
+    defer std.testing.allocator.free(denied_reply);
+    try std.testing.expectEqual(@as(usize, 0), denied_reply.len);
+    try std.testing.expect(!restricted.joined_osu);
+    try std.testing.expect(!restricted.joined_lobby_channel and !restricted.in_lobby);
+    try std.testing.expect(restricted.match_id == null);
+    try std.testing.expect(restricted.spectating_user_id == null);
+    try std.testing.expect(!restricted.isFriend(visible.user.id));
+    try std.testing.expect(!restricted.block_non_friend_dms);
+    try std.testing.expect(sessions.matchById(0) == null);
+    try std.testing.expectEqual(@as(usize, 0), visible.queue.items.len);
+
+    const allowed_action = try clientActionPacket(std.testing.allocator, 2);
+    defer std.testing.allocator.free(allowed_action);
+    const action_reply = try bancho.poll(std.testing.allocator, &store, &sessions, restricted, allowed_action);
+    defer std.testing.allocator.free(action_reply);
+    try std.testing.expectEqual(@as(u8, 2), restricted.action);
+    try expectPacket(action_reply, .user_stats);
+    try std.testing.expectEqual(@as(usize, 0), visible.queue.items.len);
+}
+
+test "deferred Stable commands leave authority to the database and owner poll refresh" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/deferred-command-authority.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const admin_id = try store.register("authority admin", "authority-admin@example.invalid", "00000000000000000000000000000000");
+    const target_id = try store.register("authority target", "authority-target@example.invalid", "11111111111111111111111111111111");
+    _ = try store.changePrivileges(admin_id, admin_id, 1 << 13, true);
+
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const admin = try sessions.create((try store.userById(std.testing.allocator, admin_id)).?, 0, 0, 0);
+    const target = try sessions.create((try store.userById(std.testing.allocator, target_id)).?, 0, 0, 0);
+    try std.testing.expect(sessions.join(admin, "#osu"));
+
+    const restrict = try clientMessagePacket(std.testing.allocator, .send_public_message, admin.user.name, "!restrict authority_target current command", "#osu", admin_id);
+    defer std.testing.allocator.free(restrict);
+    const command_reply = try bancho.poll(std.testing.allocator, &store, &sessions, admin, restrict);
+    defer std.testing.allocator.free(command_reply);
+    const stored_restricted = (try store.userById(std.testing.allocator, target_id)).?;
+    defer {
+        std.testing.allocator.free(stored_restricted.name);
+        std.testing.allocator.free(stored_restricted.safe_name);
+    }
+    try std.testing.expect(stored_restricted.restricted);
+    try std.testing.expect(!target.user.restricted);
+
+    const target_restricted = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(target_restricted);
+    try std.testing.expect(target.user.restricted);
+    try expectPacket(target_restricted, .account_restricted);
+
+    try store.setRestricted(admin_id, target_id, false, "newer database truth");
+    _ = try store.changePrivileges(admin_id, target_id, 1 << 12, true);
+    const silence_end = std.Io.Clock.real.now(std.testing.io).toSeconds() + 600;
+    try store.setSilence(admin_id, target_id, silence_end, "account.silence", "newer database truth");
+    const refreshed = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(refreshed);
+    try std.testing.expect(!target.user.restricted);
+    try std.testing.expect(target.user.privileges & (1 << 12) != 0);
+    try std.testing.expectEqual(silence_end, target.user.silence_end);
+    try expectPacket(refreshed, .privileges);
+    try expectPacket(refreshed, .silence_end);
+    try expectPacket(refreshed, .restart);
+}
+
 test "joined public chat delivers once and kai answers private chat as user three" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4244,6 +4384,32 @@ test "online Stable direct mail becomes read only when the target drains the exa
     defer std.testing.allocator.free(read);
     try std.testing.expectEqual(@as(usize, 0), read.len);
     try std.testing.expect(!try store.markDirectMessageRead(target_id, message_id));
+}
+
+test "Stable polling recovers mail inserted after login without duplicating it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-reconnect-mail.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const sender_id = try store.register("late sender", "late-sender@example.invalid", "00000000000000000000000000000000");
+    const target_id = try store.register("late target", "late-target@example.invalid", "11111111111111111111111111111111");
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const target = try sessions.create((try store.userById(std.testing.allocator, target_id)).?, 0, 0, 0);
+
+    const message_id = try store.storeDirectMessage(sender_id, target_id, "arrived after login snapshot");
+    try std.testing.expectEqual(@as(usize, 0), target.pending_dm_reads.items.len);
+    const delivered = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(delivered);
+    try expectMessageContains(delivered, "arrived after login snapshot");
+    try std.testing.expect(!try store.markDirectMessageRead(target_id, message_id));
+
+    const duplicate = try bancho.poll(std.testing.allocator, &store, &sessions, target, "");
+    defer std.testing.allocator.free(duplicate);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate, "arrived after login snapshot") == null);
 }
 
 test "stable slash np selects the linked map and returns pp without a fake pp command" {
@@ -4719,7 +4885,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 17), builds.len);
+    try std.testing.expectEqual(@as(usize, 18), builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);

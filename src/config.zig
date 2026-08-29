@@ -23,6 +23,10 @@ pub const Config = struct {
     beatmap_media_cache_max_bytes: u64,
     irc_bind: []u8,
     irc_port: u16,
+    http_max_connections: u32,
+    http_header_timeout_seconds: u16,
+    http_request_timeout_seconds: u16,
+    http_long_request_timeout_seconds: u16,
 
     pub fn empty(allocator: std.mem.Allocator) !Config {
         const osu_api_key = try allocator.dupe(u8, "");
@@ -70,6 +74,10 @@ pub const Config = struct {
             .beatmap_media_cache_max_bytes = 512 * 1024 * 1024,
             .irc_bind = irc_bind,
             .irc_port = 0,
+            .http_max_connections = 512,
+            .http_header_timeout_seconds = 10,
+            .http_request_timeout_seconds = 30,
+            .http_long_request_timeout_seconds = 300,
         };
     }
 
@@ -148,9 +156,57 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
             if (validIrcBind(value)) try result.replace(&result.irc_bind, value);
         } else if (std.mem.eql(u8, key, "irc_port")) {
             result.irc_port = std.fmt.parseInt(u16, value, 10) catch continue;
+        } else if (std.mem.eql(u8, key, "http_max_connections")) {
+            const parsed = std.fmt.parseInt(u32, value, 10) catch continue;
+            if (parsed >= 64 and parsed <= 4096) result.http_max_connections = parsed;
+        } else if (std.mem.eql(u8, key, "http_header_timeout_seconds")) {
+            const parsed = std.fmt.parseInt(u16, value, 10) catch continue;
+            if (parsed >= 2 and parsed <= 60) result.http_header_timeout_seconds = parsed;
+        } else if (std.mem.eql(u8, key, "http_request_timeout_seconds")) {
+            const parsed = std.fmt.parseInt(u16, value, 10) catch continue;
+            if (parsed >= 5 and parsed <= 300) result.http_request_timeout_seconds = parsed;
+        } else if (std.mem.eql(u8, key, "http_long_request_timeout_seconds")) {
+            const parsed = std.fmt.parseInt(u16, value, 10) catch continue;
+            if (parsed >= 30 and parsed <= 1800) result.http_long_request_timeout_seconds = parsed;
         }
     }
+    if (result.http_long_request_timeout_seconds < result.http_request_timeout_seconds) {
+        result.http_long_request_timeout_seconds = result.http_request_timeout_seconds;
+    }
     return result;
+}
+
+test "http limits keep bounded production defaults and reject unsafe config" {
+    var defaults = try Config.empty(std.testing.allocator);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u32, 512), defaults.http_max_connections);
+    try std.testing.expectEqual(@as(u16, 10), defaults.http_header_timeout_seconds);
+    try std.testing.expectEqual(@as(u16, 30), defaults.http_request_timeout_seconds);
+    try std.testing.expectEqual(@as(u16, 300), defaults.http_long_request_timeout_seconds);
+
+    var configured = try parse(std.testing.allocator,
+        \\http_max_connections=768
+        \\http_header_timeout_seconds=12
+        \\http_request_timeout_seconds=45
+        \\http_long_request_timeout_seconds=420
+    );
+    defer configured.deinit();
+    try std.testing.expectEqual(@as(u32, 768), configured.http_max_connections);
+    try std.testing.expectEqual(@as(u16, 12), configured.http_header_timeout_seconds);
+    try std.testing.expectEqual(@as(u16, 45), configured.http_request_timeout_seconds);
+    try std.testing.expectEqual(@as(u16, 420), configured.http_long_request_timeout_seconds);
+
+    var unsafe = try parse(std.testing.allocator,
+        \\http_max_connections=0
+        \\http_header_timeout_seconds=1
+        \\http_request_timeout_seconds=1
+        \\http_long_request_timeout_seconds=1
+    );
+    defer unsafe.deinit();
+    try std.testing.expectEqual(@as(u32, 512), unsafe.http_max_connections);
+    try std.testing.expectEqual(@as(u16, 10), unsafe.http_header_timeout_seconds);
+    try std.testing.expectEqual(@as(u16, 30), unsafe.http_request_timeout_seconds);
+    try std.testing.expectEqual(@as(u16, 300), unsafe.http_long_request_timeout_seconds);
 }
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io) !Config {

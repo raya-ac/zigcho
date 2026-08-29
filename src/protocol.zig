@@ -52,6 +52,23 @@ pub const ClientPacket = enum(u16) {
     _,
 };
 
+/// Restricted Stable sessions keep only the packets needed to stay connected,
+/// update their own local status, request visible stats, and leave cleanly.
+/// Social, channel, spectator, lobby, friend, and match mutations are denied
+/// before their handlers can inspect a payload.
+pub fn restrictedClientPacketAllowed(packet: ClientPacket) bool {
+    return switch (packet) {
+        .ping,
+        .change_action,
+        .logout,
+        .request_status,
+        .receive_updates,
+        .user_stats_request,
+        => true,
+        else => false,
+    };
+}
+
 pub const ServerPacket = enum(u16) {
     user_id = 5,
     send_message = 7,
@@ -106,6 +123,34 @@ pub const ServerPacket = enum(u16) {
     match_abort = 106,
     switch_tournament_server = 107,
 };
+
+test "restricted Stable packet allowlist excludes every social and multiplayer mutation" {
+    inline for (.{
+        ClientPacket.ping,
+        .change_action,
+        .logout,
+        .request_status,
+        .receive_updates,
+        .user_stats_request,
+    }) |packet| try std.testing.expect(restrictedClientPacketAllowed(packet));
+    inline for (.{
+        ClientPacket.send_public_message,
+        .send_private_message,
+        .friend_add,
+        .friend_remove,
+        .channel_join,
+        .channel_part,
+        .join_lobby,
+        .part_lobby,
+        .create_match,
+        .join_match,
+        .part_match,
+        .start_spectating,
+        .stop_spectating,
+        .spectate_frames,
+        .cant_spectate,
+    }) |packet| try std.testing.expect(!restrictedClientPacketAllowed(packet));
+}
 
 pub const Packet = struct { id: ClientPacket, payload: []const u8 };
 

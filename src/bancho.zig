@@ -29,6 +29,7 @@ pub const StableLoginDetails = struct {
     utc_offset: i8,
     display_city: bool,
     pm_private: bool,
+    client_binding: sessions_mod.StableClientBinding,
     hardware: storage.ClientHardware,
 };
 
@@ -68,7 +69,8 @@ pub fn parseStableLoginDetails(details: []const u8) !StableLoginDetails {
     if (utc_offset < -24 or utc_offset > 24) return error.InvalidLoginDetails;
     if ((!std.mem.eql(u8, display_city, "0") and !std.mem.eql(u8, display_city, "1")) or
         (!std.mem.eql(u8, pm_private, "0") and !std.mem.eql(u8, pm_private, "1"))) return error.InvalidLoginDetails;
-    if (client_hashes.len < 2 or client_hashes[client_hashes.len - 1] != ':') return error.InvalidLoginDetails;
+    if (client_hashes.len < 2 or client_hashes.len > sessions_mod.max_stable_client_hash_bytes or client_hashes[client_hashes.len - 1] != ':') return error.InvalidLoginDetails;
+    const client_binding = sessions_mod.StableClientBinding.init(osu_version, client_hashes) catch return error.InvalidLoginDetails;
 
     var hashes = std.mem.splitScalar(u8, client_hashes[0 .. client_hashes.len - 1], ':');
     const osu_path_md5 = hashes.next() orelse return error.InvalidLoginDetails;
@@ -94,6 +96,7 @@ pub fn parseStableLoginDetails(details: []const u8) !StableLoginDetails {
         .utc_offset = utc_offset,
         .display_city = std.mem.eql(u8, display_city, "1"),
         .pm_private = std.mem.eql(u8, pm_private, "1"),
+        .client_binding = client_binding,
         .hardware = .{
             .osu_path_md5 = osu_path_md5,
             .adapters_md5 = adapters_md5,
@@ -164,6 +167,596 @@ const SessionSnapshot = struct {
         return self.info_text[0..self.info_len];
     }
 };
+
+const StableStatsUser = struct { id: i32 };
+
+/// A fixed-size copy of every session field needed to build a Stable stats
+/// packet. It can cross the session-mutex boundary without retaining a Session
+/// pointer or borrowing user-owned memory.
+const StableStatsSnapshot = struct {
+    user: StableStatsUser,
+    generation: u64,
+    action: u8,
+    mode: u8,
+    mods: i32,
+    map_id: i32,
+    map_md5: [32]u8,
+    info_text: [96]u8,
+    info_len: usize,
+
+    fn init(session: *const sessions_mod.Session) StableStatsSnapshot {
+        return .{
+            .user = .{ .id = session.user.id },
+            .generation = session.generation,
+            .action = session.action,
+            .mode = session.mode,
+            .mods = session.mods,
+            .map_id = session.map_id,
+            .map_md5 = session.map_md5,
+            .info_text = session.info_text,
+            .info_len = session.info_len,
+        };
+    }
+
+    fn info(self: *const StableStatsSnapshot) []const u8 {
+        return self.info_text[0..self.info_len];
+    }
+};
+
+fn applyStableAction(target: anytype, payload: []const u8) !void {
+    var reader: protocol.PayloadReader = .{ .data = payload };
+    target.action = try reader.byte();
+    const info = try reader.string();
+    const md5 = try reader.string();
+    target.mods = try reader.int(i32);
+    target.mode = try reader.byte();
+    target.map_id = try reader.int(i32);
+    target.info_len = @min(info.len, target.info_text.len);
+    @memcpy(target.info_text[0..target.info_len], info[0..target.info_len]);
+    @memset(&target.map_md5, 0);
+    @memcpy(target.map_md5[0..@min(32, md5.len)], md5[0..@min(32, md5.len)]);
+}
+
+const StableStatsRequest = struct {
+    packet_index: usize,
+    snapshot: StableStatsSnapshot,
+};
+
+const CapturedDmTarget = struct {
+    user_id: i32,
+    generation: u64,
+    name: [96]u8 = [_]u8{0} ** 96,
+    name_len: usize = 0,
+    block_non_friend_dms: bool,
+    sender_is_friend: bool,
+    away_message: [512]u8 = [_]u8{0} ** 512,
+    away_message_len: usize = 0,
+
+    fn init(target: *const sessions_mod.Session, sender_id: i32) CapturedDmTarget {
+        var result: CapturedDmTarget = .{
+            .user_id = target.user.id,
+            .generation = target.generation,
+            .block_non_friend_dms = target.block_non_friend_dms,
+            .sender_is_friend = target.isFriend(sender_id),
+        };
+        result.name_len = @min(target.user.name.len, result.name.len);
+        @memcpy(result.name[0..result.name_len], target.user.name[0..result.name_len]);
+        if (target.action == 1) {
+            result.away_message_len = @min(target.away().len, result.away_message.len);
+            @memcpy(result.away_message[0..result.away_message_len], target.away()[0..result.away_message_len]);
+        }
+        return result;
+    }
+
+    fn nameText(self: *const CapturedDmTarget) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    fn away(self: *const CapturedDmTarget) []const u8 {
+        return self.away_message[0..self.away_message_len];
+    }
+};
+
+const StableDirectMessageRequest = struct {
+    packet_index: usize,
+    sender_id: i32,
+    target_name: []u8,
+    message: []u8,
+    online_target: ?CapturedDmTarget,
+};
+
+const StableCommandRequest = struct {
+    packet_index: usize,
+    sender_id: i32,
+    text: []u8,
+    target: []u8,
+    private_bot: bool,
+    run_now_playing: bool,
+    run_command: bool,
+};
+
+const StableDbRequest = union(enum) {
+    friend_add: struct { packet_index: usize, user_id: i32, friend_id: i32 },
+    friend_remove: struct { packet_index: usize, user_id: i32, friend_id: i32 },
+    channel_write: struct { packet_index: usize, target: []u8, privileges: u32 },
+    direct_message: StableDirectMessageRequest,
+    command: StableCommandRequest,
+
+    fn deinit(self: *StableDbRequest, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .channel_write => |request| allocator.free(request.target),
+            .direct_message => |request| {
+                allocator.free(request.target_name);
+                allocator.free(request.message);
+            },
+            .command => |request| {
+                allocator.free(request.text);
+                allocator.free(request.target);
+            },
+            else => {},
+        }
+        self.* = undefined;
+    }
+
+    fn packetIndex(self: StableDbRequest) usize {
+        return switch (self) {
+            inline else => |request| request.packet_index,
+        };
+    }
+};
+
+const StablePollCapture = struct {
+    allocator: std.mem.Allocator,
+    owner_user_id: i32,
+    owner_generation: u64,
+    owner_restricted: bool,
+    owner_name: [96]u8 = [_]u8{0} ** 96,
+    owner_name_len: usize = 0,
+    requests: std.ArrayList(StableStatsRequest) = .empty,
+    db_requests: std.ArrayList(StableDbRequest) = .empty,
+    command_world: ?sessions_mod.Sessions = null,
+
+    fn deinit(self: *StablePollCapture) void {
+        self.requests.deinit(self.allocator);
+        for (self.db_requests.items) |*request| request.deinit(self.allocator);
+        self.db_requests.deinit(self.allocator);
+        if (self.command_world) |*world| world.deinit();
+        self.* = undefined;
+    }
+
+    fn hasRequest(self: *const StablePollCapture, packet_index: usize, user_id: i32, generation: u64) bool {
+        for (self.requests.items) |request| if (request.packet_index == packet_index and request.snapshot.user.id == user_id and request.snapshot.generation == generation) return true;
+        return false;
+    }
+
+    fn append(self: *StablePollCapture, packet_index: usize, snapshot: StableStatsSnapshot) !void {
+        if (self.hasRequest(packet_index, snapshot.user.id, snapshot.generation)) return;
+        try self.requests.append(self.allocator, .{ .packet_index = packet_index, .snapshot = snapshot });
+    }
+
+    fn ownerName(self: *const StablePollCapture) []const u8 {
+        return self.owner_name[0..self.owner_name_len];
+    }
+
+    fn appendCommand(self: *StablePollCapture, sessions: *sessions_mod.Sessions, packet_index: usize, text: []const u8, target: []const u8, private_bot: bool, run_now_playing: bool, run_command: bool) !void {
+        if (self.command_world == null) self.command_world = try cloneCommandWorld(self.allocator, sessions);
+        const owned_text = try self.allocator.dupe(u8, text);
+        const owned_target = self.allocator.dupe(u8, target) catch |err| {
+            self.allocator.free(owned_text);
+            return err;
+        };
+        self.db_requests.append(self.allocator, .{ .command = .{
+            .packet_index = packet_index,
+            .sender_id = self.owner_user_id,
+            .text = owned_text,
+            .target = owned_target,
+            .private_bot = private_bot,
+            .run_now_playing = run_now_playing,
+            .run_command = run_command,
+        } }) catch |err| {
+            self.allocator.free(owned_text);
+            self.allocator.free(owned_target);
+            return err;
+        };
+    }
+};
+
+fn cloneCommandWorld(allocator: std.mem.Allocator, source: *const sessions_mod.Sessions) !sessions_mod.Sessions {
+    var clone = sessions_mod.Sessions.init(allocator, source.io);
+    errdefer clone.deinit();
+    for (source.items.items) |original| {
+        var user = original.user;
+        const owned_name = try allocator.dupe(u8, original.user.name);
+        const owned_safe_name = allocator.dupe(u8, original.user.safe_name) catch |err| {
+            allocator.free(owned_name);
+            return err;
+        };
+        user.name = owned_name;
+        user.safe_name = owned_safe_name;
+        user.team = null;
+        const replica = (if (original.is_bot) clone.createBot(user) else clone.create(user, original.utc_offset, original.longitude, original.latitude)) catch |err| {
+            allocator.free(owned_name);
+            allocator.free(owned_safe_name);
+            return err;
+        };
+        replica.generation = original.generation;
+        replica.action = original.action;
+        replica.mode = original.mode;
+        replica.mods = original.mods;
+        replica.map_id = original.map_id;
+        replica.map_md5 = original.map_md5;
+        replica.info_text = original.info_text;
+        replica.info_len = original.info_len;
+        replica.block_non_friend_dms = original.block_non_friend_dms;
+        replica.presence_filter = original.presence_filter;
+        replica.away_message = original.away_message;
+        replica.away_message_len = original.away_message_len;
+        replica.presence_suppressed = original.presence_suppressed;
+        replica.joined_osu = original.joined_osu;
+        replica.joined_announce = original.joined_announce;
+        replica.in_lobby = original.in_lobby;
+        replica.joined_lobby_channel = original.joined_lobby_channel;
+        replica.match_id = original.match_id;
+        replica.tourney_matches = original.tourney_matches;
+        replica.spectating_user_id = original.spectating_user_id;
+        try replica.friend_ids.appendSlice(allocator, original.friend_ids.items);
+    }
+    return clone;
+}
+
+/// Capture the database-independent half of a Stable poll while the session
+/// mutex is held. The returned plan owns only values and fixed-size snapshots.
+fn captureStablePollLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) !StablePollCapture {
+    var capture: StablePollCapture = .{ .allocator = allocator, .owner_user_id = session.user.id, .owner_generation = session.generation, .owner_restricted = session.user.restricted };
+    errdefer capture.deinit();
+    capture.owner_name_len = @min(session.user.name.len, capture.owner_name.len);
+    @memcpy(capture.owner_name[0..capture.owner_name_len], session.user.name[0..capture.owner_name_len]);
+    var own = StableStatsSnapshot.init(session);
+    var packet_index: usize = 0;
+    var packets: protocol.Reader = .{ .data = body };
+    while (try packets.next()) |packet| : (packet_index += 1) {
+        if (session.user.restricted and !protocol.restrictedClientPacketAllowed(packet.id)) continue;
+        switch (packet.id) {
+            .request_status => try capture.append(packet_index, own),
+            .change_action => {
+                try applyStableAction(&own, packet.payload);
+                try capture.append(packet_index, own);
+            },
+            .user_stats_request => {
+                var payload: protocol.PayloadReader = .{ .data = packet.payload };
+                const count = try payload.int(u16);
+                for (0..count) |_| {
+                    const user_id = try payload.int(i32);
+                    if (user_id == session.user.id) {
+                        if (!session.user.restricted) try capture.append(packet_index, own);
+                        continue;
+                    }
+                    const target = sessions.onlineByUser(user_id) orelse continue;
+                    if (target.user.restricted) continue;
+                    try capture.append(packet_index, StableStatsSnapshot.init(target));
+                }
+            },
+            .friend_add => {
+                const friend_id = packetUserId(packet.payload) orelse continue;
+                if (friend_id == session.user.id or friend_id == 3 or session.isFriend(friend_id)) continue;
+                try capture.db_requests.append(allocator, .{ .friend_add = .{ .packet_index = packet_index, .user_id = session.user.id, .friend_id = friend_id } });
+            },
+            .friend_remove => {
+                const friend_id = packetUserId(packet.payload) orelse continue;
+                if (friend_id == 3) continue;
+                try capture.db_requests.append(allocator, .{ .friend_remove = .{ .packet_index = packet_index, .user_id = session.user.id, .friend_id = friend_id } });
+            },
+            .send_public_message => {
+                var payload: protocol.PayloadReader = .{ .data = packet.payload };
+                _ = try payload.string();
+                const text = std.mem.trim(u8, try payload.string(), " \t\r\n");
+                const target = try payload.string();
+                _ = try payload.int(i32);
+                if (text.len == 0 or text.len > 2000 or std.mem.indexOfScalar(u8, text, 0) != null) continue;
+                const owned_target = try allocator.dupe(u8, target);
+                capture.db_requests.append(allocator, .{ .channel_write = .{ .packet_index = packet_index, .target = owned_target, .privileges = session.user.privileges } }) catch |err| {
+                    allocator.free(owned_target);
+                    return err;
+                };
+                const run_now_playing = commands.parseNowPlaying(text) != null;
+                const run_command = text[0] == '!' and !std.mem.eql(u8, target, multiplayer_channel) and !std.mem.eql(u8, target, "#spectator");
+                if (run_now_playing or run_command) try capture.appendCommand(sessions, packet_index, text, target, false, run_now_playing, run_command);
+            },
+            .send_private_message => {
+                var payload: protocol.PayloadReader = .{ .data = packet.payload };
+                _ = try payload.string();
+                const text = std.mem.trim(u8, try payload.string(), " \t\r\n");
+                const target_name = try payload.string();
+                _ = try payload.int(i32);
+                if (text.len == 0 or text.len > 2000 or std.mem.indexOfScalar(u8, text, 0) != null) continue;
+                const target = sessions.onlineByName(target_name);
+                if (target) |online| if (online.is_bot) {
+                    try capture.appendCommand(sessions, packet_index, text, session.user.name, true, true, true);
+                    continue;
+                };
+                const online_target = if (target) |online| CapturedDmTarget.init(online, session.user.id) else null;
+                const owned_target = try allocator.dupe(u8, target_name);
+                const owned_message = allocator.dupe(u8, text) catch |err| {
+                    allocator.free(owned_target);
+                    return err;
+                };
+                capture.db_requests.append(allocator, .{ .direct_message = .{
+                    .packet_index = packet_index,
+                    .sender_id = session.user.id,
+                    .target_name = owned_target,
+                    .message = owned_message,
+                    .online_target = online_target,
+                } }) catch |err| {
+                    allocator.free(owned_target);
+                    allocator.free(owned_message);
+                    return err;
+                };
+            },
+            else => {},
+        }
+    }
+    return capture;
+}
+
+const PreparedStableStatsItem = struct {
+    packet_index: usize,
+    snapshot: StableStatsSnapshot,
+    bytes: []u8,
+
+    fn stillCurrent(self: *const PreparedStableStatsItem, session: *const sessions_mod.Session) bool {
+        const snapshot = &self.snapshot;
+        return snapshot.user.id == session.user.id and
+            snapshot.generation == session.generation and
+            snapshot.action == session.action and
+            snapshot.mode == session.mode and
+            snapshot.mods == session.mods and
+            snapshot.map_id == session.map_id and
+            snapshot.info_len == session.info_len and
+            std.mem.eql(u8, &snapshot.map_md5, &session.map_md5) and
+            std.mem.eql(u8, snapshot.info(), session.info());
+    }
+};
+
+const PreparedStableStats = struct {
+    allocator: std.mem.Allocator,
+    owner_generation: u64,
+    items: std.ArrayList(PreparedStableStatsItem) = .empty,
+
+    fn deinit(self: *PreparedStableStats) void {
+        for (self.items.items) |item| self.allocator.free(item.bytes);
+        self.items.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn find(self: *const PreparedStableStats, packet_index: usize, session: *const sessions_mod.Session) ?[]const u8 {
+        for (self.items.items) |*item| if (item.packet_index == packet_index and item.stillCurrent(session)) return item.bytes;
+        return null;
+    }
+};
+
+const PreparedDirectMessageStatus = enum { missing, blocked, silenced, stored_online, stored_offline };
+
+const PreparedDirectMessage = struct {
+    packet_index: usize,
+    status: PreparedDirectMessageStatus,
+    target_id: i32 = 0,
+    target_generation: u64 = 0,
+    direct_message_id: i64 = 0,
+    target_name: [96]u8 = [_]u8{0} ** 96,
+    target_name_len: usize = 0,
+    away_message: [512]u8 = [_]u8{0} ** 512,
+    away_message_len: usize = 0,
+
+    fn setName(self: *PreparedDirectMessage, value: []const u8) void {
+        self.target_name_len = @min(value.len, self.target_name.len);
+        @memcpy(self.target_name[0..self.target_name_len], value[0..self.target_name_len]);
+    }
+
+    fn setAway(self: *PreparedDirectMessage, value: []const u8) void {
+        self.away_message_len = @min(value.len, self.away_message.len);
+        @memcpy(self.away_message[0..self.away_message_len], value[0..self.away_message_len]);
+    }
+
+    fn name(self: *const PreparedDirectMessage) []const u8 {
+        return self.target_name[0..self.target_name_len];
+    }
+
+    fn away(self: *const PreparedDirectMessage) []const u8 {
+        return self.away_message[0..self.away_message_len];
+    }
+};
+
+const PreparedUnreadDirectMessage = struct {
+    id: i64,
+    bytes: []u8,
+};
+
+const PreparedUnreadDirectMessages = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(PreparedUnreadDirectMessage) = .empty,
+
+    fn deinit(self: *PreparedUnreadDirectMessages) void {
+        for (self.items.items) |item| self.allocator.free(item.bytes);
+        self.items.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn prepareUnreadDirectMessages(allocator: std.mem.Allocator, store: *storage.Store, user_id: i32, target_name: []const u8) !PreparedUnreadDirectMessages {
+    const unread = try store.unreadDirectMessages(allocator, user_id);
+    defer {
+        for (unread) |*message| message.deinit(allocator);
+        allocator.free(unread);
+    }
+    var prepared: PreparedUnreadDirectMessages = .{ .allocator = allocator };
+    errdefer prepared.deinit();
+    var total_bytes: usize = 0;
+    for (unread) |message| {
+        var packet = protocol.Writer.init(allocator);
+        defer packet.deinit();
+        try protocol.writeMessage(&packet, message.from_name, message.message, target_name, message.from_id);
+        const next_bytes = std.math.add(usize, total_bytes, packet.bytes().len) catch break;
+        if (next_bytes > sessions_mod.max_queue_bytes) break;
+        const owned = try allocator.dupe(u8, packet.bytes());
+        prepared.items.append(allocator, .{ .id = message.id, .bytes = owned }) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+        total_bytes = next_bytes;
+    }
+    return prepared;
+}
+
+const CommandSessionState = struct {
+    user_id: i32,
+    generation: u64,
+    privileges: u32,
+    silence_end: i64,
+    restricted: bool,
+    mode: u8,
+    mods: i32,
+    map_id: i32,
+    map_md5: [32]u8,
+
+    fn init(session: *const sessions_mod.Session) CommandSessionState {
+        return .{
+            .user_id = session.user.id,
+            .generation = session.generation,
+            .privileges = session.user.privileges,
+            .silence_end = session.user.silence_end,
+            .restricted = session.user.restricted,
+            .mode = session.mode,
+            .mods = session.mods,
+            .map_id = session.map_id,
+            .map_md5 = session.map_md5,
+        };
+    }
+};
+
+const PreparedCommandMutation = struct {
+    user_id: i32,
+    generation: u64,
+    mode: ?u8 = null,
+    mods: ?i32 = null,
+    map_id: ?i32 = null,
+    map_md5: ?[32]u8 = null,
+    queue: []u8,
+};
+
+const PreparedCommand = struct {
+    allocator: std.mem.Allocator,
+    packet_index: usize,
+    consume: bool,
+    output: []u8,
+    mutations: std.ArrayList(PreparedCommandMutation) = .empty,
+
+    fn deinit(self: *PreparedCommand) void {
+        self.allocator.free(self.output);
+        for (self.mutations.items) |mutation| self.allocator.free(mutation.queue);
+        self.mutations.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+const StableDbResult = union(enum) {
+    friend_add: struct { packet_index: usize, friend_id: i32, result: domain.RelationshipAddResult },
+    friend_remove: struct { packet_index: usize, friend_id: i32, removed: bool },
+    channel_write: struct { packet_index: usize, allowed: bool },
+    direct_message: PreparedDirectMessage,
+    command: PreparedCommand,
+
+    fn deinit(self: *StableDbResult) void {
+        switch (self.*) {
+            .command => |*command| command.deinit(),
+            else => {},
+        }
+        self.* = undefined;
+    }
+
+    fn packetIndex(self: StableDbResult) usize {
+        return switch (self) {
+            inline else => |result| result.packet_index,
+        };
+    }
+};
+
+const PreparedStableDatabase = struct {
+    allocator: std.mem.Allocator,
+    owner_generation: u64,
+    results: std.ArrayList(StableDbResult) = .empty,
+
+    fn deinit(self: *PreparedStableDatabase) void {
+        for (self.results.items) |*result| result.deinit();
+        self.results.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn find(self: *const PreparedStableDatabase, packet_index: usize, tag: std.meta.Tag(StableDbResult)) ?*const StableDbResult {
+        for (self.results.items) |*result| if (result.packetIndex() == packet_index and std.meta.activeTag(result.*) == tag) return result;
+        return null;
+    }
+};
+
+const PreparedOwnerAuth = struct {
+    allocator: std.mem.Allocator,
+    privileges: u32,
+    silence_end: i64,
+    restricted: bool,
+    privileges_packet: []u8,
+    silence_packet: []u8,
+    restricted_packet: []u8,
+    unrestricted_packet: []u8,
+
+    fn deinit(self: *PreparedOwnerAuth) void {
+        self.allocator.free(self.privileges_packet);
+        self.allocator.free(self.silence_packet);
+        self.allocator.free(self.restricted_packet);
+        self.allocator.free(self.unrestricted_packet);
+        self.* = undefined;
+    }
+};
+
+fn prepareOwnerAuth(allocator: std.mem.Allocator, store: *storage.Store, user_id: i32) !PreparedOwnerAuth {
+    const user = (try store.userById(allocator, user_id)) orelse return error.StablePollOwnerMissing;
+    defer {
+        allocator.free(user.name);
+        allocator.free(user.safe_name);
+    }
+    var privileges = protocol.Writer.init(allocator);
+    defer privileges.deinit();
+    const visible_privileges = if (user.restricted) user.privileges & ~@as(u32, 1) else user.privileges;
+    try privileges.packetInt(.privileges, clientPrivileges(visible_privileges, true));
+    const privileges_packet = try allocator.dupe(u8, privileges.bytes());
+    errdefer allocator.free(privileges_packet);
+
+    var silence = protocol.Writer.init(allocator);
+    defer silence.deinit();
+    const now = std.Io.Clock.real.now(store.io).toSeconds();
+    try silence.packetInt(.silence_end, @intCast(@min(@as(i64, std.math.maxInt(i32)), @max(0, user.silence_end - now))));
+    const silence_packet = try allocator.dupe(u8, silence.bytes());
+    errdefer allocator.free(silence_packet);
+
+    var restricted = protocol.Writer.init(allocator);
+    defer restricted.deinit();
+    try restricted.packetEmpty(.account_restricted);
+    try restricted.packetInt(.restart, 0);
+    const restricted_packet = try allocator.dupe(u8, restricted.bytes());
+    errdefer allocator.free(restricted_packet);
+
+    var unrestricted = protocol.Writer.init(allocator);
+    defer unrestricted.deinit();
+    try unrestricted.packetInt(.restart, 0);
+    return .{
+        .allocator = allocator,
+        .privileges = user.privileges,
+        .silence_end = user.silence_end,
+        .restricted = user.restricted,
+        .privileges_packet = privileges_packet,
+        .silence_packet = silence_packet,
+        .restricted_packet = restricted_packet,
+        .unrestricted_packet = try allocator.dupe(u8, unrestricted.bytes()),
+    };
+}
 
 const LazerPresenceSnapshot = struct {
     user: domain.User,
@@ -241,9 +834,10 @@ fn notePresenceRequest(requests: *std.AutoHashMap(i32, u8), user_id: i32, bits: 
 /// Prepare database-backed lazer presence packets before the global Stable
 /// session mutex is acquired. `pollLocked` only re-checks current Stable
 /// ownership and copies these owned bytes into the response.
-fn prepareLazerPresences(allocator: std.mem.Allocator, store: *storage.Store, body: []const u8, epoch: u64) !PreparedLazerPresences {
+fn prepareLazerPresences(allocator: std.mem.Allocator, store: *storage.Store, body: []const u8, epoch: u64, restricted: bool) !PreparedLazerPresences {
     var prepared: PreparedLazerPresences = .{ .allocator = allocator, .epoch = epoch };
     errdefer prepared.deinit();
+    if (restricted) return prepared;
     var requests = std.AutoHashMap(i32, u8).init(allocator);
     defer requests.deinit();
 
@@ -378,6 +972,207 @@ fn stats(w: *protocol.Writer, store: *storage.Store, s: anytype) !void {
     w.finish(start);
 }
 
+/// Execute every stats read in an owned poll plan without holding the global
+/// Stable session mutex. Applying these bytes later requires the same session
+/// generation to still own the token.
+fn prepareStableStats(allocator: std.mem.Allocator, store: *storage.Store, capture: *const StablePollCapture) !PreparedStableStats {
+    var prepared: PreparedStableStats = .{ .allocator = allocator, .owner_generation = capture.owner_generation };
+    errdefer prepared.deinit();
+    try prepared.items.ensureTotalCapacity(allocator, capture.requests.items.len);
+    for (capture.requests.items) |request| {
+        var output = protocol.Writer.init(allocator);
+        defer output.deinit();
+        try stats(&output, store, &request.snapshot);
+        const bytes = try allocator.dupe(u8, output.bytes());
+        prepared.items.appendAssumeCapacity(.{
+            .packet_index = request.packet_index,
+            .snapshot = request.snapshot,
+            .bytes = bytes,
+        });
+    }
+    return prepared;
+}
+
+fn prepareDirectMessage(allocator: std.mem.Allocator, store: *storage.Store, request: StableDirectMessageRequest) !PreparedDirectMessage {
+    var prepared: PreparedDirectMessage = .{ .packet_index = request.packet_index, .status = .missing };
+    prepared.setName(request.target_name);
+    const target = if (request.online_target) |online|
+        try store.userById(allocator, online.user_id)
+    else
+        try store.userByName(allocator, request.target_name);
+    const user = target orelse return prepared;
+    defer {
+        allocator.free(user.name);
+        allocator.free(user.safe_name);
+    }
+    prepared.target_id = user.id;
+    prepared.setName(user.name);
+    if (user.restricted or user.silence_end > std.Io.Clock.real.now(store.io).toSeconds()) {
+        prepared.status = .silenced;
+        return prepared;
+    }
+    if (request.online_target) |online| {
+        prepared.target_generation = online.generation;
+        prepared.setAway(online.away());
+        if (online.block_non_friend_dms and !online.sender_is_friend) {
+            prepared.status = .blocked;
+            return prepared;
+        }
+    }
+    prepared.direct_message_id = store.storeDirectMessage(request.sender_id, user.id, request.message) catch |err| switch (err) {
+        error.DirectMessageBlocked => {
+            prepared.status = .blocked;
+            return prepared;
+        },
+        else => return err,
+    };
+    prepared.status = if (request.online_target != null) .stored_online else .stored_offline;
+    return prepared;
+}
+
+fn prepareCommand(allocator: std.mem.Allocator, store: *storage.Store, world: *sessions_mod.Sessions, request: StableCommandRequest) !PreparedCommand {
+    // The command world was cloned while the session mutex was held, but staff
+    // state may have changed in the database before this deferred command got
+    // its turn. Refresh every online user's authority before taking the
+    // before-image used to identify command-owned mutations.
+    for (world.items.items) |session| {
+        const current = (try store.userById(allocator, session.user.id)) orelse continue;
+        defer {
+            allocator.free(current.name);
+            allocator.free(current.safe_name);
+        }
+        session.user.privileges = current.privileges;
+        session.user.silence_end = current.silence_end;
+        session.user.restricted = current.restricted;
+    }
+    var before: std.ArrayList(CommandSessionState) = .empty;
+    defer before.deinit(allocator);
+    try before.ensureTotalCapacity(allocator, world.items.items.len);
+    for (world.items.items) |session| before.appendAssumeCapacity(CommandSessionState.init(session));
+
+    const sender = world.byUser(request.sender_id) orelse return error.StableCommandSenderMissing;
+    const current_user = (try store.userById(allocator, request.sender_id)) orelse return error.StableCommandSenderMissing;
+    defer {
+        allocator.free(current_user.name);
+        allocator.free(current_user.safe_name);
+    }
+    // The cloned world is only an owned transport for session state. Staff
+    // authority still comes from the database immediately before the command
+    // runs, so a concurrent role removal, restriction, or silence cannot race
+    // a captured command.
+    sender.user.privileges = current_user.privileges;
+    sender.user.restricted = current_user.restricted;
+    sender.user.silence_end = current_user.silence_end;
+    var output = protocol.Writer.init(allocator);
+    defer output.deinit();
+    var consume = false;
+    const now = std.Io.Clock.real.now(store.io).toSeconds();
+    if (sender.user.restricted) {
+        try output.packetEmpty(.account_restricted);
+        try output.packetInt(.restart, 0);
+        consume = true;
+    } else if (sender.user.silence_end > now) {
+        try output.packetInt(.silence_end, @intCast(@min(@as(i64, std.math.maxInt(i32)), sender.user.silence_end - now)));
+        consume = true;
+    } else {
+        if (request.run_now_playing) {
+            const handled = try commands.handleNowPlaying(allocator, store, sender, request.text);
+            if (request.private_bot and handled) consume = true;
+        }
+        if (!consume and request.run_command) {
+            consume = try commands.handleCommand(allocator, store, world, sender, request.text, request.target, &output) == .handled;
+        }
+        if (request.private_bot and !consume) {
+            try protocol.writeMessage(&output, "kai", "send /np here for pp, then use !with for a custom play", sender.user.name, 3);
+            consume = true;
+        }
+    }
+
+    var mutations: std.ArrayList(PreparedCommandMutation) = .empty;
+    errdefer {
+        for (mutations.items) |mutation| allocator.free(mutation.queue);
+        mutations.deinit(allocator);
+    }
+    try mutations.ensureTotalCapacity(allocator, world.items.items.len);
+    for (world.items.items) |session| {
+        const previous = for (before.items) |state| {
+            if (state.user_id == session.user.id) break state;
+        } else continue;
+        const auth_changed = previous.privileges != session.user.privileges or previous.silence_end != session.user.silence_end or previous.restricted != session.user.restricted;
+        const mode = if (previous.mode != session.mode) session.mode else null;
+        const mods = if (previous.mods != session.mods) session.mods else null;
+        const map_id = if (previous.map_id != session.map_id) session.map_id else null;
+        const map_md5 = if (!std.mem.eql(u8, &previous.map_md5, &session.map_md5)) session.map_md5 else null;
+        // Authority is never copied out of the command clone. The affected
+        // player's next poll reads the authoritative database row and emits
+        // the correct privilege/silence/restriction packet. Dropping this
+        // clone-owned queue for that player prevents an older command packet
+        // from winning after a newer database transition.
+        const queue_source: []const u8 = if (auth_changed) "" else session.queue.items;
+        if (mode == null and mods == null and map_id == null and map_md5 == null and queue_source.len == 0) {
+            session.queue.clearRetainingCapacity();
+            session.pending_dm_reads.clearRetainingCapacity();
+            continue;
+        }
+        const queue = try allocator.dupe(u8, queue_source);
+        mutations.appendAssumeCapacity(.{
+            .user_id = session.user.id,
+            .generation = session.generation,
+            .mode = mode,
+            .mods = mods,
+            .map_id = map_id,
+            .map_md5 = map_md5,
+            .queue = queue,
+        });
+        session.queue.clearRetainingCapacity();
+        session.pending_dm_reads.clearRetainingCapacity();
+    }
+    const owned_output = try allocator.dupe(u8, output.bytes());
+    return .{ .allocator = allocator, .packet_index = request.packet_index, .consume = consume, .output = owned_output, .mutations = mutations };
+}
+
+fn applyPreparedCommand(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, out: *protocol.Writer, command: *const PreparedCommand) !void {
+    for (command.mutations.items) |mutation| {
+        const current = sessions.onlineByUser(mutation.user_id) orelse continue;
+        if (current.generation != mutation.generation) continue;
+        if (mutation.mode) |value| current.mode = value;
+        if (mutation.mods) |value| current.mods = value;
+        if (mutation.map_id) |value| current.map_id = value;
+        if (mutation.map_md5) |value| current.map_md5 = value;
+        if (mutation.queue.len != 0) try current.enqueue(allocator, mutation.queue);
+    }
+    if (command.output.len != 0) try out.raw(command.output);
+}
+
+fn prepareStableDatabase(allocator: std.mem.Allocator, store: *storage.Store, capture: *StablePollCapture, owner_auth: *const PreparedOwnerAuth) !PreparedStableDatabase {
+    var prepared: PreparedStableDatabase = .{ .allocator = allocator, .owner_generation = capture.owner_generation };
+    errdefer prepared.deinit();
+    if (owner_auth.restricted) return prepared;
+    try prepared.results.ensureTotalCapacity(allocator, capture.db_requests.items.len);
+    for (capture.db_requests.items) |request| switch (request) {
+        .friend_add => |add| prepared.results.appendAssumeCapacity(.{ .friend_add = .{
+            .packet_index = add.packet_index,
+            .friend_id = add.friend_id,
+            .result = try store.addFriend(add.user_id, add.friend_id),
+        } }),
+        .friend_remove => |remove| prepared.results.appendAssumeCapacity(.{ .friend_remove = .{
+            .packet_index = remove.packet_index,
+            .friend_id = remove.friend_id,
+            .removed = try store.removeFriend(remove.user_id, remove.friend_id),
+        } }),
+        .channel_write => |channel| prepared.results.appendAssumeCapacity(.{ .channel_write = .{
+            .packet_index = channel.packet_index,
+            .allowed = try store.channelCanWrite(channel.target, channel.privileges),
+        } }),
+        .direct_message => |message| prepared.results.appendAssumeCapacity(.{ .direct_message = if (owner_auth.silence_end > std.Io.Clock.real.now(store.io).toSeconds()) .{ .packet_index = message.packet_index, .status = .missing } else try prepareDirectMessage(allocator, store, message) }),
+        .command => |command| {
+            const world = if (capture.command_world) |*value| value else return error.StableCommandWorldMissing;
+            prepared.results.appendAssumeCapacity(.{ .command = try prepareCommand(allocator, store, world, command) });
+        },
+    };
+    return prepared;
+}
+
 fn loginFailure(allocator: std.mem.Allocator, token_text: []const u8, notification: []const u8) !LoginResult {
     var out = protocol.Writer.init(allocator);
     defer out.deinit();
@@ -388,14 +1183,14 @@ fn loginFailure(allocator: std.mem.Allocator, token_text: []const u8, notificati
     return .{ .allocator = allocator, .token = token, .body = try allocator.dupe(u8, out.bytes()) };
 }
 
-fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool) !LoginCapture {
+fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user: domain.User, utc: i8, longitude: f32, latitude: f32, friend_ids: []i32, block_non_friend_dms: bool, client_binding: sessions_mod.StableClientBinding) !LoginCapture {
     var user_owned = true;
     errdefer if (user_owned) {
         allocator.free(user.name);
         allocator.free(user.safe_name);
     };
     if (sessions.byUser(user.id)) |old| removeSessionLocked(allocator, sessions, old);
-    const session = try sessions.createWithSocial(user, utc, longitude, latitude, friend_ids, block_non_friend_dms);
+    const session = try sessions.createWithSocial(user, utc, longitude, latitude, friend_ids, block_non_friend_dms, client_binding);
     user_owned = false;
     errdefer sessions.remove(session);
     const token = try allocator.dupe(u8, &session.token);
@@ -480,7 +1275,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
     pruneExpiredLocked(allocator, sessions);
     user_transferred = true;
     friends_transferred = true;
-    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, session_friend_ids, parsed.pm_private) catch |err| {
+    var capture = captureLoginLocked(allocator, sessions, user, parsed.utc_offset, longitude, latitude, session_friend_ids, parsed.pm_private, parsed.client_binding) catch |err| {
         sessions.mutex.unlock(sessions.io);
         return err;
     };
@@ -1032,7 +1827,43 @@ pub fn captureLazerPresenceEpoch(sessions: *sessions_mod.Sessions) u64 {
     return sessions.lazer_presence_epoch;
 }
 
-fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8, prepared_lazer: *const PreparedLazerPresences, logged_out: *bool, delivered_dm_ids: *std.ArrayList(i64)) ![]u8 {
+const DeferredPublicMessage = struct {
+    sender_id: i32,
+    target: []u8,
+    message: []u8,
+
+    fn deinit(self: *DeferredPublicMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.target);
+        allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
+fn deferPublicMessage(allocator: std.mem.Allocator, pending: *std.ArrayList(DeferredPublicMessage), sender_id: i32, target: []const u8, message: []const u8) !void {
+    const owned_target = try allocator.dupe(u8, target);
+    errdefer allocator.free(owned_target);
+    const owned_message = try allocator.dupe(u8, message);
+    errdefer allocator.free(owned_message);
+    try pending.append(allocator, .{ .sender_id = sender_id, .target = owned_target, .message = owned_message });
+}
+
+fn applyOwnerAuthLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, prepared: *const PreparedOwnerAuth) !void {
+    const privileges_changed = session.user.privileges != prepared.privileges;
+    const silence_changed = session.user.silence_end != prepared.silence_end;
+    const restricted_changed = session.user.restricted != prepared.restricted;
+    session.user.privileges = prepared.privileges;
+    session.user.silence_end = prepared.silence_end;
+    session.user.restricted = prepared.restricted;
+    if (privileges_changed) try session.enqueue(allocator, prepared.privileges_packet);
+    if (silence_changed) try session.enqueue(allocator, prepared.silence_packet);
+    if (restricted_changed) {
+        if (prepared.restricted) broadcastLogoutLocked(allocator, sessions, session);
+        try session.enqueue(allocator, if (prepared.restricted) prepared.restricted_packet else prepared.unrestricted_packet);
+    }
+}
+
+fn pollLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8, prepared_stable: *const PreparedStableStats, prepared_database: *const PreparedStableDatabase, prepared_lazer: *const PreparedLazerPresences, prepared_unread: *const PreparedUnreadDirectMessages, logged_out: *bool, delivered_dm_ids: *std.ArrayList(i64), deferred_public_messages: *std.ArrayList(DeferredPublicMessage)) ![]u8 {
+    if (prepared_stable.owner_generation != session.generation or prepared_database.owner_generation != session.generation) return error.StaleStablePollPlan;
     const now = std.Io.Clock.real.now(sessions.io).toSeconds();
     session.last_seen = now;
     var out = protocol.Writer.init(allocator);
@@ -1041,47 +1872,43 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
     try delivered_dm_ids.appendSlice(allocator, session.pending_dm_reads.items);
     session.queue.clearRetainingCapacity();
     session.pending_dm_reads.clearRetainingCapacity();
+    for (prepared_unread.items.items) |message| {
+        if (std.mem.indexOfScalar(i64, delivered_dm_ids.items, message.id) != null) continue;
+        try out.raw(message.bytes);
+        try delivered_dm_ids.append(allocator, message.id);
+    }
     var reader: protocol.Reader = .{ .data = body };
-    while (try reader.next()) |packet| switch (packet.id) {
+    var packet_index: usize = 0;
+    while (try reader.next()) |packet| : (packet_index += 1) switch (if (session.user.restricted and !protocol.restrictedClientPacketAllowed(packet.id)) @as(protocol.ClientPacket, @enumFromInt(std.math.maxInt(u16))) else packet.id) {
         .ping => {},
-        .request_status => try stats(&out, store, session),
+        .request_status => try out.raw(prepared_stable.find(packet_index, session) orelse return error.StalePreparedStableStats),
         .change_action => {
-            var p: protocol.PayloadReader = .{ .data = packet.payload };
-            session.action = try p.byte();
-            const info = try p.string();
-            const md5 = try p.string();
-            session.mods = try p.int(i32);
-            session.mode = try p.byte();
-            session.map_id = try p.int(i32);
-            session.info_len = @min(info.len, session.info_text.len);
-            @memcpy(session.info_text[0..session.info_len], info[0..session.info_len]);
-            @memset(&session.map_md5, 0);
-            @memcpy(session.map_md5[0..@min(32, md5.len)], md5[0..@min(32, md5.len)]);
-            var event = protocol.Writer.init(allocator);
-            defer event.deinit();
-            try stats(&event, store, session);
-            try out.raw(event.bytes());
-            try sessions.broadcast(event.bytes(), session);
+            try applyStableAction(session, packet.payload);
+            const event = prepared_stable.find(packet_index, session) orelse return error.StalePreparedStableStats;
+            try out.raw(event);
+            if (!session.user.restricted) try sessions.broadcast(event, session);
         },
         .friend_add => {
-            const friend_id = packetUserId(packet.payload) orelse continue;
-            if (friend_id == session.user.id or friend_id == 3 or session.isFriend(friend_id)) continue;
-            if (sessions.onlineByUser(friend_id) == null) {
-                const found = (try store.userById(allocator, friend_id)) orelse continue;
-                allocator.free(found.name);
-                allocator.free(found.safe_name);
-            }
+            const result = prepared_database.find(packet_index, .friend_add) orelse continue;
+            const add = switch (result.*) {
+                .friend_add => |value| value,
+                else => return error.InvalidStableDatabasePlan,
+            };
+            const friend_id = add.friend_id;
+            if (session.isFriend(friend_id)) continue;
             try session.friend_ids.ensureUnusedCapacity(allocator, 1);
-            switch (try store.addFriend(session.user.id, friend_id)) {
+            switch (add.result) {
                 .inserted, .existing => session.friend_ids.appendAssumeCapacity(friend_id),
                 .ineligible => {},
             }
         },
         .friend_remove => {
-            const friend_id = packetUserId(packet.payload) orelse continue;
-            if (friend_id == 3) continue;
-            _ = try store.removeFriend(session.user.id, friend_id);
-            session.removeFriend(friend_id);
+            const result = prepared_database.find(packet_index, .friend_remove) orelse continue;
+            const remove = switch (result.*) {
+                .friend_remove => |value| value,
+                else => return error.InvalidStableDatabasePlan,
+            };
+            if (remove.removed) session.removeFriend(remove.friend_id);
         },
         .receive_updates => {
             if (packet.payload.len != @sizeOf(i32)) continue;
@@ -1115,91 +1942,57 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                 try out.packetInt(.silence_end, @intCast(@min(@as(i64, std.math.maxInt(i32)), session.user.silence_end - now)));
                 continue;
             }
-            if (packet.id == .send_public_message and !try store.channelCanWrite(target_name, session.user.privileges)) {
-                try out.packetString(.notification, "that channel is read-only right now");
-                continue;
-            }
-            if (packet.id == .send_private_message) {
-                if (sessions.onlineByName(target_name)) |target| {
-                    if (target.is_bot) {
-                        if (try commands.handleNowPlaying(allocator, store, session, text)) continue;
-                        if (try commands.handleCommand(allocator, store, sessions, session, text, session.user.name, &out) == .handled) continue;
-                        try protocol.writeMessage(&out, "kai", "send /np here for pp, then use !with for a custom play", session.user.name, 3);
-                        continue;
-                    }
+            if (packet.id == .send_public_message) {
+                const result = prepared_database.find(packet_index, .channel_write) orelse return error.MissingStableDatabasePlan;
+                const channel = switch (result.*) {
+                    .channel_write => |value| value,
+                    else => return error.InvalidStableDatabasePlan,
+                };
+                if (!channel.allowed) {
+                    try out.packetString(.notification, "that channel is read-only right now");
+                    continue;
                 }
             }
-            _ = if (packet.id == .send_public_message) try commands.handleNowPlaying(allocator, store, session, text) else false;
-            if (packet.id == .send_public_message and try handleMultiplayerCommandLocked(allocator, sessions, session, target_name, text)) continue;
-            if (packet.id == .send_public_message and text[0] == '!' and !std.mem.eql(u8, target_name, multiplayer_channel) and !std.mem.eql(u8, target_name, "#spectator")) {
-                if (try commands.handleCommand(allocator, store, sessions, session, text, target_name, &out) == .handled) continue;
+            if (prepared_database.find(packet_index, .command)) |result| {
+                const command = switch (result.*) {
+                    .command => |*value| value,
+                    else => return error.InvalidStableDatabasePlan,
+                };
+                try applyPreparedCommand(allocator, sessions, &out, command);
+                if (command.consume) continue;
             }
+            if (packet.id == .send_public_message and try handleMultiplayerCommandLocked(allocator, sessions, session, target_name, text)) continue;
             var message = protocol.Writer.init(allocator);
             defer message.deinit();
             try protocol.writeMessage(&message, session.user.name, text, target_name, session.user.id);
             if (packet.id == .send_private_message) {
-                if (sessions.onlineByName(target_name)) |target| {
-                    if (!target.is_bot) {
-                        if (target.block_non_friend_dms and !target.isFriend(session.user.id)) {
-                            try writeDmBlocked(&out, target.user.name);
-                            continue;
-                        }
-                        if (target.user.silence_end > now or target.user.restricted) {
-                            var blocked = protocol.Writer.init(allocator);
-                            defer blocked.deinit();
-                            const start = try blocked.begin(.target_is_silenced);
-                            try blocked.string("");
-                            try blocked.string("");
-                            try blocked.string(target.user.name);
-                            try blocked.int(i32, 0);
-                            blocked.finish(start);
-                            try out.raw(blocked.bytes());
-                            continue;
-                        }
-                        if (!try store.directMessageAllowed(session.user.id, target.user.id)) {
-                            try writeDmBlocked(&out, target.user.name);
-                            continue;
-                        }
-                        if (target.action == 1 and target.away().len != 0) {
-                            try protocol.writeMessage(&out, target.user.name, target.away(), session.user.name, target.user.id);
-                        }
-                        const direct_message_id = store.storeDirectMessage(session.user.id, target.user.id, text) catch |err| switch (err) {
-                            error.DirectMessageBlocked => {
-                                try writeDmBlocked(&out, target.user.name);
-                                continue;
-                            },
-                            else => return err,
-                        };
-                        try target.enqueueDirectMessage(allocator, direct_message_id, message.bytes());
-                    }
-                } else if (try store.userByName(allocator, target_name)) |target_user| {
-                    defer {
-                        allocator.free(target_user.name);
-                        allocator.free(target_user.safe_name);
-                    }
-                    if (target_user.silence_end > now or target_user.restricted) {
+                const result = prepared_database.find(packet_index, .direct_message) orelse continue;
+                const dm = switch (result.*) {
+                    .direct_message => |value| value,
+                    else => return error.InvalidStableDatabasePlan,
+                };
+                switch (dm.status) {
+                    .missing => {},
+                    .blocked => try writeDmBlocked(&out, dm.name()),
+                    .silenced => {
                         const start = try out.begin(.target_is_silenced);
                         try out.string("");
                         try out.string("");
-                        try out.string(target_user.name);
+                        try out.string(dm.name());
                         try out.int(i32, 0);
                         out.finish(start);
-                        continue;
-                    }
-                    if (!try store.directMessageAllowed(session.user.id, target_user.id)) {
-                        try writeDmBlocked(&out, target_user.name);
-                        continue;
-                    }
-                    _ = store.storeDirectMessage(session.user.id, target_user.id, text) catch |err| switch (err) {
-                        error.DirectMessageBlocked => {
-                            try writeDmBlocked(&out, target_user.name);
-                            continue;
-                        },
-                        else => return err,
-                    };
-                    var notice_buf: [192]u8 = undefined;
-                    const notice = try std.fmt.bufPrint(&notice_buf, "{s} is offline, but they'll get your message when they next log in.", .{target_user.name});
-                    try out.packetString(.notification, notice);
+                    },
+                    .stored_online => if (sessions.onlineByUser(dm.target_id)) |target| {
+                        if (target.generation == dm.target_generation and !target.is_bot and !target.user.restricted and target.user.silence_end <= now) {
+                            if (dm.away().len != 0) try protocol.writeMessage(&out, dm.name(), dm.away(), session.user.name, dm.target_id);
+                            try target.enqueueDirectMessage(allocator, dm.direct_message_id, message.bytes());
+                        }
+                    },
+                    .stored_offline => {
+                        var notice_buf: [192]u8 = undefined;
+                        const notice = try std.fmt.bufPrint(&notice_buf, "{s} is offline, but they'll get your message when they next log in.", .{dm.name()});
+                        try out.packetString(.notification, notice);
+                    },
                 }
             } else {
                 if (std.mem.eql(u8, target_name, "#spectator")) {
@@ -1207,7 +2000,7 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                         const host_id = session.spectating_user_id orelse session.user.id;
                         var history_target_buf: [32]u8 = undefined;
                         const history_target = try std.fmt.bufPrint(&history_target_buf, "#spectator_{d}", .{host_id});
-                        store.recordPublicMessage(session.user.id, history_target, text) catch |err| std.log.warn("chat history write failed: {s}", .{@errorName(err)});
+                        try deferPublicMessage(allocator, deferred_public_messages, session.user.id, history_target, text);
                     }
                     continue;
                 }
@@ -1216,12 +2009,12 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
                     try broadcastMatchChatLocked(allocator, sessions, match_id, message.bytes(), session);
                     var history_target_buf: [32]u8 = undefined;
                     const history_target = try std.fmt.bufPrint(&history_target_buf, "#multi_{d}", .{match_id});
-                    store.recordPublicMessage(session.user.id, history_target, text) catch |err| std.log.warn("chat history write failed: {s}", .{@errorName(err)});
+                    try deferPublicMessage(allocator, deferred_public_messages, session.user.id, history_target, text);
                     continue;
                 }
                 if (!session.joined(target_name)) continue;
                 try sessions.broadcastChannel(target_name, message.bytes(), session);
-                store.recordPublicMessage(session.user.id, target_name, text) catch |err| std.log.warn("chat history write failed: {s}", .{@errorName(err)});
+                try deferPublicMessage(allocator, deferred_public_messages, session.user.id, target_name, text);
             }
         },
         .join_lobby => {
@@ -1610,10 +2403,12 @@ fn pollLocked(allocator: std.mem.Allocator, store: *storage.Store, sessions: *se
             var i: usize = 0;
             while (i < count) : (i += 1) {
                 const user_id = try p.int(i32);
-                if (sessions.onlineByUser(user_id)) |s|
-                    try stats(&out, store, s)
-                else
+                if (sessions.onlineByUser(user_id)) |target| {
+                    if (target.user.restricted or (session.user.restricted and target.user.id == session.user.id)) continue;
+                    if (prepared_stable.find(packet_index, target)) |event| try out.raw(event);
+                } else if (!session.user.restricted) {
                     _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, user_id, false, true);
+                }
             }
         },
         .user_presence_request => {
@@ -1681,6 +2476,12 @@ fn markDeliveredDirectMessages(store: *storage.Store, user_id: i32, message_ids:
     }
 }
 
+fn storeDeferredPublicMessages(store: *storage.Store, messages: []const DeferredPublicMessage) void {
+    for (messages) |message| store.recordPublicMessage(message.sender_id, message.target, message.message) catch |err| {
+        std.log.warn("chat history write failed: {s}", .{@errorName(err)});
+    };
+}
+
 fn drainSuppressedLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session) ![]u8 {
     const result = try allocator.dupe(u8, session.queue.items);
     session.queue.clearRetainingCapacity();
@@ -1690,50 +2491,87 @@ fn drainSuppressedLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.S
 }
 
 pub fn poll(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, session: *sessions_mod.Session, body: []const u8) ![]u8 {
-    var delivered_dm_ids: std.ArrayList(i64) = .empty;
-    defer delivered_dm_ids.deinit(allocator);
-    const lazer_presence_epoch = captureLazerPresenceEpoch(sessions);
-    var prepared_lazer = try prepareLazerPresences(allocator, store, body, lazer_presence_epoch);
-    defer prepared_lazer.deinit();
     sessions.mutex.lockUncancelable(sessions.io);
-    pruneLazerPresenceLocked(allocator, sessions) catch |err| {
-        sessions.mutex.unlock(sessions.io);
-        return err;
-    };
-    if (session.presence_suppressed) {
-        const result = drainSuppressedLocked(allocator, sessions, session) catch |err| {
+    const token = if (sessions.byToken(&session.token)) |current| blk: {
+        if (current != session or current.generation != session.generation) {
             sessions.mutex.unlock(sessions.io);
-            return err;
-        };
+            return error.StaleStableSession;
+        }
+        break :blk current.token;
+    } else {
         sessions.mutex.unlock(sessions.io);
-        return result;
-    }
-    const user_id = session.user.id;
-    var logged_out = false;
-    const result = pollLocked(allocator, store, sessions, session, body, &prepared_lazer, &logged_out, &delivered_dm_ids) catch |err| {
-        sessions.mutex.unlock(sessions.io);
-        return err;
+        return error.StaleStableSession;
     };
-    if (logged_out) removeSessionLocked(allocator, sessions, session);
     sessions.mutex.unlock(sessions.io);
-    markDeliveredDirectMessages(store, user_id, delivered_dm_ids.items);
-    return result;
+    return (try pollByToken(allocator, store, sessions, &token, body)) orelse error.StaleStableSession;
+}
+
+/// Resolve the owner needed to acquire the app's per-user game-session lease.
+/// `pollByToken` checks the token again after the lease is held, so a takeover
+/// between this lookup and lock acquisition cannot execute any database work.
+pub fn pollUserIdForToken(sessions: *sessions_mod.Sessions, token: []const u8) ?i32 {
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const session = sessions.byToken(token) orelse return null;
+    return session.user.id;
 }
 
 pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, token: []const u8, body: []const u8) !?[]u8 {
     var delivered_dm_ids: std.ArrayList(i64) = .empty;
     defer delivered_dm_ids.deinit(allocator);
+    var deferred_public_messages: std.ArrayList(DeferredPublicMessage) = .empty;
+    defer {
+        for (deferred_public_messages.items) |*message| message.deinit(allocator);
+        deferred_public_messages.deinit(allocator);
+    }
     // Do not let an unknown token trigger the database-backed presence
     // preparation pass. The token is checked again after preparation because
     // a concurrent reconnect may replace it in between.
+    var stable_capture: StablePollCapture = undefined;
+    var lazer_presence_epoch: u64 = 0;
     sessions.mutex.lockUncancelable(sessions.io);
     pruneExpiredLocked(allocator, sessions);
-    const token_was_live = sessions.byToken(token) != null;
-    const lazer_presence_epoch = sessions.lazer_presence_epoch;
+    {
+        const initial_session = sessions.byToken(token) orelse {
+            sessions.mutex.unlock(sessions.io);
+            return null;
+        };
+        if (initial_session.queue_overflowed) {
+            removeSessionLocked(allocator, sessions, initial_session);
+            sessions.mutex.unlock(sessions.io);
+            return null;
+        }
+        if (initial_session.presence_suppressed) {
+            const result = drainSuppressedLocked(allocator, sessions, initial_session) catch |err| {
+                sessions.mutex.unlock(sessions.io);
+                return err;
+            };
+            sessions.mutex.unlock(sessions.io);
+            return result;
+        }
+        initial_session.last_seen = std.Io.Clock.real.now(sessions.io).toSeconds();
+        lazer_presence_epoch = sessions.lazer_presence_epoch;
+        stable_capture = captureStablePollLocked(allocator, sessions, initial_session, body) catch |err| {
+            sessions.mutex.unlock(sessions.io);
+            return err;
+        };
+    }
     sessions.mutex.unlock(sessions.io);
-    if (!token_was_live) return null;
-    var prepared_lazer = try prepareLazerPresences(allocator, store, body, lazer_presence_epoch);
+    defer stable_capture.deinit();
+
+    var prepared_owner_auth = try prepareOwnerAuth(allocator, store, stable_capture.owner_user_id);
+    defer prepared_owner_auth.deinit();
+    var prepared_stable = try prepareStableStats(allocator, store, &stable_capture);
+    defer prepared_stable.deinit();
+    var prepared_database = try prepareStableDatabase(allocator, store, &stable_capture, &prepared_owner_auth);
+    defer prepared_database.deinit();
+    var prepared_lazer = try prepareLazerPresences(allocator, store, body, lazer_presence_epoch, prepared_owner_auth.restricted);
     defer prepared_lazer.deinit();
+    var prepared_unread: PreparedUnreadDirectMessages = if (prepared_owner_auth.restricted)
+        .{ .allocator = allocator }
+    else
+        try prepareUnreadDirectMessages(allocator, store, stable_capture.owner_user_id, stable_capture.ownerName());
+    defer prepared_unread.deinit();
     sessions.mutex.lockUncancelable(sessions.io);
     pruneExpiredLocked(allocator, sessions);
     pruneLazerPresenceLocked(allocator, sessions) catch |err| {
@@ -1744,6 +2582,10 @@ pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions
         sessions.mutex.unlock(sessions.io);
         return null;
     };
+    if (session.generation != stable_capture.owner_generation) {
+        sessions.mutex.unlock(sessions.io);
+        return null;
+    }
     if (session.queue_overflowed) {
         removeSessionLocked(allocator, sessions, session);
         sessions.mutex.unlock(sessions.io);
@@ -1757,15 +2599,20 @@ pub fn pollByToken(allocator: std.mem.Allocator, store: *storage.Store, sessions
         sessions.mutex.unlock(sessions.io);
         return result;
     }
+    applyOwnerAuthLocked(allocator, sessions, session, &prepared_owner_auth) catch |err| {
+        sessions.mutex.unlock(sessions.io);
+        return err;
+    };
     const user_id = session.user.id;
     var logged_out = false;
-    const result = pollLocked(allocator, store, sessions, session, body, &prepared_lazer, &logged_out, &delivered_dm_ids) catch |err| {
+    const result = pollLocked(allocator, sessions, session, body, &prepared_stable, &prepared_database, &prepared_lazer, &prepared_unread, &logged_out, &delivered_dm_ids, &deferred_public_messages) catch |err| {
         sessions.mutex.unlock(sessions.io);
         return err;
     };
     if (logged_out) removeSessionLocked(allocator, sessions, session);
     sessions.mutex.unlock(sessions.io);
     markDeliveredDirectMessages(store, user_id, delivered_dm_ids.items);
+    storeDeferredPublicMessages(store, deferred_public_messages.items);
     return result;
 }
 
@@ -1850,14 +2697,27 @@ pub fn disconnectRestrictedUser(allocator: std.mem.Allocator, sessions: *session
 }
 
 pub fn publishStats(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, mode: u8, mods: i32) !void {
+    var snapshot: StableStatsSnapshot = undefined;
     sessions.mutex.lockUncancelable(sessions.io);
-    defer sessions.mutex.unlock(sessions.io);
-    const session = sessions.onlineByUser(user_id) orelse return;
-    session.mode = mode;
-    session.mods = mods;
+    {
+        const session = sessions.onlineByUser(user_id) orelse {
+            sessions.mutex.unlock(sessions.io);
+            return;
+        };
+        session.mode = mode;
+        session.mods = mods;
+        snapshot = StableStatsSnapshot.init(session);
+    }
+    sessions.mutex.unlock(sessions.io);
+
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
-    try stats(&event, store, session);
+    try stats(&event, store, &snapshot);
+
+    sessions.mutex.lockUncancelable(sessions.io);
+    defer sessions.mutex.unlock(sessions.io);
+    const current = sessions.onlineByUser(user_id) orelse return;
+    if (current.generation != snapshot.generation or current.mode != snapshot.mode or current.mods != snapshot.mods) return;
     try sessions.broadcast(event.bytes(), null);
 }
 
@@ -1961,7 +2821,7 @@ test "lazer logout invalidates presence prepared by an earlier Stable poll" {
     request[2] = 0;
     std.mem.writeInt(u32, request[3..7], payload.len, .little);
     @memcpy(request[7..], &payload);
-    var prepared = try prepareLazerPresences(std.testing.allocator, &store, &request, prepared_epoch);
+    var prepared = try prepareLazerPresences(std.testing.allocator, &store, &request, prepared_epoch, false);
     defer prepared.deinit();
     try std.testing.expect(prepared.find(user_id) != null);
 
@@ -2149,4 +3009,39 @@ test "Stable login rollback removes the session even when logout allocation fail
     try std.testing.expect(rollbackLogin(failing.allocator(), &sessions, login_session.user.id, &token));
     try std.testing.expect(sessions.byUser(8) == null);
     try std.testing.expect(sessions.byToken(&token) == null);
+}
+
+fn cloneCommandWorldAllocationRun(allocator: std.mem.Allocator) !void {
+    var source = sessions_mod.Sessions.init(allocator, std.testing.io);
+    defer source.deinit();
+    const owned_name = try allocator.dupe(u8, "allocation owner");
+    const owned_safe_name = allocator.dupe(u8, "allocation_owner") catch |err| {
+        allocator.free(owned_name);
+        return err;
+    };
+    const session = source.create(.{ .id = 90, .name = owned_name, .safe_name = owned_safe_name }, 0, 0, 0) catch |err| {
+        allocator.free(owned_name);
+        allocator.free(owned_safe_name);
+        return err;
+    };
+    try session.friend_ids.appendSlice(allocator, &.{ 3, 91, 92, 93 });
+    var clone = try cloneCommandWorld(allocator, &source);
+    defer clone.deinit();
+    try std.testing.expectEqualSlices(i32, session.friend_ids.items, clone.byUser(90).?.friend_ids.items);
+}
+
+test "command world ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneCommandWorldAllocationRun, .{});
+}
+
+test "prepared Stable stats reject a newer action from the same session generation" {
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const target = try sessions.create(.{ .id = 91, .name = try std.testing.allocator.dupe(u8, "stats target"), .safe_name = try std.testing.allocator.dupe(u8, "stats_target") }, 0, 0, 0);
+    const snapshot = StableStatsSnapshot.init(target);
+    var prepared: PreparedStableStats = .{ .allocator = std.testing.allocator, .owner_generation = target.generation };
+    defer prepared.deinit();
+    try prepared.items.append(std.testing.allocator, .{ .packet_index = 0, .snapshot = snapshot, .bytes = try std.testing.allocator.dupe(u8, "stale") });
+    target.action = 2;
+    try std.testing.expect(prepared.find(0, target) == null);
 }

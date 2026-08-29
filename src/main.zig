@@ -23,6 +23,7 @@ const changelog = @import("changelog");
 const lazer_wiki = @import("lazer_wiki.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
+const pp_admin = @import("pp_admin.zig");
 const screenshot = @import("screenshot.zig");
 const index_page = @embedFile("index.html");
 const form_urlencoded = @import("form_urlencoded.zig");
@@ -60,6 +61,57 @@ const lazer_refresh_lifetime_seconds: i64 = 90 * 24 * 60 * 60;
 
 fn healthResponse(buf: []u8, online: usize) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19,\"hotfixes\":true}}", .{online});
+}
+
+const HttpGate = struct {
+    limit: u32,
+    active: std.atomic.Value(u32) = .init(0),
+    rejected: std.atomic.Value(u64) = .init(0),
+    timed_out: std.atomic.Value(u64) = .init(0),
+
+    fn init(limit: u32) HttpGate {
+        std.debug.assert(limit > 0);
+        return .{ .limit = limit };
+    }
+
+    fn tryAcquire(self: *HttpGate) bool {
+        const previous = self.active.fetchAdd(1, .acq_rel);
+        if (previous < self.limit) return true;
+        const active_before_release = self.active.fetchSub(1, .acq_rel);
+        std.debug.assert(active_before_release > 0);
+        _ = self.rejected.fetchAdd(1, .acq_rel);
+        return false;
+    }
+
+    fn release(self: *HttpGate) void {
+        const previous = self.active.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+    }
+
+    fn recordTimeout(self: *HttpGate) void {
+        _ = self.timed_out.fetchAdd(1, .acq_rel);
+    }
+};
+
+fn httpRequestDeadlineSeconds(method: std.http.Method, target: []const u8, normal_seconds: u16, long_seconds: u16) ?u16 {
+    const query = std.mem.findScalar(u8, target, '?') orelse target.len;
+    const path = routing.canonicalPath(target[0..query]);
+    if (std.mem.eql(u8, path, "/multiplayer") or
+        std.mem.eql(u8, path, "/spectator") or
+        std.mem.eql(u8, path, "/notification-endpoint")) return null;
+    if (method == .PUT or method == .PATCH or
+        std.mem.startsWith(u8, path, "/d/") or
+        std.mem.endsWith(u8, path, "/download") or
+        std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") or
+        std.mem.eql(u8, path, "/web/osu-screenshot.php") or
+        std.mem.eql(u8, path, "/api/v2/scores") or
+        std.mem.endsWith(u8, path, "/solo/scores") or
+        (std.mem.indexOf(u8, path, "/playlist/") != null and std.mem.endsWith(u8, path, "/scores")) or
+        std.mem.eql(u8, path, "/api/v1/account/avatar") or
+        std.mem.eql(u8, path, "/api/v1/account/banner") or
+        std.mem.endsWith(u8, path, "/flag") or
+        std.mem.endsWith(u8, path, "/header")) return long_seconds;
+    return normal_seconds;
 }
 
 var shutdown_requested: std.atomic.Value(bool) = .init(false);
@@ -153,6 +205,51 @@ fn parsePinPath(path: []const u8) ?PinPath {
 
 const LazerPerformance = struct { pp: f64 = 0, stars: f64 = 0, max_combo: u32 = 0, mods: u32 = 0 };
 
+const StaffPpPreviewRequest = struct {
+    beatmap_id: i32,
+    source: pp_admin.Source,
+    namespace: pp_admin.Namespace,
+    mode: u8,
+    mods: u32,
+    max_combo: u32,
+    large_tick_hits: u32 = 0,
+    small_tick_hits: u32 = 0,
+    slider_end_hits: u32 = 0,
+    n_geki: u32 = 0,
+    n_katu: u32 = 0,
+    n300: u32,
+    n100: u32,
+    n50: u32,
+    misses: u32,
+    legacy_total_score: u32,
+    mods_json: []const u8 = "[]",
+};
+
+fn ppNamespace(value: []const u8) ?pp_admin.Namespace {
+    return std.meta.stringToEnum(pp_admin.Namespace, value);
+}
+
+fn lazerPpNamespace(value: lazer.Namespace) ?pp_admin.Namespace {
+    return switch (value) {
+        .vanilla => .vanilla,
+        .relax => .relax,
+        .autopilot => .autopilot,
+        .custom => null,
+    };
+}
+
+fn staffPpComparisonJson(allocator: std.mem.Allocator, result: pp_admin.Comparison) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.print(
+        "{{\"policy\":\"{s}\",\"engine\":\"{s}\",\"source\":\"{s}\",\"namespace\":\"{s}\",\"submitted_mods\":{d},\"candidate_mods\":{d},\"rate\":{{\"mod\":\"{s}\",\"multiplier\":{d}}},\"current\":{{\"pp\":{d},\"stars\":{d},\"max_combo\":{d}}},\"candidate\":{{\"pp\":{d},\"stars\":{d},\"max_combo\":{d}}},\"delta\":{{\"pp\":{d},\"stars\":{d},\"max_combo\":{d},\"pp_percent\":",
+        .{ result.policy, result.upstream_engine, @tagName(result.source), @tagName(result.namespace), result.submitted_mods, result.candidate_mods, @tagName(result.rate.mod), result.rate.multiplier, result.current.pp, result.current.stars, result.current.max_combo, result.candidate.pp, result.candidate.stars, result.candidate.max_combo, result.delta.pp, result.delta.stars, result.delta.max_combo },
+    );
+    if (result.delta.pp_percent) |value| try output.writer.print("{d}", .{value}) else try output.writer.writeAll("null");
+    try output.writer.print("}},\"changed\":{}}}", .{result.changed});
+    return output.toOwnedSlice();
+}
+
 fn lazerPerformance(allocator: std.mem.Allocator, store: *storage.Store, input: lazer.ScoreInput, mods_json: []const u8) !LazerPerformance {
     const state = (try lazer.performanceState(input)) orelse return .{};
     const map_file = (try store.beatmapFileById(allocator, @intCast(input.beatmap_id))) orelse return error.BeatmapPayloadMissing;
@@ -173,7 +270,14 @@ fn lazerPerformance(allocator: std.mem.Allocator, store: *storage.Store, input: 
         .misses = state.misses,
         .legacy_total_score = state.legacy_total_score,
     };
-    const performance = if (input.namespace == .vanilla)
+    const performance = if (lazerPpNamespace(input.namespace)) |namespace|
+        try pp_admin.calculate(allocator, map_file, .{
+            .source = .lazer,
+            .namespace = namespace,
+            .input = performance_input,
+            .mods_json = mods_json,
+        })
+    else if (input.namespace == .vanilla)
         try pp.calculateLazer(map_file, mods_json, performance_input)
     else
         try pp.calculate(map_file, performance_input);
@@ -267,6 +371,10 @@ const App = struct {
     changelog_feed: changelog.Feed,
     started_at: i64,
     irc_clients: std.atomic.Value(u32) = .init(0),
+    http_gate: HttpGate,
+    http_header_timeout_seconds: u16,
+    http_request_timeout_seconds: u16,
+    http_long_request_timeout_seconds: u16,
     game_session_mutexes: [game_session_lock_count]std.Io.Mutex = [_]std.Io.Mutex{.init} ** game_session_lock_count,
     server_control_mutex: std.Io.Mutex = .init,
 
@@ -773,18 +881,21 @@ const App = struct {
         const media = self.media_sync.metrics();
         const multiplayer = self.lazer_multiplayer.runtimeCounts();
         const spectator_connections = self.lazer_spectator.connectionCount();
+        const http_active = self.http_gate.active.load(.acquire);
+        const http_rejected = self.http_gate.rejected.load(.acquire);
+        const http_timed_out = self.http_gate.timed_out.load(.acquire);
         const controls = try self.store.staffServerControlsJson(self.allocator);
         defer self.allocator.free(controls);
         const uptime = @max(@as(i64, 0), std.Io.Clock.real.now(self.store.io).toSeconds() - self.started_at);
         var output: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer output.deinit();
         try output.writer.print(
-            "{{\"runtime\":{{\"uptime_seconds\":{d},\"online\":{d},\"stable_online\":{d},\"lazer_online\":{d},\"irc_connections\":{d},\"multiplayer_connections\":{d},\"multiplayer_rooms\":{d},\"multiplayer_queued\":{d},\"pending_matches\":{d},\"spectator_connections\":{d},\"anticheat_loaded\":{},\"anticheat_sample_modulus\":{d},\"restart_supported\":true}},",
-            .{ uptime, online, stable_online, lazer_ids.len, self.irc_clients.load(.acquire), multiplayer.connections, multiplayer.rooms, multiplayer.queued, multiplayer.pending_matches, spectator_connections, self.anticheat != null, self.anticheat_allow_sample_modulus },
+            "{{\"runtime\":{{\"uptime_seconds\":{d},\"online\":{d},\"stable_online\":{d},\"lazer_online\":{d},\"irc_connections\":{d},\"http_connections\":{d},\"http_connection_limit\":{d},\"http_rejected\":{d},\"http_timeouts\":{d},\"multiplayer_connections\":{d},\"multiplayer_rooms\":{d},\"multiplayer_queued\":{d},\"pending_matches\":{d},\"spectator_connections\":{d},\"anticheat_loaded\":{},\"anticheat_sample_modulus\":{d},\"restart_supported\":true}},",
+            .{ uptime, online, stable_online, lazer_ids.len, self.irc_clients.load(.acquire), http_active, self.http_gate.limit, http_rejected, http_timed_out, multiplayer.connections, multiplayer.rooms, multiplayer.queued, multiplayer.pending_matches, spectator_connections, self.anticheat != null, self.anticheat_allow_sample_modulus },
         );
         try output.writer.print(
-            "\"storage\":{{\"schema\":45,\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"beatmap_cache_entries\":{d},\"beatmap_cache_bytes\":{d},\"media_cache_entries\":{d},\"media_cache_bytes\":{d},\"hydration_blocked\":{d}}},",
-            .{ counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures },
+            "\"storage\":{{\"schema\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"beatmap_cache_entries\":{d},\"beatmap_cache_bytes\":{d},\"media_cache_entries\":{d},\"media_cache_bytes\":{d},\"hydration_blocked\":{d}}},",
+            .{ if (storage.is_postgres) @as(u8, 46) else @as(u8, 45), counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures },
         );
         try output.writer.print(
             "\"pipeline\":{{\"hydration_attempts\":{d},\"hydration_successes\":{d},\"hydration_failures\":{d},\"mirror_hits\":{d},\"mirror_misses\":{d},\"mirror_fills\":{d},\"mirror_failures\":{d},\"mirror_bytes_served\":{d},\"media_attempts\":{d},\"media_successes\":{d},\"media_failures\":{d}}},\"state\":{s}}}",
@@ -1304,6 +1415,7 @@ const App = struct {
 
     fn bodyLimit(path: []const u8) usize {
         if (bss.parsePath(path) != null) return bss.max_upload_bytes + 1024 * 1024;
+        if (std.mem.eql(u8, path, "/api/v1/staff/pp")) return pp_admin.max_mods_json_bytes + 8 * 1024;
         if (std.mem.eql(u8, path, "/api/v1/account/avatar")) return profile_avatar.max_bytes;
         if (std.mem.eql(u8, path, "/api/v1/account/banner")) return profile_banner.max_bytes;
         if (std.mem.startsWith(u8, path, "/api/v1/teams/") and (std.mem.endsWith(u8, path, "/flag") or std.mem.endsWith(u8, path, "/header"))) return team_image.header_max_bytes;
@@ -1660,6 +1772,10 @@ const App = struct {
                 "# HELP zigcho_up Whether the server can answer requests.\n" ++
                     "# TYPE zigcho_up gauge\nzigcho_up 1\n" ++
                     "# TYPE zigcho_online_users gauge\nzigcho_online_users {d}\n" ++
+                    "# TYPE zigcho_http_connections gauge\nzigcho_http_connections {d}\n" ++
+                    "# TYPE zigcho_http_connection_limit gauge\nzigcho_http_connection_limit {d}\n" ++
+                    "# TYPE zigcho_http_rejected counter\nzigcho_http_rejected {d}\n" ++
+                    "# TYPE zigcho_http_timeouts counter\nzigcho_http_timeouts {d}\n" ++
                     "# TYPE zigcho_accounts gauge\nzigcho_accounts {d}\n" ++
                     "# TYPE zigcho_plays gauge\nzigcho_plays {d}\n" ++
                     "# TYPE zigcho_passed_plays gauge\nzigcho_passed_plays {d}\n" ++
@@ -1687,7 +1803,7 @@ const App = struct {
                     "# TYPE zigcho_beatmap_media_cache_pruned_entries counter\nzigcho_beatmap_media_cache_pruned_entries {d}\n" ++
                     "# TYPE zigcho_beatmap_media_cache_pruned_bytes counter\nzigcho_beatmap_media_cache_pruned_bytes {d}\n" ++
                     "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
-                .{ online, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.capacity_skips, hydration.pruned_entries, hydration.pruned_bytes, hydration.mirror_hits, hydration.mirror_misses, hydration.mirror_fills, hydration.mirror_failures, hydration.mirror_bytes_served, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
+                .{ online, self.http_gate.active.load(.acquire), self.http_gate.limit, self.http_gate.rejected.load(.acquire), self.http_gate.timed_out.load(.acquire), counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.capacity_skips, hydration.pruned_entries, hydration.pruned_bytes, hydration.mirror_hits, hydration.mirror_misses, hydration.mirror_fills, hydration.mirror_failures, hydration.mirror_bytes_served, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
             );
             return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
         }
@@ -2490,6 +2606,53 @@ const App = struct {
                     return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
                 }
             }
+            if (std.mem.eql(u8, path, "/api/v1/staff/pp")) {
+                if (!web_auth.canDevelop(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"developer access required\"}", &no_store);
+                if (req.head.method == .GET) {
+                    var metadata: [384]u8 = undefined;
+                    const json = try std.fmt.bufPrint(
+                        &metadata,
+                        "{{\"policy\":\"{s}\",\"engine\":\"{s}\",\"max_map_bytes\":{d},\"max_mods_json_bytes\":{d},\"max_preview_items\":{d},\"max_recalculation_items\":{d},\"live\":true,\"apply\":false}}",
+                        .{ pp_admin.policy_version, pp_admin.upstream_engine_version, pp_admin.max_map_bytes, pp_admin.max_mods_json_bytes, pp_admin.max_preview_items, pp_admin.max_recalculation_items },
+                    );
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+                if (req.head.method == .POST) {
+                    const parsed = std.json.parseFromSlice(StaffPpPreviewRequest, self.allocator, body, .{ .ignore_unknown_fields = false }) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid pp preview input\"}", &no_store);
+                    defer parsed.deinit();
+                    const input = parsed.value;
+                    if (input.beatmap_id <= 0 or input.mode > 3) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid beatmap or mode\"}", &no_store);
+                    const map_file = (try self.store.beatmapFileById(self.allocator, input.beatmap_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"beatmap payload not found\"}", &no_store);
+                    defer self.allocator.free(map_file);
+                    const result = pp_admin.compare(self.allocator, map_file, .{
+                        .source = input.source,
+                        .namespace = input.namespace,
+                        .input = .{
+                            .mode = input.mode,
+                            .lazer = if (input.source == .lazer) 1 else 0,
+                            .mods = input.mods,
+                            .max_combo = input.max_combo,
+                            .large_tick_hits = input.large_tick_hits,
+                            .small_tick_hits = input.small_tick_hits,
+                            .slider_end_hits = input.slider_end_hits,
+                            .n_geki = input.n_geki,
+                            .n_katu = input.n_katu,
+                            .n300 = input.n300,
+                            .n100 = input.n100,
+                            .n50 = input.n50,
+                            .misses = input.misses,
+                            .legacy_total_score = input.legacy_total_score,
+                        },
+                        .mods_json = if (input.source == .lazer) input.mods_json else "",
+                    }) catch |err| {
+                        std.log.warn("event=staff_pp_preview_failed actor_id={d} beatmap_id={d} error={t}", .{ staff_user.id, input.beatmap_id, err });
+                        return respond(req, .unprocessable_entity, "application/json", "{\"error\":\"pp preview could not be calculated\"}", &no_store);
+                    };
+                    const json = try staffPpComparisonJson(self.allocator, result);
+                    defer self.allocator.free(json);
+                    return respond(req, .ok, "application/json", json, &no_store);
+                }
+            }
             if (std.mem.eql(u8, path, "/api/v1/staff/overview") and req.head.method == .GET) {
                 const json = try self.store.staffOverviewJson(self.allocator);
                 defer self.allocator.free(json);
@@ -2784,6 +2947,7 @@ const App = struct {
                 }
             }
             const known_staff_path = std.mem.eql(u8, path, "/api/v1/staff/infrastructure") or
+                std.mem.eql(u8, path, "/api/v1/staff/pp") or
                 std.mem.eql(u8, path, "/api/v1/staff/overview") or
                 std.mem.eql(u8, path, "/api/v1/staff/users") or
                 std.mem.eql(u8, path, "/api/v1/staff/ranking") or
@@ -4378,7 +4542,22 @@ const App = struct {
         }
         if (std.mem.eql(u8, path, "/") and req.head.method == .POST) {
             if (osu_token_owned) |token| {
-                const bytes = (try bancho.pollByToken(self.allocator, &self.store, &self.sessions, token, body)) orelse {
+                const poll_user_id = bancho.pollUserIdForToken(&self.sessions, token) orelse {
+                    var restart = protocol.Writer.init(self.allocator);
+                    defer restart.deinit();
+                    try restart.packetString(.notification, "Server has restarted.");
+                    const rs = try restart.begin(.restart);
+                    try restart.int(i32, 0);
+                    restart.finish(rs);
+                    return respond(req, .ok, "application/octet-stream", restart.bytes(), &.{});
+                };
+                const maybe_bytes = poll: {
+                    const mutex = self.gameSessionMutex(poll_user_id);
+                    mutex.lockUncancelable(self.store.io);
+                    defer mutex.unlock(self.store.io);
+                    break :poll try bancho.pollByToken(self.allocator, &self.store, &self.sessions, token, body);
+                };
+                const bytes = maybe_bytes orelse {
                     var restart = protocol.Writer.init(self.allocator);
                     defer restart.deinit();
                     try restart.packetString(.notification, "Server has restarted.");
@@ -4720,7 +4899,8 @@ const App = struct {
             };
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
-            switch (self.sessions.authorizeScoreToken(score_token_owned, user.id)) {
+            const submitted_binding = sessions_mod.StableClientBinding.init(osu_version, decrypted.client_hash) catch null;
+            switch (self.sessions.authorizeScoreToken(score_token_owned, user.id, submitted_binding)) {
                 .exact, .stale_online => {},
                 .missing => {
                     std.log.warn("stable score rejected: reason=missing_session_token body_bytes={d}", .{body.len});
@@ -4734,6 +4914,22 @@ const App = struct {
                     std.log.warn("stable score rejected: reason=inactive_session body_bytes={d}", .{body.len});
                     return respond(req, .ok, "text/plain", "error: no", &.{});
                 },
+                .client_version_mismatch => {
+                    std.log.warn("stable score rejected: reason=client_version_mismatch user_id={d} body_bytes={d}", .{ user.id, body.len });
+                    return respond(req, .unauthorized, "text/plain", "", &.{});
+                },
+                .client_hardware_mismatch => {
+                    std.log.warn("stable score rejected: reason=client_hardware_mismatch user_id={d} body_bytes={d}", .{ user.id, body.len });
+                    return respond(req, .unauthorized, "text/plain", "", &.{});
+                },
+                .missing_login_client_binding => {
+                    std.log.err("stable score rejected: reason=missing_login_client_binding user_id={d} body_bytes={d}", .{ user.id, body.len });
+                    return respond(req, .unauthorized, "text/plain", "", &.{});
+                },
+                .invalid_client_binding => {
+                    std.log.warn("stable score rejected: reason=invalid_client_binding user_id={d} body_bytes={d}", .{ user.id, body.len });
+                    return respond(req, .unauthorized, "text/plain", "", &.{});
+                },
             }
             if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) {
                 self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .checksum_mismatch));
@@ -4745,18 +4941,22 @@ const App = struct {
             }
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             defer self.allocator.free(map_file);
-            const performance = pp.calculate(map_file, .{
-                .mode = score.mode,
-                .lazer = 0,
-                .mods = @intCast(score.mods),
-                .max_combo = @intCast(score.max_combo),
-                .n_geki = @intCast(score.ngeki),
-                .n_katu = @intCast(score.nkatu),
-                .n300 = @intCast(score.n300),
-                .n100 = @intCast(score.n100),
-                .n50 = @intCast(score.n50),
-                .misses = @intCast(score.nmiss),
-                .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
+            const performance = pp_admin.calculate(self.allocator, map_file, .{
+                .source = .stable,
+                .namespace = ppNamespace(score.rankNamespace()) orelse return respond(req, .ok, "text/plain", "error: no", &.{}),
+                .input = .{
+                    .mode = score.mode,
+                    .lazer = 0,
+                    .mods = @intCast(score.mods),
+                    .max_combo = @intCast(score.max_combo),
+                    .n_geki = @intCast(score.ngeki),
+                    .n_katu = @intCast(score.nkatu),
+                    .n300 = @intCast(score.n300),
+                    .n100 = @intCast(score.n100),
+                    .n50 = @intCast(score.n50),
+                    .misses = @intCast(score.nmiss),
+                    .legacy_total_score = @intCast(@min(score.total_score, std.math.maxInt(u32))),
+                },
             }) catch return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             score.achievement_stars = performance.stars;
             const elapsed_ms = if (score.passed) score_time else fail_time;
@@ -4920,6 +5120,23 @@ test "health advertises the verified hotfix lane" {
     var buf: [256]u8 = undefined;
     const json = try healthResponse(&buf, 7);
     try std.testing.expectEqualStrings("{\"ok\":true,\"service\":\"zigcho\",\"online\":7,\"protocol\":19,\"hotfixes\":true}", json);
+}
+
+test "http gate bounds tasks and deadlines preserve realtime" {
+    var gate = HttpGate.init(2);
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectEqual(@as(u32, 2), gate.active.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate.rejected.load(.acquire));
+    gate.release();
+    gate.release();
+    try std.testing.expectEqual(@as(u32, 0), gate.active.load(.acquire));
+
+    try std.testing.expectEqual(@as(?u16, null), httpRequestDeadlineSeconds(.GET, "/multiplayer?access_token=redacted", 30, 300));
+    try std.testing.expectEqual(@as(?u16, 30), httpRequestDeadlineSeconds(.GET, "/api/v1/status", 30, 300));
+    try std.testing.expectEqual(@as(?u16, 300), httpRequestDeadlineSeconds(.GET, "/d/1", 30, 300));
+    try std.testing.expectEqual(@as(?u16, 300), httpRequestDeadlineSeconds(.POST, "/api/v2/rooms/1/playlist/2/scores", 30, 300));
 }
 
 test "failed lazer password response revokes tokens and always clears presence" {
@@ -5561,7 +5778,15 @@ fn serveIrcListener(app: *App, bind: []const u8, port: u16, io: std.Io) std.Io.C
     }
 }
 
+fn httpDeadlineWatchdog(app: *App, stream: std.Io.net.Stream, io: std.Io, completed: *std.atomic.Value(bool), timeout_seconds: u16) std.Io.Cancelable!void {
+    try std.Io.sleep(io, .fromSeconds(timeout_seconds), .awake);
+    if (completed.swap(true, .acq_rel)) return;
+    app.http_gate.recordTimeout();
+    stream.shutdown(io, .both) catch {};
+}
+
 fn serveConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) void {
+    defer app.http_gate.release();
     var stream = stream_value;
     defer stream.close(io);
     var peer_buffer: [64]u8 = undefined;
@@ -5571,7 +5796,34 @@ fn serveConnection(app: *App, stream_value: std.Io.net.Stream, io: std.Io) void 
     var cr = stream.reader(io, &recv);
     var cw = stream.writer(io, &send);
     var server: std.http.Server = .init(&cr.interface, &cw.interface);
-    var req = server.receiveHead() catch return;
+    var header_completed: std.atomic.Value(bool) = .init(false);
+    var header_deadline: std.Io.Group = .init;
+    header_deadline.concurrent(io, httpDeadlineWatchdog, .{ app, stream, io, &header_completed, app.http_header_timeout_seconds }) catch {
+        _ = app.http_gate.rejected.fetchAdd(1, .acq_rel);
+        return;
+    };
+    var req = server.receiveHead() catch {
+        header_completed.store(true, .release);
+        header_deadline.cancel(io);
+        return;
+    };
+    header_completed.store(true, .release);
+    header_deadline.cancel(io);
+
+    if (httpRequestDeadlineSeconds(req.head.method, req.head.target, app.http_request_timeout_seconds, app.http_long_request_timeout_seconds)) |timeout_seconds| {
+        var request_completed: std.atomic.Value(bool) = .init(false);
+        var request_deadline: std.Io.Group = .init;
+        request_deadline.concurrent(io, httpDeadlineWatchdog, .{ app, stream, io, &request_completed, timeout_seconds }) catch {
+            _ = app.http_gate.rejected.fetchAdd(1, .acq_rel);
+            return;
+        };
+        defer {
+            request_completed.store(true, .release);
+            request_deadline.cancel(io);
+        }
+        app.serve(&req, peer_ip) catch |err| std.log.err("request failed: {t}", .{err});
+        return;
+    }
     app.serve(&req, peer_ip) catch |err| std.log.err("request failed: {t}", .{err});
 }
 
@@ -6033,6 +6285,10 @@ pub fn main(init: std.process.Init) !void {
         .geo_client = .{ .allocator = allocator, .io = init.io },
         .changelog_feed = changelog.Feed.init(allocator, init.io),
         .started_at = std.Io.Clock.real.now(init.io).toSeconds(),
+        .http_gate = .init(config.http_max_connections),
+        .http_header_timeout_seconds = config.http_header_timeout_seconds,
+        .http_request_timeout_seconds = config.http_request_timeout_seconds,
+        .http_long_request_timeout_seconds = config.http_long_request_timeout_seconds,
     };
     app.map_sync.bindOsuApiKey(config.osu_api_key);
     var kai = (try app.store.userById(allocator, 3)) orelse return error.SystemBotMissing;
@@ -6094,8 +6350,14 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("accept: {t}", .{err});
             continue;
         };
+        if (!app.http_gate.tryAcquire()) {
+            var rejected = stream;
+            rejected.close(init.io);
+            continue;
+        }
         connections.concurrent(init.io, serveConnection, .{ &app, stream, init.io }) catch |err| {
             std.log.err("spawn connection: {t}", .{err});
+            app.http_gate.release();
             var rejected = stream;
             rejected.close(init.io);
         };

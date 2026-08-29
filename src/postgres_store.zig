@@ -7802,6 +7802,7 @@ test "postgres concurrent first score submissions keep one best row per scope" {
     try std.testing.expectEqual(@as(i64, 2), try winner.int(i64, 0, 0));
     try std.testing.expectEqual(@as(i64, 1), try winner.int(i64, 0, 1));
     try std.testing.expectEqual(@as(i64, 600), try winner.int(i64, 0, 2));
+    try postgres.exec(lease.conn, "DELETE FROM zigcho.lazer_scores WHERE user_id IN(SELECT id FROM zigcho.users WHERE safe_name='best_race_pg'); DELETE FROM zigcho.scores WHERE user_id IN(SELECT id FROM zigcho.users WHERE safe_name='best_race_pg'); DELETE FROM zigcho.users WHERE safe_name='best_race_pg'; DELETE FROM zigcho.beatmaps WHERE id=2000000460");
 }
 
 test "postgres runtime migrates through best score schema forty six" {

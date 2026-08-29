@@ -605,6 +605,28 @@ CREATE TABLE oauth_tokens (
 );
 CREATE INDEX oauth_tokens_user ON oauth_tokens(user_id, expires_at);
 
+CREATE TABLE stable_score_sessions (
+    token_hash bytea PRIMARY KEY CHECK(octet_length(token_hash) = 32),
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    version_date char(8) NOT NULL CHECK(version_date ~ '^[0-9]{8}$'),
+    hardware_digest bytea NOT NULL CHECK(octet_length(hardware_digest) = 32),
+    issued_at bigint NOT NULL,
+    grace_expires_at bigint,
+    consumed_at bigint,
+    submission_checksum char(32) CHECK(submission_checksum ~ '^[0-9a-f]{32}$'),
+    revoked_at bigint,
+    CHECK(grace_expires_at IS NULL OR grace_expires_at BETWEEN issued_at AND issued_at + 900),
+    CHECK((consumed_at IS NULL) = (submission_checksum IS NULL)),
+    CHECK(consumed_at IS NULL OR grace_expires_at IS NOT NULL),
+    CHECK(consumed_at IS NULL OR consumed_at >= issued_at),
+    CHECK(revoked_at IS NULL OR revoked_at >= issued_at)
+);
+CREATE UNIQUE INDEX stable_score_sessions_one_current
+    ON stable_score_sessions(user_id)
+    WHERE grace_expires_at IS NULL AND revoked_at IS NULL;
+CREATE INDEX stable_score_sessions_user_grace
+    ON stable_score_sessions(user_id, grace_expires_at DESC, issued_at DESC);
+
 CREATE TABLE beatmap_archives (
     set_id integer PRIMARY KEY,
     sha256 char(64) NOT NULL,
@@ -757,4 +779,4 @@ VALUES('#osu','general chat',1),('#announce','updates',8192),('#lobby','multipla
 INSERT INTO server_controls(key)
 VALUES('registrations'),('stable_login'),('lazer_login'),('stable_scores'),('lazer_scores'),('lazer_multiplayer'),('spectator'),('bss'),('beatmap_downloads'),('website_writes');
 
-INSERT INTO schema_migrations(version) VALUES (46);
+INSERT INTO schema_migrations(version) VALUES (47);

@@ -9,6 +9,7 @@ const country = @import("country.zig");
 const commands = @import("commands.zig");
 const log = @import("logutil.zig");
 const multiplayer = @import("multiplayer.zig");
+const stable_login = @import("stable_login.zig");
 
 pub const LoginResult = struct {
     allocator: std.mem.Allocator,
@@ -17,6 +18,7 @@ pub const LoginResult = struct {
     user_id: i32 = 0,
     hardware_match_count: u32 = 0,
     running_under_wine: bool = false,
+    client_binding: ?sessions_mod.StableClientBinding = null,
 
     pub fn deinit(self: *LoginResult) void {
         self.allocator.free(self.token);
@@ -25,90 +27,8 @@ pub const LoginResult = struct {
     }
 };
 
-pub const StableLoginDetails = struct {
-    osu_version: []const u8,
-    utc_offset: i8,
-    display_city: bool,
-    pm_private: bool,
-    client_binding: sessions_mod.StableClientBinding,
-    hardware: storage.ClientHardware,
-};
-
-fn isMd5(value: []const u8) bool {
-    if (value.len != 32) return false;
-    for (value) |char| if (!std.ascii.isHex(char)) return false;
-    return true;
-}
-
-fn isValidClientVersion(value: []const u8) bool {
-    if (value.len < 9 or value[0] != 'b') return false;
-    for (value[1..9]) |char| if (!std.ascii.isDigit(char)) return false;
-    var remainder = value[9..];
-    if (remainder.len >= 2 and remainder[0] == '.' and std.ascii.isDigit(remainder[1])) remainder = remainder[2..];
-    return remainder.len == 0 or
-        std.mem.eql(u8, remainder, "beta") or
-        std.mem.eql(u8, remainder, "cuttingedge") or
-        std.mem.eql(u8, remainder, "dev") or
-        std.mem.eql(u8, remainder, "tourney");
-}
-
-fn commonHardwareHash(value: []const u8) bool {
-    return std.mem.eql(u8, value, "00000000000000000000000000000000") or
-        std.ascii.eqlIgnoreCase(value, "d41d8cd98f00b204e9800998ecf8427e") or
-        std.ascii.eqlIgnoreCase(value, "cfcd208495d565ef66e7dff9f98764da");
-}
-
-pub fn parseStableLoginDetails(details: []const u8) !StableLoginDetails {
-    var fields = std.mem.splitScalar(u8, details, '|');
-    const osu_version = fields.next() orelse return error.InvalidLoginDetails;
-    const utc_text = fields.next() orelse return error.InvalidLoginDetails;
-    const display_city = fields.next() orelse return error.InvalidLoginDetails;
-    const client_hashes = fields.next() orelse return error.InvalidLoginDetails;
-    const pm_private = fields.next() orelse return error.InvalidLoginDetails;
-    if (fields.next() != null or !isValidClientVersion(osu_version)) return error.InvalidLoginDetails;
-    const utc_offset = std.fmt.parseInt(i8, utc_text, 10) catch return error.InvalidLoginDetails;
-    if (utc_offset < -24 or utc_offset > 24) return error.InvalidLoginDetails;
-    if ((!std.mem.eql(u8, display_city, "0") and !std.mem.eql(u8, display_city, "1")) or
-        (!std.mem.eql(u8, pm_private, "0") and !std.mem.eql(u8, pm_private, "1"))) return error.InvalidLoginDetails;
-    if (client_hashes.len < 2 or client_hashes.len > sessions_mod.max_stable_client_hash_bytes or client_hashes[client_hashes.len - 1] != ':') return error.InvalidLoginDetails;
-    const client_binding = sessions_mod.StableClientBinding.init(osu_version, client_hashes) catch return error.InvalidLoginDetails;
-
-    var hashes = std.mem.splitScalar(u8, client_hashes[0 .. client_hashes.len - 1], ':');
-    const osu_path_md5 = hashes.next() orelse return error.InvalidLoginDetails;
-    const adapters_str = hashes.next() orelse return error.InvalidLoginDetails;
-    const adapters_md5 = hashes.next() orelse return error.InvalidLoginDetails;
-    const uninstall_md5 = hashes.next() orelse return error.InvalidLoginDetails;
-    const disk_signature_md5 = hashes.next() orelse return error.InvalidLoginDetails;
-    if (hashes.next() != null or !isMd5(osu_path_md5) or !isMd5(adapters_md5) or !isMd5(uninstall_md5) or !isMd5(disk_signature_md5)) return error.InvalidLoginDetails;
-
-    const running_under_wine = std.mem.eql(u8, adapters_str, "runningunderwine");
-    if (!running_under_wine) {
-        if (adapters_str.len < 2 or adapters_str[adapters_str.len - 1] != '.') return error.InvalidLoginDetails;
-        var adapters = std.mem.splitScalar(u8, adapters_str[0 .. adapters_str.len - 1], '.');
-        var any_adapter = false;
-        while (adapters.next()) |adapter| if (adapter.len != 0) {
-            any_adapter = true;
-        };
-        if (!any_adapter) return error.InvalidLoginDetails;
-    }
-
-    return .{
-        .osu_version = osu_version,
-        .utc_offset = utc_offset,
-        .display_city = std.mem.eql(u8, display_city, "1"),
-        .pm_private = std.mem.eql(u8, pm_private, "1"),
-        .client_binding = client_binding,
-        .hardware = .{
-            .osu_path_md5 = osu_path_md5,
-            .adapters_md5 = adapters_md5,
-            .uninstall_md5 = uninstall_md5,
-            .disk_signature_md5 = disk_signature_md5,
-            .client_version = osu_version,
-            .running_under_wine = running_under_wine,
-            .actionable = !commonHardwareHash(adapters_md5) and !commonHardwareHash(uninstall_md5) and !commonHardwareHash(disk_signature_md5),
-        },
-    };
-}
+pub const StableLoginDetails = stable_login.Details;
+pub const parseStableLoginDetails = stable_login.parse;
 pub const session_idle_seconds: i64 = 300;
 pub const lazer_presence_lease_seconds: i64 = 120;
 
@@ -1253,20 +1173,17 @@ fn captureLoginLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sess
 }
 
 fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32, expected_user_id: ?i32) !LoginResult {
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    const name = std.mem.trim(u8, lines.next() orelse "", "\r");
-    const password = std.mem.trim(u8, lines.next() orelse "", "\r");
-    const details = std.mem.trim(u8, lines.next() orelse "", "\r");
+    const request = stable_login.envelope(body);
     // Existing accounts may have a staff-approved one-character username.
     // Registration keeps the public two-character minimum; login only needs
     // a non-empty name which resolves to a real stored account.
-    if (name.len == 0 or password.len != 32) {
+    if (request.name.len == 0 or request.password.len != 32) {
         return loginFailure(allocator, "invalid-request", "Invalid login request.");
     }
-    const parsed = parseStableLoginDetails(details) catch {
+    const parsed = parseStableLoginDetails(request.details) catch {
         return loginFailure(allocator, "invalid-request", "Please restart osu! and try again.");
     };
-    var user = (try store.authenticate(allocator, name, password)) orelse {
+    var user = (try store.authenticate(allocator, request.name, request.password)) orelse {
         return loginFailure(allocator, "no", "Incorrect credentials.");
     };
     var user_transferred = false;
@@ -1295,7 +1212,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
         allocator.free(unread_messages);
     }
     std.debug.print("{s}{s}╔══════════════════════════════════════════════════╗{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
-    std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, name, log.reset, log.magenta ++ log.bold, "", log.reset });
+    std.debug.print("{s}{s}║  LOGIN — {s}{s}{s}{s}{s} ║{s}\n", .{ log.magenta ++ log.bold, "", log.green, request.name, log.reset, log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}{s}╚══════════════════════════════════════════════════╝{s}\n", .{ log.magenta ++ log.bold, "", log.reset });
     std.debug.print("{s}  ► user_id  :{s} {d}\n", .{ log.dim, log.reset, user.id });
     const country_display: []const u8 = if (login_country) |c| &c else "??";
@@ -1393,6 +1310,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
         .user_id = capture.user_id,
         .hardware_match_count = @intCast(@min(hardware_evidence.matched_user_ids.len, std.math.maxInt(u32))),
         .running_under_wine = parsed.hardware.running_under_wine,
+        .client_binding = parsed.client_binding,
     };
 }
 
@@ -2653,6 +2571,9 @@ fn pollByTokenWithOwnerAuthFallback(allocator: std.mem.Allocator, store: *storag
     };
     if (logged_out) removeSessionLocked(allocator, sessions, session);
     sessions.mutex.unlock(sessions.io);
+    if (logged_out) {
+        if (comptime storage.is_postgres) _ = try store.revokeStableScoreSessionsForUser(user_id);
+    }
     markDeliveredDirectMessages(store, user_id, delivered_dm_ids.items);
     storeDeferredPublicMessages(store, deferred_public_messages.items);
     return result;

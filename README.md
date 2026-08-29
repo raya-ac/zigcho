@@ -24,12 +24,12 @@ zigcho is pinned to Zig 0.16.0. the PP bridge also needs Rust, SQLite 3 and Post
 ```sh
 zig build test
 zig build test -Doptimize=ReleaseSafe
-zig build -Dpostgres=true -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseSafe
 ZIGCHO_POSTGRES_URL='host=/var/run/postgresql dbname=zigcho user=zigcho connect_timeout=5' \
   ./zig-out/bin/zigcho 127.0.0.1 8080
 ```
 
-copy `config.example.ini` to `config.ini` for local secrets. the real config is ignored. the useful player-path checks live in `tools/`, including Stable web/map checks and lazer solo, multiplayer and spectator runs.
+the server build is PostgreSQL by default. SQLite is only kept for fixtures and offline tools; build those explicitly with `zig build -Dpostgres=false`. copy `config.example.ini` to `config.ini` for local secrets. the real config is ignored. the useful player-path checks live in `tools/`, including Stable web/map checks and lazer solo, multiplayer and spectator runs.
 
 production binaries come from the pinned Linux GitHub runner, not my Mac. each release lives at `/opt/zigcho/releases/<commit>` and is activated through `tools/activate-release.sh`, which backs up and restore-tests PostgreSQL before switching the live symlink. zigcho!lazer packages are built by runners for Windows, macOS, Linux, Android and unsigned iOS.
 

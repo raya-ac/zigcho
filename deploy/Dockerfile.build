@@ -34,7 +34,7 @@ RUN if [ "$TEST_SCOPE" = full ]; then \
     elif [ "$TEST_SCOPE" != focused ]; then \
         echo "invalid TEST_SCOPE: $TEST_SCOPE" >&2; exit 1; \
     fi \
-    && zig build -Dcpu=baseline -Doptimize=ReleaseSafe \
+    && zig build -Dcpu=baseline -Dpostgres=false -Doptimize=ReleaseSafe \
     && zig build -Dcpu=baseline -Dpostgres=true -Doptimize=ReleaseSafe \
     && mkdir -p /out/tools /out/deploy/systemd /out/deploy/stunnel /out/deploy/certbot \
     && cp zig-out/bin/zigcho zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/ \

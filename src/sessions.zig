@@ -1,13 +1,15 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const multiplayer = @import("multiplayer.zig");
+const stable_client = @import("stable_client.zig");
 
 pub const max_queue_bytes = 1024 * 1024;
-pub const max_stable_client_hash_bytes = 4096;
+pub const max_stable_client_hash_bytes = stable_client.max_client_hash_bytes;
+pub const StableClientBinding = stable_client.Binding;
 
 pub const ScoreTokenAuthorization = enum {
     exact,
-    stale_online,
+    grace_candidate,
     foreign_live,
     offline,
     missing,
@@ -17,113 +19,13 @@ pub const ScoreTokenAuthorization = enum {
     invalid_client_binding,
 };
 
-/// Owned, immutable evidence shared by a real Stable login and score submit.
-/// Stable login versions include the leading `b` and may include a stream,
-/// while score submissions only send the eight-digit build date. The client
-/// hash is the same five-field hardware value in both requests. We retain no
-/// raw hardware identifiers on the session.
-pub const StableClientBinding = struct {
-    version_date: [8]u8,
-    hardware_digest: [32]u8,
-
-    pub fn init(osu_version: []const u8, client_hash: []const u8) !StableClientBinding {
-        const version_date = try normalizedStableVersion(osu_version);
-        const fields = try stableClientHashFields(client_hash);
-        var digest: [32]u8 = undefined;
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("zigcho-stable-client-binding-v1\x00");
-        hashBindingField(&hash, fields.osu_path_md5);
-        hashBindingField(&hash, fields.adapters);
-        hashBindingField(&hash, fields.adapters_md5);
-        hashBindingField(&hash, fields.uninstall_md5);
-        hashBindingField(&hash, fields.disk_signature_md5);
-        hash.final(&digest);
-        return .{ .version_date = version_date, .hardware_digest = digest };
-    }
-
-    fn compare(self: StableClientBinding, submitted: StableClientBinding) ?ScoreTokenAuthorization {
-        if (!std.crypto.timing_safe.eql([8]u8, self.version_date, submitted.version_date)) return .client_version_mismatch;
-        if (!std.crypto.timing_safe.eql([32]u8, self.hardware_digest, submitted.hardware_digest)) return .client_hardware_mismatch;
-        return null;
-    }
-};
-
-const StableClientHashFields = struct {
-    osu_path_md5: []const u8,
-    adapters: []const u8,
-    adapters_md5: []const u8,
-    uninstall_md5: []const u8,
-    disk_signature_md5: []const u8,
-};
-
-fn normalizedStableVersion(value: []const u8) ![8]u8 {
-    const date = if (value.len == 8) value else if (value.len >= 9 and value[0] == 'b') value[1..9] else return error.InvalidStableClientVersion;
-    for (date) |char| if (!std.ascii.isDigit(char)) return error.InvalidStableClientVersion;
-    if (value.len != 8) {
-        var remainder = value[9..];
-        if (remainder.len >= 2 and remainder[0] == '.' and std.ascii.isDigit(remainder[1])) remainder = remainder[2..];
-        if (remainder.len != 0 and
-            !std.mem.eql(u8, remainder, "beta") and
-            !std.mem.eql(u8, remainder, "cuttingedge") and
-            !std.mem.eql(u8, remainder, "dev") and
-            !std.mem.eql(u8, remainder, "tourney")) return error.InvalidStableClientVersion;
-    }
-    return date[0..8].*;
-}
-
-fn stableClientHashFields(value: []const u8) !StableClientHashFields {
-    if (value.len < 2 or value.len > max_stable_client_hash_bytes or value[value.len - 1] != ':') return error.InvalidStableClientHash;
-    var fields = std.mem.splitScalar(u8, value[0 .. value.len - 1], ':');
-    const osu_path_md5 = fields.next() orelse return error.InvalidStableClientHash;
-    const adapters = fields.next() orelse return error.InvalidStableClientHash;
-    const adapters_md5 = fields.next() orelse return error.InvalidStableClientHash;
-    const uninstall_md5 = fields.next() orelse return error.InvalidStableClientHash;
-    const disk_signature_md5 = fields.next() orelse return error.InvalidStableClientHash;
-    if (fields.next() != null or !validMd5(osu_path_md5) or !validMd5(adapters_md5) or !validMd5(uninstall_md5) or !validMd5(disk_signature_md5)) return error.InvalidStableClientHash;
-    if (std.mem.eql(u8, adapters, "runningunderwine")) return .{
-        .osu_path_md5 = osu_path_md5,
-        .adapters = adapters,
-        .adapters_md5 = adapters_md5,
-        .uninstall_md5 = uninstall_md5,
-        .disk_signature_md5 = disk_signature_md5,
-    };
-    if (adapters.len < 2 or adapters[adapters.len - 1] != '.') return error.InvalidStableClientHash;
-    var adapter_parts = std.mem.splitScalar(u8, adapters[0 .. adapters.len - 1], '.');
-    var any_adapter = false;
-    while (adapter_parts.next()) |adapter| if (adapter.len != 0) {
-        any_adapter = true;
-        for (adapter) |char| if (char == 0 or char == ':') return error.InvalidStableClientHash;
-    };
-    if (!any_adapter) return error.InvalidStableClientHash;
-    return .{
-        .osu_path_md5 = osu_path_md5,
-        .adapters = adapters,
-        .adapters_md5 = adapters_md5,
-        .uninstall_md5 = uninstall_md5,
-        .disk_signature_md5 = disk_signature_md5,
-    };
-}
-
-fn validMd5(value: []const u8) bool {
-    if (value.len != 32) return false;
-    for (value) |char| if (!std.ascii.isHex(char)) return false;
-    return true;
-}
-
-fn hashBindingField(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
-    var length: [4]u8 = undefined;
-    std.mem.writeInt(u32, &length, @intCast(value.len), .little);
-    hash.update(&length);
-    for (value) |char| {
-        const normalized = [1]u8{std.ascii.toLower(char)};
-        hash.update(&normalized);
-    }
-}
-
 fn scoreBindingDecision(session: *const Session, submitted_binding: ?StableClientBinding) ?ScoreTokenAuthorization {
     const submitted = submitted_binding orelse return .invalid_client_binding;
     const login = session.stable_client_binding orelse return .missing_login_client_binding;
-    return login.compare(submitted);
+    return switch (login.mismatch(submitted) orelse return null) {
+        .version => .client_version_mismatch,
+        .hardware => .client_hardware_mismatch,
+    };
 }
 
 pub const PublicPresence = struct {
@@ -380,7 +282,10 @@ pub const Sessions = struct {
             return scoreBindingDecision(session, submitted_binding) orelse .exact;
         }
         const online = self.onlineByUser(user_id) orelse return .offline;
-        return scoreBindingDecision(online, submitted_binding) orelse .stale_online;
+        // Persisted grace still has to match the currently active Stable
+        // client. The durable row then independently proves the old token's
+        // original binding, so a different machine cannot borrow the window.
+        return scoreBindingDecision(online, submitted_binding) orelse .grace_candidate;
     }
     pub fn remove(self: *Sessions, target: *Session) void {
         for (self.items.items) |session| {
@@ -634,7 +539,7 @@ test "Stable client bindings normalize only fields shared by login and score sub
     try std.testing.expectError(error.InvalidStableClientHash, StableClientBinding.init("20260811", "not-a-client-hash"));
 }
 
-test "score authorization binds exact and stale tokens to the live Stable client" {
+test "score authorization binds exact and grace candidate tokens to the live Stable client" {
     const allocator = std.testing.allocator;
     var sessions = Sessions.init(allocator, std.testing.io);
     defer sessions.deinit();
@@ -664,7 +569,7 @@ test "score authorization binds exact and stale tokens to the live Stable client
     const foreign_token = other.token;
 
     try std.testing.expectEqual(ScoreTokenAuthorization.exact, sessions.authorizeScoreToken(&token, 1, binding));
-    try std.testing.expectEqual(ScoreTokenAuthorization.stale_online, sessions.authorizeScoreToken("queued-after-restart", 1, binding));
+    try std.testing.expectEqual(ScoreTokenAuthorization.grace_candidate, sessions.authorizeScoreToken("queued-after-restart", 1, binding));
     try std.testing.expectEqual(ScoreTokenAuthorization.client_version_mismatch, sessions.authorizeScoreToken(&token, 1, wrong_version));
     try std.testing.expectEqual(ScoreTokenAuthorization.client_hardware_mismatch, sessions.authorizeScoreToken("queued-after-restart", 1, wrong_hardware));
     try std.testing.expectEqual(ScoreTokenAuthorization.invalid_client_binding, sessions.authorizeScoreToken(&token, 1, null));

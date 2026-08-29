@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const postgres_prefix = b.option([]const u8, "postgres-prefix", "PostgreSQL installation prefix (macOS defaults to Homebrew postgresql@17)");
-    const postgres_runtime = b.option(bool, "postgres", "Build the server with PostgreSQL runtime storage") orelse false;
+    const postgres_runtime = b.option(bool, "postgres", "Use PostgreSQL production storage (set false only for local legacy/fixture builds)") orelse true;
     const test_filter = b.option([]const u8, "test-filter", "Run only Zig tests containing this name");
     var test_filters: []const []const u8 = &.{};
     if (test_filter) |filter| {

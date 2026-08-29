@@ -15,7 +15,8 @@ pub const ReplaySource = backend.ReplaySource;
 pub const UpstreamUserCache = backend.UpstreamUserCache;
 pub const BeatmapSetCreator = backend.BeatmapSetCreator;
 pub const is_postgres = backend.is_postgres;
+pub const schema_version = backend.schema_version;
 
-// The SQLite C surface is retained for the offline recalc command. Its call
-// sites are compile-time excluded from PostgreSQL server builds.
+// PostgreSQL is the production server backend. SQLite remains available only
+// for local fixtures, import/recalc tools and explicit legacy builds.
 pub const c = sqlite.c;

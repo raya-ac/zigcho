@@ -3492,7 +3492,7 @@ test "poll by token survives session replacement and rejects the stale token" {
     try std.testing.expectEqual(@as(usize, 0), replacement_poll.len);
 }
 
-test "stable score token authorization keeps restart compatibility without accepting a foreign live token" {
+test "stable score token authorization only nominates a bound unknown token for persisted grace" {
     var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
     defer sessions.deinit();
     const binding = try sessions_mod.StableClientBinding.init("b20260811", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:");
@@ -3503,7 +3503,7 @@ test "stable score token authorization keeps restart compatibility without accep
 
     try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.exact, sessions.authorizeScoreToken(&ari_token, 1, binding));
     try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.foreign_live, sessions.authorizeScoreToken(&raya_token, 1, binding));
-    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.stale_online, sessions.authorizeScoreToken("stale-after-restart", 1, binding));
+    try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.grace_candidate, sessions.authorizeScoreToken("stale-after-restart", 1, binding));
     try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.offline, sessions.authorizeScoreToken("stale-after-restart", 99, binding));
     try std.testing.expectEqual(sessions_mod.ScoreTokenAuthorization.missing, sessions.authorizeScoreToken(null, 1, null));
     ari.presence_suppressed = true;

@@ -54,6 +54,9 @@ const anticheat_evidence = @import("anticheat_evidence.zig");
 const anticheat_plugin = @import("anticheat_plugin.zig");
 const anticheat_replay = @import("anticheat_replay.zig");
 const player_routes = @import("player_routes.zig");
+const http_boundary = @import("http_boundary.zig");
+const stable_score_auth = @import("stable_score_auth.zig");
+const stable_login = @import("stable_login.zig");
 const default_avatar_1 = @embedFile("assets/avatars/default-1.gif");
 const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 const lazer_access_lifetime_seconds: i64 = 3600;
@@ -63,56 +66,8 @@ fn healthResponse(buf: []u8, online: usize) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19,\"hotfixes\":true}}", .{online});
 }
 
-const HttpGate = struct {
-    limit: u32,
-    active: std.atomic.Value(u32) = .init(0),
-    rejected: std.atomic.Value(u64) = .init(0),
-    timed_out: std.atomic.Value(u64) = .init(0),
-
-    fn init(limit: u32) HttpGate {
-        std.debug.assert(limit > 0);
-        return .{ .limit = limit };
-    }
-
-    fn tryAcquire(self: *HttpGate) bool {
-        const previous = self.active.fetchAdd(1, .acq_rel);
-        if (previous < self.limit) return true;
-        const active_before_release = self.active.fetchSub(1, .acq_rel);
-        std.debug.assert(active_before_release > 0);
-        _ = self.rejected.fetchAdd(1, .acq_rel);
-        return false;
-    }
-
-    fn release(self: *HttpGate) void {
-        const previous = self.active.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-    }
-
-    fn recordTimeout(self: *HttpGate) void {
-        _ = self.timed_out.fetchAdd(1, .acq_rel);
-    }
-};
-
-fn httpRequestDeadlineSeconds(method: std.http.Method, target: []const u8, normal_seconds: u16, long_seconds: u16) ?u16 {
-    const query = std.mem.findScalar(u8, target, '?') orelse target.len;
-    const path = routing.canonicalPath(target[0..query]);
-    if (std.mem.eql(u8, path, "/multiplayer") or
-        std.mem.eql(u8, path, "/spectator") or
-        std.mem.eql(u8, path, "/notification-endpoint")) return null;
-    if (method == .PUT or method == .PATCH or
-        std.mem.startsWith(u8, path, "/d/") or
-        std.mem.endsWith(u8, path, "/download") or
-        std.mem.eql(u8, path, "/web/osu-submit-modular-selector.php") or
-        std.mem.eql(u8, path, "/web/osu-screenshot.php") or
-        std.mem.eql(u8, path, "/api/v2/scores") or
-        std.mem.endsWith(u8, path, "/solo/scores") or
-        (std.mem.indexOf(u8, path, "/playlist/") != null and std.mem.endsWith(u8, path, "/scores")) or
-        std.mem.eql(u8, path, "/api/v1/account/avatar") or
-        std.mem.eql(u8, path, "/api/v1/account/banner") or
-        std.mem.endsWith(u8, path, "/flag") or
-        std.mem.endsWith(u8, path, "/header")) return long_seconds;
-    return normal_seconds;
-}
+const HttpGate = http_boundary.Gate;
+const httpRequestDeadlineSeconds = http_boundary.requestDeadlineSeconds;
 
 var shutdown_requested: std.atomic.Value(bool) = .init(false);
 var shutdown_listener_fd: std.atomic.Value(i64) = .init(-1);
@@ -895,7 +850,7 @@ const App = struct {
         );
         try output.writer.print(
             "\"storage\":{{\"schema\":{d},\"users\":{d},\"plays\":{d},\"passed\":{d},\"maps\":{d},\"beatmap_cache_entries\":{d},\"beatmap_cache_bytes\":{d},\"media_cache_entries\":{d},\"media_cache_bytes\":{d},\"hydration_blocked\":{d}}},",
-            .{ if (storage.is_postgres) @as(u8, 46) else @as(u8, 45), counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures },
+            .{ storage.schema_version, counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures },
         );
         try output.writer.print(
             "\"pipeline\":{{\"hydration_attempts\":{d},\"hydration_successes\":{d},\"hydration_failures\":{d},\"mirror_hits\":{d},\"mirror_misses\":{d},\"mirror_fills\":{d},\"mirror_failures\":{d},\"mirror_bytes_served\":{d},\"media_attempts\":{d},\"media_successes\":{d},\"media_failures\":{d}}},\"state\":{s}}}",
@@ -923,7 +878,10 @@ const App = struct {
         var prepared = try bancho.prepareSuppression(self.allocator, message);
         defer prepared.deinit();
         const revoked = switch (scope) {
-            .game => try self.store.revokeGameTokensForUser(user_id),
+            .game => if (comptime storage.is_postgres)
+                try self.store.revokeAllGameCredentialsForUser(user_id)
+            else
+                try self.store.revokeGameTokensForUser(user_id),
             .all => try self.store.revokeAllTokensForUser(user_id),
         };
         return self.finishDisconnectPrepared(user_id, &prepared) or revoked != 0;
@@ -946,14 +904,31 @@ const App = struct {
         _ = self.lazer_multiplayer.disconnectUser(user_id);
         _ = self.lazer_spectator.disconnectUser(user_id);
         if (std.mem.eql(u8, entering_client, "lazer")) {
+            if (comptime storage.is_postgres) _ = try self.store.revokeStableScoreSessionsForUser(user_id);
             _ = try bancho.suppressForTakeover(self.allocator, &self.sessions, user_id, "This account signed in from lazer, so this client has been disconnected.");
         }
         std.log.info("event=cross_client_session_takeover user_id={d} entering_client={s}", .{ user_id, entering_client });
     }
 
+    fn activateStableLoginLocked(self: *App, result: *const bancho.LoginResult) !void {
+        if (result.user_id <= 0) return;
+        var durable_rotated = false;
+        if (comptime storage.is_postgres) {
+            const binding = result.client_binding orelse return error.StableLoginClientBindingMissing;
+            const now = std.Io.Clock.real.now(self.store.io).toSeconds();
+            try self.store.rotateStableScoreSession(result.user_id, result.token, binding, now, stable_score_auth.grace_lifetime_seconds);
+            durable_rotated = true;
+        }
+        errdefer {
+            if (durable_rotated) _ = self.store.revokeStableScoreSessionsForUser(result.user_id) catch |err| {
+                std.log.err("event=stable_login_activation_compensation_failed user_id={d} error={t}", .{ result.user_id, err });
+            };
+        }
+        try self.takeOverGameSessionsLocked(result.user_id, "stable");
+    }
+
     fn stableLoginAndTakeover(self: *App, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !bancho.LoginResult {
-        const line_end = std.mem.findScalar(u8, body, '\n') orelse body.len;
-        const name = std.mem.trim(u8, body[0..line_end], "\r");
+        const name = stable_login.username(body);
         const existing = if (name.len == 0) null else try self.store.userByName(self.allocator, name);
         if (existing) |user| {
             const user_id = user.id;
@@ -963,12 +938,10 @@ const App = struct {
             defer mutex.unlock(self.store.io);
             var result = try bancho.loginExpectedUser(self.allocator, &self.store, &self.sessions, body, login_country, longitude, latitude, user_id);
             errdefer result.deinit();
-            if (result.user_id > 0) {
-                self.takeOverGameSessionsLocked(result.user_id, "stable") catch |err| {
-                    _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
-                    return err;
-                };
-            }
+            self.activateStableLoginLocked(&result) catch |err| {
+                _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
+                return err;
+            };
             return result;
         }
 
@@ -985,12 +958,10 @@ const App = struct {
         defer mutex.unlock(self.store.io);
         var result = try bancho.loginExpectedUser(self.allocator, &self.store, &self.sessions, body, login_country, longitude, latitude, user_id);
         errdefer result.deinit();
-        if (result.user_id > 0) {
-            self.takeOverGameSessionsLocked(result.user_id, "stable") catch |err| {
-                _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
-                return err;
-            };
-        }
+        self.activateStableLoginLocked(&result) catch |err| {
+            _ = bancho.rollbackLogin(self.allocator, &self.sessions, result.user_id, result.token);
+            return err;
+        };
         return result;
     }
 
@@ -4899,14 +4870,32 @@ const App = struct {
             };
             defer self.allocator.free(user.name);
             defer self.allocator.free(user.safe_name);
+            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) {
+                self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .checksum_mismatch));
+                return rejectStableScore(req, "checksum_mismatch", body.len);
+            }
+            if (passed_score_missing_replay) {
+                self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .required_replay_missing));
+                return rejectStableScore(req, "passed_score_missing_replay", body.len);
+            }
             const submitted_binding = sessions_mod.StableClientBinding.init(osu_version, decrypted.client_hash) catch null;
-            switch (self.sessions.authorizeScoreToken(score_token_owned, user.id, submitted_binding)) {
-                .exact, .stale_online => {},
+            const score_auth = authorize: {
+                const mutex = self.gameSessionMutex(user.id);
+                mutex.lockUncancelable(self.store.io);
+                defer mutex.unlock(self.store.io);
+                break :authorize stable_score_auth.authorize(&self.store, &self.sessions, score_token_owned, user.id, submitted_binding, score.online_checksum, std.Io.Clock.real.now(self.store.io).toSeconds()) catch |err| {
+                    std.log.err("stable score retry requested: reason=grace_authorization_failed user_id={d} error={t}", .{ user.id, err });
+                    return respond(req, .ok, "text/plain", "error: no", &.{});
+                };
+            };
+            switch (score_auth) {
+                .exact => {},
+                .grace => std.log.info("event=stable_score_grace_token_claimed user_id={d} checksum={s}", .{ user.id, score.online_checksum }),
                 .missing => {
                     std.log.warn("stable score rejected: reason=missing_session_token body_bytes={d}", .{body.len});
                     return respond(req, .unauthorized, "text/plain", "", &.{});
                 },
-                .foreign_live => {
+                .foreign => {
                     std.log.warn("stable score rejected: reason=foreign_session_token user_id={d} body_bytes={d}", .{ user.id, body.len });
                     return respond(req, .unauthorized, "text/plain", "", &.{});
                 },
@@ -4930,14 +4919,10 @@ const App = struct {
                     std.log.warn("stable score rejected: reason=invalid_client_binding user_id={d} body_bytes={d}", .{ user.id, body.len });
                     return respond(req, .unauthorized, "text/plain", "", &.{});
                 },
-            }
-            if (!score.verifyChecksum(osu_version, decrypted.client_hash, storyboard_hash)) {
-                self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .checksum_mismatch));
-                return rejectStableScore(req, "checksum_mismatch", body.len);
-            }
-            if (passed_score_missing_replay) {
-                self.observeStableSignal(user.id, .stable_score, anticheat_evidence.stableScoreSignal(score, .required_replay_missing));
-                return rejectStableScore(req, "passed_score_missing_replay", body.len);
+                .unknown, .expired, .consumed, .revoked, .current_not_grace => {
+                    std.log.warn("stable score retry requested: reason={s} user_id={d} body_bytes={d}", .{ @tagName(score_auth), user.id, body.len });
+                    return respond(req, .ok, "text/plain", "error: no", &.{});
+                },
             }
             const map_file = (try self.store.beatmapFile(self.allocator, score.map_md5)) orelse return respond(req, .ok, "text/plain", "error: beatmap", &.{});
             defer self.allocator.free(map_file);
@@ -6247,6 +6232,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const bind = if (args.len > 1) args[1] else "127.0.0.1";
     const port = if (args.len > 2) try std.fmt.parseInt(u16, args[2], 10) else 8080;
+    if (storage.is_postgres and args.len > 3) return error.PostgresUrlMustUseEnvironment;
     const default_database: [:0]const u8 = if (storage.is_postgres)
         std.mem.span(std.c.getenv("ZIGCHO_POSTGRES_URL") orelse return error.MissingPostgresUrl)
     else

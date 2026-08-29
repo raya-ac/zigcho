@@ -18,6 +18,7 @@ const account_roles = @import("account_roles.zig");
 const anticheat_review = @import("anticheat_review.zig");
 const database_sql = @import("database_sql");
 pub const is_postgres = false;
+pub const schema_version: u16 = 45;
 
 const visible_follower_count_sql = "CASE WHEN u.restricted=0 AND u.id!=3 THEN (SELECT count(*) FROM friends relation JOIN users follower ON follower.id=relation.user_id WHERE relation.friend_id=u.id AND relation.user_id!=u.id AND follower.restricted=0) ELSE 0 END";
 

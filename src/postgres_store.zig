@@ -21,6 +21,8 @@ const server_control = @import("server_control.zig");
 const account_roles = @import("account_roles.zig");
 const anticheat_evidence = @import("anticheat_evidence.zig");
 const anticheat_review = @import("anticheat_review.zig");
+const stable_client = @import("stable_client.zig");
+const postgres_stable_sessions = @import("postgres_stable_sessions.zig");
 const database_sql = @import("database_sql");
 
 pub const ClientHardware = sqlite_storage.ClientHardware;
@@ -29,6 +31,8 @@ pub const AnticheatSource = sqlite_storage.AnticheatSource;
 pub const AnticheatReviewLabel = sqlite_storage.AnticheatReviewLabel;
 pub const AnticheatObservation = sqlite_storage.AnticheatObservation;
 pub const is_postgres = true;
+pub const schema_version: u16 = 47;
+pub const StableScoreGraceResult = postgres_stable_sessions.GraceResult;
 pub const LazerCommentable = sqlite_storage.LazerCommentable;
 pub const LazerCommentTarget = sqlite_storage.LazerCommentTarget;
 pub const LazerCommentSort = sqlite_storage.LazerCommentSort;
@@ -142,6 +146,18 @@ pub const Store = struct {
         self.pool.deinit();
     }
 
+    pub fn rotateStableScoreSession(self: *Store, user_id: i32, token: []const u8, binding: stable_client.Binding, now: i64, grace_seconds: i64) !void {
+        return postgres_stable_sessions.rotate(self.allocator, &self.pool, user_id, token, binding, now, grace_seconds);
+    }
+
+    pub fn consumeStableScoreGrace(self: *Store, token: []const u8, user_id: i32, binding: stable_client.Binding, submission_checksum: []const u8, now: i64) !StableScoreGraceResult {
+        return postgres_stable_sessions.consume(self.allocator, &self.pool, token, user_id, binding, submission_checksum, now);
+    }
+
+    pub fn revokeStableScoreSessionsForUser(self: *Store, user_id: i32) !usize {
+        return postgres_stable_sessions.revoke(self.allocator, &self.pool, user_id, std.Io.Clock.real.now(self.io).toSeconds());
+    }
+
     fn refreshExternalOnly(self: *Store, conn: *postgres.c.PGconn) !void {
         var result = try postgres.query(conn, "SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND is_nullable='YES' AND ((table_name='beatmap_archives' AND column_name='osz_file') OR (table_name='beatmap_media' AND column_name='data'))");
         defer result.deinit();
@@ -178,7 +194,7 @@ pub const Store = struct {
                     "INSERT INTO zigcho.schema_migrations(version) VALUES(13);" ++
                     "COMMIT",
             );
-        } else if (version < 13 or version > 46) return error.UnsupportedSchemaVersion;
+        } else if (version < 13 or version > schema_version) return error.UnsupportedSchemaVersion;
         if (version <= 13) {
             try postgres.exec(
                 lease.conn,
@@ -394,6 +410,7 @@ pub const Store = struct {
         if (version <= 43) try postgres.exec(lease.conn, database_sql.postgresMigration(44));
         if (version <= 44) try postgres.exec(lease.conn, database_sql.postgresMigration(45));
         if (version <= 45) try postgres.exec(lease.conn, database_sql.postgresMigration(46));
+        if (version <= 46) try postgres.exec(lease.conn, database_sql.postgresMigration(47));
         try self.backfillLazerClassicScoresWithConnection(lease.conn);
         try self.finishPendingRankedStatsRebuild(lease.conn);
         try postgres.exec(lease.conn, "DELETE FROM zigcho.user_stats_history WHERE day<((extract(epoch FROM clock_timestamp())::bigint/86400)-89)*86400");
@@ -2873,6 +2890,7 @@ pub const Store = struct {
         revoke.deinit();
         var clear = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.lazer_presence WHERE user_id=$1", &.{id});
         clear.deinit();
+        _ = try postgres_stable_sessions.revokeWithConnection(self.allocator, lease.conn, user_id, std.Io.Clock.real.now(self.io).toSeconds());
         try postgres.exec(lease.conn, "COMMIT");
     }
 
@@ -2903,6 +2921,7 @@ pub const Store = struct {
         revoke.deinit();
         var clear = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.lazer_presence WHERE user_id=$1", &.{id});
         clear.deinit();
+        _ = try postgres_stable_sessions.revokeWithConnection(self.allocator, lease.conn, user_id, std.Io.Clock.real.now(self.io).toSeconds());
         try postgres.exec(lease.conn, "COMMIT");
     }
 
@@ -2913,13 +2932,16 @@ pub const Store = struct {
         defer lease.release();
         try postgres.exec(lease.conn, "BEGIN");
         errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var token_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT pg_advisory_xact_lock($1::bigint)", &.{id});
+        token_lock.deinit();
         var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.oauth_tokens SET revoked_at=extract(epoch FROM clock_timestamp())::bigint WHERE user_id=$1 AND revoked_at IS NULL RETURNING 1", &.{id});
         const revoked = result.rows();
         result.deinit();
         var clear = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.lazer_presence WHERE user_id=$1", &.{id});
         clear.deinit();
+        const stable_revoked = try postgres_stable_sessions.revokeWithConnection(self.allocator, lease.conn, user_id, std.Io.Clock.real.now(self.io).toSeconds());
         try postgres.exec(lease.conn, "COMMIT");
-        return revoked;
+        return revoked + stable_revoked;
     }
 
     pub fn teamsJson(self: *Store, allocator: std.mem.Allocator, requester_id: ?i32) ![]u8 {
@@ -4878,6 +4900,7 @@ pub const Store = struct {
             revoke.deinit();
             var clear = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.lazer_presence WHERE user_id=$1", &.{target});
             clear.deinit();
+            _ = try postgres_stable_sessions.revokeWithConnection(self.allocator, lease.conn, target_id, std.Io.Clock.real.now(self.io).toSeconds());
         }
         try self.recordAllStatsHistoryCurrentWithConnection(lease.conn);
         try postgres.exec(lease.conn, "COMMIT");
@@ -5118,7 +5141,7 @@ pub const Store = struct {
         defer lease.release();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try output.writer.writeAll("{\"schema\":46,\"controls\":[");
+        try output.writer.print("{{\"schema\":{d},\"controls\":[", .{schema_version});
         for (server_control.definitions, 0..) |definition, index| {
             if (index != 0) try output.writer.writeByte(',');
             var result = try postgres.queryParams(allocator, lease.conn, "SELECT c.enabled,c.reason,c.updated_at,coalesce(u.name,'system') FROM zigcho.server_controls c LEFT JOIN zigcho.users u ON u.id=c.updated_by WHERE c.key=$1", &.{definition.feature.key()});
@@ -7545,6 +7568,25 @@ pub const Store = struct {
         return revoked;
     }
 
+    pub fn revokeAllGameCredentialsForUser(self: *Store, user_id: i32) !usize {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
+        var lease = self.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "BEGIN");
+        errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+        var lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT pg_advisory_xact_lock($1::bigint)", &.{id});
+        lock.deinit();
+        var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.oauth_tokens SET revoked_at=extract(epoch FROM clock_timestamp())::bigint WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>extract(epoch FROM clock_timestamp())::bigint AND ((scopes ~ '(^| )identify( |$)' AND scopes ~ '(^| )scores:write( |$)') OR scopes ~ '(^| )game:refresh( |$)') RETURNING 1", &.{id});
+        const oauth_revoked = result.rows();
+        result.deinit();
+        const stable_revoked = try postgres_stable_sessions.revokeWithConnection(self.allocator, lease.conn, user_id, std.Io.Clock.real.now(self.io).toSeconds());
+        var clear = try postgres.queryParams(self.allocator, lease.conn, "DELETE FROM zigcho.lazer_presence WHERE user_id=$1", &.{id});
+        clear.deinit();
+        try postgres.exec(lease.conn, "COMMIT");
+        return oauth_revoked + stable_revoked;
+    }
+
     pub fn revokeLazerAccessTokensForUser(self: *Store, user_id: i32) !usize {
         var id_buf: [24]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "{d}", .{user_id});
@@ -7805,7 +7847,7 @@ test "postgres concurrent first score submissions keep one best row per scope" {
     try postgres.exec(lease.conn, "DELETE FROM zigcho.lazer_scores WHERE user_id IN(SELECT id FROM zigcho.users WHERE safe_name='best_race_pg'); DELETE FROM zigcho.scores WHERE user_id IN(SELECT id FROM zigcho.users WHERE safe_name='best_race_pg'); DELETE FROM zigcho.users WHERE safe_name='best_race_pg'; DELETE FROM zigcho.beatmaps WHERE id=2000000460");
 }
 
-test "postgres runtime migrates through best score schema forty six" {
+test "postgres runtime migrates through stable score grace schema forty seven" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -7813,7 +7855,7 @@ test "postgres runtime migrates through best score schema forty six" {
         try old_store.migrate();
         var previous = old_store.pool.acquire();
         defer previous.release();
-        try postgres.exec(previous.conn, "DROP TABLE zigcho.server_controls; DROP TABLE IF EXISTS zigcho.score_replay_views; DROP TABLE zigcho.user_stats_history; DROP TABLE zigcho.lazer_ranked_matches; DROP TABLE zigcho.lazer_ranked_ratings; DROP TABLE zigcho.lazer_multiplayer_room_history; DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
+        try postgres.exec(previous.conn, "DROP TABLE zigcho.stable_score_sessions; DROP TABLE zigcho.server_controls; DROP TABLE IF EXISTS zigcho.score_replay_views; DROP TABLE zigcho.user_stats_history; DROP TABLE zigcho.lazer_ranked_matches; DROP TABLE zigcho.lazer_ranked_ratings; DROP TABLE zigcho.lazer_multiplayer_room_history; DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
         try postgres.exec(previous.conn, "DROP INDEX zigcho.scores_one_best_per_scope; DROP INDEX zigcho.lazer_scores_one_best_per_scope; DROP TABLE zigcho.maintenance_markers; ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP CONSTRAINT lazer_scores_legacy_total_score_range; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating,DROP COLUMN total_score_without_mods; ALTER TABLE zigcho.lazer_scores ALTER COLUMN legacy_total_score TYPE bigint USING legacy_total_score::bigint; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; ALTER TABLE zigcho.direct_messages DROP COLUMN chat_message_id; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
         try postgres.exec(previous.conn, "ALTER TABLE zigcho.beatmap_archives ALTER COLUMN osz_file SET NOT NULL; ALTER TABLE zigcho.beatmap_media ALTER COLUMN data SET NOT NULL");
         try postgres.exec(previous.conn, "DELETE FROM zigcho.lazer_scores WHERE id=2147483000; DELETE FROM zigcho.beatmaps WHERE id=2147483000; DELETE FROM zigcho.users WHERE id=2147483000; INSERT INTO zigcho.users(id,name,safe_name,password_hash,password_salt) VALUES(2147483000,'schema43 migration','schema43_migration',decode('00','hex'),decode('00','hex')); INSERT INTO zigcho.stats(user_id,mode,ranked_score,total_score,pp,plays,play_time,total_hits,accuracy,max_combo) VALUES(2147483000,0,999999,999999,999999,999,999,999,0.01,999); INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(2147483000,2147483000,'fffffffffffffffffffffffffffffff0','artist','title','diff','mapper',3); INSERT INTO zigcho.lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace) VALUES(2147483000,2147483000,2147483000,0,987654,900000,0.98,321,true,'[]'::jsonb,'{}'::jsonb,'vanilla')");
@@ -7826,7 +7868,7 @@ test "postgres runtime migrates through best score schema forty six" {
     defer lease.release();
     var result = try postgres.query(lease.conn, "SELECT max(version),(to_regclass('zigcho.chat_messages') IS NOT NULL)::int,(to_regclass('zigcho.chat_channels') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_requests') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_rank_events') IS NOT NULL)::int,(to_regclass('zigcho.moderation_appeals') IS NOT NULL)::int,(to_regclass('zigcho.score_pins') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_hydration_failures') IS NOT NULL)::int,(to_regclass('zigcho.screenshots') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_media') IS NOT NULL)::int,(to_regclass('zigcho.beatmap_comments') IS NOT NULL)::int,(to_regclass('zigcho.direct_messages') IS NOT NULL)::int,(to_regclass('zigcho.lazer_score_tokens') IS NOT NULL)::int,(to_regclass('zigcho.user_avatars') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_observations') IS NOT NULL)::int,(to_regclass('zigcho.anticheat_replay_fingerprints') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('bio','preferred_mode','profile_source')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='lazer_scores' AND column_name IN('pp','best')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('profile_title','profile_pronouns','profile_location','profile_website','profile_accent','show_country','show_profile_stats','show_recent_scores')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='chat_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.lazer_channel_reads') IS NOT NULL)::int,(to_regclass('zigcho.user_blocks') IS NOT NULL)::int,(to_regclass('zigcho.user_achievements') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name IN('is_action','client_uuid')),(to_regclass('zigcho.direct_messages_sender_uuid') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name IN('scores','lazer_scores') AND column_name='star_rating'),(SELECT count(*) FROM information_schema.tables WHERE table_schema='zigcho' AND table_name IN('lazer_comments','user_name_changes','user_banners','teams','team_members','team_applications','team_assets','lazer_presence','replay_objects','lazer_reports','beatmap_tag_votes','profile_score_pins')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='users' AND column_name IN('username_changes','username_changed_at')),(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='direct_messages' AND column_name='chat_message_id'),(to_regclass('zigcho.direct_messages_chat_message') IS NOT NULL)::int,(SELECT count(*) FROM pg_constraint WHERE connamespace='zigcho'::regnamespace AND conname='direct_messages_chat_message_id_fkey' AND convalidated) FROM zigcho.schema_migrations");
     defer result.deinit();
-    try std.testing.expectEqual(@as(i32, 46), try result.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, schema_version), try result.int(i32, 0, 0));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 1));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 3));
@@ -7857,6 +7899,10 @@ test "postgres runtime migrates through best score schema forty six" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 28));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 29));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 30));
+    var stable_score_session_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.stable_score_sessions') IS NOT NULL)::int,(SELECT count(*) FROM pg_indexes WHERE schemaname='zigcho' AND indexname IN('stable_score_sessions_one_current','stable_score_sessions_user_grace'))");
+    defer stable_score_session_schema.deinit();
+    try std.testing.expectEqual(@as(i32, 1), try stable_score_session_schema.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i64, 2), try stable_score_session_schema.int(i64, 0, 1));
     var ranked_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.lazer_ranked_ratings') IS NOT NULL)::int,(to_regclass('zigcho.lazer_ranked_matches') IS NOT NULL)::int");
     defer ranked_schema.deinit();
     try std.testing.expectEqual(@as(i32, 1), try ranked_schema.int(i32, 0, 0));
@@ -7976,7 +8022,9 @@ test "postgres best score migration repairs duplicate winners deterministically"
                 "(2147482911,2147482998,2147482998,0,500,500,1,1,true,'A','[]'::jsonb,'{}'::jsonb,'vanilla',200,true)," ++
                 "(2147482912,2147482998,2147482998,0,600,600,1,1,true,'A','[]'::jsonb,'{}'::jsonb,'vanilla',200,true)," ++
                 "(2147482913,2147482998,2147482998,0,999,999,0,1,false,'F','[]'::jsonb,'{}'::jsonb,'vanilla',900,true);" ++
+                "DROP TABLE zigcho.stable_score_sessions;" ++
                 "DELETE FROM zigcho.maintenance_markers WHERE key='schema46_ranked_stats_rebuild';" ++
+                "DELETE FROM zigcho.schema_migrations WHERE version=47;" ++
                 "DELETE FROM zigcho.schema_migrations WHERE version=46;" ++
                 "COMMIT",
         );
@@ -7999,7 +8047,7 @@ test "postgres best score migration repairs duplicate winners deterministically"
         defer lease.release();
         var repaired = try postgres.query(lease.conn, "SELECT (SELECT max(version) FROM zigcho.schema_migrations),(SELECT count(*) FROM zigcho.scores WHERE user_id=2147482998 AND best),(SELECT id FROM zigcho.scores WHERE user_id=2147482998 AND rank_namespace='vanilla' AND best),(SELECT id FROM zigcho.scores WHERE user_id=2147482998 AND rank_namespace='relax' AND best),(SELECT id FROM zigcho.scores WHERE user_id=2147482998 AND rank_namespace='scorev2' AND best),(SELECT id FROM zigcho.scores WHERE user_id=2147482998 AND rank_namespace='autopilot' AND best),(SELECT count(*) FROM zigcho.lazer_scores WHERE user_id=2147482998 AND best),(SELECT id FROM zigcho.lazer_scores WHERE user_id=2147482998 AND best),(SELECT count(*) FROM pg_index WHERE indexrelid='zigcho.scores_one_best_per_scope'::regclass AND indisunique AND indpred IS NOT NULL),(SELECT count(*) FROM pg_index WHERE indexrelid='zigcho.lazer_scores_one_best_per_scope'::regclass AND indisunique AND indpred IS NOT NULL),(SELECT count(*) FROM zigcho.maintenance_markers WHERE key='schema46_ranked_stats_rebuild'),(SELECT pp FROM zigcho.stats WHERE user_id=2147482998 AND mode=0),(SELECT plays FROM zigcho.stats WHERE user_id=2147482998 AND mode=0),(SELECT pp FROM zigcho.user_stats_history WHERE user_id=2147482998 AND source='all' AND mode=0 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400),(SELECT global_rank FROM zigcho.user_stats_history WHERE user_id=2147482998 AND source='all' AND mode=0 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400)");
         defer repaired.deinit();
-        try std.testing.expectEqual(@as(i32, 46), try repaired.int(i32, 0, 0));
+        try std.testing.expectEqual(@as(i32, schema_version), try repaired.int(i32, 0, 0));
         try std.testing.expectEqual(@as(i64, 4), try repaired.int(i64, 0, 1));
         try std.testing.expectEqual(@as(i64, 2147482902), try repaired.int(i64, 0, 2));
         try std.testing.expectEqual(@as(i64, 2147482905), try repaired.int(i64, 0, 3));
@@ -9602,26 +9650,36 @@ test "postgres credential and restriction commits revoke matching token families
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
     defer store.close();
     try store.migrate();
+    const stable_binding = try stable_client.Binding.init("b20260811", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:");
+    const stable_now = std.Io.Clock.real.now(std.testing.io).toSeconds();
 
     const password_id = try store.register("pg password target", "pg-password-target@example.test", "00000000000000000000000000000000");
     const password_game = try store.issueGameTokenPair(password_id, 60, 60, false);
     const password_web = try store.issueToken(password_id, "web:account", 60);
+    const password_stable = [_]u8{'4'} ** 64;
+    try store.rotateStableScoreSession(password_id, &password_stable, stable_binding, stable_now, 300);
     try store.updateAccountPassword(password_id, "11111111111111111111111111111111");
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &password_game.access, "identify")) == null);
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &password_game.refresh, "")) == null);
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &password_web, "web:account")) == null);
+    try std.testing.expectEqual(StableScoreGraceResult.revoked, try store.consumeStableScoreGrace(&password_stable, password_id, stable_binding, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", stable_now + 1));
 
     const username_id = try store.register("pg username target", "pg-username-target@example.test", "00000000000000000000000000000000");
     const username_game = try store.issueGameTokenPair(username_id, 60, 60, false);
     const username_web = try store.issueToken(username_id, "web:account", 60);
+    const username_stable = [_]u8{'5'} ** 64;
+    try store.rotateStableScoreSession(username_id, &username_stable, stable_binding, stable_now, 300);
     try store.updateAccountUsername(username_id, "pg renamed target");
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &username_game.access, "identify")) == null);
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &username_game.refresh, "")) == null);
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &username_web, "web:account")) == null);
+    try std.testing.expectEqual(StableScoreGraceResult.revoked, try store.consumeStableScoreGrace(&username_stable, username_id, stable_binding, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", stable_now + 1));
 
     const restricted_id = try store.register("pg restricted target", "pg-restricted-target@example.test", "00000000000000000000000000000000");
     const restricted_game = try store.issueGameTokenPair(restricted_id, 60, 60, false);
     const restricted_web = try store.issueToken(restricted_id, "web:account", 60);
+    const restricted_stable = [_]u8{'6'} ** 64;
+    try store.rotateStableScoreSession(restricted_id, &restricted_stable, stable_binding, stable_now, 300);
     try store.setRestricted(password_id, restricted_id, true, "postgres token transition fixture");
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &restricted_game.access, "identify")) == null);
     try std.testing.expect((try store.authenticateToken(std.testing.allocator, &restricted_game.refresh, "")) == null);
@@ -9630,6 +9688,80 @@ test "postgres credential and restriction commits revoke matching token families
         std.testing.allocator.free(appeal_session.name);
         std.testing.allocator.free(appeal_session.safe_name);
     }
+    try std.testing.expectEqual(StableScoreGraceResult.revoked, try store.consumeStableScoreGrace(&restricted_stable, restricted_id, stable_binding, "cccccccccccccccccccccccccccccccc", stable_now + 1));
+}
+
+test "postgres stable score grace is client bound expiring and one time" {
+    const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_STORE_URL") orelse return error.SkipZigTest;
+    var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
+    defer store.close();
+    try store.migrate();
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        try postgres.exec(lease.conn, "DELETE FROM zigcho.users WHERE safe_name IN('pg_stable_grace','pg_stable_foreign')");
+    }
+    const user_id = try store.register("pg stable grace", "pg-stable-grace@example.test", "00000000000000000000000000000000");
+    const foreign_id = try store.register("pg stable foreign", "pg-stable-foreign@example.test", "00000000000000000000000000000000");
+    const client_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:";
+    const binding = try stable_client.Binding.init("b20260811", client_hash);
+    const wrong_version = try stable_client.Binding.init("b20260812", client_hash);
+    const wrong_hardware = try stable_client.Binding.init("b20260811", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.2.3.:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:cccccccccccccccccccccccccccccccc:dddddddddddddddddddddddddddddddd:");
+    const token_one = [_]u8{'1'} ** 64;
+    const token_two = [_]u8{'2'} ** 64;
+    const token_three = [_]u8{'3'} ** 64;
+    const unknown = [_]u8{'9'} ** 64;
+    const checksum_one = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const checksum_two = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    try store.rotateStableScoreSession(user_id, &token_one, binding, 1_000, 300);
+    try std.testing.expectEqual(StableScoreGraceResult.current_not_grace, try store.consumeStableScoreGrace(&token_one, user_id, binding, checksum_one, 1_001));
+    try std.testing.expectEqual(StableScoreGraceResult.foreign, try store.consumeStableScoreGrace(&token_one, foreign_id, binding, checksum_one, 1_001));
+    try std.testing.expectEqual(StableScoreGraceResult.unknown, try store.consumeStableScoreGrace(&unknown, user_id, binding, checksum_one, 1_001));
+
+    try store.rotateStableScoreSession(user_id, &token_two, binding, 1_010, 300);
+    try std.testing.expectEqual(StableScoreGraceResult.version_mismatch, try store.consumeStableScoreGrace(&token_one, user_id, wrong_version, checksum_one, 1_011));
+    try std.testing.expectEqual(StableScoreGraceResult.hardware_mismatch, try store.consumeStableScoreGrace(&token_one, user_id, wrong_hardware, checksum_one, 1_011));
+    const Claim = struct {
+        store: *Store,
+        token: *const [64]u8,
+        user_id: i32,
+        binding: stable_client.Binding,
+        checksum: []const u8,
+        result: ?StableScoreGraceResult = null,
+        failed: bool = false,
+
+        fn run(context: *@This()) void {
+            context.result = context.store.consumeStableScoreGrace(context.token, context.user_id, context.binding, context.checksum, 1_012) catch {
+                context.failed = true;
+                return;
+            };
+        }
+    };
+    var first_claim: Claim = .{ .store = &store, .token = &token_one, .user_id = user_id, .binding = binding, .checksum = checksum_one };
+    var second_claim: Claim = .{ .store = &store, .token = &token_one, .user_id = user_id, .binding = binding, .checksum = checksum_two };
+    const first_thread = try std.Thread.spawn(.{}, Claim.run, .{&first_claim});
+    const second_thread = try std.Thread.spawn(.{}, Claim.run, .{&second_claim});
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(!first_claim.failed and !second_claim.failed);
+    const first_result = first_claim.result.?;
+    const second_result = second_claim.result.?;
+    try std.testing.expect((first_result == .accepted and second_result == .consumed) or (first_result == .consumed and second_result == .accepted));
+    const claimed_checksum = if (first_result == .accepted) checksum_one else checksum_two;
+    try std.testing.expectEqual(StableScoreGraceResult.accepted, try store.consumeStableScoreGrace(&token_one, user_id, binding, claimed_checksum, 1_013));
+
+    try store.rotateStableScoreSession(user_id, &token_three, binding, 1_020, 300);
+    try std.testing.expectEqual(StableScoreGraceResult.expired, try store.consumeStableScoreGrace(&token_two, user_id, binding, checksum_two, 1_321));
+    const game_tokens = try store.issueGameTokenPair(user_id, 300, 300, false);
+    try std.testing.expectEqual(@as(usize, 5), try store.revokeAllGameCredentialsForUser(user_id));
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &game_tokens.access, "identify")) == null);
+    try std.testing.expect((try store.authenticateToken(std.testing.allocator, &game_tokens.refresh, "")) == null);
+    try std.testing.expectEqual(StableScoreGraceResult.revoked, try store.consumeStableScoreGrace(&token_three, user_id, binding, checksum_two, 1_322));
+
+    var lease = store.pool.acquire();
+    defer lease.release();
+    try postgres.exec(lease.conn, "DELETE FROM zigcho.users WHERE safe_name IN('pg_stable_grace','pg_stable_foreign')");
 }
 
 test "postgres developer role changes preserve unrelated bits and revoke final staff sessions" {

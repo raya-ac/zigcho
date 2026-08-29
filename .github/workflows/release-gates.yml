@@ -260,13 +260,14 @@ jobs:
               for filter in \
                 "postgres staff announcements persist chat and audit atomically" \
                 "postgres credential and restriction commits revoke matching token families" \
+                "postgres stable score grace is client bound expiring and one time" \
                 "postgres custom lazer plays update local map counters" \
                 "postgres unbound room score tokens can be discarded" \
                 "postgres developer role changes preserve unrelated bits"
               do
                 ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_TRANSITIONS_URL" zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done
-              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through best score schema forty six"
+              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through stable score grace schema forty seven"
             '
 
       - name: boot the exact binary on PostgreSQL
@@ -277,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 46
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 47
           test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!

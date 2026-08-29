@@ -1,0 +1,43 @@
+FROM rust:1.94.1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS rust
+
+FROM debian:bookworm-slim@sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143
+
+ARG ZIG_VERSION=0.16.0
+ARG ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+ARG HOTFIX_MANIFEST
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gcc git libpq-dev libsqlite3-dev pkg-config python3 xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
+
+RUN curl --fail --location --silent --show-error \
+        "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+        --output /tmp/zig.tar.xz \
+    && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum --check --strict \
+    && mkdir /opt/zig \
+    && tar --extract --xz --file /tmp/zig.tar.xz --strip-components=1 --directory /opt/zig \
+    && ln -s /opt/zig/zig /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz
+
+WORKDIR /src
+COPY . .
+
+RUN --mount=type=cache,id=zigcho-hotfix-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=zigcho-hotfix-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=zigcho-hotfix-cargo-target,target=/src/pp/target \
+    --mount=type=cache,id=zigcho-hotfix-zig-cache,target=/src/.zig-cache \
+    case "$HOTFIX_MANIFEST" in hotfixes/*.json) ;; *) echo "invalid HOTFIX_MANIFEST" >&2; exit 1 ;; esac \
+    && python3 tools/hotfix.py run-tests --manifest "$HOTFIX_MANIFEST" \
+    && zig build hotfix -Dcpu=baseline -Dpostgres=true -Doptimize=ReleaseSafe \
+    && mkdir -p /out/tools \
+    && cp zig-out/bin/zigcho /out/ \
+    && strip --strip-all /out/zigcho \
+    && ! objdump -d /out/zigcho | grep -Eq '%zmm|%k[0-7]' \
+    && cp src/pp_engine_version.txt /out/pp-engine-version \
+    && cp tools/backup-postgres.sh tools/restore-postgres-drill.sh tools/activate-hotfix.sh /out/tools/

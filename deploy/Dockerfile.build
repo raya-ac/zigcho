@@ -41,7 +41,7 @@ RUN if [ "$TEST_SCOPE" = full ]; then \
     && strip --strip-all /out/zigcho /out/zigcho-import /out/zigcho-import-archive /out/zigcho-migrate-postgres \
     && ! objdump -d /out/zigcho | grep -Eq '%zmm|%k[0-7]' \
     && cp src/pp_engine_version.txt /out/pp-engine-version \
-    && cp tools/backup-postgres.sh tools/backup-postgres-object.sh tools/restore-postgres-drill.sh tools/activate-release.sh /out/tools/ \
+    && cp tools/backup-postgres.sh tools/backup-postgres-object.sh tools/restore-postgres-drill.sh tools/activate-release.sh tools/activate-hotfix.sh /out/tools/ \
     && cp deploy/systemd/zigcho.service deploy/systemd/zigcho-mirror-worker.service deploy/systemd/zigcho-postgres-backup.service deploy/systemd/zigcho-postgres-backup.timer deploy/systemd/zigcho-irc-tls.service /out/deploy/systemd/ \
     && cp deploy/stunnel/zigcho-irc.conf /out/deploy/stunnel/ \
     && cp deploy/certbot/zigcho-irc-certificate /out/deploy/certbot/

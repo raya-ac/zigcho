@@ -23,9 +23,13 @@ on:
       - deploy/stunnel/**
       - deploy/systemd/**
       - tools/activate-release.sh
+      - tools/activate-hotfix.sh
       - tools/backup-postgres.sh
       - tools/backup-postgres-object.sh
+      - tools/hotfix.py
       - tools/restore-postgres-drill.sh
+      - hotfixes/**
+      - deploy/Dockerfile.hotfix
       - build.zig
       - build.zig.zon
       - changelog_module.zig
@@ -39,8 +43,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  classify:
+    name: classify release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is_hotfix: ${{ steps.classify.outputs.is_hotfix }}
+      manifest: ${{ steps.classify.outputs.manifest }}
+    steps:
+      - name: check out enough history to verify a patch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: classify and verify the pushed commit
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            validator="$RUNNER_TEMP/hotfix-validator.py"
+            if git cat-file -e "${GITHUB_SHA}^:tools/hotfix.py" 2>/dev/null; then
+              git show "${GITHUB_SHA}^:tools/hotfix.py" >"$validator"
+              python3 "$validator" classify --target "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+            else
+              printf 'is_hotfix=false\nmanifest=\n' >>"$GITHUB_OUTPUT"
+            fi
+          else
+            printf 'is_hotfix=false\nmanifest=\n' >>"$GITHUB_OUTPUT"
+          fi
+
   linux-x64:
     name: pinned linux x64 release
+    needs: classify
     runs-on: ubuntu-latest
     timeout-minutes: 90
     services:
@@ -60,28 +96,57 @@ jobs:
     steps:
       - name: check out zigcho
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
 
       - name: verify the dynamic changelog feed
         run: python3 tools/changelog-manifest.py --check
 
-      - name: build with the pinned production container
+      - name: build the full release with the pinned production container
+        if: needs.classify.outputs.is_hotfix != 'true'
         env:
           TEST_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_scope || 'full' }}
         run: docker build --build-arg "TEST_SCOPE=${TEST_SCOPE}" --file deploy/Dockerfile.build --tag zigcho-release-gate:${GITHUB_SHA} .
+
+      - name: build the verified hotfix with the pinned production container
+        if: needs.classify.outputs.is_hotfix == 'true'
+        env:
+          HOTFIX_MANIFEST: ${{ needs.classify.outputs.manifest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --build-arg "HOTFIX_MANIFEST=${HOTFIX_MANIFEST}" \
+            --cache-from type=gha,scope=zigcho-hotfix \
+            --cache-to type=gha,mode=max,scope=zigcho-hotfix \
+            --file deploy/Dockerfile.hotfix \
+            --tag "zigcho-hotfix-gate:${GITHUB_SHA}" \
+            --load \
+            .
 
       - name: extract and verify the release bundle
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifacts/server
-          container=$(docker create "zigcho-release-gate:${GITHUB_SHA}")
+          if [[ "${{ needs.classify.outputs.is_hotfix }}" == true ]]; then
+            image="zigcho-hotfix-gate:${GITHUB_SHA}"
+          else
+            image="zigcho-release-gate:${GITHUB_SHA}"
+          fi
+          container=$(docker create "$image")
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
           docker cp "$container:/out/." artifacts/server
           test -x artifacts/server/zigcho
-          test -x artifacts/server/zigcho-import
-          test -x artifacts/server/zigcho-import-archive
-          test -x artifacts/server/zigcho-migrate-postgres
           test -s artifacts/server/pp-engine-version
+          if [[ "${{ needs.classify.outputs.is_hotfix }}" == true ]]; then
+            test -x artifacts/server/tools/activate-hotfix.sh
+          else
+            test -x artifacts/server/zigcho-import
+            test -x artifacts/server/zigcho-import-archive
+            test -x artifacts/server/zigcho-migrate-postgres
+          fi
           binary_type=$(file -b artifacts/server/zigcho)
           printf '%s\n' "$binary_type"
           [[ "$binary_type" == *'ELF 64-bit LSB'* ]]
@@ -90,15 +155,22 @@ jobs:
           if test -n "$(find artifacts/server -type f -name '*.pdb' -print -quit)"; then
             exit 1
           fi
-          activate=artifacts/server/tools/activate-release.sh
-          stop_line=$(grep -n '^systemctl stop "$service"$' "$activate" | cut -d: -f1)
-          stopped_line=$(grep -n '^service_stopped=yes$' "$activate" | tail -n 1 | cut -d: -f1)
-          check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
-          test "$stop_line" -lt "$stopped_line"
-          test "$stopped_line" -lt "$check_line"
+          if [[ "${{ needs.classify.outputs.is_hotfix }}" == true ]]; then
+            activate=artifacts/server/tools/activate-hotfix.sh
+            check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
+            stop_line=$(grep -n '^systemctl stop "$service"$' "$activate" | tail -n 1 | cut -d: -f1)
+            test "$check_line" -lt "$stop_line"
+          else
+            activate=artifacts/server/tools/activate-release.sh
+            stop_line=$(grep -n '^systemctl stop "$service"$' "$activate" | cut -d: -f1)
+            stopped_line=$(grep -n '^service_stopped=yes$' "$activate" | tail -n 1 | cut -d: -f1)
+            check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
+            test "$stop_line" -lt "$stopped_line"
+            test "$stopped_line" -lt "$check_line"
+          fi
 
       - name: run PostgreSQL integration tests
-        if: github.event_name != 'workflow_dispatch' || inputs.test_scope == 'full'
+        if: needs.classify.outputs.is_hotfix != 'true' && (github.event_name != 'workflow_dispatch' || inputs.test_scope == 'full')
         shell: bash
         env:
           PGPASSWORD: zigcho-gate
@@ -123,7 +195,7 @@ jobs:
             zig build test -Doptimize=ReleaseSafe
 
       - name: run focused correction tests
-        if: github.event_name == 'workflow_dispatch' && inputs.test_scope == 'focused'
+        if: needs.classify.outputs.is_hotfix != 'true' && github.event_name == 'workflow_dispatch' && inputs.test_scope == 'focused'
         shell: bash
         env:
           PGPASSWORD: zigcho-gate
@@ -230,10 +302,28 @@ jobs:
           trap - EXIT
           (cd artifacts/server && sha256sum zigcho > zigcho.sha256 && sha256sum --check zigcho.sha256)
 
+      - name: bind the source patch to the hotfix artifact
+        if: needs.classify.outputs.is_hotfix == 'true'
+        env:
+          HOTFIX_MANIFEST: ${{ needs.classify.outputs.manifest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/hotfix.py bundle \
+            --manifest "$HOTFIX_MANIFEST" \
+            --target "$GITHUB_SHA" \
+            --binary artifacts/server/zigcho \
+            --pp-engine-version artifacts/server/pp-engine-version \
+            --output-dir artifacts/server
+          test -s artifacts/server/hotfix.manifest
+          test -s artifacts/server/hotfix.json
+          test -s artifacts/server/source.patch
+          (cd artifacts/server && sha256sum --check zigcho.sha256 && sha256sum --check source.patch.sha256)
+
       - name: upload the deployable release
         uses: actions/upload-artifact@v7
         with:
-          name: zigcho-linux-x64-${{ github.sha }}
+          name: zigcho-${{ needs.classify.outputs.is_hotfix == 'true' && 'hotfix-' || '' }}linux-x64-${{ github.sha }}
           path: artifacts/server
           if-no-files-found: error
           retention-days: 30

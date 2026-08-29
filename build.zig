@@ -82,6 +82,8 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "zigcho", .root_module = mod });
     exe.step.dependOn(&cargo.step);
     b.installArtifact(exe);
+    const install_hotfix = b.addInstallArtifact(exe, .{});
+    b.step("hotfix", "Build only the production server for a verified hotfix").dependOn(&install_hotfix.step);
 
     const importer_mod = b.createModule(.{
         .root_source_file = b.path("src/import.zig"),

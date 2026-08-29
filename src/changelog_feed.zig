@@ -502,11 +502,11 @@ fn manifestWithPrependedBuildVersionAt(allocator: std.mem.Allocator, name: []con
 }
 
 fn manifestWithPrependedBuildAt(allocator: std.mem.Allocator, name: []const u8, digest_markdown: []const u8, build_id: i64, timestamp: []const u8) ![]u8 {
-    return manifestWithPrependedBuildVersionAt(allocator, name, digest_markdown, build_id, "2026.828.1", timestamp);
+    return manifestWithPrependedBuildVersionAt(allocator, name, digest_markdown, build_id, "2026.829.1", timestamp);
 }
 
 fn manifestWithPrependedBuild(allocator: std.mem.Allocator, name: []const u8, digest_markdown: []const u8) ![]u8 {
-    return manifestWithPrependedBuildAt(allocator, name, digest_markdown, 41, "2026-08-28T14:07:00+09:30");
+    return manifestWithPrependedBuildAt(allocator, name, digest_markdown, 42, "2026-08-29T12:51:00+09:30");
 }
 
 fn manifestWithPrependedUpdates(allocator: std.mem.Allocator, count: usize, digest_markdown: []const u8) ![]u8 {
@@ -517,7 +517,7 @@ fn manifestWithPrependedUpdates(allocator: std.mem.Allocator, count: usize, dige
     const digest = std.fmt.bytesToHex(digestFor(digest_markdown), .lower);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try output.writer.print("{s}\n    {{\"id\":41,\"version\":\"2026.828.1\",\"display_version\":\"raw only release\",\"created_at\":\"2026-08-28T14:07:00+09:30\",\"updates\":[", .{base[0..split]});
+    try output.writer.print("{s}\n    {{\"id\":42,\"version\":\"2026.829.1\",\"display_version\":\"raw only release\",\"created_at\":\"2026-08-29T12:51:00+09:30\",\"updates\":[", .{base[0..split]});
     for (0..count) |index| {
         if (index != 0) try output.writer.writeByte(',');
         try output.writer.print("{{\"name\":\"2026-08-25-raw-feed-{d}.md\",\"created_at\":\"2026-08-25T00:00:00+09:30\",\"commit\":\"\",\"sha256\":\"{s}\"}}", .{ index, digest });
@@ -545,7 +545,7 @@ test "checked in manifest reuses every embedded update without network fanout" {
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("zigcho release 1.4", parsed.value.object.get("builds").?.array.items[0].object.get("display_version").?.string);
+    try std.testing.expectEqualStrings("zigcho release 1.5", parsed.value.object.get("builds").?.array.items[0].object.get("display_version").?.string);
     try std.testing.expectEqual(history.historyEntryCount(), blk: {
         var count: usize = 0;
         for (parsed.value.object.get("builds").?.array.items) |build| count += build.object.get("changelog_entries").?.array.items.len;
@@ -625,7 +625,7 @@ test "dynamic changelog swaps atomically and fetch failure keeps the last good f
     try std.testing.expectEqual(@as(usize, 1), fixture.update_fetches);
     const latest = (try feed.buildJson(std.testing.allocator, "lazer", "latest")).?;
     defer std.testing.allocator.free(latest);
-    try std.testing.expect(std.mem.indexOf(u8, latest, "\"version\":\"2026.828.1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest, "\"version\":\"2026.829.1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest, "\"display_version\":\"zigcho release 1.1\"") != null);
     try std.testing.expect(feed.newsSlugKnown("2026-08-25-raw-feed-release"));
     const news = try feed.newsJson(std.testing.allocator, 2026);
@@ -645,7 +645,7 @@ test "dynamic changelog swaps atomically and fetch failure keeps the last good f
 test "dynamic next year build is visible in changelog and news contracts" {
     const markdown = "# next year release\n\nthis stayed live without a server or client rebuild.";
     const name = "2027-01-02-next-year-release.md";
-    const manifest = try manifestWithPrependedBuildVersionAt(std.testing.allocator, name, markdown, 41, "2027.102.0", "2027-01-02T00:00:00+09:30");
+    const manifest = try manifestWithPrependedBuildVersionAt(std.testing.allocator, name, markdown, 42, "2027.102.0", "2027-01-02T00:00:00+09:30");
     defer std.testing.allocator.free(manifest);
     var fixture: TestFetcher = .{ .manifest = manifest, .update_name = name, .update_markdown = markdown };
     var feed = Feed.initWithFetcher(std.testing.allocator, std.testing.io, fixture.interface());

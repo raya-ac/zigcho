@@ -3,6 +3,7 @@ set -eu
 
 release=${1:-}
 release_root=/opt/zigcho/releases
+hotfix_root=/opt/zigcho/hotfixes
 current=/opt/zigcho/current
 service=zigcho.service
 health_url=http://127.0.0.1:27180/health
@@ -30,7 +31,7 @@ esac
 
 previous=$(readlink -f "$current")
 case "$previous" in
-  "$release_root"/*) ;;
+  "$release_root"/*|"$hotfix_root"/*) ;;
   *) echo "current release is not a valid rollback target: $previous" >&2; exit 1 ;;
 esac
 candidate_pp=$(sed -n '1p' "$candidate/pp-engine-version")
@@ -42,6 +43,11 @@ fi
 case "$candidate_pp:$previous_pp" in
   *[!A-Za-z0-9._:-]*) echo "invalid pp engine marker" >&2; exit 1 ;;
 esac
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/run/zigcho-release.lock
+  flock -n 9 || { echo "another Zigcho activation is running" >&2; exit 1; }
+fi
 
 restore_previous() {
   status=$?

@@ -912,19 +912,15 @@ const App = struct {
 
     fn activateStableLoginLocked(self: *App, result: *const bancho.LoginResult) !void {
         if (result.user_id <= 0) return;
-        var durable_rotated = false;
         if (comptime storage.is_postgres) {
             const binding = result.client_binding orelse return error.StableLoginClientBindingMissing;
             const now = std.Io.Clock.real.now(self.store.io).toSeconds();
             try self.store.rotateStableScoreSession(result.user_id, result.token, binding, now, stable_score_auth.grace_lifetime_seconds);
-            durable_rotated = true;
-        }
-        errdefer {
-            if (durable_rotated) _ = self.store.revokeStableScoreSessionsForUser(result.user_id) catch |err| {
+            errdefer _ = self.store.revokeStableScoreSessionsForUser(result.user_id) catch |err| {
                 std.log.err("event=stable_login_activation_compensation_failed user_id={d} error={t}", .{ result.user_id, err });
             };
-        }
-        try self.takeOverGameSessionsLocked(result.user_id, "stable");
+            try self.takeOverGameSessionsLocked(result.user_id, "stable");
+        } else try self.takeOverGameSessionsLocked(result.user_id, "stable");
     }
 
     fn stableLoginAndTakeover(self: *App, body: []const u8, login_country: ?[2]u8, longitude: f32, latitude: f32) !bancho.LoginResult {

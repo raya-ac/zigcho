@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "id": "2026-08-29-health-hotfix-marker",
+  "base_commit": "73695e1ea606d937a5050ceccc9bc75261dec478",
+  "schema_version": 45,
+  "patch_file": "2026-08-29-health-hotfix-marker.patch",
+  "patch_sha256": "41aed26174d6616110447657ba25df6382e44112e07d4c259daa961dded43d9f",
+  "summary": "show the verified hotfix lane in the public health response",
+  "test_filters": [
+    "health advertises the verified hotfix lane"
+  ]
+}

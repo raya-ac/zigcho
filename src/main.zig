@@ -58,6 +58,10 @@ const default_avatar_2 = @embedFile("assets/avatars/default-2.jpg");
 const lazer_access_lifetime_seconds: i64 = 3600;
 const lazer_refresh_lifetime_seconds: i64 = 90 * 24 * 60 * 60;
 
+fn healthResponse(buf: []u8, online: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19,\"hotfixes\":true}}", .{online});
+}
+
 var shutdown_requested: std.atomic.Value(bool) = .init(false);
 var shutdown_listener_fd: std.atomic.Value(i64) = .init(-1);
 var restart_requested: std.atomic.Value(bool) = .init(false);
@@ -1638,7 +1642,7 @@ const App = struct {
 
         if (std.mem.eql(u8, path, "/health")) {
             var buf: [256]u8 = undefined;
-            const json = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"service\":\"zigcho\",\"online\":{d},\"protocol\":19}}", .{try self.combinedOnlineCount()});
+            const json = try healthResponse(&buf, try self.combinedOnlineCount());
             return respond(req, .ok, "application/json", json, &.{});
         }
         if (std.mem.eql(u8, path, "/metrics")) {
@@ -4910,6 +4914,12 @@ test "public beatmapset pages bypass BSS upload routing" {
     try std.testing.expect(App.bssPathForRequest(.GET, "kai.ovh", "/beatmapsets/1000000001") == null);
     try std.testing.expect(App.bssPathForRequest(.PUT, "bss.kai.ovh", "/beatmapsets/1000000001") != null);
     try std.testing.expect(App.bssPathForRequest(.PATCH, "bss.kai.ovh", "/beatmapsets/1000000001") != null);
+}
+
+test "health advertises the verified hotfix lane" {
+    var buf: [256]u8 = undefined;
+    const json = try healthResponse(&buf, 7);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"service\":\"zigcho\",\"online\":7,\"protocol\":19,\"hotfixes\":true}", json);
 }
 
 test "failed lazer password response revokes tokens and always clears presence" {

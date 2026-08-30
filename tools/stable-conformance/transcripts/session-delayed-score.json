@@ -1,0 +1,173 @@
+{
+  "schema": 1,
+  "id": "session-delayed-score",
+  "category": "policy-matrix",
+  "description": "queued score submission with the immediately replaced login token, followed by an identical retry",
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "this case submits a real encrypted score twice and changes score, stats, replay and achievement state"
+  },
+  "fixture_contract": [
+    "both isolated databases contain the same player and ranked beatmap fixture with no score using the submitted checksum",
+    "the player is unrestricted and unsilenced and has no unread messages on either target",
+    "the encrypted multipart score uses the fixture player's password hash and the exact client binding used by both logins",
+    "object storage is isolated and empty for the fixture replay key",
+    "the two servers use the same PP engine and calculation inputs"
+  ],
+  "requires": [
+    "stable_delayed_username",
+    "stable_delayed_password_md5",
+    "stable_delayed_client_hashes",
+    "stable_delayed_user_id",
+    "delayed_score_multipart_body_b64",
+    "delayed_score_multipart_content_type"
+  ],
+  "identity_roles": ["stable_delayed_user_id"],
+  "coverage": {
+    "client_packets": [],
+    "routes": ["POST /web/osu-submit-modular-selector.php"]
+  },
+  "policy_assertions": [
+    { "observer_kind": "none", "policy_id": "stable-login-bootstrap", "trigger_step": "login-before-queue", "steps": ["login-before-queue"] },
+    { "observer_kind": "none", "policy_id": "immediate-reconnect-takeover", "trigger_step": "replacement-login", "steps": ["replacement-login"] }
+  ],
+  "steps": [
+    {
+      "id": "login-before-queue",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "utf8",
+          "value": "{{stable_delayed_username}}\n{{stable_delayed_password_md5}}\n{{client_version}}|0|0|{{stable_delayed_client_hashes}}|0"
+        }
+      },
+      "capture": [
+        { "from": "header", "name": "cho-token", "as": "queued_score_token", "secret": true }
+      ],
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "stable-login-bootstrap",
+        "compare_packet_ids": [5, 11, 71, 72, 75, 83, 92],
+        "targets": {
+          "zigcho": {
+            "status": 200,
+            "required_packet_ids": [75, 5, 71, 92, 83, 11, 65, 89, 72],
+            "allowed_packet_ids": [5, 11, 65, 71, 72, 75, 83, 89, 92],
+            "allow_duplicate_packet_ids": [11, 65, 83],
+            "packet_fields": [
+              { "packet_id": 75, "path": "payload.version", "value": 19 },
+              { "packet_id": 5, "path": "payload.user_id", "variable": "stable_delayed_user_id" },
+              { "packet_id": 71, "path": "payload.privileges", "predicate": "positive" },
+              { "packet_id": 92, "path": "payload.seconds", "value": 0 },
+              { "packet_id": 83, "path": "payload.user_id", "variable": "stable_delayed_user_id" },
+              { "packet_id": 11, "path": "payload.user_id", "variable": "stable_delayed_user_id" }
+            ]
+          },
+          "reference": {
+            "status": 200,
+            "required_packet_ids": [75, 5, 71, 24, 65, 89, 76, 72, 92, 83, 11],
+            "allowed_packet_ids": [5, 11, 24, 65, 71, 72, 75, 76, 83, 89, 92],
+            "allow_duplicate_packet_ids": [11, 65, 83],
+            "packet_fields": [
+              { "packet_id": 75, "path": "payload.version", "value": 19 },
+              { "packet_id": 5, "path": "payload.user_id", "variable": "stable_delayed_user_id" },
+              { "packet_id": 71, "path": "payload.privileges", "predicate": "positive" },
+              { "packet_id": 92, "path": "payload.seconds", "value": 0 },
+              { "packet_id": 83, "path": "payload.user_id", "variable": "stable_delayed_user_id" },
+              { "packet_id": 11, "path": "payload.user_id", "variable": "stable_delayed_user_id" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "replacement-login",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "utf8",
+          "value": "{{stable_delayed_username}}\n{{stable_delayed_password_md5}}\n{{client_version}}|0|0|{{stable_delayed_client_hashes}}|0"
+        }
+      },
+      "capture": [
+        { "from": "header", "name": "cho-token", "as": "current_score_token", "secret": true }
+      ],
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "immediate-reconnect-takeover",
+        "compare_target_with_step": { "zigcho": "login-before-queue" },
+        "targets": {
+          "zigcho": {
+            "status": 200,
+            "required_packet_ids": [5, 71, 75],
+            "allowed_packet_ids": [5, 7, 11, 65, 71, 72, 75, 83, 89, 92, 104],
+            "packet_fields": [
+              { "packet_id": 5, "path": "payload.user_id", "variable": "stable_delayed_user_id" }
+            ]
+          },
+          "reference": {
+            "status": 200,
+            "packet_ids": [5, 24],
+            "packet_fields": [
+              { "packet_id": 5, "path": "payload.user_id", "value": -1 },
+              { "packet_id": 24, "path": "payload.message", "value": "User already logged in." }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "delayed-submit",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-submit-modular-selector.php",
+        "headers": {
+          "User-Agent": "osu!",
+          "token": "{{queued_score_token}}",
+          "Content-Type": "{{delayed_score_multipart_content_type}}"
+        },
+        "body": { "encoding": "base64", "value": "{{delayed_score_multipart_body_b64}}" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": ["beatmapId:", "chartId:beatmap", "chartId:overall", "onlineScoreId:"],
+        "expect_text_not_contains": ["error: no", "error: beatmap"],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "checksum-idempotent-retry",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-submit-modular-selector.php",
+        "headers": {
+          "User-Agent": "osu!",
+          "token": "{{queued_score_token}}",
+          "Content-Type": "{{delayed_score_multipart_content_type}}"
+        },
+        "body": { "encoding": "base64", "value": "{{delayed_score_multipart_body_b64}}" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_equals": "error: no",
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    }
+  ]
+}

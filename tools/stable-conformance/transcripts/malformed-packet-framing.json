@@ -1,0 +1,126 @@
+{
+  "schema": 1,
+  "id": "malformed-packet-framing",
+  "category": "malformed-input",
+  "description": "truncated headers, truncated payloads, oversized declarations and a noncanonical Stable string marker on isolated authenticated sessions",
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "malformed poll input can terminate or poison the fixture session"
+  },
+  "requires": [
+    "stable_malformed_token_1",
+    "stable_malformed_user_id_1",
+    "stable_malformed_token_2",
+    "stable_malformed_user_id_2",
+    "stable_malformed_token_3",
+    "stable_malformed_user_id_3",
+    "stable_malformed_token_4",
+    "stable_malformed_user_id_4"
+  ],
+  "session_bindings": [
+    { "token": "stable_malformed_token_1", "user_id": "stable_malformed_user_id_1" },
+    { "token": "stable_malformed_token_2", "user_id": "stable_malformed_user_id_2" },
+    { "token": "stable_malformed_token_3", "user_id": "stable_malformed_user_id_3" },
+    { "token": "stable_malformed_token_4", "user_id": "stable_malformed_user_id_4" }
+  ],
+  "coverage": { "client_packets": [63], "routes": [] },
+  "behavior_assertions": [
+    { "kind": "policy-matrix", "policy_id": "malformed-input-hardening", "client_packets": [63], "request_steps": ["invalid-string-marker"], "steps": ["invalid-string-marker"] }
+  ],
+  "policy_assertions": [
+    { "observer_kind": "none", "policy_id": "malformed-input-hardening", "trigger_step": "truncated-header", "steps": ["truncated-header"] },
+    { "observer_kind": "none", "policy_id": "malformed-input-hardening", "trigger_step": "truncated-payload", "steps": ["truncated-payload"] },
+    { "observer_kind": "none", "policy_id": "malformed-input-hardening", "trigger_step": "oversized-declaration", "steps": ["oversized-declaration"] },
+    { "observer_kind": "none", "policy_id": "malformed-input-hardening", "trigger_step": "invalid-string-marker", "steps": ["invalid-string-marker"] }
+  ],
+  "steps": [
+    {
+      "id": "truncated-header",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_malformed_token_1}}" },
+        "body": { "encoding": "hex", "value": "040000" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": [200, 400, 500],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "malformed-input-hardening",
+        "targets": {
+          "zigcho": { "status": [200, 400], "body_policy": "uncompared" },
+          "reference": { "status": 500, "body_policy": "uncompared" }
+        }
+      }
+    },
+    {
+      "id": "truncated-payload",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_malformed_token_2}}" },
+        "body": { "encoding": "hex", "value": "3f000001000000" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": [200, 400, 500],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "malformed-input-hardening",
+        "targets": {
+          "zigcho": { "status": [200, 400], "body_policy": "uncompared" },
+          "reference": { "status": 500, "body_policy": "uncompared" }
+        }
+      }
+    },
+    {
+      "id": "oversized-declaration",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_malformed_token_3}}" },
+        "body": { "encoding": "hex", "value": "04000001001000" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": [200, 400, 500],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "malformed-input-hardening",
+        "targets": {
+          "zigcho": { "status": [200, 400], "body_policy": "uncompared" },
+          "reference": { "status": 200, "body_policy": "uncompared" }
+        }
+      }
+    },
+    {
+      "id": "invalid-string-marker",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_malformed_token_4}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [{ "id": 63, "payload": { "encoding": "hex", "value": "01" } }]
+        }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": [200, 400],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "malformed-input-hardening",
+        "targets": {
+          "zigcho": { "status": 400, "body_policy": "uncompared" },
+          "reference": { "status": 200, "body_policy": "uncompared" }
+        }
+      }
+    }
+  ]
+}

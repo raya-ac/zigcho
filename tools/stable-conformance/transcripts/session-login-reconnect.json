@@ -1,0 +1,249 @@
+{
+  "schema": 1,
+  "id": "session-login-reconnect",
+  "category": "policy-matrix",
+  "description": "login ownership, token capture, immediate reconnect and old-token rejection",
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "this case creates and replaces an authenticated Stable session"
+  },
+  "fixture_contract": [
+    "the player exists with the same logical profile, numeric id, country, stats and friends on both targets, is unrestricted and unsilenced, and has no unread messages",
+    "both isolated servers expose the same channels and bot presence",
+    "no unrelated player logs in or changes channel counts while the case runs",
+    "the fixture account has no active Stable or lazer session before the first step"
+  ],
+  "requires": [
+    "stable_login_username",
+    "stable_login_password_md5",
+    "stable_login_client_hashes",
+    "stable_login_user_id"
+  ],
+  "identity_roles": ["stable_login_user_id"],
+  "coverage": {
+    "client_packets": [3, 4],
+    "routes": []
+  },
+  "behavior_assertions": [
+    {
+      "kind": "immediate-response",
+      "client_packets": [4],
+      "request_steps": ["first-poll"],
+      "steps": ["first-poll"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [3],
+      "request_steps": ["first-status"],
+      "steps": ["first-status"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [4],
+      "request_steps": ["old-session-poll"],
+      "steps": ["old-session-poll"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [4],
+      "request_steps": ["replacement-session-poll"],
+      "steps": ["replacement-session-poll"]
+    }
+  ],
+  "policy_assertions": [
+    {
+      "observer_kind": "none",
+      "policy_id": "stable-login-bootstrap",
+      "trigger_step": "login",
+      "steps": ["login"]
+    },
+    {
+      "observer_kind": "session-readback",
+      "policy_id": "immediate-reconnect-takeover",
+      "trigger_step": "immediate-reconnect",
+      "steps": ["immediate-reconnect", "old-session-poll", "replacement-session-poll"]
+    }
+  ],
+  "steps": [
+    {
+      "id": "login",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "utf8",
+          "value": "{{stable_login_username}}\n{{stable_login_password_md5}}\n{{client_version}}|0|0|{{stable_login_client_hashes}}|0"
+        }
+      },
+      "capture": [
+        { "from": "header", "name": "cho-token", "as": "first_session_token", "secret": true }
+      ],
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "stable-login-bootstrap",
+        "compare_packet_ids": [5, 11, 71, 72, 75, 83, 92],
+        "targets": {
+          "zigcho": {
+            "status": 200,
+            "required_packet_ids": [75, 5, 71, 92, 83, 11, 65, 89, 72],
+            "allowed_packet_ids": [5, 11, 65, 71, 72, 75, 83, 89, 92],
+            "allow_duplicate_packet_ids": [11, 65, 83],
+            "packet_fields": [
+              { "packet_id": 75, "path": "payload.version", "value": 19 },
+              { "packet_id": 5, "path": "payload.user_id", "variable": "stable_login_user_id" },
+              { "packet_id": 71, "path": "payload.privileges", "predicate": "positive" },
+              { "packet_id": 92, "path": "payload.seconds", "value": 0 },
+              { "packet_id": 83, "path": "payload.user_id", "variable": "stable_login_user_id" },
+              { "packet_id": 11, "path": "payload.user_id", "variable": "stable_login_user_id" }
+            ]
+          },
+          "reference": {
+            "status": 200,
+            "required_packet_ids": [75, 5, 71, 24, 65, 89, 76, 72, 92, 83, 11],
+            "allowed_packet_ids": [5, 11, 24, 65, 71, 72, 75, 76, 83, 89, 92],
+            "allow_duplicate_packet_ids": [11, 65, 83],
+            "packet_fields": [
+              { "packet_id": 75, "path": "payload.version", "value": 19 },
+              { "packet_id": 5, "path": "payload.user_id", "variable": "stable_login_user_id" },
+              { "packet_id": 71, "path": "payload.privileges", "predicate": "positive" },
+              { "packet_id": 92, "path": "payload.seconds", "value": 0 },
+              { "packet_id": 83, "path": "payload.user_id", "variable": "stable_login_user_id" },
+              { "packet_id": 11, "path": "payload.user_id", "variable": "stable_login_user_id" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "first-poll",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{first_session_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [{ "id": 4 }]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "first-status",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{first_session_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [{ "id": 3 }]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [11],
+        "forbid_packet_ids": [24, 86],
+        "packet_fields": [
+          { "packet_id": 11, "path": "payload.user_id", "variable": "stable_login_user_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "immediate-reconnect",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "utf8",
+          "value": "{{stable_login_username}}\n{{stable_login_password_md5}}\n{{client_version}}|0|0|{{stable_login_client_hashes}}|0"
+        }
+      },
+      "capture": [
+        { "from": "header", "name": "cho-token", "as": "replacement_session_token", "secret": true }
+      ],
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "immediate-reconnect-takeover",
+        "compare_target_with_step": { "zigcho": "login" },
+        "targets": {
+          "zigcho": {
+            "status": 200,
+            "required_packet_ids": [5, 71, 75],
+            "allowed_packet_ids": [5, 7, 11, 65, 71, 72, 75, 83, 89, 92, 104],
+            "packet_fields": [
+              { "packet_id": 5, "path": "payload.user_id", "variable": "stable_login_user_id" }
+            ]
+          },
+          "reference": {
+            "status": 200,
+            "packet_ids": [5, 24],
+            "packet_fields": [
+              { "packet_id": 5, "path": "payload.user_id", "value": -1 },
+              { "packet_id": 24, "path": "payload.message", "value": "User already logged in." }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "old-session-poll",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{first_session_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [{ "id": 4 }] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "immediate-reconnect-takeover",
+        "compare_after_removing": { "zigcho": [24, 86], "reference": [] },
+        "targets": {
+          "zigcho": { "status": 200, "packet_ids": [24, 86] },
+          "reference": { "status": 200, "packet_ids": [] }
+        }
+      }
+    },
+    {
+      "id": "replacement-session-poll",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{replacement_session_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [{ "id": 4 }] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "immediate-reconnect-takeover",
+        "compare_after_removing": { "zigcho": [], "reference": [24, 86] },
+        "targets": {
+          "zigcho": { "status": 200, "packet_ids": [] },
+          "reference": { "status": 200, "packet_ids": [24, 86] }
+        }
+      }
+    }
+  ]
+}

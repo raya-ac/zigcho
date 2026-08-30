@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "id": "malformed-login",
+  "category": "malformed-input",
+  "description": "identical structurally incomplete and invalid-UTF-8 Stable login bodies",
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "failed login attempts may consume authentication rate limits"
+  },
+  "coverage": { "client_packets": [], "routes": [] },
+  "policy_assertions": [
+    { "observer_kind": "none", "policy_id": "malformed-input-hardening", "trigger_step": "missing-login-lines", "steps": ["missing-login-lines"] },
+    { "observer_kind": "none", "policy_id": "malformed-input-hardening", "trigger_step": "invalid-login-utf8", "steps": ["invalid-login-utf8"] }
+  ],
+  "steps": [
+    {
+      "id": "missing-login-lines",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!" },
+        "body": { "encoding": "utf8", "value": "only-one-line" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": [200, 400, 500],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "malformed-input-hardening",
+        "targets": {
+          "zigcho": { "status": [200, 400], "body_policy": "uncompared" },
+          "reference": { "status": 500, "body_policy": "uncompared" }
+        }
+      }
+    },
+    {
+      "id": "invalid-login-utf8",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!" },
+        "body": { "encoding": "base64", "value": "/w==" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": [200, 400, 500],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "malformed-input-hardening",
+        "targets": {
+          "zigcho": { "status": [200, 400], "body_policy": "uncompared" },
+          "reference": { "status": 500, "body_policy": "uncompared" }
+        }
+      }
+    }
+  ]
+}

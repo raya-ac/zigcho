@@ -1,0 +1,175 @@
+{
+  "schema": 1,
+  "id": "route-fixture-read",
+  "category": "legacy-web",
+  "mutates_state": true,
+  "description": "legacy lookup routes against two databases seeded with the same logical fixture",
+  "safety": {
+    "production_allowed": false,
+    "reason": "replay reads record views and leaderboard/direct lookups may hydrate map or object-cache state"
+  },
+  "requires": [
+    "username",
+    "password_md5",
+    "beatmap_id",
+    "beatmap_set_id",
+    "beatmap_md5",
+    "beatmap_filename",
+    "score_id"
+  ],
+  "coverage": {
+    "client_packets": [],
+    "routes": [
+      "GET /web/osu-getfriends.php",
+      "POST /web/osu-getbeatmapinfo.php",
+      "GET /web/osu-getfavourites.php",
+      "GET /web/osu-search.php",
+      "GET /web/osu-search-set.php",
+      "GET /web/osu-getreplay.php",
+      "GET /web/osu-osz2-getscores.php"
+    ]
+  },
+  "steps": [
+    {
+      "id": "friends",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getfriends.php",
+        "query": { "u": "{{username}}", "h": "{{password_md5}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": { "format": "text", "expect_status": 200, "compare": { "content_type": false } }
+    },
+    {
+      "id": "beatmap-info",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-getbeatmapinfo.php",
+        "query": { "u": "{{username}}", "h": "{{password_md5}}" },
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "json",
+          "value": { "Filenames": ["{{beatmap_filename}}"], "Ids": [] }
+        }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": ["0|"],
+        "expect_text_not_contains": ["error", "not found", "no exist"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "favourites",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getfavourites.php",
+        "query": { "u": "{{username}}", "h": "{{password_md5}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_lines_exclude_variables": ["beatmap_set_id"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "direct-search",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-search.php",
+        "query": {
+          "u": "{{username}}",
+          "h": "{{password_md5}}",
+          "q": "{{search_query}}",
+          "m": "0",
+          "r": "4",
+          "p": "0"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": [".osz|"],
+        "expect_text_not_contains": ["error", "not found", "no exist"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "direct-set",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-search-set.php",
+        "query": {
+          "u": "{{username}}",
+          "h": "{{password_md5}}",
+          "b": "{{beatmap_id}}"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": [".osz|", "|10.0|", "|0|0|0|0|0"],
+        "expect_text_not_contains": ["error", "not found", "no exist", "-1|false"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "replay",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getreplay.php",
+        "query": {
+          "u": "{{username}}",
+          "h": "{{password_md5}}",
+          "m": "0",
+          "c": "{{score_id}}"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "leaderboard",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-osz2-getscores.php",
+        "query": {
+          "s": "0",
+          "vv": "4",
+          "v": "1",
+          "c": "{{beatmap_md5}}",
+          "f": "{{beatmap_filename}}",
+          "m": "0",
+          "i": "{{beatmap_id}}",
+          "mods": "0",
+          "h": "",
+          "a": "0",
+          "us": "{{username}}",
+          "ha": "{{password_md5}}"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": ["|false|", "\n0\n"],
+        "expect_text_not_contains": ["error", "not found", "-1|false"],
+        "compare": { "content_type": false }
+      }
+    }
+  ]
+}

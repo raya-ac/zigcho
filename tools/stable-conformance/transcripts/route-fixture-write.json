@@ -1,0 +1,295 @@
+{
+  "schema": 1,
+  "id": "route-fixture-write",
+  "category": "legacy-web",
+  "description": "isolated-database legacy mutations; never point this transcript at production",
+  "mutates_state": true,
+  "requires": [
+    "username",
+    "password_md5",
+    "beatmap_id",
+    "beatmap_set_id",
+    "beatmap_md5",
+    "now_playing_b64",
+    "stable_token",
+    "user_id",
+    "score_multipart_body_b64",
+    "score_multipart_content_type",
+    "screenshot_multipart_body_b64",
+    "screenshot_multipart_content_type",
+    "direct_message_sender"
+  ],
+  "session_bindings": [
+    { "token": "stable_token", "user_id": "user_id" }
+  ],
+  "coverage": {
+    "client_packets": [],
+    "routes": [
+      "GET /web/osu-addfavourite.php",
+      "GET /web/osu-getfavourites.php",
+      "GET /web/lastfm.php",
+      "GET /web/osu-rate.php",
+      "POST /web/osu-screenshot.php",
+      "POST /web/osu-comment.php",
+      "GET /web/osu-markasread.php",
+      "GET /web/osu-getreplay.php",
+      "POST /web/osu-submit-modular-selector.php"
+    ]
+  },
+  "steps": [
+    {
+      "id": "favourite-before",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getfavourites.php",
+        "query": { "u": "{{username}}", "h": "{{password_md5}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_lines_exclude_variables": ["beatmap_set_id"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "add-favourite",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-addfavourite.php",
+        "query": { "u": "{{username}}", "h": "{{password_md5}}", "a": "{{beatmap_set_id}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_equals": "Added favourite!",
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "favourite-readback",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getfavourites.php",
+        "query": { "u": "{{username}}", "h": "{{password_md5}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_lines_include_variables": ["beatmap_set_id"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "now-playing",
+      "request": {
+        "method": "GET",
+        "path": "/web/lastfm.php",
+        "query": {
+          "b": "{{beatmap_id}}",
+          "c": "{{now_playing_b64}}",
+          "action": "np",
+          "us": "{{username}}",
+          "ha": "{{password_md5}}"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_equals": "-3",
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "rate",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-rate.php",
+        "query": { "u": "{{username}}", "p": "{{password_md5}}", "c": "{{beatmap_md5}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_equals": "ok",
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "rate-submit",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-rate.php",
+        "query": { "u": "{{username}}", "p": "{{password_md5}}", "c": "{{beatmap_md5}}", "v": "7" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": ["alreadyvoted\n"],
+        "expect_text_not_contains": ["auth fail", "no exist", "not ranked"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "rate-readback",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-rate.php",
+        "query": { "u": "{{username}}", "p": "{{password_md5}}", "c": "{{beatmap_md5}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": ["alreadyvoted\n"],
+        "expect_text_not_contains": ["auth fail", "no exist", "not ranked"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "screenshot",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-screenshot.php",
+        "headers": {
+          "User-Agent": "osu!",
+          "Content-Type": "{{screenshot_multipart_content_type}}"
+        },
+        "body": { "encoding": "base64", "value": "{{screenshot_multipart_body_b64}}" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "compare": { "content_type": false }
+      },
+      "normalizers": [
+        { "kind": "screenshot_filename", "path": "body" }
+      ]
+    },
+    {
+      "id": "comment",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-comment.php",
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "form",
+          "fields": {
+            "u": "{{username}}",
+            "p": "{{password_md5}}",
+            "b": "{{beatmap_id}}",
+            "s": "{{beatmap_set_id}}",
+            "r": "0",
+            "m": "0",
+            "a": "post",
+            "target": "song",
+            "starttime": 12500,
+            "comment": "stable conformance fixture"
+          }
+        }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_equals": "",
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "comment-readback",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-comment.php",
+        "headers": { "User-Agent": "osu!" },
+        "body": {
+          "encoding": "form",
+          "fields": {
+            "u": "{{username}}",
+            "p": "{{password_md5}}",
+            "b": "{{beatmap_id}}",
+            "s": "{{beatmap_set_id}}",
+            "r": "0",
+            "m": "0",
+            "a": "get"
+          }
+        }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_contains": ["\tsong\t", "stable conformance fixture"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "mark-read",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-markasread.php",
+        "query": {
+          "u": "{{username}}",
+          "h": "{{password_md5}}",
+          "channel": "{{direct_message_sender}}"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_text_equals": "",
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "submit-score",
+      "request": {
+        "method": "POST",
+        "path": "/web/osu-submit-modular-selector.php",
+        "headers": {
+          "User-Agent": "osu!",
+          "Content-Type": "{{score_multipart_content_type}}",
+          "token": "{{stable_token}}"
+        },
+        "body": { "encoding": "base64", "value": "{{score_multipart_body_b64}}" }
+      },
+      "capture": [
+        { "from": "text_prefix", "prefix": "onlineScoreId:", "as": "submitted_score_id", "type": "int", "secret": false }
+      ],
+      "response": {
+        "format": "text",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "expect_text_contains": ["beatmapId:", "chartId:beatmap", "chartId:overall", "onlineScoreId:"],
+        "expect_text_not_contains": ["error: no", "error: beatmap"],
+        "compare": { "content_type": false }
+      }
+    },
+    {
+      "id": "submitted-replay-readback",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getreplay.php",
+        "query": {
+          "u": "{{username}}",
+          "h": "{{password_md5}}",
+          "m": "0",
+          "c": "{{submitted_score_id}}"
+        },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": 200,
+        "expect_nonempty": true,
+        "compare": { "content_type": false }
+      }
+    }
+  ]
+}

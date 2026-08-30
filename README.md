@@ -46,6 +46,6 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 - `deploy/` and `tools/` — production and acceptance work
 - `updates/` — the release history
 
-protocol work is checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho documentation](https://osu.ppy.sh/wiki/en/Bancho_%28server%29) and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation.
+protocol work is checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho documentation](https://osu.ppy.sh/wiki/en/Bancho_%28server%29) and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation. the [Stable conformance harness](tools/stable-conformance/README.md) inventories the whole legacy surface and can replay the same stateful transcript against both servers.
 
 this is unofficial. osu! belongs to ppy Pty Ltd; zigcho is not affiliated with or endorsed by them.

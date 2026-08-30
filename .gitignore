@@ -7,6 +7,8 @@
 /artifacts/
 /pp/target/
 /config.ini
+/tools/stable-conformance/config.json
+/tools/stable-conformance/reports/
 .DS_Store
 __pycache__/
 *.pyc

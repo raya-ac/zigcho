@@ -1,0 +1,304 @@
+{
+  "schema": 1,
+  "id": "packet-spectator",
+  "category": "stable-packets",
+  "description": "two-session Stable spectator attach, frame relay, failure notice and detach lifecycle",
+  "contract_sources": {
+    "zigcho": ["src/protocol.zig", "src/bancho.zig"],
+    "bancho_py": {
+      "repository": "https://github.com/osuAkatsuki/bancho.py",
+      "commit": "0651b54c66daa839c1bb3998e4f9a8d1173e144d",
+      "handlers": "app/api/domains/cho.py",
+      "codec": "app/packets.py"
+    }
+  },
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "this case changes live spectator membership and sends a synthetic replay frame bundle"
+  },
+  "fixture_contract": [
+    "host and spectator are unrestricted, unsilenced Stable sessions with clean response queues",
+    "host and spectator user ids represent the same logical fixture on both targets",
+    "host user id is supplied as a positive JSON integer, not a numeric string",
+    "spectator is not watching another user and host is not spectating anyone",
+    "each spectator or host action is followed by an empty poll on that actor before another session is observed",
+    "no unrelated users may join or leave the host spectator channel while the case runs"
+  ],
+  "requires": [
+    "stable_host_token",
+    "stable_host_user_id",
+    "stable_spectator_token",
+    "stable_spectator_user_id"
+  ],
+  "session_bindings": [
+    { "token": "stable_host_token", "user_id": "stable_host_user_id" },
+    { "token": "stable_spectator_token", "user_id": "stable_spectator_user_id" }
+  ],
+  "coverage": {
+    "client_packets": [16, 17, 18, 21],
+    "routes": []
+  },
+  "behavior_assertions": [
+    { "kind": "recipient-poll", "client_packets": [16], "request_steps": ["start-spectating"], "steps": ["host-observes-spectator-join"] },
+    { "kind": "recipient-poll", "client_packets": [18], "request_steps": ["relay-valid-frame-bundle"], "steps": ["spectator-observes-frame-bundle"] },
+    { "kind": "recipient-poll", "client_packets": [21], "request_steps": ["cant-spectate"], "steps": ["host-observes-cant-spectate"] },
+    { "kind": "recipient-poll", "client_packets": [17], "request_steps": ["stop-spectating"], "steps": ["host-observes-spectator-leave"] }
+  ],
+  "response_groups": [
+    { "id": "spectator-start-actor-unit", "steps": ["start-spectating", "spectator-drains-after-start"] },
+    { "id": "spectator-frame-host-unit", "steps": ["relay-valid-frame-bundle", "host-drains-after-frame-relay"] },
+    { "id": "spectator-cant-actor-unit", "steps": ["cant-spectate", "spectator-drains-after-cant"] },
+    { "id": "spectator-stop-actor-unit", "steps": ["stop-spectating", "spectator-drains-after-stop"] }
+  ],
+  "steps": [
+    {
+      "id": "start-spectating",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_spectator_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 16,
+              "payload": { "encoding": "integer", "format": "i32le", "value": "{{stable_host_user_id}}" }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "spectator-drains-after-start",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_spectator_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "host-observes-spectator-join",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_host_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [13],
+        "forbid_packet_ids": [24, 86],
+        "packet_fields": [
+          { "packet_id": 13, "path": "payload.user_id", "variable": "stable_spectator_user_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "relay-valid-frame-bundle",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_host_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 18,
+              "payload": {
+                "encoding": "concat",
+                "parts": [
+                  { "encoding": "integer", "format": "i32le", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 1 },
+                  { "encoding": "hex", "value": "00000000804300004043e8030000" },
+                  { "encoding": "integer", "format": "u8", "value": 0 },
+                  { "encoding": "integer", "format": "i32le", "value": 1000 },
+                  { "encoding": "integer", "format": "u8", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 1 },
+                  { "encoding": "integer", "format": "u16le", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 0 },
+                  { "encoding": "integer", "format": "i32le", "value": 300 },
+                  { "encoding": "integer", "format": "u16le", "value": 1 },
+                  { "encoding": "integer", "format": "u16le", "value": 1 },
+                  { "encoding": "integer", "format": "u8", "value": 1 },
+                  { "encoding": "integer", "format": "u8", "value": 255 },
+                  { "encoding": "integer", "format": "u8", "value": 0 },
+                  { "encoding": "integer", "format": "u8", "value": 0 },
+                  { "encoding": "integer", "format": "u16le", "value": 1 }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "host-drains-after-frame-relay",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_host_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "spectator-observes-frame-bundle",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_spectator_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [15],
+        "forbid_packet_ids": [24, 86],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "cant-spectate",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_spectator_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            { "id": 21 }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "spectator-drains-after-cant",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_spectator_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "host-observes-cant-spectate",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_host_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [22],
+        "forbid_packet_ids": [24, 86],
+        "packet_fields": [
+          { "packet_id": 22, "path": "payload.user_id", "variable": "stable_spectator_user_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "stop-spectating",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_spectator_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            { "id": 17 }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "spectator-drains-after-stop",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_spectator_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "host-observes-spectator-leave",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_host_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [14],
+        "forbid_packet_ids": [24, 86],
+        "packet_fields": [
+          { "packet_id": 14, "path": "payload.user_id", "variable": "stable_spectator_user_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    }
+  ]
+}

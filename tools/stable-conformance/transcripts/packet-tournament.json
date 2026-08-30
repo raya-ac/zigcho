@@ -1,0 +1,184 @@
+{
+  "schema": 1,
+  "id": "packet-tournament",
+  "category": "stable-packets",
+  "description": "Stable tournament observer reads and joins then leaves one live match channel",
+  "contract_sources": {
+    "zigcho": ["src/protocol.zig", "src/bancho.zig", "src/multiplayer.zig"],
+    "bancho_py": {
+      "repository": "https://github.com/osuAkatsuki/bancho.py",
+      "commit": "0651b54c66daa839c1bb3998e4f9a8d1173e144d",
+      "handlers": "app/api/domains/cho.py",
+      "codec": "app/packets.py"
+    }
+  },
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "this case changes live tournament channel membership"
+  },
+  "fixture_contract": [
+    "observer is an unrestricted Stable session with the target server's tournament or supporter privilege",
+    "the configured match id exists on both targets and describes the same logical match",
+    "match id is supplied as a JSON integer between zero and 63",
+    "observer is not a player or existing tournament observer in that match",
+    "observer response queue is drained immediately before the case and after every action"
+  ],
+  "blockers": [
+    "a live in-memory match cannot be seeded through the transcript format itself",
+    "Zigcho and bancho.py must be provisioned with equivalent tournament privilege mappings before differential replay"
+  ],
+  "requires": [
+    "stable_tournament_token",
+    "stable_tournament_user_id",
+    "stable_tournament_match_id"
+  ],
+  "session_bindings": [
+    { "token": "stable_tournament_token", "user_id": "stable_tournament_user_id" }
+  ],
+  "coverage": {
+    "client_packets": [93, 108, 109],
+    "routes": []
+  },
+  "behavior_assertions": [
+    { "kind": "immediate-response", "client_packets": [93], "request_steps": ["match-info"], "steps": ["match-info"] },
+    { "kind": "immediate-response", "client_packets": [108], "request_steps": ["join-match-channel"], "steps": ["join-match-channel"] },
+    { "kind": "immediate-response", "client_packets": [109], "request_steps": ["leave-match-channel"], "steps": ["leave-match-channel"] }
+  ],
+  "response_groups": [
+    { "id": "tournament-info-actor-unit", "steps": ["match-info", "observer-drains-after-match-info"] },
+    { "id": "tournament-join-actor-unit", "steps": ["join-match-channel", "observer-drains-after-channel-join"] },
+    { "id": "tournament-leave-actor-unit", "steps": ["leave-match-channel", "observer-drains-after-channel-leave"] }
+  ],
+  "steps": [
+    {
+      "id": "match-info",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_tournament_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 93,
+              "payload": { "encoding": "integer", "format": "i32le", "value": "{{stable_tournament_match_id}}" }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [26],
+        "forbid_packet_ids": [24, 86],
+        "packet_fields": [
+          { "packet_id": 26, "path": "payload.match_id", "variable": "stable_tournament_match_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "observer-drains-after-match-info",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_tournament_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "join-match-channel",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_tournament_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 108,
+              "payload": { "encoding": "integer", "format": "i32le", "value": "{{stable_tournament_match_id}}" }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [64, 65],
+        "forbid_packet_ids": [24, 86],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "observer-drains-after-channel-join",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_tournament_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "leave-match-channel",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": {
+          "User-Agent": "osu!",
+          "osu-token": "{{stable_tournament_token}}"
+        },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 109,
+              "payload": { "encoding": "integer", "format": "i32le", "value": "{{stable_tournament_match_id}}" }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "require_packet_ids": [66],
+        "forbid_packet_ids": [24, 86],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "observer-drains-after-channel-leave",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_tournament_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    }
+  ]
+}

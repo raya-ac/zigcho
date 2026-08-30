@@ -1,0 +1,21 @@
+{
+  "packet_inventory": {
+    "enum": "ClientPacket",
+    "enum_source": "src/protocol.zig",
+    "handler_function": "pollLocked",
+    "handler_source": "src/bancho.zig"
+  },
+  "packets": [
+    { "area": "session", "classification": "handled", "id": 4, "name": "ping" },
+    { "area": "compatibility", "classification": "ignored_compat", "id": 68, "name": "beatmap_info_request" },
+    { "area": "session", "classification": "handled", "id": 2, "name": "logout" }
+  ],
+  "route_inventory": {
+    "source_globs": ["src/server/routes/*.zig"]
+  },
+  "routes": [
+    { "area": "system", "classification": "implemented", "methods": ["ANY"], "path": "/web/bancho_connect.php", "source": "src/server/routes/stable.zig" },
+    { "area": "scores", "classification": "implemented", "methods": ["POST"], "path": "/web/osu-submit-modular-selector.php", "source": "src/server/routes/stable.zig" }
+  ],
+  "schema_version": 1
+}

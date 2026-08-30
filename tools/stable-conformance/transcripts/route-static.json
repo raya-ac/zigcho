@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "id": "route-static",
+  "category": "legacy-web",
+  "mutates_state": false,
+  "description": "legacy routes whose result does not require a seeded player or mutate state",
+  "fixture_contract": [
+    "the pinned reference is started with SEASONAL_BGS=[] so its configured seasonal JSON exactly matches Zigcho's empty seasonal list"
+  ],
+  "coverage": {
+    "client_packets": [],
+    "routes": [
+      "ANY /web/bancho_connect.php",
+      "ANY /web/check-updates.php",
+      "GET /web/osu-getseasonal.php"
+    ]
+  },
+  "steps": [
+    {
+      "id": "bancho-connect",
+      "request": {
+        "method": "GET",
+        "path": "/web/bancho_connect.php",
+        "query": { "v": "{{client_version}}" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "check-updates",
+      "request": {
+        "method": "GET",
+        "path": "/web/check-updates.php",
+        "query": { "action": "check", "stream": "stable", "time": "0" },
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "binary",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "seasonal",
+      "request": {
+        "method": "GET",
+        "path": "/web/osu-getseasonal.php",
+        "headers": { "User-Agent": "osu!" }
+      },
+      "response": {
+        "format": "json",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    }
+  ]
+}

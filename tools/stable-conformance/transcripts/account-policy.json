@@ -1,0 +1,585 @@
+{
+  "schema": 1,
+  "id": "account-policy",
+  "category": "policy-matrix",
+  "description": "restricted packet dispatch and silenced chat behavior, including Zigcho's intentional visible silence feedback",
+  "mutates_state": true,
+  "safety": {
+    "production_allowed": false,
+    "reason": "this case changes presence filters and session activity and attempts blocked chat and channel operations"
+  },
+  "fixture_contract": [
+    "restricted and silenced are separate active Stable fixture sessions with empty response queues",
+    "the restricted account is not a member of the configured #osu or #announce channel before the case",
+    "the unrestricted restricted-message observer is already in that channel with an empty response queue",
+    "the configured #osu or #announce channel exists with unrestricted read permission on both targets, so the restricted account cannot read or join it",
+    "the silenced account is already joined to its public channel and has at least sixty seconds left on its silence",
+    "the silenced peer is online, joined to that public channel and has an empty response queue before each probe",
+    "all fixture ids, usernames, stats and channel visibility match across targets"
+  ],
+  "requires": [
+    "stable_restricted_token",
+    "stable_restricted_user_id",
+    "stable_restricted_observer_token",
+    "stable_restricted_observer_user_id",
+    "stable_restricted_channel",
+    "stable_silenced_token",
+    "stable_silenced_user_id",
+    "stable_silenced_username",
+    "stable_silenced_public_channel",
+    "stable_silenced_peer_username",
+    "stable_silenced_peer_token",
+    "stable_silenced_peer_user_id"
+  ],
+  "session_bindings": [
+    { "token": "stable_restricted_token", "user_id": "stable_restricted_user_id" },
+    { "token": "stable_restricted_observer_token", "user_id": "stable_restricted_observer_user_id" },
+    { "token": "stable_silenced_token", "user_id": "stable_silenced_user_id" },
+    { "token": "stable_silenced_peer_token", "user_id": "stable_silenced_peer_user_id" }
+  ],
+  "coverage": {
+    "client_packets": [1, 3, 4, 16, 25, 30, 63, 78, 79, 85],
+    "routes": []
+  },
+  "behavior_assertions": [
+    {
+      "kind": "immediate-response",
+      "client_packets": [4],
+      "request_steps": ["restricted-ping"],
+      "steps": ["restricted-ping"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [3],
+      "request_steps": ["restricted-request-status"],
+      "steps": ["restricted-request-status"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [79],
+      "request_steps": ["restricted-set-presence-filter"],
+      "steps": ["restricted-set-presence-filter"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [85],
+      "request_steps": ["restricted-request-observer-stats"],
+      "steps": ["restricted-request-observer-stats"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [1],
+      "request_steps": ["restricted-public-message"],
+      "steps": ["restricted-public-message"]
+    },
+    {
+      "kind": "recipient-poll",
+      "client_packets": [1],
+      "request_steps": ["restricted-public-message"],
+      "steps": ["restricted-observer-confirms-no-message"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [16],
+      "request_steps": ["restricted-start-spectating"],
+      "steps": ["restricted-start-spectating"]
+    },
+    {
+      "kind": "recipient-poll",
+      "client_packets": [16],
+      "request_steps": ["restricted-start-spectating"],
+      "steps": ["silenced-confirms-no-restricted-spectator"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [30],
+      "request_steps": ["restricted-join-lobby"],
+      "steps": ["restricted-join-lobby"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [63],
+      "request_steps": ["restricted-channel-join"],
+      "steps": ["restricted-channel-join"]
+    },
+    {
+      "kind": "recipient-poll",
+      "client_packets": [63],
+      "request_steps": ["restricted-channel-join"],
+      "steps": ["restricted-observer-drains-channel-join"]
+    },
+    {
+      "kind": "immediate-response",
+      "client_packets": [78],
+      "request_steps": ["restricted-channel-part"],
+      "steps": ["restricted-channel-part"]
+    },
+    {
+      "kind": "recipient-poll",
+      "client_packets": [78],
+      "request_steps": ["restricted-channel-part"],
+      "steps": ["restricted-observer-drains-channel-part"]
+    },
+    {
+      "kind": "policy-matrix",
+      "policy_id": "silenced-chat-feedback",
+      "client_packets": [1],
+      "request_steps": ["silenced-public-message"],
+      "steps": ["silenced-public-message"]
+    },
+    {
+      "kind": "recipient-poll",
+      "client_packets": [1],
+      "request_steps": ["silenced-public-message"],
+      "steps": ["silenced-peer-observes-no-public-message"]
+    },
+    {
+      "kind": "policy-matrix",
+      "policy_id": "silenced-chat-feedback",
+      "client_packets": [25],
+      "request_steps": ["silenced-private-message"],
+      "steps": ["silenced-private-message"]
+    },
+    {
+      "kind": "recipient-poll",
+      "client_packets": [25],
+      "request_steps": ["silenced-private-message"],
+      "steps": ["silenced-peer-observes-no-private-message"]
+    }
+  ],
+  "policy_assertions": [
+    { "observer_kind": "none", "policy_id": "silenced-chat-feedback", "trigger_step": "silenced-public-message", "steps": ["silenced-public-message"] },
+    { "observer_kind": "none", "policy_id": "silenced-chat-feedback", "trigger_step": "silenced-private-message", "steps": ["silenced-private-message"] }
+  ],
+  "steps": [
+    {
+      "id": "precondition-drain-restricted",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "precondition-drain-restricted-observer",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_observer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "precondition-drain-silenced",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "precondition-drain-silenced-peer",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_peer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-ping",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [{ "id": 4 }] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-request-status",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [{ "id": 3 }] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [11],
+        "packet_fields": [
+          { "packet_id": 11, "path": "payload.user_id", "variable": "stable_restricted_user_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "normalizers": [
+        { "kind": "variable", "path": "body.packets.0.payload.user_id", "variable": "stable_restricted_user_id" }
+      ]
+    },
+    {
+      "id": "restricted-set-presence-filter",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [{ "id": 79, "payload": { "encoding": "integer", "format": "i32le", "value": 0 } }]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-request-observer-stats",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 85,
+              "payload": {
+                "encoding": "concat",
+                "parts": [
+                  { "encoding": "integer", "format": "u16le", "value": 1 },
+                  { "encoding": "integer", "format": "i32le", "value": "{{stable_restricted_observer_user_id}}" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [11],
+        "packet_fields": [
+          { "packet_id": 11, "path": "payload.user_id", "variable": "stable_restricted_observer_user_id" }
+        ],
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "normalizers": [
+        { "kind": "variable", "path": "body.packets.0.payload.user_id", "variable": "stable_restricted_observer_user_id" }
+      ]
+    },
+    {
+      "id": "restricted-public-message",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 1,
+              "payload": {
+                "encoding": "concat",
+                "parts": [
+                  { "encoding": "osu_string", "value": "restricted" },
+                  { "encoding": "osu_string", "value": "must not send" },
+                  { "encoding": "osu_string", "value": "{{stable_restricted_channel}}" },
+                  { "encoding": "integer", "format": "i32le", "value": "{{stable_restricted_user_id}}" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-observer-confirms-no-message",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_observer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-start-spectating",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            { "id": 16, "payload": { "encoding": "integer", "format": "i32le", "value": "{{stable_silenced_user_id}}" } }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "silenced-confirms-no-restricted-spectator",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-join-lobby",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [{ "id": 30 }] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-channel-join",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [{ "id": 63, "payload": { "encoding": "osu_string", "value": "{{stable_restricted_channel}}" } }]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-observer-drains-channel-join",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_observer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-channel-part",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [{ "id": 78, "payload": { "encoding": "osu_string", "value": "{{stable_restricted_channel}}" } }]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "restricted-observer-drains-channel-part",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_restricted_observer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "silenced-public-message",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 1,
+              "payload": {
+                "encoding": "concat",
+                "parts": [
+                  { "encoding": "osu_string", "value": "{{stable_silenced_username}}" },
+                  { "encoding": "osu_string", "value": "silenced public message" },
+                  { "encoding": "osu_string", "value": "{{stable_silenced_public_channel}}" },
+                  { "encoding": "integer", "format": "i32le", "value": "{{stable_silenced_user_id}}" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "silenced-chat-feedback",
+        "compare_after_removing": { "zigcho": [92], "reference": [] },
+        "targets": {
+          "zigcho": {
+            "status": 200,
+            "packet_ids": [92],
+            "packet_fields": [
+              { "packet_id": 92, "path": "payload.seconds", "predicate": "positive" }
+            ]
+          },
+          "reference": { "status": 200, "packet_ids": [] }
+        }
+      }
+    },
+    {
+      "id": "silenced-peer-observes-no-public-message",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_peer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    },
+    {
+      "id": "silenced-private-message",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_token}}" },
+        "body": {
+          "encoding": "packet_stream",
+          "packets": [
+            {
+              "id": 25,
+              "payload": {
+                "encoding": "concat",
+                "parts": [
+                  { "encoding": "osu_string", "value": "{{stable_silenced_username}}" },
+                  { "encoding": "osu_string", "value": "silenced private message" },
+                  { "encoding": "osu_string", "value": "{{stable_silenced_peer_username}}" },
+                  { "encoding": "integer", "format": "i32le", "value": "{{stable_silenced_user_id}}" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "compare": { "status": true, "content_type": false, "body": true }
+      },
+      "policy_matrix": {
+        "id": "silenced-chat-feedback",
+        "compare_after_removing": { "zigcho": [92], "reference": [] },
+        "targets": {
+          "zigcho": {
+            "status": 200,
+            "packet_ids": [92],
+            "packet_fields": [
+              { "packet_id": 92, "path": "payload.seconds", "predicate": "positive" }
+            ]
+          },
+          "reference": { "status": 200, "packet_ids": [] }
+        }
+      }
+    },
+    {
+      "id": "silenced-peer-observes-no-private-message",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "headers": { "User-Agent": "osu!", "osu-token": "{{stable_silenced_peer_token}}" },
+        "body": { "encoding": "packet_stream", "packets": [] }
+      },
+      "response": {
+        "format": "bancho_packets",
+        "expect_status": 200,
+        "expect_packet_ids": [],
+        "compare": { "status": true, "content_type": false, "body": true }
+      }
+    }
+  ]
+}

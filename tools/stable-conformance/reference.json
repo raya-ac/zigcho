@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "reference": {
+    "repository": "osuAkatsuki/bancho.py",
+    "url": "https://github.com/osuAkatsuki/bancho.py",
+    "branch": "master",
+    "branch_protected": true,
+    "commit": "0651b54c66daa839c1bb3998e4f9a8d1173e144d",
+    "commit_date": "2026-07-17T11:09:27Z",
+    "project_version": "5.3.0",
+    "verified_at": "2026-08-30"
+  },
+  "surface": {
+    "registered_client_packets": 46,
+    "legacy_php_routes": 17,
+    "matching_registered_packet_ids": 46,
+    "matching_legacy_php_routes": 17
+  },
+  "compatibility_noops": [
+    {
+      "id": 68,
+      "name": "beatmap_info_request",
+      "reference": "enumerated without a registered handler",
+      "zigcho": "enumerated without a dispatch case"
+    },
+    {
+      "id": 84,
+      "name": "irc_only",
+      "reference": "enumerated without a registered handler",
+      "zigcho": "enumerated without a dispatch case"
+    }
+  ],
+  "declared_policy_differences": [
+    {
+      "id": "stable-login-bootstrap",
+      "scope": "successful Stable login bootstrap packet ordering and server-branded packets",
+      "packet_ids": [],
+      "reference": "includes its welcome notification, menu icon and configured channel ordering",
+      "zigcho": "returns Zigcho's own channels and omits bancho.py branding",
+      "reason": "the client contract requires a coherent bootstrap, not another server's branding; critical protocol, identity, privileges, presence, stats, channel-end and friends packets stay pinned per target"
+    },
+    {
+      "id": "malformed-input-hardening",
+      "scope": "malformed Stable login and packet framing",
+      "packet_ids": [63],
+      "reference": "lets parser exceptions escape as HTTP 500 and accepts the oversized zero-payload ping declaration",
+      "zigcho": "rejects the same malformed cases without an internal-server response",
+      "reason": "safe rejection is intentional and more compatible with a bounded public protocol surface than reproducing reference crashes"
+    },
+    {
+      "id": "immediate-reconnect-takeover",
+      "scope": "a second Stable login less than ten seconds after an active poll",
+      "packet_ids": [],
+      "reference": "rejects the second login and keeps the first session",
+      "zigcho": "atomically replaces the first session and returns a new owned token",
+      "reason": "Zigcho enforces one cross-client session through explicit takeover instead of waiting for idle expiry"
+    },
+    {
+      "id": "silenced-chat-feedback",
+      "scope": "silenced Stable chat attempts",
+      "packet_ids": [1, 25],
+      "reference": "drops the message without a response packet",
+      "zigcho": "returns silence_end with the remaining duration",
+      "reason": "Zigcho gives the client an immediate visible silence timer"
+    },
+    {
+      "id": "stable-lobby-channel-lifecycle",
+      "scope": "entering and leaving the Stable multiplayer lobby",
+      "packet_ids": [29, 30],
+      "reference": "tracks lobby visibility and match listings without opening a channel",
+      "zigcho": "also opens and closes #lobby so the client has the requested visible lobby channel",
+      "reason": "Zigcho deliberately exposes #lobby while preserving the reference match-list lifecycle"
+    },
+    {
+      "id": "presence-request-all-reference-routing",
+      "scope": "Stable packet 98 requesting the visible presence bundle",
+      "packet_ids": [98],
+      "source_attestation": "reference-presence-request-all-shadowed-set-routing",
+      "reference": "iterates a set of unrestricted players, shadows the requester variable and enqueues the bundle onto the nondeterministic final member; the requester's live response body cannot prove which member received it",
+      "zigcho": "returns the presence bundle to the requesting session",
+      "reason": "complete mode statically attests the exact pinned reference defect, then runtime validates Zigcho's complete requester bundle without pretending the reference recipient is deterministic"
+    }
+  ]
+}

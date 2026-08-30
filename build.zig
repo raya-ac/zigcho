@@ -172,6 +172,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const anticheat_smoke = b.addExecutable(.{ .name = "zigcho-anticheat-host-smoke", .root_module = anticheat_smoke_mod });
+    b.installArtifact(anticheat_smoke);
     const run_anticheat_smoke = b.addRunArtifact(anticheat_smoke);
     if (b.args) |args| run_anticheat_smoke.addArgs(args);
     b.step("anticheat-smoke", "Load and exercise a private anticheat module").dependOn(&run_anticheat_smoke.step);

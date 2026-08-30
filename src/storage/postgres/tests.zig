@@ -264,7 +264,7 @@ test "postgres concurrent first score submissions keep one best row per scope" {
     try postgres.exec(lease.conn, "DELETE FROM zigcho.lazer_scores WHERE user_id IN(SELECT id FROM zigcho.users WHERE safe_name='best_race_pg'); DELETE FROM zigcho.scores WHERE user_id IN(SELECT id FROM zigcho.users WHERE safe_name='best_race_pg'); DELETE FROM zigcho.users WHERE safe_name='best_race_pg'; DELETE FROM zigcho.beatmaps WHERE id=2000000460");
 }
 
-test "postgres runtime migrates through stable score grace schema forty seven" {
+test "postgres runtime migrates through stable score grace schema forty eight" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_MIGRATE_URL") orelse return error.SkipZigTest;
     {
         var old_store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -273,7 +273,7 @@ test "postgres runtime migrates through stable score grace schema forty seven" {
         var previous = old_store.pool.acquire();
         defer previous.release();
         try postgres.exec(previous.conn, "DROP TABLE zigcho.stable_score_sessions; DROP TABLE zigcho.server_controls; DROP TABLE IF EXISTS zigcho.score_replay_views; DROP TABLE zigcho.user_stats_history; DROP TABLE zigcho.lazer_ranked_matches; DROP TABLE zigcho.lazer_ranked_ratings; DROP TABLE zigcho.lazer_multiplayer_room_history; DROP TABLE zigcho.beatmapset_metadata; DROP TABLE zigcho.upstream_user_profiles; ALTER TABLE zigcho.beatmaps DROP COLUMN creator_id,DROP COLUMN upstream_plays,DROP COLUMN upstream_passes,DROP COLUMN hit_length; DROP TABLE zigcho.upstream_users; DROP TABLE zigcho.beatmap_submission_maps; DROP TABLE zigcho.beatmap_submissions; DROP TABLE zigcho.bss_counters; DROP TABLE zigcho.profile_score_pins; DROP TABLE zigcho.beatmap_tag_votes; DROP TABLE zigcho.lazer_reports; DROP TABLE zigcho.replay_objects; DROP TABLE zigcho.lazer_presence; DROP TABLE zigcho.team_assets; DROP TABLE zigcho.team_applications; DROP TABLE zigcho.team_members; DROP TABLE zigcho.teams; DROP TABLE zigcho.user_banners; DROP TABLE zigcho.user_name_changes; ALTER TABLE zigcho.users DROP COLUMN username_changes,DROP COLUMN username_changed_at; DROP TABLE zigcho.lazer_comment_reports; DROP TABLE zigcho.lazer_comment_votes; DROP TABLE zigcho.lazer_comments");
-        try postgres.exec(previous.conn, "DROP INDEX zigcho.scores_one_best_per_scope; DROP INDEX zigcho.lazer_scores_one_best_per_scope; DROP TABLE zigcho.maintenance_markers; ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP CONSTRAINT lazer_scores_legacy_total_score_range; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating,DROP COLUMN total_score_without_mods; ALTER TABLE zigcho.lazer_scores ALTER COLUMN legacy_total_score TYPE bigint USING legacy_total_score::bigint; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; ALTER TABLE zigcho.direct_messages DROP COLUMN chat_message_id; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
+        try postgres.exec(previous.conn, "DROP INDEX zigcho.scores_one_best_per_scope; DROP INDEX zigcho.lazer_scores_one_best_per_scope; DROP TABLE zigcho.maintenance_markers; ALTER TABLE zigcho.scores DROP COLUMN star_rating; ALTER TABLE zigcho.lazer_scores DROP CONSTRAINT lazer_scores_legacy_total_score_range; ALTER TABLE zigcho.lazer_scores DROP COLUMN star_rating,DROP COLUMN total_score_without_mods; ALTER TABLE zigcho.lazer_scores ALTER COLUMN legacy_total_score TYPE bigint USING legacy_total_score::bigint; ALTER TABLE zigcho.beatmap_archives DROP COLUMN object_bytes; DROP TABLE zigcho.user_achievements; ALTER TABLE zigcho.direct_messages DROP COLUMN chat_message_id; DROP INDEX zigcho.direct_messages_sender_uuid; ALTER TABLE zigcho.direct_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.user_blocks; DROP TABLE zigcho.lazer_channel_reads; DROP INDEX zigcho.chat_messages_sender_uuid; ALTER TABLE zigcho.chat_messages DROP COLUMN is_action,DROP COLUMN client_uuid; DROP TABLE zigcho.anticheat_replay_fingerprints; DROP TABLE zigcho.anticheat_observations; DROP TABLE zigcho.anticheat_review_exclusions; DROP TABLE zigcho.user_avatars; ALTER TABLE zigcho.users DROP COLUMN bio,DROP COLUMN preferred_mode,DROP COLUMN profile_source,DROP COLUMN profile_title,DROP COLUMN profile_pronouns,DROP COLUMN profile_location,DROP COLUMN profile_website,DROP COLUMN profile_accent,DROP COLUMN show_country,DROP COLUMN show_profile_stats,DROP COLUMN show_recent_scores; DROP INDEX zigcho.lazer_scores_user_best; DROP TABLE zigcho.lazer_score_tokens; ALTER TABLE zigcho.lazer_scores DROP COLUMN rank,DROP COLUMN maximum_statistics_json,DROP COLUMN pauses_json,DROP COLUMN pp,DROP COLUMN best; TRUNCATE zigcho.schema_migrations; INSERT INTO zigcho.schema_migrations(version) VALUES(20)");
         try postgres.exec(previous.conn, "ALTER TABLE zigcho.beatmap_archives ALTER COLUMN osz_file SET NOT NULL; ALTER TABLE zigcho.beatmap_media ALTER COLUMN data SET NOT NULL");
         try postgres.exec(previous.conn, "DELETE FROM zigcho.lazer_scores WHERE id=2147483000; DELETE FROM zigcho.beatmaps WHERE id=2147483000; DELETE FROM zigcho.users WHERE id=2147483000; INSERT INTO zigcho.users(id,name,safe_name,password_hash,password_salt) VALUES(2147483000,'schema43 migration','schema43_migration',decode('00','hex'),decode('00','hex')); INSERT INTO zigcho.stats(user_id,mode,ranked_score,total_score,pp,plays,play_time,total_hits,accuracy,max_combo) VALUES(2147483000,0,999999,999999,999999,999,999,999,0.01,999); INSERT INTO zigcho.beatmaps(id,set_id,md5,artist,title,version,creator,status) VALUES(2147483000,2147483000,'fffffffffffffffffffffffffffffff0','artist','title','diff','mapper',3); INSERT INTO zigcho.lazer_scores(id,user_id,beatmap_id,ruleset_id,total_score,legacy_total_score,accuracy,max_combo,passed,mods_json,statistics_json,rank_namespace) VALUES(2147483000,2147483000,2147483000,0,987654,900000,0.98,321,true,'[]'::jsonb,'{}'::jsonb,'vanilla')");
     }
@@ -316,6 +316,13 @@ test "postgres runtime migrates through stable score grace schema forty seven" {
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 28));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 29));
     try std.testing.expectEqual(@as(i32, 1), try result.int(i32, 0, 30));
+    var anticheat_exclusion_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.anticheat_review_exclusions') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='anticheat_observations' AND column_name='review_exclusion_id'),(to_regclass('zigcho.anticheat_observations_review_queue') IS NOT NULL)::int,(SELECT count(*) FROM information_schema.columns WHERE table_schema='zigcho' AND table_name='anticheat_replay_fingerprints' AND column_name='replay_content_sha256'),(to_regclass('zigcho.anticheat_replay_fingerprints_content') IS NOT NULL)::int");
+    defer anticheat_exclusion_schema.deinit();
+    try std.testing.expectEqual(@as(i32, 1), try anticheat_exclusion_schema.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i64, 1), try anticheat_exclusion_schema.int(i64, 0, 1));
+    try std.testing.expectEqual(@as(i32, 1), try anticheat_exclusion_schema.int(i32, 0, 2));
+    try std.testing.expectEqual(@as(i64, 1), try anticheat_exclusion_schema.int(i64, 0, 3));
+    try std.testing.expectEqual(@as(i32, 1), try anticheat_exclusion_schema.int(i32, 0, 4));
     var stable_score_session_schema = try postgres.query(lease.conn, "SELECT (to_regclass('zigcho.stable_score_sessions') IS NOT NULL)::int,(SELECT count(*) FROM pg_indexes WHERE schemaname='zigcho' AND indexname IN('stable_score_sessions_one_current','stable_score_sessions_user_grace'))");
     defer stable_score_session_schema.deinit();
     try std.testing.expectEqual(@as(i32, 1), try stable_score_session_schema.int(i32, 0, 0));
@@ -2225,6 +2232,96 @@ test "postgres developer role changes preserve unrelated bits and revoke final s
     defer std.testing.allocator.free(roles_json);
     try std.testing.expect(std.mem.indexOf(u8, roles_json, "\"key\":\"premium\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, roles_json, "permanent premium grant") != null);
+}
+
+test "postgres anticheat review exclusions preserve evidence and audit history" {
+    const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_STORE_URL") orelse return error.SkipZigTest;
+    var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
+    defer store.close();
+    try store.migrate();
+    const actor_id = try store.register("pg exclusion admin", "pg-exclusion-admin@example.test", "22222222222222222222222222222222");
+    const player_id = try store.register("pg excluded player", "pg-excluded-player@example.test", "33333333333333333333333333333333");
+    try std.testing.expectError(error.InvalidAnticheatExclusion, store.createAnticheatExclusion(actor_id, actor_id, .all, 3600, "self exclusion"));
+    try std.testing.expectError(error.InvalidAnticheatExclusion, store.createAnticheatExclusion(actor_id, player_id, .all, 3599, "too short"));
+    try std.testing.expectError(error.AnticheatExclusionForbidden, store.createAnticheatExclusion(actor_id, player_id, .stable_score, 3600, "ordinary player cannot suppress review"));
+    {
+        var actor_buf: [24]u8 = undefined;
+        const actor = try std.fmt.bufPrint(&actor_buf, "{d}", .{actor_id});
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var grant = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.users SET privileges=privileges|(1<<13) WHERE id=$1", &.{actor});
+        grant.deinit();
+    }
+
+    const exclusion_id = try store.createAnticheatExclusion(actor_id, player_id, .stable_score, postgres_store.anticheat_exclusion_max_seconds, "postgres score calibration account");
+    try std.testing.expectEqual(player_id, (try store.anticheatExclusionTarget(exclusion_id)).?);
+    try std.testing.expectError(error.AnticheatExclusionOverlap, store.createAnticheatExclusion(actor_id, player_id, .all, 86400, "overlap"));
+    const suppressed_id = try store.recordAnticheatObservation(player_id, .{
+        .source = .stable_score,
+        .module = "pg-exclusion-test",
+        .action = 1,
+        .reason = 7101,
+        .risk_score = 450,
+        .confidence_bps = 7200,
+        .evidence = 8,
+    });
+    _ = try store.recordAnticheatObservation(player_id, .{
+        .source = .stable_login,
+        .module = "pg-exclusion-test",
+        .action = 1,
+        .reason = 7102,
+        .risk_score = 350,
+        .confidence_bps = 6800,
+        .evidence = 1,
+    });
+    try store.revokeAnticheatExclusion(actor_id, exclusion_id, "postgres calibration complete");
+    const after_revoke_id = try store.recordAnticheatObservation(player_id, .{
+        .source = .stable_score,
+        .module = "pg-exclusion-test",
+        .action = 1,
+        .reason = 7101,
+        .risk_score = 450,
+        .confidence_bps = 7200,
+        .evidence = 8,
+    });
+    try std.testing.expect(after_revoke_id != suppressed_id);
+
+    const expired_id = try store.createAnticheatExclusion(actor_id, player_id, .stable_login, 3600, "postgres login calibration");
+    var buffers: [3][32]u8 = undefined;
+    const player = try std.fmt.bufPrint(&buffers[0], "{d}", .{player_id});
+    const expired = try std.fmt.bufPrint(&buffers[1], "{d}", .{expired_id});
+    const suppressed = try std.fmt.bufPrint(&buffers[2], "{d}", .{suppressed_id});
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var update = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.anticheat_review_exclusions SET created_at=1,expires_at=3601 WHERE id=$1", &.{expired});
+        update.deinit();
+    }
+    _ = try store.recordAnticheatObservation(player_id, .{
+        .source = .stable_login,
+        .module = "pg-exclusion-test",
+        .action = 1,
+        .reason = 7103,
+        .risk_score = 375,
+        .confidence_bps = 6900,
+        .evidence = 1,
+    });
+
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var state = try postgres.queryParams(std.testing.allocator, lease.conn, "SELECT count(*) FILTER(WHERE review_label='pending' AND review_exclusion_id IS NULL),count(*) FILTER(WHERE review_label='pending' AND review_exclusion_id IS NOT NULL),(SELECT review_exclusion_id FROM zigcho.anticheat_observations WHERE id=$2::bigint),(SELECT count(*) FROM zigcho.audit_log WHERE action IN('anticheat.review_exclusion.create','anticheat.review_exclusion.revoke') AND target='user:'||$1::text) FROM zigcho.anticheat_observations WHERE user_id=$1::integer", &.{ player, suppressed });
+        defer state.deinit();
+        try std.testing.expectEqual(@as(i64, 3), try state.int(i64, 0, 0));
+        try std.testing.expectEqual(@as(i64, 1), try state.int(i64, 0, 1));
+        try std.testing.expectEqual(exclusion_id, try state.int(i64, 0, 2));
+        try std.testing.expectEqual(@as(i64, 3), try state.int(i64, 0, 3));
+    }
+    const json = try store.staffAnticheatJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "postgres score calibration account") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"review_suppressed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "postgres calibration complete") != null);
 }
 
 test "postgres anticheat hardware and flags stay review only" {

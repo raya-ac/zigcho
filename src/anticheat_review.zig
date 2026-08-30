@@ -62,12 +62,14 @@ fn reasonInfo(code: u32) ?CodeInfo {
         abi.Reason.required_replay_missing => .{ .name = "required replay missing", .description = "a passed Stable score arrived without its required replay" },
         abi.Reason.combined_anomalies => .{ .name = "combined anomalies", .description = "multiple independent score or client signals were present together" },
         abi.Reason.invalid_replay_payload => .{ .name = "invalid replay payload", .description = "the Stable replay could not be decoded or validated safely" },
+        abi.Reason.replay_content_reused => .{ .name = "replay content reused", .description = "normalized replay content matched another account after volatile metadata was removed" },
         abi.Reason.timing_outlier => .{ .name = "timing outlier", .description = "score or replay timing was outside the ordinary shape" },
         abi.Reason.pp_outlier => .{ .name = "performance outlier", .description = "performance value was unusual for the supplied score evidence" },
         abi.Reason.multiaccount_cluster => .{ .name = "multiaccount cluster", .description = "normalized evidence links the account to a wider account cluster" },
         abi.Reason.rate_anomaly => .{ .name = "rate anomaly", .description = "the client reported a suspicious playback-rate condition" },
         abi.Reason.registry_remnant => .{ .name = "registry remnant", .description = "the Stable client reported a known registry remnant" },
         abi.Reason.duplicate_score => .{ .name = "duplicate score", .description = "the submitted score duplicates an existing score signal" },
+        abi.Reason.suspicious_frame_cadence => .{ .name = "suspicious frame cadence", .description = "a long replay used an unusually uniform single frame interval" },
         abi.Reason.relax_keyless_play => .{ .name = "keyless play pattern", .description = "the replay hit objects without the expected physical key input" },
         abi.Reason.relax_timing_lock => .{ .name = "timing lock pattern", .description = "replay hit timing is unusually exact and tightly grouped" },
         abi.Reason.relax_hold_lock => .{ .name = "hold lock pattern", .description = "key hold lengths and alternation are unusually consistent together" },
@@ -105,6 +107,8 @@ const evidence_bits = [_]BitInfo{
     .{ .mask = abi.Evidence.duplicate_score, .name = "duplicate score", .description = "score evidence duplicates another submission" },
     .{ .mask = abi.Evidence.checksum_mismatch, .name = "checksum mismatch", .description = "a submitted checksum signal did not match" },
     .{ .mask = abi.Evidence.rate_anomaly, .name = "rate anomaly", .description = "the client reported an unusual playback rate" },
+    .{ .mask = abi.Evidence.replay_content_reused, .name = "replay content reused", .description = "normalized replay content matched another account after volatile metadata was removed" },
+    .{ .mask = abi.Evidence.suspicious_frame_cadence, .name = "suspicious frame cadence", .description = "a long replay used an unusually uniform single frame interval" },
 };
 
 const decision_bits = [_]BitInfo{

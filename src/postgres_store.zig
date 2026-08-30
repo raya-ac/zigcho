@@ -28,10 +28,13 @@ const database_sql = @import("database_sql");
 pub const ClientHardware = sqlite_storage.ClientHardware;
 pub const HardwareEvidence = sqlite_storage.HardwareEvidence;
 pub const AnticheatSource = sqlite_storage.AnticheatSource;
+pub const AnticheatExclusionScope = sqlite_storage.AnticheatExclusionScope;
+pub const anticheat_exclusion_min_seconds = sqlite_storage.anticheat_exclusion_min_seconds;
+pub const anticheat_exclusion_max_seconds = sqlite_storage.anticheat_exclusion_max_seconds;
 pub const AnticheatReviewLabel = sqlite_storage.AnticheatReviewLabel;
 pub const AnticheatObservation = sqlite_storage.AnticheatObservation;
 pub const is_postgres = true;
-pub const schema_version: u16 = 47;
+pub const schema_version: u16 = 48;
 pub const StableScoreGraceResult = postgres_stable_sessions.GraceResult;
 pub const LazerCommentable = sqlite_storage.LazerCommentable;
 pub const LazerCommentTarget = sqlite_storage.LazerCommentTarget;
@@ -119,6 +122,15 @@ pub const Store = struct {
         return pg_accounts.register(self, name, email, password_md5);
     }
     const insertHardwareMatchAudit = pg_moderation.insertHardwareMatchAudit;
+    pub fn createAnticheatExclusion(self: *Store, actor_id: i32, user_id: i32, scope: AnticheatExclusionScope, duration_seconds: i64, reason: []const u8) !i64 {
+        return pg_moderation.createAnticheatExclusion(self, actor_id, user_id, scope, duration_seconds, reason);
+    }
+    pub fn anticheatExclusionTarget(self: *Store, exclusion_id: i64) !?i32 {
+        return pg_moderation.anticheatExclusionTarget(self, exclusion_id);
+    }
+    pub fn revokeAnticheatExclusion(self: *Store, actor_id: i32, exclusion_id: i64, reason: []const u8) !void {
+        return pg_moderation.revokeAnticheatExclusion(self, actor_id, exclusion_id, reason);
+    }
     pub fn recordAnticheatObservation(self: *Store, user_id: i32, observation: AnticheatObservation) !i64 {
         return pg_moderation.recordAnticheatObservation(self, user_id, observation);
     }
@@ -127,6 +139,12 @@ pub const Store = struct {
     }
     pub fn recordReplayFingerprint(self: *Store, user_id: i32, score_id: i64, digest: *const [32]u8) !void {
         return pg_moderation.recordReplayFingerprint(self, user_id, score_id, digest);
+    }
+    pub fn crossAccountReplayContentMatches(self: *Store, user_id: i32, map_md5: []const u8, mode: u8, digest: *const [32]u8) !u32 {
+        return pg_moderation.crossAccountReplayContentMatches(self, user_id, map_md5, mode, digest);
+    }
+    pub fn recordReplayContentFingerprint(self: *Store, user_id: i32, score_id: i64, digest: *const [32]u8) !void {
+        return pg_moderation.recordReplayContentFingerprint(self, user_id, score_id, digest);
     }
     pub fn recordClientHardware(self: *Store, user_id: i32, hardware: ClientHardware) !HardwareEvidence {
         return pg_moderation.recordClientHardware(self, user_id, hardware);

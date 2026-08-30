@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const latest_version = "2026.830.2";
+pub const latest_version = "2026.831.0";
 pub const max_updates: usize = 256;
 pub const max_build_id: i64 = @divFloor(std.math.maxInt(i64) - @as(i64, max_updates - 1), 100);
 
@@ -20,6 +20,9 @@ pub const Build = struct {
 };
 
 pub const fallback_builds = [_]Build{
+    .{ .id = 46, .version = "2026.831.0", .display_version = "zigcho release 2.0", .created_at = "2026-08-31T00:45:07+09:30", .updates = &.{
+        .{ .name = "2026-08-31-anticheat-review-and-replay-signals.md", .created_at = "2026-08-31T00:45:07+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-31-anticheat-review-and-replay-signals.md") },
+    } },
     .{ .id = 45, .version = "2026.830.2", .display_version = "zigcho release 1.9", .created_at = "2026-08-30T18:13:18+09:30", .updates = &.{
         .{ .name = "2026-08-30-lazer-multiplayer-leaves.md", .created_at = "2026-08-30T18:13:18+09:30", .commit = "3088e91fa830c0f7291792ad0af4e98fdcd211f7", .markdown = @embedFile("../updates/2026-08-30-lazer-multiplayer-leaves.md") },
         .{ .name = "2026-08-30-lazer-signalr-wire.md", .created_at = "2026-08-30T18:12:07+09:30", .commit = "00bc1569ffa40024ede50e18a6dbf3f91eb0ec93", .markdown = @embedFile("../updates/2026-08-30-lazer-signalr-wire.md") },

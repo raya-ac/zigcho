@@ -580,8 +580,11 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
             .none => {},
             .invalid_replay => self.persistHostAnticheatObservation(user.id, .stable_score, score_id, anticheat_evidence.stableReplay(.invalid_payload, replay_match_count)),
             .result => |observation| {
-                const allow_sample = observation.decision.action == anticheat_abi.Action.allow and self.anticheat_allow_sample_modulus != 0 and @mod(score_id, @as(i64, self.anticheat_allow_sample_modulus)) == 0;
-                if (observation.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, stableGameplayEvidence(score, replay_match_count), replay_match_count, observation);
+                self.store.recordReplayContentFingerprint(user.id, score_id, &observation.replay_content_digest) catch |err| {
+                    std.log.warn("event=anticheat_replay_content_fingerprint_write_failed score_id={d} error={t}", .{ score_id, err });
+                };
+                const allow_sample = observation.result.decision.action == anticheat_abi.Action.allow and self.anticheat_allow_sample_modulus != 0 and @mod(score_id, @as(i64, self.anticheat_allow_sample_modulus)) == 0;
+                if (observation.result.decision.action != anticheat_abi.Action.allow or allow_sample) self.persistAnticheatObservation(user.id, score_id, if (allow_sample) self.anticheat_allow_sample_modulus else 1, observation.evidence, replay_match_count, observation.result);
             },
         }
         const after_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};

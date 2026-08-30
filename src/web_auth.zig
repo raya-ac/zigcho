@@ -39,6 +39,10 @@ pub fn canManage(actor: domain.User, target: domain.User) bool {
     return target.privileges & staff == 0 or canDevelop(actor);
 }
 
+pub fn canManageAnticheatExclusion(actor: domain.User, target: domain.User) bool {
+    return canAdmin(actor) and canManage(actor, target);
+}
+
 pub fn passwordCredential(password: []const u8) ![32]u8 {
     if (password.len < 8 or password.len > 128) return error.InvalidCredential;
     var digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
@@ -159,6 +163,15 @@ test "staff roles stay least privilege" {
     const player: domain.User = .{ .id = 5, .name = "player", .safe_name = "player" };
     try std.testing.expect(canManage(user, player));
     try std.testing.expect(!canManage(user, user));
+    try std.testing.expect(canManageAnticheatExclusion(user, player));
+    try std.testing.expect(!canManageAnticheatExclusion(user, user));
+    user.privileges = 3 | moderator;
+    try std.testing.expect(!canManageAnticheatExclusion(user, player));
+    user.privileges = 3 | administrator;
+    const staff_target: domain.User = .{ .id = 6, .name = "staff", .safe_name = "staff", .privileges = 3 | moderator };
+    try std.testing.expect(!canManageAnticheatExclusion(user, staff_target));
+    user.privileges = 3 | developer;
+    try std.testing.expect(canManageAnticheatExclusion(user, staff_target));
 }
 
 test "host cookie parsing is exact and rejects malformed tokens" {

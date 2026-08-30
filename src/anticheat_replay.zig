@@ -13,6 +13,11 @@ const mania_max_x: f32 = (1 << 20) - 1;
 const replay_key_mask: u32 = 1 | 2 | 4 | 8 | 16;
 const easy_mod: u64 = 1 << 1;
 const hard_rock_mod: u64 = 1 << 4;
+const minimum_cadence_intervals: u32 = 1_500;
+const minimum_cadence_duration_ms: i64 = 30_000;
+const maximum_cadence_interval_ms = 50;
+const maximum_suspicious_cadence_ms = 13;
+const suspicious_cadence_bps: u64 = 9_900;
 
 pub const Prepared = struct {
     allocator: std.mem.Allocator,
@@ -21,6 +26,10 @@ pub const Prepared = struct {
     map_object_count: u32,
     hit_window_ms: u32,
     map_duration_ms: u32,
+    // The current map parser applies Hard Rock, but not Stable's stacking
+    // transform. Until stacking is implemented, object coordinates are not
+    // reliable enough for cursor-family evidence.
+    gameplay_coordinates_reliable: bool,
 
     pub fn deinit(self: *Prepared) void {
         self.allocator.free(self.frames);
@@ -51,6 +60,7 @@ pub fn prepare(allocator: std.mem.Allocator, replay: []const u8, map: []const u8
         .map_object_count = parsed_map.map_object_count,
         .hit_window_ms = parsed_map.hit_window_ms,
         .map_duration_ms = parsed_map.map_duration_ms,
+        .gameplay_coordinates_reliable = false,
     };
 }
 
@@ -106,13 +116,13 @@ fn parseFramesWithLimit(allocator: std.mem.Allocator, decoded: []const u8, max_x
         const y_text = fields.next() orelse return error.InvalidReplay;
         const keys_text = fields.next() orelse return error.InvalidReplay;
         if (fields.next() != null) return error.InvalidReplay;
-        const delta = std.fmt.parseInt(i64, delta_text, 10) catch return error.InvalidReplay;
-        if (delta == -12345) {
+        if (std.mem.eql(u8, delta_text, "-12345")) {
             _ = std.fmt.parseInt(i64, keys_text, 10) catch return error.InvalidReplay;
             if (!std.mem.eql(u8, x_text, "0") or !std.mem.eql(u8, y_text, "0")) return error.InvalidReplay;
             saw_sentinel = true;
             continue;
         }
+        const delta = parseReplayDelta(delta_text) catch return error.InvalidReplay;
         total_time = std.math.add(i64, total_time, delta) catch return error.InvalidReplay;
         if (total_time < min_time_ms or total_time > max_time_ms) return error.InvalidReplay;
         const x = std.fmt.parseFloat(f32, x_text) catch return error.InvalidReplay;
@@ -132,12 +142,116 @@ fn parseFramesWithLimit(allocator: std.mem.Allocator, decoded: []const u8, max_x
         frames.items[0].time_ms = frames.items[2].time_ms;
         frames.items[1].time_ms = frames.items[2].time_ms;
     }
-    var previous_time = min_time_ms;
+    // Stable's decoder removes these historical prelude frames after applying
+    // its early ordering repairs.
+    if (frames.items.len >= 2 and isPreludeFrame(frames.items[1])) _ = frames.orderedRemove(1);
+    if (frames.items.len >= 1 and isPreludeFrame(frames.items[0])) _ = frames.orderedRemove(0);
+
+    // Historical repairs are deliberately narrow. Stable drops any remaining
+    // backwards frames instead of rejecting the entire replay.
+    var write_index: usize = 0;
     for (frames.items) |frame| {
-        if (frame.time_ms < previous_time) return error.InvalidReplay;
-        previous_time = frame.time_ms;
+        if (write_index != 0 and frame.time_ms < frames.items[write_index - 1].time_ms) continue;
+        frames.items[write_index] = frame;
+        write_index += 1;
     }
+    frames.items.len = write_index;
+    if (frames.items.len < 2) return error.InvalidReplay;
     return frames.toOwnedSlice(allocator);
+}
+
+fn parseReplayDelta(value: []const u8) !i64 {
+    return std.fmt.parseInt(i64, value, 10) catch {
+        const parsed = std.fmt.parseFloat(f32, value) catch return error.InvalidReplay;
+        if (!std.math.isFinite(parsed)) return error.InvalidReplay;
+        const rounded = roundToEven(@as(f64, parsed));
+        const minimum: f64 = @floatFromInt(std.math.minInt(i64));
+        const maximum_exclusive: f64 = @floatFromInt(std.math.maxInt(i64));
+        if (rounded < minimum or rounded >= maximum_exclusive) return error.InvalidReplay;
+        return @intFromFloat(rounded);
+    };
+}
+
+fn roundToEven(value: f64) f64 {
+    const lower = @floor(value);
+    const fraction = value - lower;
+    if (fraction < 0.5) return lower;
+    if (fraction > 0.5) return lower + 1;
+    return if (@mod(lower, 2.0) == 0) lower else lower + 1;
+}
+
+fn isPreludeFrame(frame: abi.ReplayFrameV1) bool {
+    return frame.x == 256 and frame.y == -500;
+}
+
+pub const CadenceSummary = struct {
+    interval_count: u32 = 0,
+    ignored_short_intervals: u32 = 0,
+    dominant_interval_ms: u32 = 0,
+    dominant_intervals: u32 = 0,
+    distinct_intervals: u32 = 0,
+    duration_ms: u32 = 0,
+    suspicious: bool = false,
+};
+
+pub fn frameCadence(frames: []const abi.ReplayFrameV1) CadenceSummary {
+    if (frames.len < 2) return .{};
+    var counts = [_]u32{0} ** (maximum_cadence_interval_ms + 1);
+    var summary: CadenceSummary = .{};
+    for (frames[1..], 1..) |frame, index| {
+        const delta = frame.time_ms - frames[index - 1].time_ms;
+        if (delta <= 2) {
+            summary.ignored_short_intervals += 1;
+            continue;
+        }
+        summary.interval_count += 1;
+        if (delta > maximum_cadence_interval_ms) continue;
+        counts[@intCast(delta)] += 1;
+    }
+    for (counts[3..], 3..) |count, interval| {
+        if (count == 0) continue;
+        summary.distinct_intervals += 1;
+        if (count > summary.dominant_intervals) {
+            summary.dominant_intervals = count;
+            summary.dominant_interval_ms = @intCast(interval);
+        }
+    }
+    const raw_duration = frames[frames.len - 1].time_ms - frames[0].time_ms;
+    if (raw_duration > 0) summary.duration_ms = @intCast(@min(raw_duration, @as(i64, std.math.maxInt(u32))));
+    const all_intervals = @as(u64, summary.interval_count) + summary.ignored_short_intervals;
+    summary.suspicious = summary.interval_count >= minimum_cadence_intervals and
+        raw_duration >= minimum_cadence_duration_ms and
+        summary.dominant_interval_ms <= maximum_suspicious_cadence_ms and
+        @as(u64, summary.dominant_intervals) * 10_000 >= all_intervals * suspicious_cadence_bps;
+    return summary;
+}
+
+pub fn contentDigest(frames: []const abi.ReplayFrameV1) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("zigcho-stable-replay-content-v1\x00");
+    var count_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_bytes, frames.len, .little);
+    hash.update(&count_bytes);
+    for (frames) |frame| {
+        var time_bytes: [8]u8 = undefined;
+        var x_bytes: [4]u8 = undefined;
+        var y_bytes: [4]u8 = undefined;
+        var keys_bytes: [4]u8 = undefined;
+        std.mem.writeInt(i64, &time_bytes, frame.time_ms, .little);
+        std.mem.writeInt(u32, &x_bytes, @bitCast(if (frame.x == 0) @as(f32, 0) else frame.x), .little);
+        std.mem.writeInt(u32, &y_bytes, @bitCast(if (frame.y == 0) @as(f32, 0) else frame.y), .little);
+        const logical_keys: u32 = @intFromBool(frame.keys & (1 | 4) != 0) |
+            (@as(u32, @intFromBool(frame.keys & (2 | 8) != 0)) << 1) |
+            (@as(u32, @intFromBool(frame.keys & 16 != 0)) << 2);
+        std.mem.writeInt(u32, &keys_bytes, logical_keys, .little);
+        hash.update(&time_bytes);
+        hash.update(&x_bytes);
+        hash.update(&y_bytes);
+        hash.update(&keys_bytes);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
 }
 
 fn parseMap(allocator: std.mem.Allocator, map: []const u8, mods: u64, played_to_ms: i64) !ParsedMap {
@@ -218,6 +332,81 @@ test "stable replay input preserves the historical third frame repair" {
     try std.testing.expectEqual(@as(i64, 4), frames[0].time_ms);
     try std.testing.expectEqual(@as(i64, 4), frames[1].time_ms);
     try std.testing.expectEqual(@as(i64, 4), frames[2].time_ms);
+}
+
+test "stable replay input rounds fractional historical deltas like the official decoder" {
+    const frames = try parseFrames(std.testing.allocator, "0|0|0|0,16.5|1|1|0,17.5|2|2|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(i64, 16), frames[1].time_ms);
+    try std.testing.expectEqual(@as(i64, 34), frames[2].time_ms);
+}
+
+test "stable replay input removes historical prelude frames" {
+    const frames = try parseFrames(std.testing.allocator, "0|256|-500|0,1|256|-500|0,2|10|20|0,3|30|40|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(@as(f32, 10), frames[0].x);
+    try std.testing.expectEqual(@as(i64, 3), frames[0].time_ms);
+}
+
+test "stable replay input discards backwards frames left after historical repairs" {
+    const frames = try parseFrames(std.testing.allocator, "0|0|0|0,10|1|1|0,-3|2|2|0,-20|3|3|0,30|4|4|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 10, 17 }, &.{ frames[0].time_ms, frames[1].time_ms, frames[2].time_ms });
+}
+
+test "frame cadence tolerates sparse one and two millisecond noise" {
+    var frames: [4_001]abi.ReplayFrameV1 = undefined;
+    var time: i64 = 0;
+    frames[0] = .{ .time_ms = time, .x = 0, .y = 0, .keys = 0 };
+    for (frames[1..], 1..) |*frame, index| {
+        time += if (@mod(index, 300) == 0) 2 else 10;
+        frame.* = .{ .time_ms = time, .x = 0, .y = 0, .keys = 0 };
+    }
+    const cadence = frameCadence(&frames);
+    try std.testing.expect(cadence.suspicious);
+    try std.testing.expectEqual(@as(u32, 10), cadence.dominant_interval_ms);
+    try std.testing.expectEqual(@as(u32, 13), cadence.ignored_short_intervals);
+}
+
+test "ordinary uniform sixteen millisecond cadence stays clean" {
+    var frames: [2_001]abi.ReplayFrameV1 = undefined;
+    for (&frames, 0..) |*frame, index| frame.* = .{ .time_ms = @intCast(index * 16), .x = 0, .y = 0, .keys = 0 };
+    const cadence = frameCadence(&frames);
+    try std.testing.expect(!cadence.suspicious);
+    try std.testing.expectEqual(@as(u32, 16), cadence.dominant_interval_ms);
+}
+
+test "frame cadence rejects legitimate multimodal timing" {
+    var frames: [2_001]abi.ReplayFrameV1 = undefined;
+    var time: i64 = 0;
+    frames[0] = .{ .time_ms = time, .x = 0, .y = 0, .keys = 0 };
+    for (frames[1..], 1..) |*frame, index| {
+        time += if (@mod(index, 2) == 0) 16 else 17;
+        frame.* = .{ .time_ms = time, .x = 0, .y = 0, .keys = 0 };
+    }
+    const cadence = frameCadence(&frames);
+    try std.testing.expect(!cadence.suspicious);
+    try std.testing.expectEqual(@as(u32, 2), cadence.distinct_intervals);
+}
+
+test "one and two millisecond intervals cannot signal cadence alone" {
+    var frames: [2_001]abi.ReplayFrameV1 = undefined;
+    for (&frames, 0..) |*frame, index| frame.* = .{ .time_ms = @intCast(index * 2), .x = 0, .y = 0, .keys = 0 };
+    const cadence = frameCadence(&frames);
+    try std.testing.expect(!cadence.suspicious);
+    try std.testing.expectEqual(@as(u32, 0), cadence.interval_count);
+}
+
+test "canonical replay content ignores encoding and physical key aliases" {
+    const first = try parseFrames(std.testing.allocator, "0|0|0|0,16.5|1|2|1,17.5|3|4|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(first);
+    const equivalent = try parseFrames(std.testing.allocator, "0|0|0|0,16|1|2|4,18|3|4|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(equivalent);
+    const changed = try parseFrames(std.testing.allocator, "0|0|0|0,16|1|2|4,18|3|5|0,-12345|0|0|1,");
+    defer std.testing.allocator.free(changed);
+    try std.testing.expectEqualSlices(u8, &contentDigest(first), &contentDigest(equivalent));
+    try std.testing.expect(!std.mem.eql(u8, &contentDigest(first), &contentDigest(changed)));
 }
 
 test "mania replay payload bounds allow its encoded key field" {

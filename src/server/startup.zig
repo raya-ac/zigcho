@@ -137,10 +137,7 @@ pub fn run(init: std.process.Init) !void {
     const anticheat: ?anticheat_plugin.Host = if (config.anticheat_module_path.len == 0)
         null
     else
-        anticheat_plugin.Host.open(config.anticheat_module_path) catch |err| blk: {
-            std.log.warn("event=anticheat_module_load_failed path={s} error={t}", .{ config.anticheat_module_path, err });
-            break :blk null;
-        };
+        try anticheat_plugin.Host.open(config.anticheat_module_path);
     var app: App = .{
         .allocator = allocator,
         .store = store,
@@ -176,7 +173,7 @@ pub fn run(init: std.process.Init) !void {
     const kai_session = try app.sessions.createBot(kai);
     kai_session.longitude = -21.9426; // reykjavik
     kai_session.latitude = 64.1466;
-    if (app.anticheat) |*loaded| std.log.info("event=anticheat_module_loaded module={s} abi={d} mode=observe", .{ loaded.name(), anticheat_abi.version });
+    if (app.anticheat) |*loaded| std.log.info("event=anticheat_module_loaded module={s} abi={d} rule_revision={d} mode=observe", .{ loaded.name(), anticheat_abi.version, loaded.ruleRevision() });
     defer if (app.anticheat) |*loaded| loaded.close();
     defer app.score_webhook.deinit();
     defer app.avatar_cache.deinit();

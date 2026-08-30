@@ -106,6 +106,12 @@ pub fn stableGameplayEvidence(score: stable_score.Submission, replay_match_count
     return stableScoreEvidence(score) | (if (replay_match_count != 0) anticheat_abi.Evidence.replay_hash_reused else 0);
 }
 
+pub fn stableReplayShadowEvidence(passed: bool, suspicious_cadence: bool, replay_content_match_count: u32) u64 {
+    if (!passed) return 0;
+    return (if (suspicious_cadence) anticheat_abi.Evidence.suspicious_frame_cadence else 0) |
+        (if (replay_content_match_count != 0) anticheat_abi.Evidence.replay_content_reused else 0);
+}
+
 pub fn persistHostAnticheatObservation(self: anytype, user_id: i32, source: storage.AnticheatSource, score_id: ?i64, observation: anticheat_evidence.Observation) void {
     _ = self.store.recordAnticheatObservation(user_id, .{
         .source = source,
@@ -169,8 +175,34 @@ pub fn observeStableLastFmFlags(self: anytype, user_id: i32, flags: u32) void {
 pub const StableGameplayObservation = union(enum) {
     none,
     invalid_replay,
-    result: anticheat_abi.GameplayResultV1,
+    result: struct {
+        result: anticheat_abi.GameplayResultV1,
+        evidence: u64,
+        replay_content_digest: [32]u8,
+        replay_content_match_count: u32,
+    },
 };
+
+fn cursorFamilyReason(reason: u32) bool {
+    return reason == anticheat_abi.Reason.aim_center_lock or
+        reason == anticheat_abi.Reason.aim_snap_pattern or
+        reason == anticheat_abi.Reason.aim_radial_lock or
+        reason == anticheat_abi.Reason.aim_velocity_pattern;
+}
+
+pub fn gateUnreliableCursorEvidence(result: *anticheat_abi.GameplayResultV1) void {
+    if (cursorFamilyReason(result.decision.reason)) {
+        const rule_revision = result.decision.rule_revision;
+        result.decision = .{ .rule_revision = rule_revision };
+    } else if (result.decision.reason == anticheat_abi.Reason.combined_gameplay_anomalies) {
+        result.decision.action = anticheat_abi.Action.audit;
+        result.decision.flags = anticheat_abi.DecisionFlag.write_audit | anticheat_abi.DecisionFlag.require_staff_review;
+    }
+    result.center_hits_bps = 0;
+    result.mean_center_distance_milli = 0;
+    result.snap_events = 0;
+    result.target_distance_stddev_milli = 0;
+}
 
 pub fn observeStableGameplay(self: anytype, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32, replay_match_count: u32) StableGameplayObservation {
     if (replay.len == 0) return .none;
@@ -186,7 +218,30 @@ pub fn observeStableGameplay(self: anytype, user_id: i32, score: stable_score.Su
         return if (score.passed and err == error.InvalidReplay) .invalid_replay else .none;
     };
     defer prepared.deinit();
+    const replay_content_digest = anticheat_replay.contentDigest(prepared.frames);
+    const replay_content_match_count = if (score.passed) self.store.crossAccountReplayContentMatches(user_id, score.map_md5, score.mode, &replay_content_digest) catch |err| blk: {
+        std.log.warn("event=anticheat_replay_content_match_lookup_failed user_id={d} error={t}", .{ user_id, err });
+        break :blk 0;
+    } else 0;
     const host = if (self.anticheat) |*loaded| loaded else return .none;
+    const cadence = anticheat_replay.frameCadence(prepared.frames);
+    const evidence = stableGameplayEvidence(score, replay_match_count) |
+        stableReplayShadowEvidence(score.passed, cadence.suspicious, replay_content_match_count);
+    if (cadence.suspicious) {
+        std.log.warn("event=anticheat_suspicious_frame_cadence user_id={d} passed={} intervals={d} ignored_short={d} dominant_ms={d} dominant={d} distinct={d} duration_ms={d}", .{
+            user_id,
+            score.passed,
+            cadence.interval_count,
+            cadence.ignored_short_intervals,
+            cadence.dominant_interval_ms,
+            cadence.dominant_intervals,
+            cadence.distinct_intervals,
+            cadence.duration_ms,
+        });
+    }
+    if (score.passed and replay_content_match_count != 0) {
+        std.log.warn("event=anticheat_replay_content_reused user_id={d} cross_account_matches={d}", .{ user_id, replay_content_match_count });
+    }
     const passed_hits_i64 = @as(i64, score.n300) + @as(i64, score.n100) + @as(i64, score.n50);
     const accuracy_ppm: u32 = @intFromFloat(@round(@min(1.0, @max(0.0, score.accuracy())) * 1_000_000.0));
     const pp_milli: u64 = @intFromFloat(@round(@min(performance.pp * 1000.0, @as(f64, @floatFromInt(std.math.maxInt(u64))))));
@@ -199,7 +254,7 @@ pub fn observeStableGameplay(self: anytype, user_id: i32, score: stable_score.Su
             .ruleset = score.mode,
             .namespace = anticheatNamespace(score.mods),
             .event_flags = event_flags,
-            .evidence = stableGameplayEvidence(score, replay_match_count),
+            .evidence = evidence,
             .score = @intCast(score.total_score),
             .pp_milli = pp_milli,
             .accuracy_ppm = accuracy_ppm,
@@ -224,14 +279,25 @@ pub fn observeStableGameplay(self: anytype, user_id: i32, score: stable_score.Su
         .objects = prepared.objects.ptr,
         .object_count = @intCast(prepared.objects.len),
     };
-    const result = host.evaluateGameplay(event) catch |err| {
+    var result = host.evaluateGameplay(event) catch |err| {
         std.log.warn("event=anticheat_module_evaluation_failed module={s} error={t}", .{ host.name(), err });
         return .none;
     };
+    if (!prepared.gameplay_coordinates_reliable) {
+        const cursor_reason = cursorFamilyReason(result.decision.reason);
+        const combined_reason = result.decision.reason == anticheat_abi.Reason.combined_gameplay_anomalies;
+        gateUnreliableCursorEvidence(&result);
+        if (cursor_reason or combined_reason) std.log.warn("event=anticheat_cursor_evidence_gated module={s} coordinate_space=raw_unstacked cursor_only={any}", .{ host.name(), cursor_reason });
+    }
     if (result.decision.action != anticheat_abi.Action.allow) std.log.warn("event=anticheat_observation module={s} action={d} reason={d} risk={d} confidence_bps={d} objects={d} clicks={d}", .{
         host.name(), result.decision.action, result.decision.reason, result.decision.risk_score, result.decision.confidence_bps, result.objects_checked, result.matched_clicks,
     });
-    return .{ .result = result };
+    return .{ .result = .{
+        .result = result,
+        .evidence = evidence,
+        .replay_content_digest = replay_content_digest,
+        .replay_content_match_count = replay_content_match_count,
+    } };
 }
 
 pub fn persistAnticheatObservation(self: anytype, user_id: i32, score_id: i64, sample_weight: u32, evidence: u64, replay_match_count: u32, result: anticheat_abi.GameplayResultV1) void {

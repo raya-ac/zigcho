@@ -1169,6 +1169,71 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
                 return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
             }
         }
+        if (std.mem.eql(u8, path, "/api/v1/staff/anticheat/exclusions")) {
+            if (!web_auth.canAdmin(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"administrator access required\"}", &no_store);
+            if (req.head.method == .POST) {
+                const action = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"action"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"action required\"}", &no_store);
+                defer self.allocator.free(action);
+                const reason_value = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"reason"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"reason required\"}", &no_store);
+                defer self.allocator.free(reason_value);
+                const reason = std.mem.trim(u8, reason_value, " \t\r\n");
+                if (!validWebText(reason, 3, 500)) return respond(req, .bad_request, "application/json", "{\"error\":\"reason must be between 3 and 500 characters\"}", &no_store);
+                if (std.mem.eql(u8, action, "create")) {
+                    const user_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"user"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"player required\"}", &no_store);
+                    defer self.allocator.free(user_text);
+                    const scope_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"scope"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"scope required\"}", &no_store);
+                    defer self.allocator.free(scope_text);
+                    const duration_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"duration_seconds"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"expiry required\"}", &no_store);
+                    defer self.allocator.free(duration_text);
+                    const scope = storage.AnticheatExclusionScope.parse(scope_text) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"invalid exclusion scope\"}", &no_store);
+                    const duration_seconds = std.fmt.parseInt(i64, duration_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid exclusion expiry\"}", &no_store);
+                    var target_id = std.fmt.parseInt(i32, user_text, 10) catch 0;
+                    if (target_id <= 0) {
+                        const found = (try self.store.userByName(self.allocator, user_text)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                        defer freeUser(self.allocator, found);
+                        target_id = found.id;
+                    }
+                    const transition = self.gameSessionMutex(target_id);
+                    transition.lockUncancelable(self.store.io);
+                    defer transition.unlock(self.store.io);
+                    const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                    defer freeUser(self.allocator, target_user);
+                    if (!web_auth.canManageAnticheatExclusion(staff_user, target_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"self, bot, and staff exclusions are blocked for this account\"}", &no_store);
+                    const exclusion_id = self.store.createAnticheatExclusion(staff_user.id, target_id, scope, duration_seconds, reason) catch |err| switch (err) {
+                        error.AnticheatExclusionForbidden => return respond(req, .forbidden, "application/json", "{\"error\":\"administrator access or target eligibility changed\"}", &no_store),
+                        error.AnticheatExclusionOverlap => return respond(req, .conflict, "application/json", "{\"error\":\"an overlapping exclusion is already active\"}", &no_store),
+                        error.InvalidAnticheatExclusion => return respond(req, .bad_request, "application/json", "{\"error\":\"expiry must be between one hour and thirty days\"}", &no_store),
+                        error.AnticheatExclusionUserNotFound => return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store),
+                        else => return err,
+                    };
+                    std.log.warn("event=staff_anticheat_exclusion_created actor_id={d} target_id={d} exclusion_id={d} scope={s} duration_seconds={d}", .{ staff_user.id, target_id, exclusion_id, scope.text(), duration_seconds });
+                    var response_buf: [96]u8 = undefined;
+                    const response = try std.fmt.bufPrint(&response_buf, "{{\"ok\":true,\"id\":{d}}}", .{exclusion_id});
+                    return respond(req, .created, "application/json", response, &no_store);
+                }
+                if (std.mem.eql(u8, action, "revoke")) {
+                    const id_text = (try form_urlencoded.requestField(self.allocator, body, content_type_owned, &.{"exclusion_id"})) orelse return respond(req, .bad_request, "application/json", "{\"error\":\"exclusion required\"}", &no_store);
+                    defer self.allocator.free(id_text);
+                    const exclusion_id = std.fmt.parseInt(i64, id_text, 10) catch return respond(req, .bad_request, "application/json", "{\"error\":\"invalid exclusion\"}", &no_store);
+                    const target_id = (try self.store.anticheatExclusionTarget(exclusion_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"exclusion not found\"}", &no_store);
+                    const transition = self.gameSessionMutex(target_id);
+                    transition.lockUncancelable(self.store.io);
+                    defer transition.unlock(self.store.io);
+                    const target_user = (try self.store.userById(self.allocator, target_id)) orelse return respond(req, .not_found, "application/json", "{\"error\":\"player not found\"}", &no_store);
+                    defer freeUser(self.allocator, target_user);
+                    if (!web_auth.canManageAnticheatExclusion(staff_user, target_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"self, bot, and staff exclusions are blocked for this account\"}", &no_store);
+                    self.store.revokeAnticheatExclusion(staff_user.id, exclusion_id, reason) catch |err| switch (err) {
+                        error.AnticheatExclusionForbidden => return respond(req, .forbidden, "application/json", "{\"error\":\"administrator access or target eligibility changed\"}", &no_store),
+                        error.AnticheatExclusionNotActive => return respond(req, .conflict, "application/json", "{\"error\":\"exclusion is not active\"}", &no_store),
+                        error.InvalidAnticheatExclusion => return respond(req, .bad_request, "application/json", "{\"error\":\"invalid exclusion revocation\"}", &no_store),
+                        else => return err,
+                    };
+                    std.log.warn("event=staff_anticheat_exclusion_revoked actor_id={d} target_id={d} exclusion_id={d}", .{ staff_user.id, target_id, exclusion_id });
+                    return respond(req, .ok, "application/json", "{\"ok\":true}", &no_store);
+                }
+                return respond(req, .bad_request, "application/json", "{\"error\":\"unknown exclusion action\"}", &no_store);
+            }
+        }
         if (std.mem.eql(u8, path, "/api/v1/staff/anticheat")) {
             if (!web_auth.canModerate(staff_user)) return respond(req, .forbidden, "application/json", "{\"error\":\"moderation access required\"}", &no_store);
             if (req.head.method == .GET) {
@@ -1229,6 +1294,7 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
             std.mem.eql(u8, path, "/api/v1/staff/appeals") or
             std.mem.eql(u8, path, "/api/v1/staff/reports") or
             std.mem.eql(u8, path, "/api/v1/staff/anticheat") or
+            std.mem.eql(u8, path, "/api/v1/staff/anticheat/exclusions") or
             std.mem.eql(u8, path, "/api/v1/staff/audit") or
             std.mem.eql(u8, path, "/api/v1/staff/channels");
         return respond(req, if (known_staff_path) .method_not_allowed else .not_found, "application/json", if (known_staff_path) "{\"error\":\"method not allowed\"}" else "{\"error\":\"not found\"}", &no_store);

@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 46,
+      "version": "2026.831.0",
+      "display_version": "zigcho release 2.0",
+      "created_at": "2026-08-31T00:45:07+09:30",
+      "updates": [
+        {
+          "name": "2026-08-31-anticheat-review-and-replay-signals.md",
+          "created_at": "2026-08-31T00:45:07+09:30",
+          "commit": "",
+          "sha256": "af5785ce600efe7d45a7c3850676829497e18856c9cb6bbb2514b5f63e900589"
+        }
+      ]
+    },
+    {
       "id": 45,
       "version": "2026.830.2",
       "display_version": "zigcho release 1.9",

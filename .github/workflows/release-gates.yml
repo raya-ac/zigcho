@@ -144,6 +144,7 @@ jobs:
           if [[ "${{ needs.classify.outputs.is_hotfix }}" == true ]]; then
             test -x artifacts/server/tools/activate-hotfix.sh
           else
+            test -x artifacts/server/zigcho-anticheat-host-smoke
             test -x artifacts/server/zigcho-import
             test -x artifacts/server/zigcho-import-archive
             test -x artifacts/server/zigcho-migrate-postgres
@@ -153,6 +154,12 @@ jobs:
           [[ "$binary_type" == *'ELF 64-bit LSB'* ]]
           [[ "$binary_type" == *'x86-64'* ]]
           [[ "$binary_type" != *'not stripped'* ]]
+          if [[ "${{ needs.classify.outputs.is_hotfix }}" != true ]]; then
+            smoke_type=$(file -b artifacts/server/zigcho-anticheat-host-smoke)
+            [[ "$smoke_type" == *'ELF 64-bit LSB'* ]]
+            [[ "$smoke_type" == *'x86-64'* ]]
+            [[ "$smoke_type" != *'not stripped'* ]]
+          fi
           if test -n "$(find artifacts/server -type f -name '*.pdb' -print -quit)"; then
             exit 1
           fi
@@ -168,6 +175,8 @@ jobs:
             stop_line=$(grep -n '^systemctl stop "$service"$' "$activate" | cut -d: -f1)
             stopped_line=$(grep -n '^service_stopped=yes$' "$activate" | tail -n 1 | cut -d: -f1)
             check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
+            anticheat_line=$(grep -n '^  runuser --user zigcho -- "$candidate/zigcho-anticheat-host-smoke" "$anticheat_module"$' "$activate" | cut -d: -f1)
+            test "$anticheat_line" -lt "$stop_line"
             test "$stop_line" -lt "$stopped_line"
             test "$stopped_line" -lt "$check_line"
           fi
@@ -220,6 +229,9 @@ jobs:
                 "feature gate" \
                 "room score writes require" \
                 "anticheat null signals coalesce" \
+                "anticheat review exclusions" \
+                "failed stable plays cannot emit behavioral shadow evidence" \
+                "raw unstacked cursor output cannot become review evidence" \
                 "review decoder" \
                 "rejected scores cross the module boundary" \
                 "rejected stable score evidence" \
@@ -257,6 +269,7 @@ jobs:
               done
               zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres account auth stats and token slice"
               ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_ANTICHEAT_URL" zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres anticheat hardware and flags stay review only"
+              ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_ANTICHEAT_URL" zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres anticheat review exclusions"
               for filter in \
                 "postgres staff announcements persist chat and audit atomically" \
                 "postgres credential and restriction commits revoke matching token families" \
@@ -267,7 +280,7 @@ jobs:
               do
                 ZIGCHO_TEST_POSTGRES_STORE_URL="$ZIGCHO_TEST_POSTGRES_TRANSITIONS_URL" zig build test -Doptimize=ReleaseSafe "-Dtest-filter=$filter"
               done
-              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through stable score grace schema forty seven"
+              zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through stable score grace schema forty eight"
             '
 
       - name: boot the exact binary on PostgreSQL
@@ -278,7 +291,7 @@ jobs:
         run: |
           set -euo pipefail
           artifacts/server/zigcho check
-          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 47
+          test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select max(version) from zigcho.schema_migrations')" = 48
           test "$(psql -h 127.0.0.1 -U zigcho -d zigcho -Atc 'select min(next_id) >= 1000000000 from zigcho.bss_counters')" = t
           artifacts/server/zigcho 127.0.0.1 18099 >artifacts/server-smoke.log 2>&1 &
           server_pid=$!

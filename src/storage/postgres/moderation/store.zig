@@ -13,6 +13,7 @@ const pg_score_maintenance = @import("../scores/maintenance.zig");
 
 const ClientHardware = sqlite_storage.ClientHardware;
 const HardwareEvidence = sqlite_storage.HardwareEvidence;
+const AnticheatExclusionScope = sqlite_storage.AnticheatExclusionScope;
 const AnticheatReviewLabel = sqlite_storage.AnticheatReviewLabel;
 const AnticheatObservation = sqlite_storage.AnticheatObservation;
 const schema_version = common.schema_version;
@@ -24,11 +25,99 @@ pub fn insertHardwareMatchAudit(allocator: std.mem.Allocator, conn: *postgres.c.
     result.deinit();
 }
 
+fn requireAnticheatExclusionAuthority(allocator: std.mem.Allocator, conn: *postgres.c.PGconn, actor_id: i32, user_id: i32, actor: []const u8, user: []const u8) !void {
+    var result = try postgres.queryParams(allocator, conn, "SELECT id,restricted,privileges FROM zigcho.users WHERE id IN($1,$2) ORDER BY id FOR UPDATE", &.{ actor, user });
+    defer result.deinit();
+    if (result.rows() != 2) return error.AnticheatExclusionUserNotFound;
+    var found: u8 = 0;
+    var actor_restricted = false;
+    var actor_privileges: u32 = 0;
+    var user_privileges: u32 = 0;
+    for (0..result.rows()) |row| {
+        const id = try result.int(i32, row, 0);
+        if (id == actor_id) {
+            actor_restricted = try result.boolean(row, 1);
+            actor_privileges = try result.int(u32, row, 2);
+            found |= 1;
+        } else if (id == user_id) {
+            user_privileges = try result.int(u32, row, 2);
+            found |= 2;
+        }
+    }
+    if (found != 3) return error.AnticheatExclusionUserNotFound;
+    if (!sqlite_storage.canManageAnticheatExclusion(actor_id, user_id, actor_restricted, actor_privileges, user_privileges)) return error.AnticheatExclusionForbidden;
+}
+
+pub fn createAnticheatExclusion(self: anytype, actor_id: i32, user_id: i32, scope: AnticheatExclusionScope, duration_seconds: i64, reason: []const u8) !i64 {
+    const trimmed = try sqlite_storage.validateAnticheatExclusion(actor_id, user_id, duration_seconds, reason);
+    var actor_buf: [24]u8 = undefined;
+    var user_buf: [24]u8 = undefined;
+    var duration_buf: [24]u8 = undefined;
+    const actor = try std.fmt.bufPrint(&actor_buf, "{d}", .{actor_id});
+    const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+    const duration = try std.fmt.bufPrint(&duration_buf, "{d}", .{duration_seconds});
+    const scope_text = scope.text();
+    var lease = self.pool.acquire();
+    defer lease.release();
+    try postgres.exec(lease.conn, "BEGIN");
+    errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try requireAnticheatExclusionAuthority(self.allocator, lease.conn, actor_id, user_id, actor, user);
+    var overlap = try postgres.queryParams(self.allocator, lease.conn, "SELECT 1 FROM zigcho.anticheat_review_exclusions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>extract(epoch FROM clock_timestamp())::bigint AND (scope='all' OR $2='all' OR scope=$2) LIMIT 1", &.{ user, scope_text });
+    defer overlap.deinit();
+    if (overlap.rows() != 0) return error.AnticheatExclusionOverlap;
+    var insert = try postgres.queryParams(self.allocator, lease.conn, "WITH stamp AS (SELECT extract(epoch FROM statement_timestamp())::bigint AS now) INSERT INTO zigcho.anticheat_review_exclusions(user_id,scope,reason,created_by,created_at,expires_at) SELECT $1,$2,$3,$4,now,now+$5::bigint FROM stamp RETURNING id,expires_at", &.{ user, scope_text, trimmed, actor, duration });
+    defer insert.deinit();
+    const exclusion_id = try insert.int(i64, 0, 0);
+    const expires_at = try insert.int(i64, 0, 1);
+    var detail_buf: [760]u8 = undefined;
+    const detail = try std.fmt.bufPrint(&detail_buf, "exclusion_id={d} scope={s} expires_at={d} reason={s}", .{ exclusion_id, scope_text, expires_at, trimmed });
+    try common.insertAudit(self.allocator, lease.conn, actor_id, "anticheat.review_exclusion.create", user_id, detail);
+    try postgres.exec(lease.conn, "COMMIT");
+    return exclusion_id;
+}
+
+pub fn anticheatExclusionTarget(self: anytype, exclusion_id: i64) !?i32 {
+    if (exclusion_id <= 0) return null;
+    var id_buf: [24]u8 = undefined;
+    const id = try std.fmt.bufPrint(&id_buf, "{d}", .{exclusion_id});
+    var lease = self.pool.acquire();
+    defer lease.release();
+    var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT user_id FROM zigcho.anticheat_review_exclusions WHERE id=$1", &.{id});
+    defer result.deinit();
+    return if (result.rows() == 0) null else try result.int(i32, 0, 0);
+}
+
+pub fn revokeAnticheatExclusion(self: anytype, actor_id: i32, exclusion_id: i64, reason: []const u8) !void {
+    const trimmed = try sqlite_storage.validateAnticheatExclusionRevocation(actor_id, exclusion_id, reason);
+    var actor_buf: [24]u8 = undefined;
+    var id_buf: [24]u8 = undefined;
+    const actor = try std.fmt.bufPrint(&actor_buf, "{d}", .{actor_id});
+    const id = try std.fmt.bufPrint(&id_buf, "{d}", .{exclusion_id});
+    var lease = self.pool.acquire();
+    defer lease.release();
+    try postgres.exec(lease.conn, "BEGIN");
+    errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    var target = try postgres.queryParams(self.allocator, lease.conn, "SELECT user_id FROM zigcho.anticheat_review_exclusions WHERE id=$1", &.{id});
+    defer target.deinit();
+    if (target.rows() == 0) return error.AnticheatExclusionNotActive;
+    const user_id = try target.int(i32, 0, 0);
+    var user_buf: [24]u8 = undefined;
+    const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+    try requireAnticheatExclusionAuthority(self.allocator, lease.conn, actor_id, user_id, actor, user);
+    var update = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.anticheat_review_exclusions SET revoked_by=$1,revoked_at=extract(epoch FROM clock_timestamp())::bigint,revoke_reason=$2 WHERE id=$3 AND user_id=$4 AND revoked_at IS NULL AND expires_at>extract(epoch FROM clock_timestamp())::bigint RETURNING scope", &.{ actor, trimmed, id, user });
+    defer update.deinit();
+    if (update.rows() == 0) return error.AnticheatExclusionNotActive;
+    var detail_buf: [720]u8 = undefined;
+    const detail = try std.fmt.bufPrint(&detail_buf, "exclusion_id={d} scope={s} reason={s}", .{ exclusion_id, update.value(0, 0), trimmed });
+    try common.insertAudit(self.allocator, lease.conn, actor_id, "anticheat.review_exclusion.revoke", user_id, detail);
+    try postgres.exec(lease.conn, "COMMIT");
+}
+
 pub fn recordAnticheatObservation(self: anytype, user_id: i32, observation: AnticheatObservation) !i64 {
     try sqlite_storage.validateAnticheatObservation(user_id, observation);
-    var buffers: [32][64]u8 = undefined;
+    var buffers: [33][64]u8 = undefined;
     var cursor: usize = 0;
-    var params: [29]?[]const u8 = undefined;
+    var params: [30]?[]const u8 = undefined;
     params[0] = try common.param(&buffers, &cursor, user_id);
     params[1] = if (observation.score_id) |score_id| try common.param(&buffers, &cursor, score_id) else null;
     params[2] = observation.source.text();
@@ -62,15 +151,16 @@ pub fn recordAnticheatObservation(self: anytype, user_id: i32, observation: Anti
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
-    if (observation.score_id == null) {
-        var user_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.users WHERE id=$1 FOR UPDATE", &.{params[0]});
-        defer user_lock.deinit();
-    }
+    var user_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.users WHERE id=$1 FOR UPDATE", &.{params[0]});
+    defer user_lock.deinit();
     try postgres.exec(lease.conn, "DELETE FROM zigcho.anticheat_observations WHERE id IN (SELECT id FROM zigcho.anticheat_observations WHERE score_id IS NULL AND source!='stable_score' AND ((review_label!='pending' AND reviewed_at<extract(epoch FROM clock_timestamp())::bigint-15552000) OR (review_label='pending' AND created_at<extract(epoch FROM clock_timestamp())::bigint-7776000)) ORDER BY created_at,id LIMIT 128)");
     try postgres.exec(lease.conn, "DELETE FROM zigcho.audit_log WHERE id IN (SELECT id FROM zigcho.audit_log WHERE ((action='anticheat.observe' AND detail LIKE '% score_id=0 mode=observe %') OR action IN('anticheat.hardware_match','stable.lastfm_flag')) AND created_at<extract(epoch FROM clock_timestamp())::bigint-15552000 ORDER BY created_at,id LIMIT 128)");
+    var active_exclusion = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.anticheat_review_exclusions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>extract(epoch FROM clock_timestamp())::bigint AND (scope='all' OR scope=$2) ORDER BY (scope=$2) DESC,created_at DESC,id DESC LIMIT 1", &.{ params[0], params[2] });
+    defer active_exclusion.deinit();
+    params[29] = if (active_exclusion.rows() == 0) null else try common.param(&buffers, &cursor, try active_exclusion.int(i64, 0, 0));
     if (observation.score_id == null) {
-        const coalesce_params = [_]?[]const u8{ params[0], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9], params[10], params[11], params[12], params[13], params[14], params[15], params[16], params[17], params[18], params[19], params[20], params[21], params[22], params[23], params[24], params[25], params[26], params[27], params[28] };
-        var existing = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.anticheat_observations WHERE user_id=$1 AND score_id IS NULL AND review_label='pending' AND source=$2 AND module=$3 AND action=$4 AND sample_weight=$5 AND reason=$6 AND risk_score=$7 AND confidence_bps=$8 AND evidence=$9 AND decision_flags=$10 AND rule_revision=$11 AND objects_checked=$12 AND matched_clicks=$13 AND mean_abs_timing_error_milli=$14 AND timing_stddev_milli=$15 AND exact_timing_bps=$16 AND center_hits_bps=$17 AND mean_center_distance_milli=$18 AND snap_events=$19 AND replay_match_count=$20 AND key_press_count=$21 AND key_hold_count=$22 AND mean_hold_duration_milli=$23 AND hold_duration_stddev_milli=$24 AND alternation_bps=$25 AND target_distance_stddev_milli=$26 AND velocity_spike_count=$27 AND movement_velocity_stddev_milli=$28 AND created_at>=extract(epoch FROM clock_timestamp())::bigint-86400 ORDER BY id DESC LIMIT 1", &coalesce_params);
+        const coalesce_params = [_]?[]const u8{ params[0], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9], params[10], params[11], params[12], params[13], params[14], params[15], params[16], params[17], params[18], params[19], params[20], params[21], params[22], params[23], params[24], params[25], params[26], params[27], params[28], params[29] };
+        var existing = try postgres.queryParams(self.allocator, lease.conn, "SELECT id FROM zigcho.anticheat_observations WHERE user_id=$1 AND score_id IS NULL AND review_label='pending' AND source=$2 AND module=$3 AND action=$4 AND sample_weight=$5 AND reason=$6 AND risk_score=$7 AND confidence_bps=$8 AND evidence=$9 AND decision_flags=$10 AND rule_revision=$11 AND objects_checked=$12 AND matched_clicks=$13 AND mean_abs_timing_error_milli=$14 AND timing_stddev_milli=$15 AND exact_timing_bps=$16 AND center_hits_bps=$17 AND mean_center_distance_milli=$18 AND snap_events=$19 AND replay_match_count=$20 AND key_press_count=$21 AND key_hold_count=$22 AND mean_hold_duration_milli=$23 AND hold_duration_stddev_milli=$24 AND alternation_bps=$25 AND target_distance_stddev_milli=$26 AND velocity_spike_count=$27 AND movement_velocity_stddev_milli=$28 AND coalesce(review_exclusion_id,0)=coalesce($29::bigint,0) AND created_at>=extract(epoch FROM clock_timestamp())::bigint-86400 ORDER BY id DESC LIMIT 1", &coalesce_params);
         defer existing.deinit();
         if (existing.rows() != 0) {
             const observation_id = try existing.int(i64, 0, 0);
@@ -78,11 +168,11 @@ pub fn recordAnticheatObservation(self: anytype, user_id: i32, observation: Anti
             return observation_id;
         }
     }
-    var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events,replay_match_count,key_press_count,key_hold_count,mean_hold_duration_milli,hold_duration_stddev_milli,alternation_bps,target_distance_stddev_milli,velocity_spike_count,movement_velocity_stddev_milli) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING id", &params);
+    var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,evidence,decision_flags,rule_revision,objects_checked,matched_clicks,mean_abs_timing_error_milli,timing_stddev_milli,exact_timing_bps,center_hits_bps,mean_center_distance_milli,snap_events,replay_match_count,key_press_count,key_hold_count,mean_hold_duration_milli,hold_duration_stddev_milli,alternation_bps,target_distance_stddev_milli,velocity_spike_count,movement_velocity_stddev_milli,review_exclusion_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30) RETURNING id", &params);
     defer result.deinit();
     const observation_id = try result.int(i64, 0, 0);
-    var detail_buf: [512]u8 = undefined;
-    const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} replay_match_count={d} rule_revision={d}", .{
+    var detail_buf: [560]u8 = undefined;
+    const detail = try std.fmt.bufPrint(&detail_buf, "observation_id={d} module={s} source={s} score_id={d} mode=observe action={d} sample_weight={d} reason={d} risk={d} confidence_bps={d} evidence={d} replay_match_count={d} rule_revision={d} review_exclusion_id={s}", .{
         observation_id,
         observation.module,
         observation.source.text(),
@@ -95,6 +185,7 @@ pub fn recordAnticheatObservation(self: anytype, user_id: i32, observation: Anti
         observation.evidence,
         observation.replay_match_count,
         observation.rule_revision,
+        params[29] orelse "0",
     });
     try common.insertAudit(self.allocator, lease.conn, 3, "anticheat.observe", user_id, detail);
     try postgres.exec(lease.conn, "COMMIT");
@@ -126,6 +217,36 @@ pub fn recordReplayFingerprint(self: anytype, user_id: i32, score_id: i64, diges
     defer lease.release();
     var result = try postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.anticheat_replay_fingerprints(score_id,user_id,replay_sha256) SELECT id,user_id,$1 FROM zigcho.scores WHERE id=$2 AND user_id=$3 ON CONFLICT(score_id) DO NOTHING", &.{ encoded, score, user });
     result.deinit();
+}
+
+pub fn crossAccountReplayContentMatches(self: anytype, user_id: i32, map_md5: []const u8, mode: u8, digest: *const [32]u8) !u32 {
+    if (user_id <= 0 or map_md5.len != 32 or mode > 3) return error.InvalidReplayFingerprint;
+    const encoded = try postgres.encodeBytea(self.allocator, digest);
+    defer self.allocator.free(encoded);
+    var user_buf: [24]u8 = undefined;
+    var mode_buf: [8]u8 = undefined;
+    const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+    const mode_text = try std.fmt.bufPrint(&mode_buf, "{d}", .{mode});
+    var lease = self.pool.acquire();
+    defer lease.release();
+    var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT least(count(DISTINCT fp.user_id),100000) FROM zigcho.anticheat_replay_fingerprints fp JOIN zigcho.scores score ON score.id=fp.score_id WHERE fp.replay_content_sha256=$1 AND fp.user_id!=$2 AND fp.user_id!=3 AND score.passed AND score.map_md5=$3 AND score.mode=$4", &.{ encoded, user, map_md5, mode_text });
+    defer result.deinit();
+    return @intCast(try result.int(i64, 0, 0));
+}
+
+pub fn recordReplayContentFingerprint(self: anytype, user_id: i32, score_id: i64, digest: *const [32]u8) !void {
+    if (user_id <= 0 or score_id <= 0) return error.InvalidReplayFingerprint;
+    const encoded = try postgres.encodeBytea(self.allocator, digest);
+    defer self.allocator.free(encoded);
+    var user_buf: [24]u8 = undefined;
+    var score_buf: [24]u8 = undefined;
+    const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
+    const score = try std.fmt.bufPrint(&score_buf, "{d}", .{score_id});
+    var lease = self.pool.acquire();
+    defer lease.release();
+    var result = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.anticheat_replay_fingerprints SET replay_content_sha256=$1 WHERE score_id=$2 AND user_id=$3 RETURNING score_id", &.{ encoded, score, user });
+    defer result.deinit();
+    if (result.rows() != 1) return error.InvalidReplayFingerprint;
 }
 
 pub fn recordClientHardware(self: anytype, user_id: i32, hardware: ClientHardware) !HardwareEvidence {
@@ -544,15 +665,36 @@ pub fn beatmapMd5ForSet(self: anytype, set_id: i32) !?[32]u8 {
 pub fn staffAnticheatJson(self: anytype, allocator: std.mem.Allocator) ![]u8 {
     var lease = self.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.replay_match_count,o.key_press_count,o.key_hold_count,o.mean_hold_duration_milli,o.hold_duration_stddev_milli,o.alternation_bps,o.target_distance_stddev_milli,o.velocity_spike_count,o.movement_velocity_stddev_milli,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at FROM zigcho.anticheat_observations o JOIN zigcho.users u ON u.id=o.user_id LEFT JOIN zigcho.users reviewer ON reviewer.id=o.reviewer_id ORDER BY (o.review_label='pending') DESC,o.created_at DESC,o.id DESC LIMIT 250");
+    try postgres.exec(lease.conn, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    var result = try postgres.query(lease.conn, "SELECT o.id,o.user_id,u.name,coalesce(o.score_id,0),o.source,o.module,o.action,o.sample_weight,o.reason,o.risk_score,o.confidence_bps,o.evidence,o.decision_flags,o.rule_revision,o.objects_checked,o.matched_clicks,o.mean_abs_timing_error_milli,o.timing_stddev_milli,o.exact_timing_bps,o.center_hits_bps,o.mean_center_distance_milli,o.snap_events,o.replay_match_count,o.key_press_count,o.key_hold_count,o.mean_hold_duration_milli,o.hold_duration_stddev_milli,o.alternation_bps,o.target_distance_stddev_milli,o.velocity_spike_count,o.movement_velocity_stddev_milli,o.review_label,coalesce(reviewer.name,''),o.review_note,coalesce(o.reviewed_at,0),o.created_at,coalesce(x.id,0),coalesce(x.scope,''),coalesce(x.reason,''),coalesce(creator.name,''),coalesce(x.created_at,0),coalesce(x.expires_at,0),coalesce(revoker.name,''),coalesce(x.revoked_at,0),coalesce(x.revoke_reason,'') FROM zigcho.anticheat_observations o JOIN zigcho.users u ON u.id=o.user_id LEFT JOIN zigcho.users reviewer ON reviewer.id=o.reviewer_id LEFT JOIN zigcho.anticheat_review_exclusions x ON x.id=o.review_exclusion_id LEFT JOIN zigcho.users creator ON creator.id=x.created_by LEFT JOIN zigcho.users revoker ON revoker.id=x.revoked_by WHERE o.id IN(SELECT id FROM zigcho.anticheat_observations WHERE review_label='pending' AND review_exclusion_id IS NULL ORDER BY created_at DESC,id DESC LIMIT 250) OR o.id IN(SELECT id FROM zigcho.anticheat_observations WHERE review_label='pending' AND review_exclusion_id IS NOT NULL ORDER BY created_at DESC,id DESC LIMIT 250) OR o.id IN(SELECT id FROM zigcho.anticheat_observations WHERE review_label!='pending' ORDER BY created_at DESC,id DESC LIMIT 250) ORDER BY (o.review_label='pending' AND o.review_exclusion_id IS NULL) DESC,(o.review_label='pending' AND o.review_exclusion_id IS NOT NULL) DESC,o.created_at DESC,o.id DESC");
     defer result.deinit();
-    var pending_result = try postgres.query(lease.conn, "SELECT count(*) FROM zigcho.anticheat_observations WHERE review_label='pending'");
+    var pending_result = try postgres.query(lease.conn, "SELECT count(*) FILTER(WHERE review_label='pending' AND review_exclusion_id IS NULL),count(*) FILTER(WHERE review_label='pending' AND review_exclusion_id IS NOT NULL) FROM zigcho.anticheat_observations");
     defer pending_result.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try output.writer.print("{{\"pending\":{d},\"policy\":", .{try pending_result.int(i64, 0, 0)});
+    try output.writer.print("{{\"pending\":{d},\"suppressed_pending\":{d},\"policy\":", .{ try pending_result.int(i64, 0, 0), try pending_result.int(i64, 0, 1) });
     try anticheat_review.writePolicyJson(&output.writer);
-    try output.writer.writeAll(",\"observations\":[");
+    try output.writer.writeAll(",\"exclusions\":[");
+    var exclusions = try postgres.query(lease.conn, "SELECT x.id,x.user_id,u.name,x.scope,x.reason,creator.name,x.created_at,x.expires_at,coalesce(revoker.name,''),coalesce(x.revoked_at,0),x.revoke_reason,(x.revoked_at IS NULL AND x.expires_at>extract(epoch FROM transaction_timestamp())::bigint) FROM zigcho.anticheat_review_exclusions x JOIN zigcho.users u ON u.id=x.user_id JOIN zigcho.users creator ON creator.id=x.created_by LEFT JOIN zigcho.users revoker ON revoker.id=x.revoked_by WHERE x.id IN(SELECT id FROM zigcho.anticheat_review_exclusions WHERE revoked_at IS NULL AND expires_at>extract(epoch FROM transaction_timestamp())::bigint ORDER BY created_at DESC,id DESC LIMIT 200) OR x.id IN(SELECT id FROM zigcho.anticheat_review_exclusions WHERE revoked_at IS NOT NULL OR expires_at<=extract(epoch FROM transaction_timestamp())::bigint ORDER BY created_at DESC,id DESC LIMIT 200) ORDER BY (x.revoked_at IS NULL AND x.expires_at>extract(epoch FROM transaction_timestamp())::bigint) DESC,x.created_at DESC,x.id DESC");
+    defer exclusions.deinit();
+    for (0..exclusions.rows()) |row| {
+        if (row != 0) try output.writer.writeByte(',');
+        try output.writer.print("{{\"id\":{d},\"user_id\":{d},\"user\":", .{ try exclusions.int(i64, row, 0), try exclusions.int(i32, row, 1) });
+        try common.jsonString(&output.writer, exclusions.value(row, 2));
+        try output.writer.writeAll(",\"scope\":");
+        try common.jsonString(&output.writer, exclusions.value(row, 3));
+        try output.writer.writeAll(",\"reason\":");
+        try common.jsonString(&output.writer, exclusions.value(row, 4));
+        try output.writer.writeAll(",\"created_by\":");
+        try common.jsonString(&output.writer, exclusions.value(row, 5));
+        try output.writer.print(",\"created_at\":{d},\"expires_at\":{d},\"revoked_by\":", .{ try exclusions.int(i64, row, 6), try exclusions.int(i64, row, 7) });
+        try common.jsonString(&output.writer, exclusions.value(row, 8));
+        try output.writer.print(",\"revoked_at\":{d},\"revoke_reason\":", .{try exclusions.int(i64, row, 9)});
+        try common.jsonString(&output.writer, exclusions.value(row, 10));
+        try output.writer.print(",\"active\":{}}}", .{try exclusions.boolean(row, 11)});
+    }
+    try output.writer.writeAll("],\"observations\":[");
     for (0..result.rows()) |row| {
         if (row != 0) try output.writer.writeByte(',');
         try output.writer.print("{{\"id\":{d},\"user_id\":{d},\"user\":", .{ try result.int(i64, row, 0), try result.int(i32, row, 1) });
@@ -604,9 +746,27 @@ pub fn staffAnticheatJson(self: anytype, allocator: std.mem.Allocator) ![]u8 {
         try common.jsonString(&output.writer, result.value(row, 32));
         try output.writer.writeAll(",\"review_note\":");
         try common.jsonString(&output.writer, result.value(row, 33));
-        try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}}}", .{ try result.int(i64, row, 34), try result.int(i64, row, 35) });
+        try output.writer.print(",\"reviewed_at\":{d},\"created_at\":{d}", .{ try result.int(i64, row, 34), try result.int(i64, row, 35) });
+        const exclusion_id = try result.int(i64, row, 36);
+        if (exclusion_id == 0) {
+            try output.writer.writeAll(",\"review_suppressed\":false,\"review_exclusion\":null");
+        } else {
+            try output.writer.print(",\"review_suppressed\":true,\"review_exclusion\":{{\"id\":{d},\"scope\":", .{exclusion_id});
+            try common.jsonString(&output.writer, result.value(row, 37));
+            try output.writer.writeAll(",\"reason\":");
+            try common.jsonString(&output.writer, result.value(row, 38));
+            try output.writer.writeAll(",\"created_by\":");
+            try common.jsonString(&output.writer, result.value(row, 39));
+            try output.writer.print(",\"created_at\":{d},\"expires_at\":{d},\"revoked_by\":", .{ try result.int(i64, row, 40), try result.int(i64, row, 41) });
+            try common.jsonString(&output.writer, result.value(row, 42));
+            try output.writer.print(",\"revoked_at\":{d},\"revoke_reason\":", .{try result.int(i64, row, 43)});
+            try common.jsonString(&output.writer, result.value(row, 44));
+            try output.writer.writeByte('}');
+        }
+        try output.writer.writeByte('}');
     }
     try output.writer.writeAll("]}");
+    try postgres.exec(lease.conn, "COMMIT");
     return output.toOwnedSlice();
 }
 
@@ -692,7 +852,7 @@ pub fn setServerControl(self: anytype, actor_id: i32, feature: server_control.Fe
 pub fn staffOverviewJson(self: anytype, allocator: std.mem.Allocator) ![]u8 {
     var lease = self.pool.acquire();
     defer lease.release();
-    var result = try postgres.query(lease.conn, "SELECT (SELECT count(*) FROM zigcho.moderation_appeals WHERE status='open'),(SELECT count(DISTINCT set_id) FROM zigcho.beatmap_rank_requests WHERE active),(SELECT count(*) FROM zigcho.users WHERE restricted),(SELECT count(*) FROM zigcho.users WHERE silence_end>extract(epoch FROM clock_timestamp())::bigint),(SELECT count(*) FROM zigcho.audit_log WHERE created_at>=extract(epoch FROM clock_timestamp())::bigint-86400),(SELECT count(*) FROM zigcho.client_hardware),(SELECT count(*) FROM zigcho.anticheat_observations WHERE review_label='pending'),(SELECT count(*) FROM zigcho.lazer_reports WHERE status='open')");
+    var result = try postgres.query(lease.conn, "SELECT (SELECT count(*) FROM zigcho.moderation_appeals WHERE status='open'),(SELECT count(DISTINCT set_id) FROM zigcho.beatmap_rank_requests WHERE active),(SELECT count(*) FROM zigcho.users WHERE restricted),(SELECT count(*) FROM zigcho.users WHERE silence_end>extract(epoch FROM clock_timestamp())::bigint),(SELECT count(*) FROM zigcho.audit_log WHERE created_at>=extract(epoch FROM clock_timestamp())::bigint-86400),(SELECT count(*) FROM zigcho.client_hardware),(SELECT count(*) FROM zigcho.anticheat_observations WHERE review_label='pending' AND review_exclusion_id IS NULL),(SELECT count(*) FROM zigcho.lazer_reports WHERE status='open')");
     defer result.deinit();
     return std.fmt.allocPrint(allocator, "{{\"open_appeals\":{d},\"ranking_sets\":{d},\"restricted_users\":{d},\"silenced_users\":{d},\"audit_24h\":{d},\"hardware_records\":{d},\"anticheat_pending\":{d},\"open_reports\":{d}}}", .{ try result.int(i64, 0, 0), try result.int(i64, 0, 1), try result.int(i64, 0, 2), try result.int(i64, 0, 3), try result.int(i64, 0, 4), try result.int(i64, 0, 5), try result.int(i64, 0, 6), try result.int(i64, 0, 7) });
 }

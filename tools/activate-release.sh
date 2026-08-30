@@ -20,7 +20,7 @@ case "$release" in
   "$release_root"/*) ;;
   *) echo "usage: $0 /opt/zigcho/releases/<commit>" >&2; exit 1 ;;
 esac
-if [ ! -x "$release/zigcho" ] || [ ! -s "$release/pp-engine-version" ] || [ ! -x "$release/tools/backup-postgres.sh" ] || [ ! -x "$release/tools/restore-postgres-drill.sh" ] || [ ! -x "$release/tools/rollback-release.sh" ]; then
+if [ ! -x "$release/zigcho" ] || [ ! -x "$release/zigcho-anticheat-host-smoke" ] || [ ! -s "$release/pp-engine-version" ] || [ ! -x "$release/tools/backup-postgres.sh" ] || [ ! -x "$release/tools/restore-postgres-drill.sh" ] || [ ! -x "$release/tools/rollback-release.sh" ]; then
   echo "candidate release is incomplete: $release" >&2
   exit 1
 fi
@@ -49,6 +49,20 @@ esac
 if command -v flock >/dev/null 2>&1; then
   exec 9>/run/zigcho-release.lock
   flock -n 9 || { echo "another Zigcho activation is running" >&2; exit 1; }
+fi
+
+config=/var/lib/zigcho/config.ini
+anticheat_module=
+if [ -f "$config" ]; then
+  anticheat_module=$(sed -n 's/^[[:space:]]*anticheat_module_path[[:space:]]*=[[:space:]]*\([^#]*\).*$/\1/p' "$config" | tail -n 1 | sed 's/[[:space:]]*$//')
+fi
+if [ -n "$anticheat_module" ]; then
+  case "$anticheat_module" in
+    /opt/zigcho/private/anticheat/*/libzigcho_anticheat.so) ;;
+    *) echo "configured anticheat module is not an immutable private release: $anticheat_module" >&2; exit 1 ;;
+  esac
+  [ -r "$anticheat_module" ] || { echo "configured anticheat module is unreadable: $anticheat_module" >&2; exit 1; }
+  runuser --user zigcho -- "$candidate/zigcho-anticheat-host-smoke" "$anticheat_module"
 fi
 
 restore_previous() {

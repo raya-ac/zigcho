@@ -7,7 +7,7 @@ pub const ServerCounts = struct { users: i64, plays: i64, passed: i64, maps: i64
 pub const BeatmapCacheStats = struct { entries: i64, bytes: i64, hydration_failures: i64 };
 pub const BeatmapCachePrune = struct { entries: i64, bytes: i64 };
 pub const BeatmapMediaCacheStats = struct { entries: i64, bytes: i64 };
-pub const schema_version: u16 = 47;
+pub const schema_version: u16 = 48;
 pub const archive_object_limit: usize = 128 * 1024 * 1024;
 pub const max_replay_object_bytes: usize = 32 * 1024 * 1024;
 pub const visible_follower_count_sql = "CASE WHEN NOT u.restricted AND u.id!=3 THEN (SELECT count(*) FROM zigcho.friends relation JOIN zigcho.users follower ON follower.id=relation.user_id WHERE relation.friend_id=u.id AND relation.user_id!=u.id AND NOT follower.restricted) ELSE 0 END";

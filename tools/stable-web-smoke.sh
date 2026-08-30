@@ -69,7 +69,7 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
 expect_status "$code" 201 register_social_friend
 social_friend_id=$(jq -er '.id' "$response")
 
-sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; UPDATE users SET privileges=privileges|(1<<4) WHERE id=$social_player_id; INSERT INTO friends(user_id,friend_id) VALUES($social_player_id,$social_friend_id); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10),(9002,9002,'90029002900290029002900290029002','ranked artist','ranked title','ranked diff','ranked mapper',3,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id); INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,checksum,rank_namespace,best,time_elapsed) VALUES($social_player_id,'90029002900290029002900290029002',0,8,1000000,20,1,10,10,0,0,0,0,0,1,1,'smoke-score-checksum','vanilla',1,12000); INSERT INTO direct_messages(from_id,to_id,message) VALUES($social_friend_id,$social_player_id,'offline smoke hello'); INSERT INTO beatmap_archives(set_id,sha256,osz_file) VALUES(9002,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',x'6f737a20736d6f6b65');"
+sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<12)|(1<<13)|(1<<14) WHERE id=$staff_id; UPDATE users SET restricted=1 WHERE id=$player_id; UPDATE users SET privileges=privileges|(1<<4) WHERE id=$social_player_id; INSERT INTO friends(user_id,friend_id) VALUES($social_player_id,$social_friend_id); INSERT INTO beatmaps(id,set_id,md5,artist,title,version,creator,status,max_combo) VALUES(9001,9001,'90019001900190019001900190019001','smoke artist','smoke title','staff queue','mapper',2,10),(9002,9002,'90029002900290029002900290029002','ranked artist','ranked title','ranked diff','ranked mapper',3,10); INSERT INTO beatmap_rank_requests(set_id,map_id,requester_id) VALUES(9001,9001,$player_id); INSERT INTO scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,checksum,rank_namespace,best,time_elapsed) VALUES($social_player_id,'90029002900290029002900290029002',0,8,1000000,20,1,10,10,0,0,0,0,0,1,1,'smoke-score-checksum','vanilla',1,12000); INSERT INTO direct_messages(from_id,to_id,message) VALUES($social_friend_id,$social_player_id,'offline smoke hello'); INSERT INTO beatmap_archives(set_id,sha256,osz_file,object_bytes) VALUES(9002,'7eaad034b2f888b35440bdc715a621e69a2d0bb16f4bd867bbff8c780ca82a77',x'6f737a20736d6f6b65',9);"
 score_id=$(sqlite3 "$database" "SELECT id FROM scores WHERE checksum='smoke-score-checksum'")
 sqlite3 "$database" "INSERT INTO anticheat_observations(user_id,score_id,source,module,action,sample_weight,reason,risk_score,confidence_bps,rule_revision,objects_checked,matched_clicks) VALUES($social_player_id,$score_id,'stable_score','smoke-private',0,100,0,0,0,7,10,9);"
 anticheat_observation_id=$(sqlite3 "$database" "SELECT id FROM anticheat_observations WHERE score_id=$score_id")
@@ -207,9 +207,48 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
 expect_status "$code" 200 staff_report_resolve
 [ "$(sqlite3 "$database" "SELECT status||':'||resolver_id FROM lazer_reports WHERE id=$lazer_report_id")" = "resolved:$staff_id" ] || fail report_resolution_not_saved
 
+sqlite3 "$database" "UPDATE users SET privileges=3|(1<<12) WHERE id=$staff_id"
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat/exclusions" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode 'action=create' --data-urlencode "user=$social_player_id" --data-urlencode 'scope=stable_lastfm' \
+  --data-urlencode 'duration_seconds=3600' --data-urlencode 'reason=moderator must not suppress review')
+expect_status "$code" 403 anticheat_exclusion_moderator_forbidden
+sqlite3 "$database" "UPDATE users SET privileges=privileges|(1<<11)|(1<<13)|(1<<14) WHERE id=$staff_id"
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat/exclusions" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header 'X-CSRF-Token: wrong' \
+  --data-urlencode 'action=create' --data-urlencode "user=$social_player_id" --data-urlencode 'scope=stable_lastfm' \
+  --data-urlencode 'duration_seconds=3600' --data-urlencode 'reason=smoke calibration account')
+expect_status "$code" 403 anticheat_exclusion_wrong_csrf
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat/exclusions" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode 'action=create' --data-urlencode "user=$staff_id" --data-urlencode 'scope=all' \
+  --data-urlencode 'duration_seconds=3600' --data-urlencode 'reason=self exclusion must fail')
+expect_status "$code" 403 anticheat_exclusion_self_forbidden
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat/exclusions" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode 'action=create' --data-urlencode "user=$social_player_id" --data-urlencode 'scope=stable_lastfm' \
+  --data-urlencode 'duration_seconds=3600' --data-urlencode 'reason=smoke calibration account')
+expect_status "$code" 201 anticheat_exclusion_create
+anticheat_exclusion_id=$(jq -er '.id' "$response")
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat/exclusions" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode 'action=create' --data-urlencode "user=$social_player_id" --data-urlencode 'scope=all' \
+  --data-urlencode 'duration_seconds=3600' --data-urlencode 'reason=overlapping smoke exclusion')
+expect_status "$code" 409 anticheat_exclusion_overlap
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/lastfm.php" \
+  --data-urlencode 'action=np' --data-urlencode 'us=social player' --data-urlencode 'ha=00000000000000000000000000000000' --data-urlencode 'b=a393216')
+expect_status "$code" 200 anticheat_exclusion_signal
+suppressed_observation_id=$(sqlite3 "$database" "SELECT id FROM anticheat_observations WHERE user_id=$social_player_id AND source='stable_lastfm' AND review_exclusion_id=$anticheat_exclusion_id ORDER BY id DESC LIMIT 1")
+[ -n "$suppressed_observation_id" ] || fail anticheat_exclusion_did_not_preserve_evidence
+
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/anticheat" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_anticheat
-jq -e ".pending == 1 and .policy.mode == \"observe_only\" and (.observations[] | select(.id == $anticheat_observation_id and .score_id == $score_id and .action == 0 and .sample_weight == 100 and .review_label == \"pending\" and .meaning.action.display == \"allow (0)\" and .meaning.reason.display == \"none (0)\" and .meaning.observe_only == true))" "$response" >/dev/null || fail invalid_anticheat_queue
+jq -e ".pending == 1 and .suppressed_pending == 1 and .policy.mode == \"observe_only\" and (.exclusions[] | select(.id == $anticheat_exclusion_id and .active == true and .scope == \"stable_lastfm\")) and (.observations[] | select(.id == $anticheat_observation_id and .score_id == $score_id and .action == 0 and .sample_weight == 100 and .review_label == \"pending\" and .meaning.action.display == \"allow (0)\" and .meaning.reason.display == \"none (0)\" and .meaning.observe_only == true)) and (.observations[] | select(.id == $suppressed_observation_id and .review_suppressed == true and .review_exclusion.id == $anticheat_exclusion_id))" "$response" >/dev/null || fail invalid_anticheat_queue
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat" \
   --header "Cookie: $cookie" --header "Origin: $origin" --header 'X-CSRF-Token: wrong' \
@@ -222,6 +261,22 @@ code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}
 expect_status "$code" 200 anticheat_review
 [ "$(sqlite3 "$database" "SELECT review_label FROM anticheat_observations WHERE id=$anticheat_observation_id")" = clean ] || fail anticheat_label_not_saved
 [ "$(sqlite3 "$database" "SELECT restricted||':'||(SELECT total_score||':'||ranked_score||':'||plays FROM stats WHERE user_id=$social_player_id AND mode=0) FROM users WHERE id=$social_player_id")" = "$anticheat_player_state" ] || fail anticheat_review_enforced_player_state
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --request POST "$origin/api/v1/staff/anticheat/exclusions" \
+  --header "Cookie: $cookie" --header "Origin: $origin" --header "X-CSRF-Token: $csrf" \
+  --data-urlencode 'action=revoke' --data-urlencode "exclusion_id=$anticheat_exclusion_id" --data-urlencode 'reason=smoke calibration complete')
+expect_status "$code" 200 anticheat_exclusion_revoke
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --get "$origin/web/lastfm.php" \
+  --data-urlencode 'action=np' --data-urlencode 'us=social player' --data-urlencode 'ha=00000000000000000000000000000000' --data-urlencode 'b=a393216')
+expect_status "$code" 200 anticheat_post_revoke_signal
+post_revoke_observation_id=$(sqlite3 "$database" "SELECT id FROM anticheat_observations WHERE user_id=$social_player_id AND source='stable_lastfm' AND review_exclusion_id IS NULL ORDER BY id DESC LIMIT 1")
+[ -n "$post_revoke_observation_id" ] || fail anticheat_revocation_did_not_restore_queue
+[ "$(sqlite3 "$database" "SELECT review_exclusion_id FROM anticheat_observations WHERE id=$suppressed_observation_id")" = "$anticheat_exclusion_id" ] || fail anticheat_suppressed_history_not_preserved
+
+code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/anticheat" --header "Cookie: $cookie")
+expect_status "$code" 200 staff_anticheat_after_revoke
+jq -e ".pending == 1 and .suppressed_pending == 1 and (.exclusions[] | select(.id == $anticheat_exclusion_id and .active == false and .revoke_reason == \"smoke calibration complete\")) and (.observations[] | select(.id == $post_revoke_observation_id and .review_suppressed == false))" "$response" >/dev/null || fail invalid_anticheat_revocation_state
 
 code=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "$origin/api/v1/staff/ranking" --header "Cookie: $cookie")
 expect_status "$code" 200 staff_ranking

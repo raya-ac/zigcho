@@ -1,4 +1,5 @@
 pub const version: u32 = 1;
+pub const rule_revision: u32 = 4;
 
 pub const Status = struct {
     pub const ok: u32 = 0;
@@ -53,7 +54,9 @@ pub const Evidence = struct {
     pub const duplicate_score: u64 = 1 << 14;
     pub const checksum_mismatch: u64 = 1 << 15;
     pub const rate_anomaly: u64 = 1 << 16;
-    pub const known_mask: u64 = (1 << 17) - 1;
+    pub const replay_content_reused: u64 = 1 << 17;
+    pub const suspicious_frame_cadence: u64 = 1 << 18;
+    pub const known_mask: u64 = (1 << 19) - 1;
 };
 
 pub const Action = struct {
@@ -77,12 +80,14 @@ pub const Reason = struct {
     pub const required_replay_missing: u32 = 2006;
     pub const combined_anomalies: u32 = 2007;
     pub const invalid_replay_payload: u32 = 2008;
+    pub const replay_content_reused: u32 = 2009;
     pub const timing_outlier: u32 = 3001;
     pub const pp_outlier: u32 = 3002;
     pub const multiaccount_cluster: u32 = 3003;
     pub const rate_anomaly: u32 = 3004;
     pub const registry_remnant: u32 = 3005;
     pub const duplicate_score: u32 = 3006;
+    pub const suspicious_frame_cadence: u32 = 3007;
     pub const relax_keyless_play: u32 = 4001;
     pub const relax_timing_lock: u32 = 4002;
     pub const relax_hold_lock: u32 = 4003;
@@ -163,6 +168,9 @@ pub const HitObjectKind = struct {
 
 pub const HitObjectV1 = extern struct {
     time_ms: i64,
+    // Gameplay-space coordinates after every position-transforming mod and
+    // stacking adjustment has been applied. Raw .osu coordinates do not meet
+    // this contract and must not drive cursor-family decisions.
     x: f32,
     y: f32,
     kind: u32,

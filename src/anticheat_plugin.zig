@@ -2,6 +2,7 @@ const std = @import("std");
 const abi = @import("anticheat_abi.zig");
 
 const AbiVersionFn = *const fn () callconv(.c) u32;
+const RuleRevisionFn = *const fn () callconv(.c) u32;
 const SizeFn = *const fn () callconv(.c) u32;
 const NameFn = *const fn () callconv(.c) ?[*:0]const u8;
 const EvaluateFn = *const fn (?*const abi.EventV1, ?*abi.DecisionV1) callconv(.c) u32;
@@ -107,6 +108,7 @@ fn validateGameplayResult(event: abi.GameplayEventV1, result: abi.GameplayResult
 pub const Host = struct {
     library: std.DynLib,
     module_name: []const u8,
+    rule_revision: u32,
     evaluate_fn: EvaluateFn,
     evaluate_gameplay_fn: EvaluateGameplayFn,
 
@@ -115,6 +117,7 @@ pub const Host = struct {
         var library = try std.DynLib.open(path);
         errdefer library.close();
         const abi_version = library.lookup(AbiVersionFn, "zigcho_anticheat_abi_version") orelse return error.MissingAbiVersion;
+        const rule_revision_fn = library.lookup(RuleRevisionFn, "zigcho_anticheat_rule_revision") orelse return error.MissingRuleRevision;
         const event_size = library.lookup(SizeFn, "zigcho_anticheat_event_size_v1") orelse return error.MissingEventSize;
         const decision_size = library.lookup(SizeFn, "zigcho_anticheat_decision_size_v1") orelse return error.MissingDecisionSize;
         const gameplay_event_size = library.lookup(SizeFn, "zigcho_anticheat_gameplay_event_size_v1") orelse return error.MissingGameplayEventSize;
@@ -124,6 +127,8 @@ pub const Host = struct {
         const evaluate_gameplay_fn = library.lookup(EvaluateGameplayFn, "zigcho_anticheat_evaluate_gameplay_v1") orelse return error.MissingGameplayEvaluator;
 
         if (abi_version() != abi.version) return error.UnsupportedAbi;
+        const rule_revision = rule_revision_fn();
+        if (rule_revision != abi.rule_revision) return error.UnsupportedRuleRevision;
         if (event_size() != @sizeOf(abi.EventV1) or decision_size() != @sizeOf(abi.DecisionV1) or
             gameplay_event_size() != @sizeOf(abi.GameplayEventV1) or gameplay_result_size() != @sizeOf(abi.GameplayResultV1)) return error.LayoutMismatch;
         const module_name_pointer = name_fn() orelse return error.InvalidModuleName;
@@ -134,6 +139,7 @@ pub const Host = struct {
         return .{
             .library = library,
             .module_name = module_name,
+            .rule_revision = rule_revision,
             .evaluate_fn = evaluate_fn,
             .evaluate_gameplay_fn = evaluate_gameplay_fn,
         };
@@ -148,11 +154,16 @@ pub const Host = struct {
         return self.module_name;
     }
 
+    pub fn ruleRevision(self: Host) u32 {
+        return self.rule_revision;
+    }
+
     pub fn evaluate(self: Host, event: abi.EventV1) !abi.DecisionV1 {
         try validateEvent(event);
         var decision: abi.DecisionV1 = .{};
         if (self.evaluate_fn(&event, &decision) != abi.Status.ok) return error.ModuleRejectedEvent;
         try validateDecision(decision);
+        if (decision.rule_revision != self.rule_revision) return error.RuleRevisionMismatch;
         return decision;
     }
 
@@ -161,6 +172,7 @@ pub const Host = struct {
         var result: abi.GameplayResultV1 = .{};
         if (self.evaluate_gameplay_fn(&event, &result) != abi.Status.ok) return error.ModuleRejectedEvent;
         try validateGameplayResult(event, result);
+        if (result.decision.rule_revision != self.rule_revision) return error.RuleRevisionMismatch;
         return result;
     }
 };

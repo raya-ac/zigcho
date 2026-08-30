@@ -5,6 +5,8 @@ const storage = @import("runtime_storage.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
 const multiplayer_fixed = @import("lazer_multiplayer/fixed.zig");
 const multiplayer_model = @import("lazer_multiplayer/model.zig");
+const room_paths = @import("lazer_multiplayer/paths.zig");
+const room_scoring = @import("lazer_multiplayer/scoring.zig");
 
 pub const max_rooms = 64;
 const max_pending_archives = max_rooms * 2;
@@ -36,32 +38,16 @@ const timespan_ticks_per_second: i64 = std.time.ms_per_s * timespan_ticks_per_mi
 const matchmaking_stage = multiplayer_model.matchmaking_stage;
 const ranked_stage = multiplayer_model.ranked_stage;
 
-pub const RoomScorePath = struct {
-    room_id: i64,
-    playlist_item_id: i64,
-    token_id: ?i64,
-};
-
-pub const RoomUserPath = struct { room_id: i64, user_id: i32 };
-pub const RoomUserScorePath = struct { room_id: i64, playlist_item_id: i64, user_id: i32 };
-
-pub const RoomListMode = enum { open, ended, participated, owned };
-pub const RoomListStatus = enum { idle, playing };
-pub const RoomListKind = enum { any, playlists, realtime };
-pub const RoomListFilter = struct {
-    requester_id: i32,
-    mode: RoomListMode = .open,
-    status: ?RoomListStatus = null,
-    kind: RoomListKind = .any,
-    category: []const u8 = "",
-};
+pub const RoomScorePath = room_paths.RoomScorePath;
+pub const RoomUserPath = room_paths.RoomUserPath;
+pub const RoomUserScorePath = room_paths.RoomUserScorePath;
+pub const RoomListMode = room_paths.RoomListMode;
+pub const RoomListStatus = room_paths.RoomListStatus;
+pub const RoomListKind = room_paths.RoomListKind;
+pub const RoomListFilter = room_paths.RoomListFilter;
 
 pub fn roomListFilter(requester_id: i32, mode: []const u8, status: ?[]const u8, category: []const u8) !RoomListFilter {
-    const parsed_mode = std.meta.stringToEnum(RoomListMode, mode) orelse return error.InvalidRoomListFilter;
-    const parsed_status: ?RoomListStatus = if (status) |value| std.meta.stringToEnum(RoomListStatus, value) orelse return error.InvalidRoomListFilter else null;
-    if (category.len != 0 and !std.mem.eql(u8, category, "normal") and !std.mem.eql(u8, category, "realtime") and !std.mem.eql(u8, category, "spotlight") and !std.mem.eql(u8, category, "featured_artist")) return error.InvalidRoomListFilter;
-    const kind: RoomListKind = if (std.mem.eql(u8, category, "realtime")) .realtime else .playlists;
-    return .{ .requester_id = requester_id, .mode = parsed_mode, .status = parsed_status, .kind = kind, .category = if (kind == .realtime) "" else category };
+    return room_paths.roomListFilter(requester_id, mode, status, category);
 }
 
 fn archiveIncludesUser(allocator: std.mem.Allocator, participant_ids_json: []const u8, user_id: i32) bool {
@@ -271,60 +257,19 @@ fn archivedScores(allocator: std.mem.Allocator, room_json: []const u8, playlist_
 }
 
 pub fn parseRoomUserPath(path: []const u8) ?RoomUserPath {
-    const prefix = "/api/v2/rooms/";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    const rest = path[prefix.len..];
-    const marker = "/users/";
-    const marker_at = std.mem.indexOf(u8, rest, marker) orelse return null;
-    const room_id = std.fmt.parseInt(i64, rest[0..marker_at], 10) catch return null;
-    const user_text = rest[marker_at + marker.len ..];
-    if (std.mem.indexOfScalar(u8, user_text, '/') != null) return null;
-    const user_id = std.fmt.parseInt(i32, user_text, 10) catch return null;
-    if (room_id <= 0 or user_id <= 0) return null;
-    return .{ .room_id = room_id, .user_id = user_id };
+    return room_paths.parseRoomUserPath(path);
 }
 
 pub fn parseRoomLeaderboardPath(path: []const u8) ?i64 {
-    const prefix = "/api/v2/rooms/";
-    const suffix = "/leaderboard";
-    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
-    const id_text = path[prefix.len .. path.len - suffix.len];
-    if (id_text.len == 0 or std.mem.indexOfScalar(u8, id_text, '/') != null) return null;
-    const id = std.fmt.parseInt(i64, id_text, 10) catch return null;
-    return if (id > 0) id else null;
+    return room_paths.parseRoomLeaderboardPath(path);
 }
 
 pub fn parseRoomUserScorePath(path: []const u8) ?RoomUserScorePath {
-    const prefix = "/api/v2/rooms/";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    var parts = std.mem.splitScalar(u8, path[prefix.len..], '/');
-    const room_text = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "playlist")) return null;
-    const playlist_text = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "scores")) return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "users")) return null;
-    const user_text = parts.next() orelse return null;
-    if (parts.next() != null) return null;
-    const room_id = std.fmt.parseInt(i64, room_text, 10) catch return null;
-    const playlist_item_id = std.fmt.parseInt(i64, playlist_text, 10) catch return null;
-    const user_id = std.fmt.parseInt(i32, user_text, 10) catch return null;
-    if (room_id <= 0 or playlist_item_id <= 0 or user_id <= 0) return null;
-    return .{ .room_id = room_id, .playlist_item_id = playlist_item_id, .user_id = user_id };
+    return room_paths.parseRoomUserScorePath(path);
 }
 
-pub const RoomScoreContext = struct {
-    beatmap_id: i32,
-    ruleset_id: u8,
-};
-
-pub const RoomScoreResult = struct {
-    token_id: ?i64 = null,
-    score_id: i64,
-    total_score: i64,
-    accuracy: f64,
-    max_combo: i32,
-    passed: bool,
-};
+pub const RoomScoreContext = room_scoring.RoomScoreContext;
+pub const RoomScoreResult = room_scoring.RoomScoreResult;
 
 const RoomScoreTokenRecord = struct {
     token_id: i64,
@@ -333,79 +278,16 @@ const RoomScoreTokenRecord = struct {
     score_id: ?i64 = null,
 };
 
-const RoomScoreRecord = struct {
-    score_id: i64,
-    user_id: i32,
-    playlist_item_id: i64,
-    total_score: i64,
-    accuracy: f64,
-    max_combo: i32,
-    passed: bool,
-};
-
-pub const room_score_around_limit = 10;
-
-pub const RoomScoreRanking = struct {
-    position: usize,
-    higher_ids: [room_score_around_limit]i64 = [_]i64{0} ** room_score_around_limit,
-    higher_count: usize = 0,
-    lower_ids: [room_score_around_limit]i64 = [_]i64{0} ** room_score_around_limit,
-    lower_count: usize = 0,
-};
+const RoomScoreRecord = room_scoring.RoomScoreRecord;
+pub const room_score_around_limit = room_scoring.room_score_around_limit;
+pub const RoomScoreRanking = room_scoring.RoomScoreRanking;
 
 const RoomPersistence = enum { none, archive, checkpoint };
-
-fn scoreRanksBefore(left: RoomScoreRecord, right: RoomScoreRecord) bool {
-    if (left.total_score != right.total_score) return left.total_score > right.total_score;
-    return left.score_id < right.score_id;
-}
-
-fn sortRoomScores(scores: []RoomScoreRecord) void {
-    std.mem.sort(RoomScoreRecord, scores, {}, struct {
-        fn lessThan(_: void, left: RoomScoreRecord, right: RoomScoreRecord) bool {
-            return scoreRanksBefore(left, right);
-        }
-    }.lessThan);
-}
-
-fn scoreEligibleForHighScore(score: RoomScoreRecord, realtime: bool) bool {
-    // osu-web only promotes passing playlist scores, while realtime rooms also
-    // retain failed results. A zero score never creates a high-score row.
-    return score.total_score > 0 and (realtime or score.passed);
-}
-
-fn considerHighScore(allocator: std.mem.Allocator, high_scores: *std.ArrayList(RoomScoreRecord), score: RoomScoreRecord, realtime: bool) !void {
-    if (!scoreEligibleForHighScore(score, realtime)) return;
-    for (high_scores.items) |*existing| if (existing.user_id == score.user_id) {
-        if (scoreRanksBefore(score, existing.*)) existing.* = score;
-        return;
-    };
-    try high_scores.append(allocator, score);
-}
-
-fn rankingForScore(exact: RoomScoreRecord, high_scores: []const RoomScoreRecord) RoomScoreRanking {
-    var ranking: RoomScoreRanking = .{ .position = 1 };
-    for (high_scores) |score| ranking.position += @intFromBool(scoreRanksBefore(score, exact));
-
-    // Official scoresAround excludes the exact score's user. Higher scores are
-    // returned nearest-first in score_asc order; lower scores are nearest-first
-    // in the normal score_desc order.
-    var index = high_scores.len;
-    while (index != 0 and ranking.higher_count < room_score_around_limit) {
-        index -= 1;
-        const score = high_scores[index];
-        if (score.user_id == exact.user_id or !scoreRanksBefore(score, exact)) continue;
-        ranking.higher_ids[ranking.higher_count] = score.score_id;
-        ranking.higher_count += 1;
-    }
-    for (high_scores) |score| {
-        if (ranking.lower_count == room_score_around_limit) break;
-        if (score.user_id == exact.user_id or !scoreRanksBefore(exact, score)) continue;
-        ranking.lower_ids[ranking.lower_count] = score.score_id;
-        ranking.lower_count += 1;
-    }
-    return ranking;
-}
+const scoreRanksBefore = room_scoring.scoreRanksBefore;
+const sortRoomScores = room_scoring.sortRoomScores;
+const scoreEligibleForHighScore = room_scoring.scoreEligibleForHighScore;
+const considerHighScore = room_scoring.considerHighScore;
+const rankingForScore = room_scoring.rankingForScore;
 
 const FixedRaw = multiplayer_fixed.FixedRaw;
 const Raw64 = multiplayer_fixed.Raw64;
@@ -7059,29 +6941,11 @@ pub fn pingOwned(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn parseRoomPath(path: []const u8) ?i64 {
-    const prefix = "/api/v2/rooms/";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    const rest = path[prefix.len..];
-    if (rest.len == 0 or std.mem.indexOfScalar(u8, rest, '/') != null) return null;
-    const id = std.fmt.parseInt(i64, rest, 10) catch return null;
-    return if (id > 0) id else null;
+    return room_paths.parseRoomPath(path);
 }
 
 pub fn parseRoomScorePath(path: []const u8) ?RoomScorePath {
-    const prefix = "/api/v2/rooms/";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    var parts = std.mem.splitScalar(u8, path[prefix.len..], '/');
-    const room_text = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "playlist")) return null;
-    const playlist_text = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "scores")) return null;
-    const token_text = parts.next();
-    if (parts.next() != null) return null;
-    const room_id = std.fmt.parseInt(i64, room_text, 10) catch return null;
-    const playlist_item_id = std.fmt.parseInt(i64, playlist_text, 10) catch return null;
-    const token_id = if (token_text) |value| std.fmt.parseInt(i64, value, 10) catch return null else null;
-    if (room_id <= 0 or playlist_item_id <= 0 or (token_id != null and token_id.? <= 0)) return null;
-    return .{ .room_id = room_id, .playlist_item_id = playlist_item_id, .token_id = token_id };
+    return room_paths.parseRoomScorePath(path);
 }
 
 pub fn negotiateJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {

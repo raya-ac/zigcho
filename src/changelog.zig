@@ -416,17 +416,17 @@ test "changelog exposes the complete checked in release history" {
     const object = parsed.value.object;
     try std.testing.expectEqualStrings("zigcho!lazer", object.get("streams").?.array.items[0].object.get("display_name").?.string);
     try std.testing.expectEqualStrings(latest_version, object.get("builds").?.array.items[0].object.get("version").?.string);
-    try std.testing.expectEqual(@as(usize, 21), object.get("builds").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 22), object.get("builds").?.array.items.len);
     var entries: usize = 0;
     for (object.get("builds").?.array.items) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(historyEntryCount(), entries);
-    try std.testing.expectEqualStrings("zigcho release 1.9", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("zigcho release 2.0", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
 
     const latest = (try buildJson(std.testing.allocator, "lazer", "latest")).?;
     defer std.testing.allocator.free(latest);
     const parsed_latest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, latest, .{});
     defer parsed_latest.deinit();
-    try std.testing.expectEqualStrings("2026.830.1", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
+    try std.testing.expectEqualStrings("2026.830.2", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
 
     const oldest = (try buildJson(std.testing.allocator, "zigcho", "2026.809.0")).?;
     defer std.testing.allocator.free(oldest);

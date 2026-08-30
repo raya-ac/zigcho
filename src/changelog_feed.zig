@@ -545,7 +545,7 @@ test "checked in manifest reuses every embedded update without network fanout" {
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("zigcho release 1.9", parsed.value.object.get("builds").?.array.items[0].object.get("display_version").?.string);
+    try std.testing.expectEqualStrings("zigcho release 2.0", parsed.value.object.get("builds").?.array.items[0].object.get("display_version").?.string);
     try std.testing.expectEqual(history.historyEntryCount(), blk: {
         var count: usize = 0;
         for (parsed.value.object.get("builds").?.array.items) |build| count += build.object.get("changelog_entries").?.array.items.len;

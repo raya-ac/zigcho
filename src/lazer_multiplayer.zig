@@ -3,6 +3,8 @@ const domain = @import("domain.zig");
 const lazer = @import("lazer.zig");
 const storage = @import("runtime_storage.zig");
 const beatmap_sync = @import("beatmap_sync.zig");
+const multiplayer_fixed = @import("lazer_multiplayer/fixed.zig");
+const multiplayer_model = @import("lazer_multiplayer/model.zig");
 
 pub const max_rooms = 64;
 const max_pending_archives = max_rooms * 2;
@@ -12,49 +14,27 @@ fn publicCountry(user: domain.User) [2]u8 {
 }
 pub const Activity = enum { lobby, queue, multiplayer, playing };
 pub const max_connections = 128;
-pub const max_users = 16;
-pub const max_playlist = 32;
-pub const max_matchmaking_maps = 16;
+pub const max_users = multiplayer_model.max_users;
+pub const max_playlist = multiplayer_model.max_playlist;
+pub const max_matchmaking_maps = multiplayer_model.max_matchmaking_maps;
 // A playlist room may accept up to 1,000 attempts from each of its 16 users.
 // Keep that whole supported contract available for the eventual archive rather
 // than silently rotating older attempts out of the room history.
 pub const max_room_scores = max_users * 1000;
 pub const max_room_participants = 128;
-pub const matchmaking_rounds = 3;
-const ranked_player_count = 2;
-const ranked_hand_size = 5;
-const max_ranked_cards = max_playlist * ranked_player_count;
+pub const matchmaking_rounds = multiplayer_model.matchmaking_rounds;
+const ranked_player_count = multiplayer_model.ranked_player_count;
+const ranked_hand_size = multiplayer_model.ranked_hand_size;
+const max_ranked_cards = multiplayer_model.max_ranked_cards;
 const max_hub_message = 60 * 1024;
 const ranked_pick_seconds: i64 = 30;
 const pending_match_timeout_seconds: i64 = 30;
 const multiplayer_score_grace_seconds: i64 = 5 * 60;
-const timespan_ticks_per_millisecond: i64 = 10_000;
+const timespan_ticks_per_millisecond = multiplayer_model.timespan_ticks_per_millisecond;
 const timespan_ticks_per_second: i64 = std.time.ms_per_s * timespan_ticks_per_millisecond;
 
-const matchmaking_stage = struct {
-    const waiting_for_clients_join: u8 = 0;
-    const round_warmup: u8 = 1;
-    const user_beatmap_select: u8 = 2;
-    const server_beatmap_finalised: u8 = 3;
-    const waiting_for_beatmap_download: u8 = 4;
-    const gameplay_warmup: u8 = 5;
-    const gameplay: u8 = 6;
-    const results: u8 = 7;
-    const ended: u8 = 8;
-};
-
-const ranked_stage = struct {
-    const wait_for_join: u8 = 0;
-    const round_warmup: u8 = 1;
-    const card_discard: u8 = 2;
-    const finish_card_discard: u8 = 3;
-    const card_play: u8 = 4;
-    const finish_card_play: u8 = 5;
-    const gameplay_warmup: u8 = 6;
-    const gameplay: u8 = 7;
-    const results: u8 = 8;
-    const ended: u8 = 9;
-};
+const matchmaking_stage = multiplayer_model.matchmaking_stage;
+const ranked_stage = multiplayer_model.ranked_stage;
 
 pub const RoomScorePath = struct {
     room_id: i64,
@@ -427,38 +407,13 @@ fn rankingForScore(exact: RoomScoreRecord, high_scores: []const RoomScoreRecord)
     return ranking;
 }
 
-fn FixedRaw(comptime capacity: usize) type {
-    return struct {
-        len: u16 = 0,
-        bytes: [capacity]u8 = undefined,
-
-        const Self = @This();
-
-        fn set(self: *Self, value: []const u8) !void {
-            if (value.len > self.bytes.len) return error.MultiplayerPayloadTooLarge;
-            @memcpy(self.bytes[0..value.len], value);
-            self.len = @intCast(value.len);
-        }
-
-        fn setText(self: *Self, value: []const u8) void {
-            var len = @min(value.len, self.bytes.len);
-            while (len != 0 and !std.unicode.utf8ValidateSlice(value[0..len])) len -= 1;
-            @memcpy(self.bytes[0..len], value[0..len]);
-            self.len = @intCast(len);
-        }
-
-        fn slice(self: *const Self) []const u8 {
-            return self.bytes[0..self.len];
-        }
-    };
-}
-
-const Raw64 = FixedRaw(64);
-const Raw128 = FixedRaw(128);
-const Raw2048 = FixedRaw(2048);
-const Text64 = FixedRaw(64);
-const Text128 = FixedRaw(128);
-const Text256 = FixedRaw(256);
+const FixedRaw = multiplayer_fixed.FixedRaw;
+const Raw64 = multiplayer_fixed.Raw64;
+const Raw128 = multiplayer_fixed.Raw128;
+const Raw2048 = multiplayer_fixed.Raw2048;
+const Text64 = multiplayer_fixed.Text64;
+const Text128 = multiplayer_fixed.Text128;
+const Text256 = multiplayer_fixed.Text256;
 
 pub const MessagePackReader = struct {
     data: []const u8,
@@ -707,182 +662,21 @@ pub const MessagePackWriter = struct {
     }
 };
 
-const PlaylistItem = struct {
-    id: i64 = 0,
-    owner_id: i32 = 0,
-    beatmap_id: i32 = 0,
-    beatmapset_id: i32 = 0,
-    checksum: Text64 = .{},
-    ruleset_id: u8 = 0,
-    artist: Text256 = .{},
-    title: Text256 = .{},
-    version: Text128 = .{},
-    creator: Text128 = .{},
-    status: i8 = 3,
-    required_mods: Raw2048 = .{},
-    allowed_mods: Raw2048 = .{},
-    expired: bool = false,
-    order: u16 = 0,
-    played_at: Raw64 = .{},
-    star_rating: f64 = 0,
-    total_length: i32 = 0,
-    hit_length: i32 = 0,
-    freestyle: bool = false,
-};
-
-const RoomUser = struct {
-    id: i32,
-    name: Text64 = .{},
-    country: [2]u8 = .{ 'X', 'X' },
-    state: u8 = 0,
-    availability: Raw128 = .{},
-    mods: Raw2048 = .{},
-    ruleset_id: ?i32 = null,
-    beatmap_id: ?i32 = null,
-    voted_skip: bool = false,
-    role: u8 = 0,
-    team_id: ?i32 = null,
-};
-
-const RoomParticipant = struct {
-    id: i32,
-    name: Text64 = .{},
-    country: [2]u8 = .{ 'X', 'X' },
-};
-
-const MatchmakingRound = struct {
-    round: u8,
-    placement: u8 = 0,
-    total_score: i64 = 0,
-    accuracy: f64 = 0,
-    max_combo: i32 = 0,
-    passed: bool = false,
-};
-
-const MatchmakingUser = struct {
-    id: i32,
-    placement: ?u8 = null,
-    points: i32 = 0,
-    rounds: [matchmaking_rounds]?MatchmakingRound = [_]?MatchmakingRound{null} ** matchmaking_rounds,
-};
-
-const MatchmakingState = struct {
-    stage: u8 = 0,
-    current_round: u8 = 0,
-    candidate_items: [max_users]i64 = [_]i64{0} ** max_users,
-    candidate_count: usize = 0,
-    candidate_item: i64 = 0,
-    gameplay_item: i64 = 0,
-    users: [max_users]?MatchmakingUser = [_]?MatchmakingUser{null} ** max_users,
-    user_count: usize = 0,
-    picks: [max_users]?i64 = [_]?i64{null} ** max_users,
-
-    fn userIndex(self: *const MatchmakingState, user_id: i32) ?usize {
-        for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
-        return null;
-    }
-};
-
-const RankedCard = struct {
-    id: Text64 = .{},
-    playlist_item_id: i64,
-};
-
-const RankedDamage = struct {
-    damage: i32 = 0,
-    raw_damage: i32 = 0,
-    old_life: i32 = 1_000_000,
-    new_life: i32 = 1_000_000,
-    direct_damage: i32 = 0,
-    multiplier: f64 = 1,
-    bonus_damage: i32 = 0,
-};
-
-const RankedUser = struct {
-    id: i32,
-    rating: i32 = 1500,
-    life: i32 = 1_000_000,
-    hand: [ranked_hand_size]?RankedCard = [_]?RankedCard{null} ** ranked_hand_size,
-    hand_count: usize = 0,
-    rating_after: i32 = 1500,
-    damage: ?RankedDamage = null,
-    rounds_won: i32 = 0,
-    damage_multiplier: f64 = 0.5,
-    total_score: i64 = 0,
-    submitted: bool = false,
-    discarded: bool = false,
-
-    fn cardIndex(self: *const RankedUser, card_id: []const u8) ?usize {
-        for (self.hand, 0..) |entry, index| if (entry) |card| if (std.mem.eql(u8, card.id.slice(), card_id)) return index;
-        return null;
-    }
-};
-
-const RankedPlayState = struct {
-    stage: u8 = ranked_stage.wait_for_join,
-    current_round: u16 = 0,
-    damage_multiplier: f64 = 0.5,
-    users: [ranked_player_count]?RankedUser = [_]?RankedUser{null} ** ranked_player_count,
-    user_count: usize = 0,
-    active_user_id: ?i32 = null,
-    star_rating: f64 = 0,
-    winning_user_id: ?i32 = null,
-    deck: [max_ranked_cards]?RankedCard = [_]?RankedCard{null} ** max_ranked_cards,
-    deck_count: usize = 0,
-    deck_cursor: usize = 0,
-    played_card: ?RankedCard = null,
-    gameplay_item: i64 = 0,
-    round_winner_id: ?i32 = null,
-    pick_countdown: ?RankedStageCountdown = null,
-    result_persisted: bool = false,
-
-    fn userIndex(self: *const RankedPlayState, user_id: i32) ?usize {
-        for (self.users, 0..) |entry, index| if (entry) |user| if (user.id == user_id) return index;
-        return null;
-    }
-};
-
-const RankedResultContext = struct {
-    room_id: i64,
-    ruleset_id: u8,
-    winner_id: i32,
-    loser_id: i32,
-};
-
-const RankedStageCountdown = struct {
-    id: i32,
-    deadline_ms: i64,
-    stage: u8,
-
-    fn remainingTicks(self: RankedStageCountdown, now_ms: i64) i64 {
-        return @max(0, self.deadline_ms - now_ms) * timespan_ticks_per_millisecond;
-    }
-};
-
-const MatchStartCountdownState = struct {
-    id: i32,
-    deadline_ms: i64,
-
-    fn remainingTicks(self: MatchStartCountdownState, now_ms: i64) i64 {
-        return @max(0, self.deadline_ms - now_ms) * timespan_ticks_per_millisecond;
-    }
-};
-
-const PlaylistAdvance = struct {
-    expired: ?PlaylistItem = null,
-    next_item_id: ?i64 = null,
-};
-
-const Settings = struct {
-    name: Text128 = .{},
-    playlist_item_id: i64 = 0,
-    password: Text64 = .{},
-    match_type: u8 = 1,
-    queue_mode: u8 = 0,
-    auto_start: Raw64 = .{},
-    auto_skip: bool = false,
-    max_participants: ?u8 = null,
-};
+const PlaylistItem = multiplayer_model.PlaylistItem;
+const RoomUser = multiplayer_model.RoomUser;
+const RoomParticipant = multiplayer_model.RoomParticipant;
+const MatchmakingRound = multiplayer_model.MatchmakingRound;
+const MatchmakingUser = multiplayer_model.MatchmakingUser;
+const MatchmakingState = multiplayer_model.MatchmakingState;
+const RankedCard = multiplayer_model.RankedCard;
+const RankedDamage = multiplayer_model.RankedDamage;
+const RankedUser = multiplayer_model.RankedUser;
+const RankedPlayState = multiplayer_model.RankedPlayState;
+const RankedResultContext = multiplayer_model.RankedResultContext;
+const RankedStageCountdown = multiplayer_model.RankedStageCountdown;
+const MatchStartCountdownState = multiplayer_model.MatchStartCountdownState;
+const PlaylistAdvance = multiplayer_model.PlaylistAdvance;
+const Settings = multiplayer_model.Settings;
 
 const Room = struct {
     id: i64,
@@ -961,22 +755,7 @@ fn roomCategory(room: *const Room) []const u8 {
     return if (room.settings.match_type == 0) "normal" else "realtime";
 }
 
-const PendingMatch = struct {
-    id: u32,
-    pool_id: i32,
-    users: [2]i32,
-    joined: [2]bool = .{ true, true },
-    accepted: [2]bool = .{ false, false },
-    is_duel: bool = false,
-    duel_id: Text64 = .{},
-    created_at: i64,
-
-    fn userIndex(self: PendingMatch, user_id: i32) ?usize {
-        if (self.users[0] == user_id) return 0;
-        if (self.users[1] == user_id) return 1;
-        return null;
-    }
-};
+const PendingMatch = multiplayer_model.PendingMatch;
 
 pub const Connection = struct {
     allocator: std.mem.Allocator,

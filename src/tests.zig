@@ -33,6 +33,7 @@ const registration = @import("registration.zig");
 const postgres = @import("postgres.zig");
 const migrate_postgres = @import("migrate_postgres.zig");
 const postgres_store = @import("postgres_store.zig");
+const postgres_store_tests = @import("storage/postgres/tests.zig");
 const webhook = @import("webhook.zig");
 const web_auth = @import("web_auth.zig");
 const screenshot = @import("screenshot.zig");
@@ -58,13 +59,20 @@ const lazer_route_manifest = @import("lazer_route_manifest.zig");
 const lazer_wiki = @import("lazer_wiki.zig");
 const player_routes = @import("player_routes.zig");
 const index_page = @embedFile("index.html");
-const server_source = @embedFile("main.zig");
+const server_website_source = @embedFile("server/routes/website.zig");
+const server_lazer_source = @embedFile("server/app/lazer.zig");
+const server_sessions_source = @embedFile("server/app/sessions.zig");
+const server_router_source = @embedFile("server/http/router.zig");
+const server_platform_source = @embedFile("server/routes/platform.zig");
+const server_primitives_source = @embedFile("server/http/primitives.zig");
+const server_fallback_source = @embedFile("server/routes/fallback.zig");
 
 comptime {
     _ = postgres;
     _ = server_control_route;
     _ = migrate_postgres;
     _ = postgres_store;
+    _ = postgres_store_tests;
     _ = web_auth;
     _ = screenshot;
     _ = media_contract;
@@ -1741,8 +1749,8 @@ test "credential and restriction commits revoke the matching token family atomic
 }
 
 test "website name history is an explicit profile-only dropdown" {
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/users/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "/name-history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/api/v1/users/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/name-history") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-name-history") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "name-history-tooltip") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-name-history") == null);
@@ -1798,10 +1806,10 @@ test "developer server controls persist fixed gates and audit every change" {
 }
 
 test "developer operations plane stays bounded and recoverable" {
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/staff/infrastructure") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "developer access required") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "restart zigcho") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "infra.restart") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/api/v1/staff/infrastructure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "developer access required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "restart zigcho") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "infra.restart") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "no shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "deploy and rollback stay outside the browser") != null);
 }
@@ -2051,7 +2059,7 @@ test "private profile stats never enter website or lazer rankings" {
 
 test "website profile plays keep an accessible score details dialog" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "const emptyImage='data:image/gif") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "img-src 'self' data: https://a.kai.ovh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_fallback_source, "img-src 'self' data: https://a.kai.ovh") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".accent-bot #pinned-plays") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, ".accent-bot #recent-plays") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-head-tools") != null);
@@ -2231,24 +2239,24 @@ test "website multiplayer exposes normal quick and ranked room views" {
 }
 
 test "website profile presence keeps optional owner auth and cross-client takeover wired" {
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "const token = web_auth.playerSessionToken(cookie_owned)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "attachProfilePresence(profile, user_id, viewer_id)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "bancho.suppressForTakeover") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "domain.profilePresenceClient(stable_presence != null, lazer_online)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "const token = web_auth.playerSessionToken(cookie_owned)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "attachProfilePresence(profile, user_id, viewer_id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_sessions_source, "bancho.suppressForTakeover") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_lazer_source, "domain.profilePresenceClient(stable_presence != null, lazer_online)") != null);
 }
 
 test "lazer BSS reserves owned ids publishes pending and returns WIP through one atomic store path" {
     try std.testing.expectEqual(@as(u32, 1 << 5), bss.premium_privilege);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "user.privileges & bss.premium_privilege == 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "{\\\"error\\\":\\\"premium required\\\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_router_source, "user.privileges & bss.premium_privilege == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_router_source, "{\\\"error\\\":\\\"premium required\\\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "premium mapper uploads, package validation and BN review handoff") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "mappedBeatmapRows") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "id=\"mapped-beatmaps\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-map-preview=\"/preview/${set.id}.mp3\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "recent.after(mapped)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "bindMappedSetPreviews()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "storeBssMedia") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "package.media()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_primitives_source, "storeBssMedia") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_platform_source, "package.media()") != null);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3327,10 +3335,10 @@ test "developer role workspace changes one named bit and revokes the final staff
 }
 
 test "developer role workspace removes raw privilege masks from the website" {
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "/api/v1/staff/roles") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "account_roles.Role.parse") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "staff_sessions_revoked") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_source, "add_privilege") == null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/api/v1/staff/roles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "account_roles.Role.parse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "staff_sessions_revoked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "add_privilege") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "add privilege bits") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "permanent until a developer explicitly revokes it") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-role-key") != null);

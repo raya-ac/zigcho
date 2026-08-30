@@ -35,7 +35,11 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 
 ## layout
 
-- `src/` — server, protocols, storage and website
+- `src/main.zig` — the small server entrypoint
+- `src/server/` — app state, HTTP routing, Stable and lazer routes, IRC, workers and command-line jobs
+- `src/postgres_store.zig` — the storage compatibility facade
+- `src/storage/postgres/` — PostgreSQL accounts, maps, scores, chat, multiplayer and moderation repositories
+- the rest of `src/` — shared protocols, scoring, sessions and the website
 - `database/` — schemas and ordered migrations
 - `client/lazer/` — the pinned lazer patch and packaging
 - `pp/` — the local PP bridge

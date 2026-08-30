@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const latest_version = "2026.829.1";
+pub const latest_version = "2026.830.2";
 pub const max_updates: usize = 256;
 pub const max_build_id: i64 = @divFloor(std.math.maxInt(i64) - @as(i64, max_updates - 1), 100);
 
@@ -20,6 +20,18 @@ pub const Build = struct {
 };
 
 pub const fallback_builds = [_]Build{
+    .{ .id = 45, .version = "2026.830.2", .display_version = "zigcho release 1.9", .created_at = "2026-08-30T18:13:18+09:30", .updates = &.{
+        .{ .name = "2026-08-30-lazer-multiplayer-leaves.md", .created_at = "2026-08-30T18:13:18+09:30", .commit = "3088e91fa830c0f7291792ad0af4e98fdcd211f7", .markdown = @embedFile("../updates/2026-08-30-lazer-multiplayer-leaves.md") },
+        .{ .name = "2026-08-30-lazer-signalr-wire.md", .created_at = "2026-08-30T18:12:07+09:30", .commit = "00bc1569ffa40024ede50e18a6dbf3f91eb0ec93", .markdown = @embedFile("../updates/2026-08-30-lazer-signalr-wire.md") },
+        .{ .name = "2026-08-30-lazer-multiplayer-paths-and-scoring.md", .created_at = "2026-08-30T18:11:31+09:30", .commit = "43f06c4bbfed746b2ad7a8cf72254e26b4641608", .markdown = @embedFile("../updates/2026-08-30-lazer-multiplayer-paths-and-scoring.md") },
+        .{ .name = "2026-08-30-lazer-multiplayer-models.md", .created_at = "2026-08-30T18:11:06+09:30", .commit = "81257eb1bdca2a76e27ed2f5dd5689f12cd55bf5", .markdown = @embedFile("../updates/2026-08-30-lazer-multiplayer-models.md") },
+    } },
+    .{ .id = 44, .version = "2026.830.1", .display_version = "zigcho release 1.8", .created_at = "2026-08-30T17:32:56+09:30", .updates = &.{
+        .{ .name = "2026-08-30-stable-conformance.md", .created_at = "2026-08-30T17:32:56+09:30", .commit = "44eba5ac03be05747d339f3a984e175e72191816", .markdown = @embedFile("../updates/2026-08-30-stable-conformance.md") },
+    } },
+    .{ .id = 43, .version = "2026.830.0", .display_version = "zigcho release 1.7", .created_at = "2026-08-30T13:49:43+09:30", .updates = &.{
+        .{ .name = "2026-08-30-server-file-split.md", .created_at = "2026-08-30T13:49:43+09:30", .commit = "c4fa1f5dab17ee7969dfa40f8f747acac761988a", .markdown = @embedFile("../updates/2026-08-30-server-file-split.md") },
+    } },
     .{ .id = 42, .version = "2026.829.1", .display_version = "zigcho release 1.6", .created_at = "2026-08-29T15:21:02+09:30", .updates = &.{
         .{ .name = "2026-08-29-stable-and-score-hardening.md", .created_at = "2026-08-29T15:21:02+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-29-stable-and-score-hardening.md") },
     } },
@@ -401,17 +413,17 @@ test "changelog exposes the complete checked in release history" {
     const object = parsed.value.object;
     try std.testing.expectEqualStrings("zigcho!lazer", object.get("streams").?.array.items[0].object.get("display_name").?.string);
     try std.testing.expectEqualStrings(latest_version, object.get("builds").?.array.items[0].object.get("version").?.string);
-    try std.testing.expectEqual(@as(usize, 18), object.get("builds").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 21), object.get("builds").?.array.items.len);
     var entries: usize = 0;
     for (object.get("builds").?.array.items) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(historyEntryCount(), entries);
-    try std.testing.expectEqualStrings("zigcho release 1.6", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("zigcho release 1.9", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
 
     const latest = (try buildJson(std.testing.allocator, "lazer", "latest")).?;
     defer std.testing.allocator.free(latest);
     const parsed_latest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, latest, .{});
     defer parsed_latest.deinit();
-    try std.testing.expectEqualStrings("2026.829.0", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
+    try std.testing.expectEqualStrings("2026.830.1", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
 
     const oldest = (try buildJson(std.testing.allocator, "zigcho", "2026.809.0")).?;
     defer std.testing.allocator.free(oldest);

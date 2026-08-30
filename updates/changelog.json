@@ -10,8 +10,26 @@
         {
           "name": "2026-08-30-lazer-multiplayer-leaves.md",
           "created_at": "2026-08-30T18:13:18+09:30",
-          "commit": "",
+          "commit": "3088e91fa830c0f7291792ad0af4e98fdcd211f7",
           "sha256": "06451e81ff637c5744d6813f85ce212e36126617274111e69c37466795ef771a"
+        },
+        {
+          "name": "2026-08-30-lazer-signalr-wire.md",
+          "created_at": "2026-08-30T18:12:07+09:30",
+          "commit": "00bc1569ffa40024ede50e18a6dbf3f91eb0ec93",
+          "sha256": "10a434048268482a597a8103713cfeaf4d3ec442e92235803e071241510994ec"
+        },
+        {
+          "name": "2026-08-30-lazer-multiplayer-paths-and-scoring.md",
+          "created_at": "2026-08-30T18:11:31+09:30",
+          "commit": "43f06c4bbfed746b2ad7a8cf72254e26b4641608",
+          "sha256": "70be554a2f09ed910e94128fae675e12cd7d9dbc190606718fdddde8df3c39f9"
+        },
+        {
+          "name": "2026-08-30-lazer-multiplayer-models.md",
+          "created_at": "2026-08-30T18:11:06+09:30",
+          "commit": "81257eb1bdca2a76e27ed2f5dd5689f12cd55bf5",
+          "sha256": "ed825bb7d324fe031676fe6d6d16868cf458a4b7b8b87c495b11e8ec66ccf427"
         }
       ]
     },

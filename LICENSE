@@ -1,21 +1,101 @@
-MIT License
+Zigcho Public Use License 1.0
 
-Copyright (c) 2026 zigcho contributors
+Copyright (c) 2026 raya and Zigcho contributors.
+All rights reserved except for the permissions written below.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This licence applies to the original Zigcho code, documentation and patches in
+this repository (the "Software"). Third-party code, libraries, assets, names,
+marks and hosted content keep their own terms. See `THIRD_PARTY_NOTICES.md`.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. What you may do
+
+You may:
+
+- read and study the source;
+- use the Software privately or publicly, including in production and as a
+  publicly reachable service;
+- copy, fork and modify the Software for any purpose allowed by this licence;
+- redistribute original or modified source and binaries free of charge; and
+- submit changes back to the official Zigcho project.
+
+These permissions are worldwide, royalty-free and non-exclusive. Every person
+who receives a copy receives these permissions directly under this licence.
+
+2. Conditions
+
+Every original or modified copy, fork and build must keep this licence and
+every copyright, attribution and provenance notice.
+
+Every public fork, build, download or hosted service must:
+
+- clearly state that it is based on Zigcho and link to
+  `https://github.com/zigcho/zigcho` in its repository, documentation and any
+  public-facing website or download page;
+- describe any material modifications and make clear that the modified version
+  is not an official Zigcho release.
+
+If you redistribute original or modified Zigcho source or binaries, you must
+do so under this same licence.
+
+You may use a different name for a fork, but you may not claim that Zigcho's
+code or history is your own work.
+
+3. No sale
+
+Unless raya gives you prior written permission, you may not:
+
+- sell, rent, sublicense or charge for a copy of the Software;
+- charge for access to a server, service or feature powered by the Software;
+- include the Software in a paid product, paid hosting plan or subscription;
+- remove or hide the required Zigcho credit; or
+- present a fork, build or service as official Zigcho or as entirely your own
+  original work.
+
+Free public servers are allowed. Optional donations are allowed when they do
+not buy access, features, privileges, copies or support.
+
+This licence does not grant permission to use Zigcho, kai, osu!, ppy or related
+names, logos or branding in a way that claims affiliation, endorsement or
+official status.
+
+Any written exception can be limited to named people, systems, purposes,
+versions and dates. Anything outside this licence or that written exception
+remains prohibited.
+
+4. Anticheat is separate
+
+The Zigcho anticheat module is not included in this licence. It is proprietary
+software under the Zigcho Anticheat Access License and cannot be accessed,
+used, copied, modified, distributed, deployed or shared without explicit
+permission from raya. Access to its repository or binaries does not itself
+grant permission.
+
+5. Contributions
+
+If you intentionally submit a contribution to the official Zigcho project,
+you grant raya and the Zigcho project a perpetual, worldwide, non-exclusive,
+royalty-free right to use, modify, distribute and relicense that contribution
+as part of Zigcho. You confirm that you have the right to grant those terms.
+
+6. Termination
+
+Your rights under this licence end automatically if you break its terms. You
+must then stop using the Software and delete every copy you control, except
+where applicable law requires retention. Rights may be restored only by prior
+written permission from raya.
+
+7. Older releases
+
+This licence applies only to versions of Zigcho distributed with it. Copies
+that were already distributed under the MIT License remain available under
+the MIT terms attached to those copies; this licence does not and cannot
+withdraw rights that were already granted.
+
+8. No warranty
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -103,7 +103,7 @@ def main() -> None:
         [
             (hashlib.sha256(version_text).hexdigest(), "VERSION.txt"),
             (hashlib.sha256(readme_text).hexdigest(), "README-WINDOWS.txt"),
-            (digest(args.zigcho_license), "licenses/zigcho-MIT.txt"),
+            (digest(args.zigcho_license), "licenses/zigcho-LICENSE.txt"),
             (digest(args.osu_license), "licenses/osu-MIT.txt"),
         ]
     )
@@ -116,7 +116,7 @@ def main() -> None:
         with zipfile.ZipFile(temp_path, "w", allowZip64=True) as archive:
             write_bytes(archive, f"{root}/VERSION.txt", version_text)
             write_bytes(archive, f"{root}/README-WINDOWS.txt", readme_text)
-            write_file(archive, f"{root}/licenses/zigcho-MIT.txt", args.zigcho_license)
+            write_file(archive, f"{root}/licenses/zigcho-LICENSE.txt", args.zigcho_license)
             write_file(archive, f"{root}/licenses/osu-MIT.txt", args.osu_license)
             for path in published:
                 relative = path.relative_to(args.publish_dir).as_posix()

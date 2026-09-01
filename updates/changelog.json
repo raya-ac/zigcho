@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 48,
+      "version": "2026.902.1",
+      "display_version": "zigcho release 2.2",
+      "created_at": "2026-09-02T07:50:57+09:30",
+      "updates": [
+        {
+          "name": "2026-09-02-zigcho-public-use-licence.md",
+          "created_at": "2026-09-02T07:50:57+09:30",
+          "commit": "",
+          "sha256": "a935cb07cd290bb21b1a5f3cbdafdde1e6289bfb21d8e6c421e20c6dc4be62e4"
+        }
+      ]
+    },
+    {
       "id": 47,
       "version": "2026.902.0",
       "display_version": "zigcho release 2.1",

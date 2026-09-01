@@ -48,4 +48,13 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 
 protocol work is checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho documentation](https://osu.ppy.sh/wiki/en/Bancho_%28server%29) and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation. the [Stable conformance harness](tools/stable-conformance/README.md) inventories the whole legacy surface and can replay the same stateful transcript against both servers.
 
+## licence
+
+the code uses the [Zigcho Public Use License](LICENSE). public servers,
+production use, modifications and free redistribution are allowed. keep the
+credit, link back here, mark what you changed and do not sell it, charge for
+access or pretend the work is entirely yours. the private anticheat has its own
+permission-only licence and is not included in this grant. older copies already
+released under MIT keep their existing MIT terms.
+
 this is unofficial. osu! belongs to ppy Pty Ltd; zigcho is not affiliated with or endorsed by them.

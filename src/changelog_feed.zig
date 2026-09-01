@@ -502,7 +502,7 @@ fn manifestWithPrependedBuildVersionAt(allocator: std.mem.Allocator, name: []con
 }
 
 fn manifestWithPrependedBuildAt(allocator: std.mem.Allocator, name: []const u8, digest_markdown: []const u8, build_id: i64, timestamp: []const u8) ![]u8 {
-    return manifestWithPrependedBuildVersionAt(allocator, name, digest_markdown, build_id, "2026.902.1", timestamp);
+    return manifestWithPrependedBuildVersionAt(allocator, name, digest_markdown, build_id, "2026.902.2", timestamp);
 }
 
 fn manifestWithPrependedBuild(allocator: std.mem.Allocator, name: []const u8, digest_markdown: []const u8) ![]u8 {
@@ -517,7 +517,7 @@ fn manifestWithPrependedUpdates(allocator: std.mem.Allocator, count: usize, dige
     const digest = std.fmt.bytesToHex(digestFor(digest_markdown), .lower);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try output.writer.print("{s}\n    {{\"id\":{d},\"version\":\"2026.902.1\",\"display_version\":\"raw only release\",\"created_at\":\"2026-09-02T08:00:00+09:30\",\"updates\":[", .{ base[0..split], history.fallback_builds[0].id + 1 });
+    try output.writer.print("{s}\n    {{\"id\":{d},\"version\":\"2026.902.2\",\"display_version\":\"raw only release\",\"created_at\":\"2026-09-02T08:00:00+09:30\",\"updates\":[", .{ base[0..split], history.fallback_builds[0].id + 1 });
     for (0..count) |index| {
         if (index != 0) try output.writer.writeByte(',');
         try output.writer.print("{{\"name\":\"2026-08-25-raw-feed-{d}.md\",\"created_at\":\"2026-08-25T00:00:00+09:30\",\"commit\":\"\",\"sha256\":\"{s}\"}}", .{ index, digest });
@@ -545,7 +545,7 @@ test "checked in manifest reuses every embedded update without network fanout" {
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("zigcho release 2.1", parsed.value.object.get("builds").?.array.items[0].object.get("display_version").?.string);
+    try std.testing.expectEqualStrings("zigcho release 2.2", parsed.value.object.get("builds").?.array.items[0].object.get("display_version").?.string);
     try std.testing.expectEqual(history.historyEntryCount(), blk: {
         var count: usize = 0;
         for (parsed.value.object.get("builds").?.array.items) |build| count += build.object.get("changelog_entries").?.array.items.len;
@@ -625,7 +625,7 @@ test "dynamic changelog swaps atomically and fetch failure keeps the last good f
     try std.testing.expectEqual(@as(usize, 1), fixture.update_fetches);
     const latest = (try feed.buildJson(std.testing.allocator, "lazer", "latest")).?;
     defer std.testing.allocator.free(latest);
-    try std.testing.expect(std.mem.indexOf(u8, latest, "\"version\":\"2026.902.1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest, "\"version\":\"2026.902.2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest, "\"display_version\":\"zigcho release 1.1\"") != null);
     try std.testing.expect(feed.newsSlugKnown("2026-08-25-raw-feed-release"));
     const news = try feed.newsJson(std.testing.allocator, 2026);

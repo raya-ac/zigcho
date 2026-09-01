@@ -44,7 +44,7 @@ def main() -> None:
             f"{root}/VERSION.txt",
             f"{root}/README-WINDOWS.txt",
             f"{root}/SHA256SUMS",
-            f"{root}/licenses/zigcho-MIT.txt",
+            f"{root}/licenses/zigcho-LICENSE.txt",
             f"{root}/licenses/osu-MIT.txt",
         }
         missing = sorted(required.difference(names))

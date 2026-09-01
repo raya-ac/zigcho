@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 47,
+      "version": "2026.902.0",
+      "display_version": "zigcho release 2.1",
+      "created_at": "2026-09-02T07:14:19+09:30",
+      "updates": [
+        {
+          "name": "2026-09-02-zigcho-org-move.md",
+          "created_at": "2026-09-02T07:14:19+09:30",
+          "commit": "",
+          "sha256": "27075282352f59314d8e969d74c0e369b470e43fc10b479bad8c8d3caa1d0471"
+        }
+      ]
+    },
+    {
       "id": 46,
       "version": "2026.831.0",
       "display_version": "zigcho release 2.0",
@@ -369,7 +383,7 @@
           "name": "2026-08-13-lazer-windows-alpha.md",
           "created_at": "2026-08-13T15:45:58+09:30",
           "commit": "ed546ce0186447971ef4e29a21782f4b515e5acc",
-          "sha256": "50e0e38d880b366be07bf4a695e7e8fa96719b863a337fcf84a08cc52273bc32"
+          "sha256": "5c8b8c225c69a5d7280a139f2a49e2e4a5023d6c92543b9e1eb3cc6227bc3cc4"
         },
         {
           "name": "2026-08-13-lazer-ranked-stats.md",

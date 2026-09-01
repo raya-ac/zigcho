@@ -2294,7 +2294,7 @@ test "website home leads with playable clients instead of a service directory" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"home-actions\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"home-client stable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "class=\"home-client lazer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "https://github.com/raya-ac/zigcho/releases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "https://github.com/zigcho/zigcho/releases") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "href=\"https://osu.kai.ovh/\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "href=\"/api/v1/status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "aria-label=\"live server facts\"") != null);
@@ -5069,7 +5069,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 22), builds.len);
+    try std.testing.expectEqual(@as(usize, 23), builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);

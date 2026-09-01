@@ -75,7 +75,7 @@ else:
 
 commit = os.environ.get("ZIGCHO_RELEASE_COMMIT", "").strip()
 short_commit = commit[:8] if commit else "pending"
-repository = os.environ.get("ZIGCHO_RELEASE_REPOSITORY", "raya-ac/zigcho").strip()
+repository = os.environ.get("ZIGCHO_RELEASE_REPOSITORY", "zigcho/zigcho").strip()
 release_url = os.environ.get("ZIGCHO_RELEASE_URL", "").strip()
 client_version = os.environ.get("ZIGCHO_CLIENT_VERSION", "0.1.0-alpha.15").strip()
 builds = os.environ.get("ZIGCHO_RELEASE_BUILDS", "Windows · macOS · Linux · Android · unsigned iOS").strip()

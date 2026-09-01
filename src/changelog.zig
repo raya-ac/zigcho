@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const latest_version = "2026.831.0";
+pub const latest_version = "2026.902.0";
 pub const max_updates: usize = 256;
 pub const max_build_id: i64 = @divFloor(std.math.maxInt(i64) - @as(i64, max_updates - 1), 100);
 
@@ -20,6 +20,9 @@ pub const Build = struct {
 };
 
 pub const fallback_builds = [_]Build{
+    .{ .id = 47, .version = "2026.902.0", .display_version = "zigcho release 2.1", .created_at = "2026-09-02T07:14:19+09:30", .updates = &.{
+        .{ .name = "2026-09-02-zigcho-org-move.md", .created_at = "2026-09-02T07:14:19+09:30", .commit = "", .markdown = @embedFile("../updates/2026-09-02-zigcho-org-move.md") },
+    } },
     .{ .id = 46, .version = "2026.831.0", .display_version = "zigcho release 2.0", .created_at = "2026-08-31T00:45:07+09:30", .updates = &.{
         .{ .name = "2026-08-31-anticheat-review-and-replay-signals.md", .created_at = "2026-08-31T00:45:07+09:30", .commit = "", .markdown = @embedFile("../updates/2026-08-31-anticheat-review-and-replay-signals.md") },
     } },
@@ -244,8 +247,8 @@ fn writeStream(writer: *std.Io.Writer, catalog: []const Build, include_latest: b
 
 fn writeEntry(writer: *std.Io.Writer, build: Build, update: Update, index: usize) anyerror!void {
     var commit_url_buf: [128]u8 = undefined;
-    const commit_url = if (update.commit.len == 0) "https://github.com/raya-ac/zigcho" else try std.fmt.bufPrint(&commit_url_buf, "https://github.com/raya-ac/zigcho/commit/{s}", .{update.commit});
-    try writer.print("{{\"id\":{d},\"repository\":\"raya-ac/zigcho\",\"github_pull_request_id\":null,\"github_url\":null,\"url\":", .{try entryId(build.id, index)});
+    const commit_url = if (update.commit.len == 0) "https://github.com/zigcho/zigcho" else try std.fmt.bufPrint(&commit_url_buf, "https://github.com/zigcho/zigcho/commit/{s}", .{update.commit});
+    try writer.print("{{\"id\":{d},\"repository\":\"zigcho/zigcho\",\"github_pull_request_id\":null,\"github_url\":null,\"url\":", .{try entryId(build.id, index)});
     try std.json.Stringify.value(commit_url, .{}, writer);
     try writer.writeAll(",\"type\":");
     try std.json.Stringify.value(kind(update.name), .{}, writer);
@@ -328,7 +331,7 @@ pub fn buildJson(allocator: std.mem.Allocator, stream: []const u8, version: []co
 
 fn writeNewsPost(writer: *std.Io.Writer, build: Build, update: Update, index: usize) !void {
     var edit_url_buf: [128]u8 = undefined;
-    const edit_url = if (update.commit.len == 0) "https://github.com/raya-ac/zigcho" else try std.fmt.bufPrint(&edit_url_buf, "https://github.com/raya-ac/zigcho/commit/{s}", .{update.commit});
+    const edit_url = if (update.commit.len == 0) "https://github.com/zigcho/zigcho" else try std.fmt.bufPrint(&edit_url_buf, "https://github.com/zigcho/zigcho/commit/{s}", .{update.commit});
     try writer.print("{{\"id\":{d},\"author\":\"ari\",\"edit_url\":", .{try entryId(build.id, index)});
     try std.json.Stringify.value(edit_url, .{}, writer);
     try writer.writeAll(",\"first_image\":\"\",\"published_at\":");
@@ -416,17 +419,17 @@ test "changelog exposes the complete checked in release history" {
     const object = parsed.value.object;
     try std.testing.expectEqualStrings("zigcho!lazer", object.get("streams").?.array.items[0].object.get("display_name").?.string);
     try std.testing.expectEqualStrings(latest_version, object.get("builds").?.array.items[0].object.get("version").?.string);
-    try std.testing.expectEqual(@as(usize, 22), object.get("builds").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 23), object.get("builds").?.array.items.len);
     var entries: usize = 0;
     for (object.get("builds").?.array.items) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(historyEntryCount(), entries);
-    try std.testing.expectEqualStrings("zigcho release 2.0", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("zigcho has its own github org now", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
 
     const latest = (try buildJson(std.testing.allocator, "lazer", "latest")).?;
     defer std.testing.allocator.free(latest);
     const parsed_latest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, latest, .{});
     defer parsed_latest.deinit();
-    try std.testing.expectEqualStrings("2026.830.2", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
+    try std.testing.expectEqualStrings("2026.831.0", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
 
     const oldest = (try buildJson(std.testing.allocator, "zigcho", "2026.809.0")).?;
     defer std.testing.allocator.free(oldest);

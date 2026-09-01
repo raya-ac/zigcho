@@ -108,7 +108,7 @@ pub const Sync = struct {
             .response_writer = &writer,
             .headers = .{
                 .accept_encoding = .{ .override = "identity" },
-                .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/raya-ac/zigcho)" },
+                .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/zigcho/zigcho)" },
             },
         }) catch |err| switch (err) {
             error.WriteFailed => return error.UpstreamMediaTooLarge,

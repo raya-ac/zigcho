@@ -1268,7 +1268,7 @@ fn fetchFn(client: *std.http.Client, allocator: std.mem.Allocator, url: []const 
         .response_writer = &writer,
         .headers = .{
             .accept_encoding = .{ .override = "identity" },
-            .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/raya-ac/zigcho)" },
+            .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/zigcho/zigcho)" },
         },
     }) catch |err| {
         std.log.warn("[hydrate] upstream request failed url={s}: {t}", .{ url, err });
@@ -1293,7 +1293,7 @@ fn fetchSensitive(client: *std.http.Client, allocator: std.mem.Allocator, url: [
         .response_writer = &writer,
         .headers = .{
             .accept_encoding = .{ .override = "identity" },
-            .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/raya-ac/zigcho)" },
+            .user_agent = .{ .override = "zigcho/0.1 (+https://github.com/zigcho/zigcho)" },
         },
     }) catch |err| {
         std.log.warn("event=osu_api_profile_request_failed error={t}", .{err});

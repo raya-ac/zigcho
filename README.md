@@ -31,7 +31,7 @@ ZIGCHO_POSTGRES_URL='host=/var/run/postgresql dbname=zigcho user=zigcho connect_
 
 the server build is PostgreSQL by default. SQLite is only kept for fixtures and offline tools; build those explicitly with `zig build -Dpostgres=false`. copy `config.example.ini` to `config.ini` for local secrets. the real config is ignored. the useful player-path checks live in `tools/`, including Stable web/map checks and lazer solo, multiplayer and spectator runs.
 
-production binaries come from the pinned Linux GitHub runner, not my Mac. each release lives at `/opt/zigcho/releases/<commit>` and is activated through `tools/activate-release.sh`, which backs up and restore-tests PostgreSQL before switching the live symlink. zigcho!lazer packages are built by runners for Windows, macOS, Linux, Android and unsigned iOS.
+production binaries come from the pinned Linux GitHub runner, not my Mac. each release lives at `/opt/zigcho/releases/<commit>` and is activated through `tools/activate-release.sh`, which backs up and restore-tests PostgreSQL before switching the live symlink. the separate [zigcho!lazer repo](https://github.com/zigcho/zigcho-lazer) builds the portable Windows, macOS, Linux, Android and unsigned iOS clients.
 
 ## layout
 
@@ -41,12 +41,11 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 - `src/storage/postgres/` — PostgreSQL accounts, maps, scores, chat, multiplayer and moderation repositories
 - the rest of `src/` — shared protocols, scoring, sessions and the website
 - `database/` — schemas and ordered migrations
-- `client/lazer/` — the pinned lazer patch and packaging
 - `pp/` — the local PP bridge
 - `deploy/` and `tools/` — production and acceptance work
 - `updates/` — the release history
 
-protocol work is checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho documentation](https://osu.ppy.sh/wiki/en/Bancho_%28server%29) and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation. the [Stable conformance harness](tools/stable-conformance/README.md) inventories the whole legacy surface and can replay the same stateful transcript against both servers.
+protocol work is checked against the official [osu! client](https://github.com/ppy/osu), the [Bancho documentation](https://osu.ppy.sh/wiki/en/Bancho_%28server%29) and the MIT-licensed [Akatsuki bancho.py](https://github.com/osuAkatsuki/bancho.py) implementation. the separate [Stable conformance harness](https://github.com/zigcho/stable-conformance) inventories the whole legacy surface and can replay the same stateful transcript against both servers.
 
 ## licence
 

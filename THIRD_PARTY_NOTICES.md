@@ -1,11 +1,9 @@
 # third party notices
 
 zigcho's original work is covered by the Zigcho Public Use License in `LICENSE`.
-the public `client/lazer/zigcho-client.patch` records Zigcho-licensed changes
-to the official client; the upstream client code around those changes remains
-ppy copyright and MIT-licensed. everything listed below keeps its own copyright
-and license. this file does not grant rights to the osu! or ppy names, game
-resources, beatmaps, music, user uploads or other third-party art.
+everything listed below keeps its own copyright and licence. this file does not
+grant rights to the osu! or ppy names, game resources, beatmaps, music, user
+uploads or other third-party art.
 
 the separate `zigcho/zigcho-anticheat-private` module is not covered by the
 Zigcho Public Use License. it is proprietary under the Zigcho Anticheat Access
@@ -13,19 +11,20 @@ License and may only be accessed or used by people and systems given explicit
 permission by raya. repository or binary access on its own is not a licence to
 use, copy, modify, distribute, deploy or share it.
 
-## zigcho!lazer
+## related client work
 
-zigcho!lazer is built by applying our patch to the official [`ppy/osu`](https://github.com/ppy/osu)
-source at commit `12df2e4ff254975f4b66ae9efda808837ee9beea`.
+the pinned client patch and its complete notices now live in
+[`zigcho/zigcho-lazer`](https://github.com/zigcho/zigcho-lazer). official osu!
+client code is not copied or linked into this server repository.
 
-the upstream client code is MIT-licensed:
+the server is still checked against the official [`ppy/osu`](https://github.com/ppy/osu)
+client, which is MIT-licensed:
 
 - Copyright (c) 2025 ppy Pty Ltd <contact@ppy.sh>
 - license: [MIT](https://github.com/ppy/osu/blob/12df2e4ff254975f4b66ae9efda808837ee9beea/LICENCE)
 
-every desktop release package includes the original `ppy/osu` license beside
-zigcho's license. ppy's MIT license covers the client code, not the osu!/ppy
-branding or game resources.
+ppy's MIT licence covers client code, not the osu!/ppy branding or game
+resources.
 
 ## PP bridge
 

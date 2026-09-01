@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const latest_version = "2026.902.1";
+pub const latest_version = "2026.902.2";
 pub const max_updates: usize = 256;
 pub const max_build_id: i64 = @divFloor(std.math.maxInt(i64) - @as(i64, max_updates - 1), 100);
 
@@ -20,6 +20,9 @@ pub const Build = struct {
 };
 
 pub const fallback_builds = [_]Build{
+    .{ .id = 49, .version = "2026.902.2", .display_version = "zigcho release 2.3", .created_at = "2026-09-02T08:09:38+09:30", .updates = &.{
+        .{ .name = "2026-09-02-client-and-harness-repos.md", .created_at = "2026-09-02T08:09:38+09:30", .commit = "", .markdown = @embedFile("../updates/2026-09-02-client-and-harness-repos.md") },
+    } },
     .{ .id = 48, .version = "2026.902.1", .display_version = "zigcho release 2.2", .created_at = "2026-09-02T07:50:57+09:30", .updates = &.{
         .{ .name = "2026-09-02-zigcho-public-use-licence.md", .created_at = "2026-09-02T07:50:57+09:30", .commit = "", .markdown = @embedFile("../updates/2026-09-02-zigcho-public-use-licence.md") },
     } },
@@ -422,17 +425,17 @@ test "changelog exposes the complete checked in release history" {
     const object = parsed.value.object;
     try std.testing.expectEqualStrings("zigcho!lazer", object.get("streams").?.array.items[0].object.get("display_name").?.string);
     try std.testing.expectEqualStrings(latest_version, object.get("builds").?.array.items[0].object.get("version").?.string);
-    try std.testing.expectEqual(@as(usize, 24), object.get("builds").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 25), object.get("builds").?.array.items.len);
     var entries: usize = 0;
     for (object.get("builds").?.array.items) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(historyEntryCount(), entries);
-    try std.testing.expectEqualStrings("zigcho has its own licence now", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("the client and Stable harness have their own repos now", object.get("builds").?.array.items[0].object.get("changelog_entries").?.array.items[0].object.get("title").?.string);
 
     const latest = (try buildJson(std.testing.allocator, "lazer", "latest")).?;
     defer std.testing.allocator.free(latest);
     const parsed_latest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, latest, .{});
     defer parsed_latest.deinit();
-    try std.testing.expectEqualStrings("2026.902.0", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
+    try std.testing.expectEqualStrings("2026.902.1", parsed_latest.value.object.get("versions").?.object.get("previous").?.object.get("version").?.string);
 
     const oldest = (try buildJson(std.testing.allocator, "zigcho", "2026.809.0")).?;
     defer std.testing.allocator.free(oldest);

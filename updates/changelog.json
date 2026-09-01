@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 49,
+      "version": "2026.902.2",
+      "display_version": "zigcho release 2.3",
+      "created_at": "2026-09-02T08:09:38+09:30",
+      "updates": [
+        {
+          "name": "2026-09-02-client-and-harness-repos.md",
+          "created_at": "2026-09-02T08:09:38+09:30",
+          "commit": "",
+          "sha256": "54af88cafb1503c09a14e1ca8406009086328de92af07d8849cf1b118b0d1e44"
+        }
+      ]
+    },
+    {
       "id": 48,
       "version": "2026.902.1",
       "display_version": "zigcho release 2.2",

@@ -46,7 +46,7 @@ concurrency:
 jobs:
   classify:
     name: classify release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       is_hotfix: ${{ steps.classify.outputs.is_hotfix }}
@@ -78,7 +78,7 @@ jobs:
   linux-x64:
     name: pinned linux x64 release
     needs: classify
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
     services:
       postgres:

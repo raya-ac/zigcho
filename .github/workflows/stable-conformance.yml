@@ -25,7 +25,7 @@ concurrency:
 jobs:
   contracts:
     name: inventory, corpus and decoder
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: check out zigcho

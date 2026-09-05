@@ -8,4 +8,6 @@ normal releases, hotfixes, scheduled backups and rollback downloads use the same
 
 the retained 119,808,422-byte production backup has now completed a full matching readback with this path. the multipart upload took about 50 seconds; the larger read streams were still too slow, which is why verification uses small requests.
 
-this does not change pp, scores, avatars or in-game map uploads. the shared Stable score, retry and replay checks are already passing. the backup fix still needs its own release gate and live activation before this is called deployed.
+the backup gate passed, and this is now deployed with `dae9643`. one production readback timed out before the service switch; the bounded retry completed all 119,808,421 bytes with a matching SHA-256. slow storage can still stop a release, but it leaves the old server online and the local backup intact.
+
+this transport change does not change pp, scores, avatars or in-game map uploads. activation kept schema 48 and did not recalculate pp. the previous build remains available for rollback.

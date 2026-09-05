@@ -6,4 +6,4 @@ the old best is copied inside the score transaction before anything can replace 
 
 this fixes the result response. it doesn't change pp calculations, score selection or stored stats. there's no recalculation or database migration.
 
-the focused fixture covers first scores, worse plays and improvements in both storage backends. deployment status will be recorded after the candidate is live.
+the focused fixture passed in Debug and ReleaseSafe, including PostgreSQL. [release gate 33966789517](https://github.com/zigcho/zigcho/actions/runs/33966789517) passed and `dae9643` is live. the running binary matches the artifact, all 22 hosts respond, and API authorization still rejects unsigned requests. installed Stable-client acceptance remains deferred.

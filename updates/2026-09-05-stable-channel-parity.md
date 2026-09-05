@@ -1,4 +1,4 @@
-# stable channel compatibility candidate
+# stable channel cleanup
 
 channel user counts now use the two-byte unsigned field Stable expects, with an independent literal-byte fixture checking the packet boundary.
 
@@ -20,6 +20,6 @@ the score chart now includes the map's known update date and formats empty value
 
 the final comparison passes 11 cases, including score submission, duplicate retry and replay readback. the remaining failure is the reference throwing an error on its final presence-all request. we aren't making our pp, medals, links or rank tie-breaks identical to someone else's server to get a green comparison.
 
-deployment stopped before switching the service because the off-host backup transfer timed out. the restore check passed and the local backup is retained. the current server is still healthy; this candidate is staged, not live, and the Discord release post is waiting on that transfer fix.
+the first deployment attempt stopped before switching the service because the off-host backup transfer timed out. the new multipart backup path completed a full matching readback on retry, and `dae9643` is now live with these changes and the previous-personal-best chart fix. the Discord release summary is posted.
 
-this is source work, not a deployment or a claim of complete compatibility. a clean full differential run is still pending; Ari has deferred installed Stable-client acceptance for now. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.
+this is not a claim of complete compatibility. the reference presence-all failure remains documented; Ari has deferred installed Stable-client acceptance for now. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.

@@ -22,7 +22,7 @@ username history sits to the right of the profile name now, with a labelled butt
 
 the previous deployment rolled back because its backup read-back failed verification. a separate download was also crawling from storage, so the old release stayed live and no announcement went out for that attempt.
 
-backup transfers now use eight bounded range readers, one megabyte per range, with deadlines and limited retries. every response has to match the requested range and the same object version. upload verification still compares every byte with the local dump; an ETag alone does not count as a verified backup. restores use the same bounded download path and still check the saved SHA-256 before restoring.
+backup transfers now use eight bounded range readers, 256 KiB per range, with deadlines and limited retries. the real storage check showed that one-megabyte ranges could still exceed the individual deadline, so retries now cover smaller pieces and the whole transfer has a fifteen-minute ceiling. every response has to match the requested range and the same object version. upload verification still compares every byte with the local dump; an ETag alone does not count as a verified backup. restores use the same bounded download path and still check the saved SHA-256 before restoring.
 
 the backup upload and read-back now finish before the old service is stopped. a storage failure leaves that service running, rather than failing after the new release has already started accepting players.
 

@@ -1,11 +1,11 @@
 const std = @import("std");
 const r2 = @import("../../r2.zig");
 
-const chunk_bytes = 1024 * 1024;
+const chunk_bytes = 256 * 1024;
 const worker_limit = 8;
 const attempt_limit = 3;
 const range_timeout_ms = 45_000;
-const transfer_timeout_ms = 600_000;
+const transfer_timeout_ms = 900_000;
 
 fn deadline(comptime T: type, io: std.Io, milliseconds: u32, comptime function: anytype, args: anytype) !T {
     const Completion = union(enum) { value: anyerror!T, timeout: std.Io.Cancelable!void };
@@ -106,7 +106,7 @@ pub fn putVerified(allocator: std.mem.Allocator, io: std.Io, target: r2.Storage,
     if (byte[0] != bytes[0]) return error.ObjectVerificationFailed;
     var context: Context(r2.Storage) = .{ .allocator = allocator, .io = io, .target = target, .key = key, .metadata = metadata, .expected = bytes, .output = null };
     // All bytes are compared, not just an ETag or the ends of the object. Memory
-    // used for verification is bounded by eight 1 MiB buffers, not another dump.
+    // used for verification is bounded by eight 256 KiB buffers, not another dump.
     try deadline(void, io, transfer_timeout_ms, Context(r2.Storage).run, .{&context});
 }
 

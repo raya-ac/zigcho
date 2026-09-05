@@ -1,9 +1,15 @@
 -- Rank only narrow keys. Display metadata and replay checks belong after LIMIT.
-WITH candidates AS (
+WITH own_maps AS MATERIALIZED (
+    SELECT DISTINCT s.beatmap_id AS beatmap_key
+    FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id
+    WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3
+      AND s.passed AND s.best AND b.status IN(3,4)
+), candidates AS (
     SELECT s.id, s.user_id, b.id AS beatmap_key, s.total_score AS score,
            s.pp, 'lazer'::text AS client, s.submitted_at
     FROM zigcho.lazer_scores s
     JOIN zigcho.beatmaps b ON b.id=s.beatmap_id
+    JOIN own_maps own ON own.beatmap_key=b.id
     JOIN zigcho.users u ON u.id=s.user_id
     WHERE s.ruleset_id=$2 AND s.rank_namespace=$3
       AND s.passed AND s.best AND b.status IN(3,4) AND NOT u.restricted

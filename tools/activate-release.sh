@@ -114,6 +114,9 @@ runuser --user postgres -- env \
 backup_key="backups/postgres/$(basename "$backup")"
 backup_sha256=$(sha256sum "$backup" | cut -d ' ' -f1)
 printf '%s\n' "$backup_sha256" | grep -Eq '^[0-9a-f]{64}$' || { echo "invalid release backup digest" >&2; exit 1; }
+# Storage can be slow or unavailable. Verify the off-host backup while the old
+# service is still running, never after the candidate has started accepting plays.
+(cd /var/lib/zigcho && "$candidate/zigcho" object-put "$backup_key" "$backup")
 systemctl stop "$service"
 service_stopped=yes
 runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check
@@ -125,8 +128,7 @@ fi
 ln -sfn "$candidate" "$current"
 if systemctl start "$service" \
   && curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused "$health_url" >/dev/null \
-  && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$' \
-  && (cd /var/lib/zigcho && "$candidate/zigcho" object-put "$backup_key" "$backup"); then
+  && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$'; then
   release_active=yes
   trap - EXIT HUP INT TERM
   rm -f "$backup" "$backup.sha256"

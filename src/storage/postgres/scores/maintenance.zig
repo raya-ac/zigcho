@@ -5,6 +5,7 @@ const lazer = @import("../../../lazer.zig");
 const performance_calculator = @import("../../../exact_pp.zig");
 const pp_admin = @import("../../../pp_admin.zig");
 const common = @import("../common.zig");
+pub const history_updates = @import("history.zig");
 
 pub fn backfillLazerClassicScoresWithConnection(self: anytype, conn: *postgres.c.PGconn) !void {
     try postgres.exec(conn, "BEGIN");
@@ -69,6 +70,7 @@ pub fn recalculatePerformance(self: anytype, allocator: std.mem.Allocator) !u64 
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try history_updates.lockMaintenance(lease.conn);
     var scores = try postgres.query(lease.conn, "SELECT s.id,s.mode,s.mods,s.max_combo,s.n300,s.n100,s.n50,s.nmiss,s.ngeki,s.nkatu,s.score,s.rank_namespace,b.osu_file FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE b.osu_file IS NOT NULL ORDER BY s.id");
     defer scores.deinit();
     var count: u64 = 0;
@@ -226,10 +228,15 @@ pub fn recordStatsHistorySliceCurrentWithConnection(self: anytype, conn: *postgr
     const namespace = domain.siteNamespace(source, stats_mode);
     var history_mode_buf: [24]u8 = undefined;
     const history_mode = try std.fmt.bufPrint(&history_mode_buf, "{d}", .{stats_mode});
-    // Rank is a property of the whole source/mode slice. Updating only the
-    // submitting player can leave both sides of a rank swap at the same
-    // position for the rest of the day.
-    if (user_id != 0) return recordStatsHistorySliceCurrentWithConnection(self, conn, source, stats_mode, 0);
+    if (user_id != 0) {
+        if (try history_updates.hasCurrentSlice(self, conn, source, stats_mode))
+            return history_updates.recordPlayer(self, conn, source, stats_mode, user_id);
+        // First score of the day seeds the whole slice once, including inactive
+        // players whose rank must move when today's active players pass them.
+        var prune = try postgres.queryParams(self.allocator, conn, "DELETE FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day<((extract(epoch FROM transaction_timestamp())::bigint/86400)-89)*86400", &.{ @tagName(source), history_mode });
+        prune.deinit();
+        return recordStatsHistorySliceCurrentWithConnection(self, conn, source, stats_mode, 0);
+    }
     if (user_id == 0) {
         var clear = try postgres.queryParams(self.allocator, conn, "DELETE FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400", &.{ @tagName(source), history_mode });
         defer clear.deinit();
@@ -358,6 +365,7 @@ pub fn refreshStatsHistory(self: anytype) !void {
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try history_updates.lockMaintenance(lease.conn);
     try recordAllStatsHistoryCurrentWithConnection(self, lease.conn);
     try postgres.exec(lease.conn, "COMMIT");
 }

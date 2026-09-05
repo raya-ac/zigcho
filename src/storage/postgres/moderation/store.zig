@@ -369,6 +369,7 @@ pub fn applyBeatmapRankAction(self: anytype, actor_id: i32, map_md5: []const u8,
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockMaintenance(lease.conn);
     var map = try postgres.queryParams(self.allocator, lease.conn, "SELECT b.id,b.set_id,b.status,(SELECT count(*) FROM zigcho.beatmap_rank_requests r WHERE r.set_id=b.set_id AND r.active),(SELECT count(*) FROM zigcho.beatmap_nominations n WHERE n.set_id=b.set_id AND n.active) FROM zigcho.beatmaps b WHERE b.md5=$1 FOR UPDATE", &.{map_md5});
     defer map.deinit();
     if (map.rows() == 0) return error.BeatmapNotFound;
@@ -513,6 +514,7 @@ pub fn setRestricted(self: anytype, actor_id: i32, target_id: i32, restricted: b
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockMaintenance(lease.conn);
     var token_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT pg_advisory_xact_lock($1::bigint)", &.{target});
     token_lock.deinit();
     var update = try postgres.queryParams(self.allocator, lease.conn, "UPDATE zigcho.users SET restricted=$1 WHERE id=$2 AND id!=3 RETURNING 1", &.{ if (restricted) "true" else "false", target });

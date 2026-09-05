@@ -200,6 +200,7 @@ pub fn publishBssSubmission(self: anytype, user_id: i32, set_id: i32, package: *
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockMaintenance(lease.conn);
     var submission = try postgres.queryParams(self.allocator, lease.conn, "SELECT submission.owner_id,submission.target,owner.name FROM zigcho.beatmap_submissions submission JOIN zigcho.users owner ON owner.id=submission.owner_id WHERE submission.set_id=$1 FOR UPDATE OF submission", &.{set});
     defer submission.deinit();
     if (submission.rows() == 0) return error.BssSubmissionNotFound;

@@ -26,6 +26,11 @@ test "postgres batched stats and first-place query parity" {
     try @import("tests/performance.zig").verify(std.mem.span(conninfo));
 }
 
+test "postgres concurrent history matches a full rebuild without rewriting unchanged rows" {
+    const conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_HISTORY_CONCURRENCY_URL") orelse return error.SkipZigTest;
+    try @import("tests/history.zig").verify(std.mem.span(conninfo));
+}
+
 test "postgres score submissions refresh both sides of a daily rank swap" {
     const raw_conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_HISTORY_URL") orelse return error.SkipZigTest;
     var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(raw_conninfo));
@@ -178,7 +183,8 @@ test "postgres concurrent first score submissions keep one best row per scope" {
     try postgres.exec(stable_barrier.conn, "BEGIN");
     var user_buf: [24]u8 = undefined;
     const user = try std.fmt.bufPrint(&user_buf, "{d}", .{user_id});
-    var stable_lock = try postgres.queryParams(std.testing.allocator, stable_barrier.conn, "SELECT pg_advisory_xact_lock(hashtextextended('zigcho:stable-best:'||$1||':'||$2||':0:scorev2',0))", &.{ user, map_md5 });
+    // Submissions now wait at the mode barrier before taking best/map locks.
+    var stable_lock = try postgres.query(stable_barrier.conn, "SELECT pg_advisory_xact_lock(1514685256,1)");
     stable_lock.deinit();
     const stable_thread_one = std.Thread.spawn(.{}, StableSubmit.run, .{&stable_first}) catch |err| {
         try postgres.exec(stable_barrier.conn, "ROLLBACK");
@@ -238,7 +244,7 @@ test "postgres concurrent first score submissions keep one best row per scope" {
     var lazer_second: LazerSubmit = .{ .store = &store, .user_id = user_id, .input = lazer_second_input, .started = &lazer_second_started, .failed = &lazer_failed };
     var lazer_barrier = store.pool.acquire();
     try postgres.exec(lazer_barrier.conn, "BEGIN");
-    var lazer_lock = try postgres.queryParams(std.testing.allocator, lazer_barrier.conn, "SELECT pg_advisory_xact_lock(hashtextextended('zigcho:lazer-best:'||$1||':2000000460:0:vanilla',0))", &.{user});
+    var lazer_lock = try postgres.query(lazer_barrier.conn, "SELECT pg_advisory_xact_lock(1514685256,1)");
     lazer_lock.deinit();
     const lazer_thread_one = std.Thread.spawn(.{}, LazerSubmit.run, .{&lazer_first}) catch |err| {
         try postgres.exec(lazer_barrier.conn, "ROLLBACK");

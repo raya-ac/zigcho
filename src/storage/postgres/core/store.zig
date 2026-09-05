@@ -304,6 +304,7 @@ pub fn migrate(self: anytype) !void {
 pub fn finishPendingRankedStatsRebuild(self: anytype, conn: *postgres.c.PGconn) !void {
     try postgres.exec(conn, "BEGIN");
     errdefer postgres.exec(conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockMaintenance(conn);
     var marker = try postgres.query(conn, "SELECT key FROM zigcho.maintenance_markers WHERE key='schema46_ranked_stats_rebuild' FOR UPDATE");
     defer marker.deinit();
     if (marker.rows() != 0) {

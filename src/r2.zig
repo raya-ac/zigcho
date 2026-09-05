@@ -12,6 +12,38 @@ pub const Storage = struct {
     secret_access_key: []const u8,
     region: []const u8 = "auto",
 
+    pub const ObjectMetadata = struct {
+        bytes: usize,
+        etag_buffer: [256]u8 = undefined,
+        etag_len: usize = 0,
+        pub fn etag(self: *const ObjectMetadata) []const u8 {
+            return self.etag_buffer[0..self.etag_len];
+        }
+    };
+
+    const Range = struct {
+        start: usize,
+        end: usize,
+        total: ?usize,
+        etag: []const u8,
+        metadata: *ObjectMetadata,
+    };
+
+    /// Backup transfers use short, independently retryable ranges. Each response
+    /// must cover exactly the requested bytes and refer to the pinned object.
+    pub fn readRange(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, buffer: []u8, offset: usize, total: ?usize, etag: []const u8) !ObjectMetadata {
+        if (!self.enabled()) return error.R2NotConfigured;
+        if (buffer.len == 0 or buffer.len > 1024 * 1024 or offset > std.math.maxInt(usize) - buffer.len) return error.InvalidR2ObjectRange;
+        if (total) |size| if (offset >= size or buffer.len > size - offset) return error.InvalidR2ObjectRange;
+        if (etag.len > 256 or std.mem.indexOfAny(u8, etag, "\r\n") != null) return error.InvalidR2ObjectRange;
+        var writer = std.Io.Writer.fixed(buffer);
+        var metadata: ObjectMetadata = .{ .bytes = 0 };
+        const result = try self.requestWithRange(allocator, io, .GET, object_key, "application/octet-stream", "", &writer, .{ .start = offset, .end = offset + buffer.len - 1, .total = total, .etag = etag, .metadata = &metadata });
+        if (result != .partial_content) return error.R2RangeRejected;
+        if (writer.end != buffer.len) return error.R2TruncatedObject;
+        return metadata;
+    }
+
     pub fn enabled(self: Storage) bool {
         return validEndpoint(self.endpoint) and validBucket(self.bucket) and validRegion(self.region) and self.access_key_id.len > 0 and self.secret_access_key.len > 0;
     }
@@ -102,6 +134,10 @@ pub const Storage = struct {
     }
 
     fn request(self: Storage, allocator: std.mem.Allocator, io: std.Io, method: std.http.Method, object_key: []const u8, content_type: []const u8, payload: []const u8, response_writer: ?*std.Io.Writer) !std.http.Status {
+        return self.requestWithRange(allocator, io, method, object_key, content_type, payload, response_writer, null);
+    }
+
+    fn requestWithRange(self: Storage, allocator: std.mem.Allocator, io: std.Io, method: std.http.Method, object_key: []const u8, content_type: []const u8, payload: []const u8, response_writer: ?*std.Io.Writer, range: ?Range) !std.http.Status {
         if (!validObjectKey(object_key)) return error.InvalidR2ObjectKey;
         const host = endpointHost(self.endpoint) orelse return error.InvalidR2Endpoint;
         const canonical_uri = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ self.bucket, object_key });
@@ -135,12 +171,60 @@ pub const Storage = struct {
         const authorization = try std.fmt.allocPrint(allocator, "AWS4-HMAC-SHA256 Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{ self.access_key_id, credential_scope, signed_headers, &signature });
         defer allocator.free(authorization);
 
+        var range_buffer: [64]u8 = undefined;
+        const range_header = if (range) |r| try std.fmt.bufPrint(&range_buffer, "bytes={d}-{d}", .{ r.start, r.end }) else "";
         const extra_headers = [_]std.http.Header{
             .{ .name = "x-amz-content-sha256", .value = &payload_hash },
             .{ .name = "x-amz-date", .value = &timestamp.amz },
+            .{ .name = "range", .value = range_header },
+            .{ .name = "if-match", .value = if (range) |r| r.etag else "" },
         };
         var client: std.http.Client = .{ .allocator = allocator, .io = io };
         defer client.deinit();
+        if (range) |r| {
+            var req = try client.request(.GET, try std.Uri.parse(url), .{
+                .redirect_behavior = .unhandled,
+                .keep_alive = false,
+                .headers = .{
+                    .authorization = .{ .override = authorization },
+                    .content_type = .{ .override = content_type },
+                    .accept_encoding = .{ .override = "identity" },
+                    .user_agent = .{ .override = "zigcho/0.1" },
+                },
+                .extra_headers = extra_headers[0..if (r.etag.len == 0) @as(usize, 3) else 4],
+            });
+            defer req.deinit();
+            try req.sendBodiless();
+            var header_buffer: [8192]u8 = undefined;
+            var response = try req.receiveHead(&header_buffer);
+            if (response.head.status != .partial_content) return response.head.status;
+            if (response.head.content_encoding != .identity) return error.R2RangeRejected;
+            if (response.head.content_length) |length| if (length != r.end - r.start + 1) return error.R2RangeRejected;
+            var headers = response.head.iterateHeaders();
+            var found_range = false;
+            var found_etag = false;
+            while (headers.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "content-range")) {
+                    if (found_range) return error.R2RangeRejected;
+                    r.metadata.bytes = try validateContentRange(header.value, r.start, r.end, r.total);
+                    found_range = true;
+                } else if (std.ascii.eqlIgnoreCase(header.name, "etag")) {
+                    if (found_etag or header.value.len < 2 or header.value.len > r.metadata.etag_buffer.len or header.value[0] != '"' or header.value[header.value.len - 1] != '"') return error.R2RangeRejected;
+                    if (r.etag.len != 0 and !std.mem.eql(u8, r.etag, header.value)) return error.R2ObjectChanged;
+                    @memcpy(r.metadata.etag_buffer[0..header.value.len], header.value);
+                    r.metadata.etag_len = header.value.len;
+                    found_etag = true;
+                }
+            }
+            if (!found_range or !found_etag) return error.R2RangeRejected;
+            var transfer_buffer: [64 * 1024]u8 = undefined;
+            const reader = response.reader(&transfer_buffer);
+            _ = reader.streamRemaining(response_writer.?) catch |err| switch (err) {
+                error.ReadFailed => return response.bodyErr() orelse error.R2TruncatedObject,
+                else => return err,
+            };
+            return response.head.status;
+        }
         const result = try client.fetch(.{
             .location = .{ .url = url },
             .method = method,
@@ -152,11 +236,29 @@ pub const Storage = struct {
                 .accept_encoding = .{ .override = "identity" },
                 .user_agent = .{ .override = "zigcho/0.1" },
             },
-            .extra_headers = &extra_headers,
+            .extra_headers = extra_headers[0..2],
         });
         return result.status;
     }
 };
+
+fn validateContentRange(value: []const u8, start: usize, end: usize, expected_total: ?usize) !usize {
+    if (!std.mem.startsWith(u8, value, "bytes ")) return error.R2RangeRejected;
+    const dash = std.mem.indexOfScalar(u8, value[6..], '-') orelse return error.R2RangeRejected;
+    const slash = std.mem.indexOfScalar(u8, value[6..], '/') orelse return error.R2RangeRejected;
+    if (dash >= slash) return error.R2RangeRejected;
+    const actual_start = std.fmt.parseInt(usize, value[6 .. 6 + dash], 10) catch return error.R2RangeRejected;
+    const actual_end = std.fmt.parseInt(usize, value[7 + dash .. 6 + slash], 10) catch return error.R2RangeRejected;
+    const total = std.fmt.parseInt(usize, value[7 + slash ..], 10) catch return error.R2RangeRejected;
+    if (actual_start != start or actual_end != end or total <= end or (expected_total != null and total != expected_total.?)) return error.R2RangeRejected;
+    return total;
+}
+
+test "object ranges reject wrong offsets totals and truncated range metadata" {
+    try std.testing.expectEqual(@as(usize, 100), try validateContentRange("bytes 10-19/100", 10, 19, 100));
+    for ([_][]const u8{ "bytes 0-19/100", "bytes 10-18/100", "bytes 10-19/99", "bytes 10-19/*", "bytes */100", "bytes 10/100", "bytes 10-19/100/2" }) |value|
+        try std.testing.expectError(error.R2RangeRejected, validateContentRange(value, 10, 19, 100));
+}
 
 const Timestamp = struct { date: [8]u8, amz: [16]u8 };
 

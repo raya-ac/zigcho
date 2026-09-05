@@ -41,6 +41,7 @@ pub const App = struct {
     avatar_store: r2.Storage,
     avatar_cache: avatar_cache.Cache,
     geo_client: std.http.Client,
+    geo_gate: HttpGate = .init(@import("http/geolocation.zig").max_concurrent),
     changelog_feed: changelog.Feed,
     started_at: i64,
     irc_clients: std.atomic.Value(u32) = .init(0),

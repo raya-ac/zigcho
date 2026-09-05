@@ -163,6 +163,7 @@ pub fn insertStableScore(self: anytype, user_id: i32, score: stable_score.Submis
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockSubmission(self, lease.conn, stats_mode);
     var scope_lock = try postgres.queryParams(self.allocator, lease.conn, "SELECT pg_advisory_xact_lock(hashtextextended('zigcho:stable-best:'||$1||':'||$2||':'||$3||':'||$4,0))", &.{ user, score.map_md5, mode, namespace });
     scope_lock.deinit();
     // Stable and lazer both lock the beatmap before the user's stats row.
@@ -216,7 +217,6 @@ pub fn insertStableScore(self: anytype, user_id: i32, score: stable_score.Submis
     if (updates_player_stats and score.passed and ranked) {
         try pg_score_maintenance.rebuildCombinedPerformanceWithConnection(self, lease.conn, user_id, score.mode, stats_mode, namespace, false);
     }
-    try pg_score_maintenance.pruneStatsHistoryWithConnection(self, lease.conn);
     try pg_score_maintenance.recordStatsHistorySliceCurrentWithConnection(self, lease.conn, if (std.mem.eql(u8, namespace, "scorev2")) .scorev2 else .stable, stats_mode, user_id);
     if (updates_player_stats) try pg_score_maintenance.recordStatsHistorySliceCurrentWithConnection(self, lease.conn, .all, stats_mode, user_id);
     try pg_score_achievements.awardAchievementsWithConnection(self, lease.conn, user_id, "stable", score_id, .{

@@ -457,6 +457,7 @@ pub fn insertLazerScore(self: anytype, user_id: i32, input: lazer.ScoreInput, pp
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockSubmission(self, lease.conn, lazer.statsMode(input) orelse 9);
     const score_id = try insertLazerScoreWithConnection(self, lease.conn, user_id, input, pp_value, mods_json, statistics_json, maximum_statistics_json, pauses_json, replay_data);
     try postgres.exec(lease.conn, "COMMIT");
     return score_id;
@@ -494,7 +495,6 @@ pub fn insertLazerScoreWithConnection(self: anytype, conn: *postgres.c.PGconn, u
     }
     try updateLazerStatsWithConnection(self, conn, user_id, input);
     if (lazer.statsMode(input)) |stats_mode| {
-        try pg_score_maintenance.pruneStatsHistoryWithConnection(self, conn);
         try pg_score_maintenance.recordStatsHistorySliceCurrentWithConnection(self, conn, .lazer, stats_mode, user_id);
         try pg_score_maintenance.recordStatsHistorySliceCurrentWithConnection(self, conn, .all, stats_mode, user_id);
     }
@@ -629,6 +629,7 @@ pub fn submitLazerScoreTokenScoped(self: anytype, user_id: i32, beatmap_id: i32,
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    try pg_score_maintenance.history_updates.lockSubmission(self, lease.conn, lazer.statsMode(input) orelse 9);
     var token = try postgres.queryParams(self.allocator, lease.conn, "SELECT user_id,beatmap_id,ruleset_id,expires_at,consumed_at FROM zigcho.lazer_score_tokens WHERE id=$1 FOR UPDATE", &.{token_text});
     defer token.deinit();
     if (token.rows() == 0) return error.InvalidLazerScoreToken;

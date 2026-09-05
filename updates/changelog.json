@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 53,
+      "version": "2026.905.3",
+      "display_version": "zigcho release 2.7",
+      "created_at": "2026-09-05T05:39:00Z",
+      "updates": [
+        {
+          "name": "2026-09-05-history-and-backup-transfers.md",
+          "created_at": "2026-09-05T05:39:00Z",
+          "commit": "",
+          "sha256": "cb5095eaaa3ee76450b403b3213fb410c31943f97573c76f9b20be16900c8874"
+        }
+      ]
+    },
+    {
       "id": 52,
       "version": "2026.905.2",
       "display_version": "zigcho release 2.6",

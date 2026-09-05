@@ -74,6 +74,8 @@ comptime {
     _ = migrate_postgres;
     _ = postgres_store;
     _ = postgres_store_tests;
+    _ = @import("server/http/geolocation.zig");
+    _ = @import("server/cli/backup_transfer.zig");
     _ = web_auth;
     _ = screenshot;
     _ = media_contract;

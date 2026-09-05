@@ -78,6 +78,7 @@ pub fn upsertBeatmapInner(self: anytype, metadata: beatmap.Metadata, md5: []cons
     defer lease.release();
     try postgres.exec(lease.conn, "BEGIN");
     errdefer postgres.exec(lease.conn, "ROLLBACK") catch {};
+    if (update_existing) try pg_score_maintenance.history_updates.lockMaintenance(lease.conn);
     var previous = try postgres.queryParams(self.allocator, lease.conn, "SELECT b.status,b.status_frozen,EXISTS(SELECT 1 FROM zigcho.scores s WHERE s.map_md5=b.md5) OR EXISTS(SELECT 1 FROM zigcho.lazer_scores l WHERE l.beatmap_id=b.id) FROM zigcho.beatmaps b WHERE b.id=$1 FOR UPDATE", &.{map_id});
     defer previous.deinit();
     const previous_status: ?i8 = if (previous.rows() == 0) null else try previous.int(i8, 0, 0);

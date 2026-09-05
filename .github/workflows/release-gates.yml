@@ -185,7 +185,9 @@ jobs:
             stopped_line=$(grep -n '^service_stopped=yes$' "$activate" | tail -n 1 | cut -d: -f1)
             check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
             anticheat_line=$(grep -n '^  runuser --user zigcho -- "$candidate/zigcho-anticheat-host-smoke" "$anticheat_module"$' "$activate" | cut -d: -f1)
+            backup_verified_line=$(grep -n '^.*"$candidate/zigcho" object-put "$backup_key" "$backup")$' "$activate" | cut -d: -f1)
             test "$anticheat_line" -lt "$stop_line"
+            test "$backup_verified_line" -lt "$stop_line"
             test "$stop_line" -lt "$stopped_line"
             test "$stopped_line" -lt "$check_line"
           fi
@@ -204,6 +206,7 @@ jobs:
           createdb -h 127.0.0.1 -U zigcho zigcho_room_chat
           createdb -h 127.0.0.1 -U zigcho zigcho_ranked
           createdb -h 127.0.0.1 -U zigcho zigcho_history
+          createdb -h 127.0.0.1 -U zigcho zigcho_history_concurrency
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_URL=host=127.0.0.1 port=5432 dbname=zigcho_pool user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
@@ -212,6 +215,7 @@ jobs:
             -e 'ZIGCHO_TEST_POSTGRES_ROOM_CHAT_URL=host=127.0.0.1 port=5432 dbname=zigcho_room_chat user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_RANKED_URL=host=127.0.0.1 port=5432 dbname=zigcho_ranked user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_HISTORY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_HISTORY_CONCURRENCY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history_concurrency user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             zig build test -Doptimize=ReleaseSafe
 
@@ -306,6 +310,34 @@ jobs:
               "zigcho-release-gate:${GITHUB_SHA}" \
               zig build test "-Doptimize=$optimization" -Dtest-filter="postgres batched stats and first-place query parity"
           done
+
+      - name: verify backup ranges against an isolated HTTPS object store
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: backup-fixture-access
+          AWS_SECRET_ACCESS_KEY: backup-fixture-secret
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d "$RUNNER_TEMP/backup-roundtrip.XXXXXX")
+          cert_dir=$(mktemp -d "$RUNNER_TEMP/backup-certs.XXXXXX")
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$cert_dir/private.key" -out "$cert_dir/public.crt" -days 1 -subj '/CN=localhost' -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' 2>/dev/null
+          sudo cp "$cert_dir/public.crt" /usr/local/share/ca-certificates/zigcho-backup-fixture.crt
+          sudo update-ca-certificates >/dev/null
+          docker run -d --name zigcho-backup-objects --network host -v "$cert_dir:/root/.minio/certs:ro" -e MINIO_ROOT_USER=backup-fixture-access -e MINIO_ROOT_PASSWORD=backup-fixture-secret minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e server /data --address 127.0.0.1:19020 --console-address 127.0.0.1:19021
+          trap 'docker rm -f zigcho-backup-objects >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent https://127.0.0.1:19020/minio/health/live; then break; fi
+            sleep 1
+          done
+          aws --endpoint-url https://127.0.0.1:19020 --ca-bundle "$cert_dir/public.crt" s3api create-bucket --bucket zigcho-backup-fixture
+          cp tools/fixtures/backup-object-store.ini "$runtime/config.ini"
+          openssl rand -out "$runtime/source.bin" 3145745
+          binary="$GITHUB_WORKSPACE/artifacts/server/zigcho"
+          (cd "$runtime" && "$binary" object-put backups/fixture.dump source.bin && "$binary" object-get backups/fixture.dump restored.bin)
+          cmp "$runtime/source.bin" "$runtime/restored.bin"
+          sha256sum "$runtime/source.bin" "$runtime/restored.bin"
 
       - name: boot the exact binary on PostgreSQL
         shell: bash

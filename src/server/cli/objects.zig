@@ -8,6 +8,7 @@ const r2 = d.r2;
 const object_keys = d.object_keys;
 const profile_avatar = d.profile_avatar;
 const beatmap_sync = d.beatmap_sync;
+const backup_transfer = @import("backup_transfer.zig");
 
 pub fn configuredObjectStore(config: config_mod.Config) r2.Storage {
     return .{
@@ -39,17 +40,10 @@ pub fn objectTransferCommand(allocator: std.mem.Allocator, io: std.Io, args: []c
     if (std.mem.eql(u8, args[0], "object-put")) {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, args[2], allocator, .limited(max_backup_bytes));
         defer allocator.free(bytes);
-        try target.put(allocator, io, args[1], "application/octet-stream", bytes);
-        const verified = try target.getWithLimit(allocator, io, args[1], "application/octet-stream", bytes.len);
-        defer allocator.free(verified);
-        var source_hash: [32]u8 = undefined;
-        var stored_hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &source_hash, .{});
-        std.crypto.hash.sha2.Sha256.hash(verified, &stored_hash, .{});
-        if (bytes.len != verified.len or !std.mem.eql(u8, &source_hash, &stored_hash)) return error.ObjectVerificationFailed;
+        try backup_transfer.putVerified(allocator, io, target, args[1], bytes);
         std.log.info("event=object_backup_uploaded key={s} bytes={d} verified=true", .{ args[1], bytes.len });
     } else {
-        const bytes = try target.getWithLimit(allocator, io, args[1], "application/octet-stream", max_backup_bytes);
+        const bytes = try backup_transfer.get(allocator, io, target, args[1], max_backup_bytes);
         defer allocator.free(bytes);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[2], .data = bytes, .flags = .{ .exclusive = true } });
         std.log.info("event=object_backup_downloaded key={s} bytes={d}", .{ args[1], bytes.len });

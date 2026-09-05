@@ -157,35 +157,8 @@ pub fn serveBeatmapArchive(self: anytype, req: *std.http.Server.Request, set_id:
     try body_writer.end();
 }
 
-pub const GeoResult = struct { lon: f32, lat: f32 };
-
-pub fn lookupGeo(self: anytype, ip: []const u8) GeoResult {
-    const url = std.fmt.allocPrint(self.allocator, "http://ip-api.com/line/{s}?fields=status,lat,lon", .{ip}) catch return .{ .lon = 0, .lat = 0 };
-    defer self.allocator.free(url);
-    var buf: [256]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buf);
-    const result = self.geo_client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &writer,
-        .headers = .{
-            .user_agent = .{ .override = "zigcho/0.1" },
-        },
-    }) catch return .{ .lon = 0, .lat = 0 };
-    if (result.status != .ok) return .{ .lon = 0, .lat = 0 };
-    const body_str = buf[0..writer.end];
-    var lines = std.mem.splitScalar(u8, body_str, '\n');
-    const status = std.mem.trim(u8, lines.next() orelse "", "\r ");
-    if (!std.mem.eql(u8, status, "success")) return .{ .lon = 0, .lat = 0 };
-    const lat_str = std.mem.trim(u8, lines.next() orelse "0", "\r ");
-    const lon_str = std.mem.trim(u8, lines.next() orelse "0", "\r ");
-    const lat = std.fmt.parseFloat(f32, lat_str) catch 0;
-    const lon = std.fmt.parseFloat(f32, lon_str) catch 0;
-    std.debug.print("{s}  ┌─ GEOLOCATION ──────────────────────────────────{s}\n", .{ log.blue, log.reset });
-    std.debug.print("{s}  │ {s}►{s} ip  : {s}{s}\n", .{ log.blue, log.dim, log.reset, ip, log.reset });
-    std.debug.print("{s}  │ {s}✓{s} lat : {d:.4}  lon : {d:.4}{s}\n", .{ log.blue, log.green, log.reset, lat, lon, log.reset });
-    std.debug.print("{s}  └──────────────────────────────────────────────{s}\n", .{ log.blue, log.reset });
-    return .{ .lon = lon, .lat = lat };
-}
+pub const GeoResult = @import("geolocation.zig").Result;
+pub const lookupGeo = @import("geolocation.zig").lookup;
 
 pub fn rejectStableScore(req: *std.http.Server.Request, reason: []const u8, body_len: usize) !void {
     std.log.warn("stable score rejected: reason={s} body_bytes={d}", .{ reason, body_len });

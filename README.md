@@ -31,6 +31,8 @@ ZIGCHO_POSTGRES_URL='host=/var/run/postgresql dbname=zigcho user=zigcho connect_
 
 the server build is PostgreSQL by default. SQLite is only kept for fixtures and offline tools; build those explicitly with `zig build -Dpostgres=false`. copy `config.example.ini` to `config.ini` for local secrets. the real config is ignored. the useful player-path checks live in `tools/`, including Stable web/map checks and lazer solo, multiplayer and spectator runs.
 
+release backups need `rclone` 1.60+, `curl` 7.75+ and GNU `timeout` on the host. the helper reads the existing storage config, uploads in bounded parts and checks a full ranged download against the original SHA-256 before activation. game uploads still use Zigcho's own object API.
+
 the old SQLite importers and PostgreSQL migration utility are optional: `zig build legacy-tools`. normal server releases do not package them. if you need a runner-built copy, enable `include_legacy_tools` when starting the release workflow. `zig build test-changelog` checks the changelog without building the PP bridge or server.
 
 production binaries come from the pinned Linux GitHub runner, not my Mac. each release lives at `/opt/zigcho/releases/<commit>` and is activated through `tools/activate-release.sh`, which backs up and restore-tests PostgreSQL before switching the live symlink. the separate [zigcho!lazer repo](https://github.com/zigcho/zigcho-lazer) builds the portable Windows, macOS, Linux, Android and unsigned iOS clients.

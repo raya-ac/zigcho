@@ -32,6 +32,7 @@ on:
       - tools/activate-hotfix.sh
       - tools/backup-postgres.sh
       - tools/backup-postgres-object.sh
+      - tools/backup-transfer.sh
       - tools/hotfix.py
       - tools/restore-postgres-drill.sh
       - tools/rollback-release.sh
@@ -182,7 +183,9 @@ jobs:
             activate=artifacts/server/tools/activate-hotfix.sh
             check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
             stop_line=$(grep -n '^systemctl stop "$service"$' "$activate" | tail -n 1 | cut -d: -f1)
+            backup_verified_line=$(grep -n '^"$candidate/tools/backup-transfer.sh" put ' "$activate" | cut -d: -f1)
             test "$check_line" -lt "$stop_line"
+            test "$backup_verified_line" -lt "$stop_line"
           else
             activate=artifacts/server/tools/activate-release.sh
             test -x artifacts/server/tools/rollback-release.sh
@@ -191,12 +194,14 @@ jobs:
             stopped_line=$(grep -n '^service_stopped=yes$' "$activate" | tail -n 1 | cut -d: -f1)
             check_line=$(grep -n '^runuser --user zigcho -- env ZIGCHO_POSTGRES_URL=.*"$candidate/zigcho" check$' "$activate" | cut -d: -f1)
             anticheat_line=$(grep -n '^  runuser --user zigcho -- "$candidate/zigcho-anticheat-host-smoke" "$anticheat_module"$' "$activate" | cut -d: -f1)
-            backup_verified_line=$(grep -n '^.*"$candidate/zigcho" object-put "$backup_key" "$backup")$' "$activate" | cut -d: -f1)
+            backup_verified_line=$(grep -n '^"$candidate/tools/backup-transfer.sh" put "$backup_key" "$backup"$' "$activate" | cut -d: -f1)
             test "$anticheat_line" -lt "$stop_line"
             test "$backup_verified_line" -lt "$stop_line"
             test "$stop_line" -lt "$stopped_line"
             test "$stopped_line" -lt "$check_line"
           fi
+          test -x artifacts/server/tools/backup-transfer.sh
+          sh -n artifacts/server/tools/backup-transfer.sh
 
       - name: run PostgreSQL integration tests
         if: needs.classify.outputs.is_hotfix != 'true' && (github.event_name != 'workflow_dispatch' || inputs.test_scope == 'full' || inputs.test_scope == 'stable')
@@ -347,6 +352,8 @@ jobs:
           AWS_EC2_METADATA_DISABLED: 'true'
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
           runtime=$(mktemp -d "$RUNNER_TEMP/backup-roundtrip.XXXXXX")
           cert_dir=$(mktemp -d "$RUNNER_TEMP/backup-certs.XXXXXX")
           openssl req -x509 -newkey rsa:2048 -nodes -keyout "$cert_dir/private.key" -out "$cert_dir/public.crt" -days 1 -subj '/CN=localhost' -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' 2>/dev/null
@@ -365,6 +372,17 @@ jobs:
           (cd "$runtime" && "$binary" object-put backups/fixture.dump source.bin && "$binary" object-get backups/fixture.dump restored.bin)
           cmp "$runtime/source.bin" "$runtime/restored.bin"
           sha256sum "$runtime/source.bin" "$runtime/restored.bin"
+          # Exercise the actual operational multipart path, above its 8 MiB cutoff.
+          openssl rand -out "$runtime/multipart.dump" 25165841
+          transfer="$GITHUB_WORKSPACE/artifacts/server/tools/backup-transfer.sh"
+          export ZIGCHO_BACKUP_CONFIG="$runtime/config.ini"
+          "$transfer" put backups/postgres/zigcho-20260905T000000Z.dump "$runtime/multipart.dump"
+          "$transfer" get backups/postgres/zigcho-20260905T000000Z.dump "$runtime/multipart-restored.dump"
+          cmp "$runtime/multipart.dump" "$runtime/multipart-restored.dump"
+          if "$transfer" get backups/postgres/zigcho-20260905T000000Z.dump "$runtime/multipart-restored.dump"; then
+            echo 'backup download overwrote an existing destination' >&2
+            exit 1
+          fi
 
       - name: boot the exact binary on PostgreSQL
         shell: bash

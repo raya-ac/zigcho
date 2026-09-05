@@ -6,6 +6,8 @@ database_url=${ZIGCHO_POSTGRES_URL:-dbname=zigcho}
 admin_url=${ZIGCHO_POSTGRES_ADMIN_URL:-dbname=postgres}
 expected_schema=${ZIGCHO_EXPECTED_SCHEMA:-}
 current=/opt/zigcho/current
+[ -x "$current/tools/backup-transfer.sh" ] || { echo "backup transport is missing" >&2; exit 1; }
+command -v rclone >/dev/null || { echo "backup transport requires rclone" >&2; exit 1; }
 
 if [ -z "$expected_schema" ]; then
   expected_schema=$(runuser --user postgres -- \
@@ -34,6 +36,6 @@ runuser --user postgres -- env \
   "$current/tools/restore-postgres-drill.sh" "$backup"
 
 name=$(basename "$backup")
-(cd /var/lib/zigcho && "$current/zigcho" object-put "backups/postgres/$name" "$backup")
+"$current/tools/backup-transfer.sh" put "backups/postgres/$name" "$backup"
 rm -f "$backup" "$backup.sha256"
 echo "backup_object_ok key=backups/postgres/$name local_removed=true"

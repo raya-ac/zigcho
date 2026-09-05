@@ -30,6 +30,8 @@ case "$candidate" in
   "$release_root"/*) ;;
   *) echo "candidate resolved outside release root: $candidate" >&2; exit 1 ;;
 esac
+[ -x "$candidate/tools/backup-transfer.sh" ] || { echo "candidate backup transport is missing" >&2; exit 1; }
+command -v rclone >/dev/null || { echo "release backup transport requires rclone" >&2; exit 1; }
 
 previous=$(readlink -f "$current")
 case "$previous" in
@@ -116,7 +118,7 @@ backup_sha256=$(sha256sum "$backup" | cut -d ' ' -f1)
 printf '%s\n' "$backup_sha256" | grep -Eq '^[0-9a-f]{64}$' || { echo "invalid release backup digest" >&2; exit 1; }
 # Storage can be slow or unavailable. Verify the off-host backup while the old
 # service is still running, never after the candidate has started accepting plays.
-(cd /var/lib/zigcho && "$candidate/zigcho" object-put "$backup_key" "$backup")
+"$candidate/tools/backup-transfer.sh" put "$backup_key" "$backup"
 systemctl stop "$service"
 service_stopped=yes
 runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zigcho" check

@@ -40,4 +40,4 @@ RUN --mount=type=cache,id=zigcho-hotfix-cargo-registry,target=/usr/local/cargo/r
     && strip --strip-all /out/zigcho \
     && ! objdump -d /out/zigcho | grep -Eq '%zmm|%k[0-7]' \
     && cp src/pp_engine_version.txt /out/pp-engine-version \
-    && cp tools/backup-postgres.sh tools/restore-postgres-drill.sh tools/activate-hotfix.sh /out/tools/
+    && cp tools/backup-postgres.sh tools/backup-transfer.sh tools/restore-postgres-drill.sh tools/activate-hotfix.sh /out/tools/

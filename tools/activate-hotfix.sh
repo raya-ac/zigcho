@@ -28,16 +28,17 @@ case "$candidate" in
   *) echo "candidate resolved outside the hotfix root: $candidate" >&2; exit 1 ;;
 esac
 
-for file in zigcho zigcho.sha256 pp-engine-version source.patch source.patch.sha256 hotfix.json hotfix.manifest tools/backup-postgres.sh tools/restore-postgres-drill.sh; do
+for file in zigcho zigcho.sha256 pp-engine-version source.patch source.patch.sha256 hotfix.json hotfix.manifest tools/backup-postgres.sh tools/restore-postgres-drill.sh tools/backup-transfer.sh; do
   if [ ! -f "$candidate/$file" ] || [ -L "$candidate/$file" ] || [ ! -s "$candidate/$file" ]; then
     echo "hotfix candidate is missing a regular file: $file" >&2
     exit 1
   fi
 done
-if [ ! -x "$candidate/zigcho" ] || [ ! -x "$candidate/tools/backup-postgres.sh" ] || [ ! -x "$candidate/tools/restore-postgres-drill.sh" ]; then
+if [ ! -x "$candidate/zigcho" ] || [ ! -x "$candidate/tools/backup-postgres.sh" ] || [ ! -x "$candidate/tools/restore-postgres-drill.sh" ] || [ ! -x "$candidate/tools/backup-transfer.sh" ]; then
   echo "hotfix candidate executables are not ready" >&2
   exit 1
 fi
+command -v rclone >/dev/null || { echo "hotfix backup transport requires rclone" >&2; exit 1; }
 
 manifest_value() {
   key=$1
@@ -156,13 +157,13 @@ runuser --user zigcho -- env ZIGCHO_POSTGRES_URL="$database_url" "$candidate/zig
 post_check_schema=$(runuser --user postgres -- psql --dbname=zigcho --tuples-only --no-align --command="SELECT max(version) FROM zigcho.schema_migrations")
 [ "$post_check_schema" = "$current_schema" ] || { echo "hotfix candidate changed the live schema" >&2; exit 1; }
 
+"$candidate/tools/backup-transfer.sh" put "backups/postgres/$(basename "$backup")" "$backup"
 systemctl stop "$service"
 service_stopped=yes
 ln -sfn "$candidate" "$current"
 if systemctl start "$service" \
   && curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused "$health_url" >/dev/null \
-  && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$' \
-  && (cd /var/lib/zigcho && "$candidate/zigcho" object-put "backups/postgres/$(basename "$backup")" "$backup"); then
+  && curl --fail --silent --show-error --retry 3 --retry-delay 1 --retry-connrefused "$metrics_url" | grep -q '^zigcho_up 1$'; then
   hotfix_active=yes
   trap - EXIT HUP INT TERM
   rm -f "$backup" "$backup.sha256"

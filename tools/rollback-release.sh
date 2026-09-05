@@ -55,6 +55,8 @@ esac
 [ -x "$tool_release/zigcho" ] || { echo "rollback tool executable is missing" >&2; exit 1; }
 [ -x "$tool_release/tools/backup-postgres.sh" ] || { echo "rollback backup tool is missing" >&2; exit 1; }
 [ -x "$tool_release/tools/restore-postgres-drill.sh" ] || { echo "rollback restore drill is missing" >&2; exit 1; }
+[ -x "$tool_release/tools/backup-transfer.sh" ] || { echo "rollback backup transport is missing" >&2; exit 1; }
+command -v rclone >/dev/null || { echo "rollback backup transport requires rclone" >&2; exit 1; }
 
 case "$backup_key" in
   backups/postgres/zigcho-*.dump) ;;
@@ -86,7 +88,7 @@ cleanup_files() {
 }
 trap cleanup_files EXIT HUP INT TERM
 
-(cd /var/lib/zigcho && "$tool_release/zigcho" object-get "$backup_key" "$rollback_backup")
+"$tool_release/tools/backup-transfer.sh" get "$backup_key" "$rollback_backup"
 chown postgres:postgres "$rollback_backup"
 chmod 600 "$rollback_backup"
 actual_sha256=$(sha256sum "$rollback_backup" | cut -d ' ' -f1)
@@ -126,7 +128,7 @@ runuser --user postgres -- env \
 forward_key="backups/postgres/$(basename "$forward_backup")"
 forward_sha256=$(sha256sum "$forward_backup" | cut -d ' ' -f1)
 printf '%s\n' "$forward_sha256" | grep -Eq '^[0-9a-f]{64}$' || { echo "invalid forward-recovery digest" >&2; exit 1; }
-(cd /var/lib/zigcho && "$tool_release/zigcho" object-put "$forward_key" "$forward_backup")
+"$tool_release/tools/backup-transfer.sh" put "$forward_key" "$forward_backup"
 
 restore_current() {
   status=$?

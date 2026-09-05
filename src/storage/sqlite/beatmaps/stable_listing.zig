@@ -1,7 +1,8 @@
 const std = @import("std");
 const c = @import("../../../storage.zig").c;
 const Store = @import("../../../storage.zig").Store;
-const directStatus = @import("../../contracts.zig").directStatus;
+const directListingStatus = @import("../../contracts.zig").directListingStatus;
+const stableStatus = @import("../../contracts.zig").stableStatus;
 
 pub fn writeDirectText(writer: *std.Io.Writer, value: []const u8) !void {
     for (value) |char| try writer.writeByte(switch (char) {
@@ -12,6 +13,10 @@ pub fn writeDirectText(writer: *std.Io.Writer, value: []const u8) !void {
 }
 
 pub fn appendDirectSet(self: *Store, writer: *std.Io.Writer, set_id: i32) !bool {
+    return appendDirectSetFields(self, writer, set_id, true);
+}
+
+fn appendDirectSetFields(self: *Store, writer: *std.Io.Writer, set_id: i32, include_difficulties: bool) !bool {
     const set_sql = "SELECT artist,title,creator,status,coalesce(datetime(last_update,'unixepoch'),'1970-01-01 00:00:00') FROM beatmaps WHERE set_id=?1 ORDER BY star_rating LIMIT 1";
     var set_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(self.db, set_sql, -1, &set_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
@@ -24,7 +29,10 @@ pub fn appendDirectSet(self: *Store, writer: *std.Io.Writer, set_id: i32) !bool 
     try writeDirectText(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 1)));
     try writer.writeByte('|');
     try writeDirectText(writer, std.mem.span(c.sqlite3_column_text(set_stmt, 2)));
-    try writer.print("|{d}|10.0|{s}|{d}|0|0|0|0|0|", .{ directStatus(c.sqlite3_column_int(set_stmt, 3)), std.mem.span(c.sqlite3_column_text(set_stmt, 4)), set_id });
+    const status = c.sqlite3_column_int(set_stmt, 3);
+    try writer.print("|{d}|10.0|{s}|{d}|0|0|0|0|0", .{ if (include_difficulties) directListingStatus(status) else stableStatus(status), std.mem.span(c.sqlite3_column_text(set_stmt, 4)), set_id });
+    if (!include_difficulties) return true;
+    try writer.writeByte('|');
 
     const maps_sql = "SELECT star_rating,version,cs,od,ar,hp,mode FROM beatmaps WHERE set_id=?1 ORDER BY star_rating,id";
     var maps_stmt: ?*c.sqlite3_stmt = null;
@@ -81,7 +89,7 @@ pub fn stableSearchSet(self: *Store, allocator: std.mem.Allocator, set_id: ?i32,
     const found_set_id = c.sqlite3_column_int(find_stmt, 0);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    _ = try self.appendDirectSet(&output.writer, found_set_id);
+    _ = try appendDirectSetFields(self, &output.writer, found_set_id, false);
     var list = output.toArrayList();
     return list.toOwnedSlice(allocator);
 }

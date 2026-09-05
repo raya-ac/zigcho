@@ -18,7 +18,7 @@ const BeatmapSetCreator = storage_contracts.BeatmapSetCreator;
 const StableBeatmapInfo = storage_contracts.StableBeatmapInfo;
 const BeatmapSelection = storage_contracts.BeatmapSelection;
 const BeatmapRating = storage_contracts.BeatmapRating;
-const directStatus = storage_contracts.directStatus;
+const directListingStatus = storage_contracts.directListingStatus;
 const stableStatus = storage_contracts.stableStatus;
 const lazerStatus = storage_contracts.lazerStatus;
 
@@ -326,6 +326,10 @@ pub fn writeDirectText(writer: *std.Io.Writer, value: []const u8) !void {
 }
 
 pub fn appendDirectSet(self: anytype, conn: *postgres.c.PGconn, writer: *std.Io.Writer, set_id: i32) !bool {
+    return appendDirectSetFields(self, conn, writer, set_id, true);
+}
+
+fn appendDirectSetFields(self: anytype, conn: *postgres.c.PGconn, writer: *std.Io.Writer, set_id: i32, include_difficulties: bool) !bool {
     var set_buf: [24]u8 = undefined;
     const set = try std.fmt.bufPrint(&set_buf, "{d}", .{set_id});
     var set_result = try postgres.queryParams(self.allocator, conn, "SELECT artist,title,creator,status,coalesce(to_char(to_timestamp(last_update) AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'),'1970-01-01 00:00:00') FROM zigcho.beatmaps WHERE set_id=$1 ORDER BY star_rating LIMIT 1", &.{set});
@@ -337,7 +341,10 @@ pub fn appendDirectSet(self: anytype, conn: *postgres.c.PGconn, writer: *std.Io.
     try writeDirectText(writer, set_result.value(0, 1));
     try writer.writeByte('|');
     try writeDirectText(writer, set_result.value(0, 2));
-    try writer.print("|{d}|10.0|{s}|{d}|0|0|0|0|0|", .{ directStatus(try set_result.int(i32, 0, 3)), set_result.value(0, 4), set_id });
+    const status = try set_result.int(i32, 0, 3);
+    try writer.print("|{d}|10.0|{s}|{d}|0|0|0|0|0", .{ if (include_difficulties) directListingStatus(status) else stableStatus(status), set_result.value(0, 4), set_id });
+    if (!include_difficulties) return true;
+    try writer.writeByte('|');
 
     var maps = try postgres.queryParams(self.allocator, conn, "SELECT star_rating,version,cs,od,ar,hp,mode FROM zigcho.beatmaps WHERE set_id=$1 ORDER BY star_rating,id", &.{set});
     defer maps.deinit();
@@ -384,7 +391,7 @@ pub fn stableSearchSet(self: anytype, allocator: std.mem.Allocator, set_id: ?i32
     if (found.rows() == 0) return allocator.dupe(u8, "");
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    _ = try appendDirectSet(self, lease.conn, &output.writer, try found.int(i32, 0, 0));
+    _ = try appendDirectSetFields(self, lease.conn, &output.writer, try found.int(i32, 0, 0), false);
     var list = output.toArrayList();
     return try list.toOwnedSlice(allocator);
 }

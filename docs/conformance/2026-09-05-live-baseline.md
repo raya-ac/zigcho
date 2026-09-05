@@ -40,4 +40,8 @@ the harness also needed repairs. it now checks `payload.protocol_version`, warms
 
 ## still not proved
 
+the next [diagnostic run, 33956053774](https://github.com/zigcho/stable-conformance/actions/runs/33956053774), used harness `1cfcc19` against the same server artifact. after the explicit bot-id mapping, the **whole multiplayer transcript passed: 113 action/drain/group checks**. spectator, tournament and static routes still passed. overall: 4 passed, 8 failed, 0 skipped, with the known 17 idle-status preflight failures retained.
+
+that run also exposed the next fixture and wire details. Direct search requires a stored archive on Zigcho; the initial synthetic sets had only metadata, so the runner now supplies real ZIP fixtures. inspection of the pinned Direct renderer confirmed that search results use osu!api status values, while set lookup uses the legacy map status and stops after the metadata fields. the follow-up separates those serializers in both database backends. rating averages now keep the reference's `.0` suffix for integer averages without rounding non-integer averages.
+
 a clean full differential result is still outstanding. so are real redacted Stable captures and installed-client acceptance across all four rulesets, supported Relax/AP, ScoreV2, reconnects and tournament workflows. no Warden connection was available in this task. this pass does not deploy or announce a release.

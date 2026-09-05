@@ -417,6 +417,17 @@ pub fn directStatus(db_status: i32) i32 {
     };
 }
 
+/// Search result statuses use osu!api values, not the request's filter enum.
+pub fn directListingStatus(db_status: i32) i32 {
+    return switch (db_status) {
+        3 => 1,
+        4 => 2,
+        5 => 3,
+        6 => 4,
+        else => 0,
+    };
+}
+
 pub fn stableStatus(db_status: i32) i32 {
     return switch (db_status) {
         1 => -1,

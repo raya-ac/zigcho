@@ -10,4 +10,6 @@ the first real two-server comparison caught another bug: idle stats sent a buffe
 
 the first complete diagnostic attempt ran all 12 transcripts without skips: spectator, tournament and the static routes passed; nine cases failed. some failures were harness/fixture mistakes, others were real server differences. the [comparison notes](https://github.com/zigcho/zigcho/blob/main/docs/conformance/2026-09-05-live-baseline.md) separate them. failed preflights and stopped steps are not being counted as passes.
 
+the next comparison also passed the whole multiplayer transcript. the follow-up corrects Direct search/set status fields and keeps set lookup to its actual metadata response, plus matching rating-average formatting. these are wire-format changes, not score or pp recalculations.
+
 this is source work, not a deployment or a claim of complete compatibility. a clean full differential run and installed Stable-client acceptance are still pending. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.

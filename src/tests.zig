@@ -8952,11 +8952,12 @@ test "ranked stable PP is stored and updates normal player stats" {
     try std.testing.expect(!parsed_ordered_sets.value.object.get("beatmapsets").?.array.items[0].object.get("availability").?.object.get("download_disabled").?.bool);
     const search = try store.stableSearch(std.testing.allocator, "Fixture", -1, 4, 0);
     defer std.testing.allocator.free(search);
-    try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|0|10.0|"));
+    try std.testing.expect(std.mem.startsWith(u8, search, "1\n900000000.osz|Zigcho|Zigcho Fixture|Ari|1|10.0|"));
     try std.testing.expect(std.mem.indexOf(u8, search, "[1.79⭐] Tests {cs: 4") != null);
     const set_lookup = try store.stableSearchSet(std.testing.allocator, null, null, &hash);
     defer std.testing.allocator.free(set_lookup);
-    try std.testing.expect(std.mem.startsWith(u8, set_lookup, "900000000.osz|Zigcho|Zigcho Fixture|Ari|0|10.0|"));
+    try std.testing.expect(std.mem.startsWith(u8, set_lookup, "900000000.osz|Zigcho|Zigcho Fixture|Ari|2|10.0|"));
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, set_lookup, "|"));
     const no_pending = try store.stableSearch(std.testing.allocator, "Fixture", -1, 2, 0);
     defer std.testing.allocator.free(no_pending);
     try std.testing.expectEqualStrings("0", no_pending);

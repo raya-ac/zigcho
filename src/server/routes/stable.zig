@@ -345,7 +345,10 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
             .can_rate => respond(req, .ok, "text/plain", "ok", &.{}),
             .already_voted => |average| voted: {
                 var rating_buf: [64]u8 = undefined;
-                const response = try std.fmt.bufPrint(&rating_buf, "alreadyvoted\n{d}", .{average});
+                const response = if (average == @trunc(average))
+                    try std.fmt.bufPrint(&rating_buf, "alreadyvoted\n{d:.1}", .{average})
+                else
+                    try std.fmt.bufPrint(&rating_buf, "alreadyvoted\n{d}", .{average});
                 break :voted respond(req, .ok, "text/plain", response, &.{});
             },
         };

@@ -6,6 +6,8 @@ daily history still records the submitting player's pp and everyone else's chang
 
 expired history is still pruned on submission, but within that source and mode instead of deleting across unrelated score transactions.
 
+the first mixed run caught a cold-start problem in the new rank update. a fresh day's rows were missing from PostgreSQL's older statistics, so the join could pick a very slow plan and queue scores behind it. the update now materializes the ranked row identities once and targets those rows directly. the gate compares both results with deliberately stale day statistics.
+
 Stable and lazer submissions take the mode lock before touching score, token, map or stats rows. restrictions, map-status changes, BSS updates and recalculation use the same maintenance boundary. score persistence and history stay in the same transaction.
 
 profile first places now check opponents on maps the profile owner has a qualifying play on. they still include those opponents, use the same tie rules and count all first places before limiting the displayed rows.

@@ -110,6 +110,11 @@ jobs:
       - name: verify the dynamic changelog feed
         run: python3 tools/changelog-manifest.py --check
 
+      - name: compare cold history update plans before compiling
+        env:
+          PGPASSWORD: zigcho-gate
+        run: psql -X -h 127.0.0.1 -U zigcho -d zigcho -v ON_ERROR_STOP=1 -f database/postgres/tests/history-plan.sql
+
       - name: build the full release with the pinned production container
         if: needs.classify.outputs.is_hotfix != 'true'
         env:

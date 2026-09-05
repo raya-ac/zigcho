@@ -67,7 +67,10 @@ pub fn recordPlayer(self: anytype, conn: *postgres.c.PGconn, source: domain.Site
     const removed = hidden.rows() != 0;
     hidden.deinit();
     if (!changed and !removed) return;
-    var ranks = try postgres.queryParams(self.allocator, conn, "WITH ranked AS (SELECT user_id,row_number() OVER(ORDER BY pp DESC,user_id ASC) position FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400) " ++
-        "UPDATE zigcho.user_stats_history h SET global_rank=r.position FROM ranked r WHERE h.user_id=r.user_id AND h.source=$1 AND h.mode=$2 AND h.day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 AND h.global_rank IS DISTINCT FROM r.position", &.{ @tagName(source), mode_text });
+    // A just-seeded day is absent from ANALYZE's old date histogram. Joining
+    // two underestimated slices by user_id can become a quadratic nested loop.
+    // Materialize tuple identities once and update those exact visible rows.
+    var ranks = try postgres.queryParams(self.allocator, conn, "WITH ranked AS MATERIALIZED (SELECT ctid row_id,row_number() OVER(ORDER BY pp DESC,user_id ASC) position FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400) " ++
+        "UPDATE zigcho.user_stats_history h SET global_rank=r.position FROM ranked r WHERE h.ctid=r.row_id AND h.global_rank IS DISTINCT FROM r.position", &.{ @tagName(source), mode_text });
     ranks.deinit();
 }

@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: zigcho/stable-conformance
-          ref: dcf08a672d44f3005d8bd698ceb18b1e11da1484
+          ref: be104164324bb1a91a14ba550751132ee6233417
           path: harness
           persist-credentials: false
       - uses: actions/setup-python@v6
@@ -102,8 +102,23 @@ jobs:
           runtime=$(mktemp -d "$RUNNER_TEMP/zigcho-benchmark.XXXXXX")
           cp harness/benchmarks/config.ini "$runtime/config.ini"
           server_pid=''
-          cleanup() { if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; }
-          trap cleanup EXIT
+          cleanup() {
+            if [[ -n "$server_pid" ]]; then
+              kill "$server_pid" 2>/dev/null || true
+              for attempt in $(seq 1 10); do
+                if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
+                sleep 1
+              done
+              kill -KILL "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+          }
+          finish() {
+            curl --max-time 5 --fail --silent http://127.0.0.1:18090/metrics/runtime >reports/final-runtime.prom || true
+            PGOPTIONS='-c statement_timeout=5000' psql "$ZIGCHO_BENCHMARK_POSTGRES_URL" --no-psqlrc -Atc "SELECT coalesce(json_agg(q),'[]'::json) FROM (SELECT calls,total_exec_time,mean_exec_time,max_exec_time,left(query,2000) query FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 20) q" >reports/final-queries.json || true
+            cleanup
+          }
+          trap finish EXIT
           start_server() {
             (cd "$runtime" && exec "$workspace/binary/zigcho" 127.0.0.1 18090) >>reports/server.log 2>&1 &
             server_pid=$!

@@ -1,0 +1,1015 @@
+{
+  "run": "https://github.com/zigcho/zigcho/actions/runs/33941593242",
+  "server_commit": "503b5f12604f6481a3775bd4cb972657b86a4b42",
+  "server_sha256": "91c1c123c6541ac189ee16a6b2f74ae6fb858b5bd806d605424472a4287d2458",
+  "harness_commit": "b4e18b1acddd1564d206d7a67f1cd9051ed45028",
+  "players": 100,
+  "scheduled_seconds_per_phase": 60,
+  "hardware": {
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "logical_cpus": 4,
+    "model": "AMD EPYC 7763 64-Core Processor"
+  },
+  "scope": "synthetic Stable osu!standard vanilla clients, direct-origin HTTP, local HTTPS MinIO; no production or private anticheat module",
+  "bootstrap": {
+    "completed": 100,
+    "successful": 100,
+    "failed": 0,
+    "missed_schedule_slots": 0,
+    "completed_rps": 2.408116049478928,
+    "successful_rps": 2.408116049478928,
+    "errors": {},
+    "successful_p50_ms_upper": 3246,
+    "successful_p95_ms_upper": 5646,
+    "successful_p99_ms_upper": 5889,
+    "successful_over_10s": 0,
+    "all_response_mean_ms": 3230.6935381899984,
+    "all_response_max_ms": 5968.783270000003,
+    "resolution_ms": 1,
+    "setup_seconds": 41.52687310499999,
+    "idempotent_score_retry": {
+      "acknowledged": 1,
+      "stored": 1,
+      "with_replay": 1,
+      "archived": 1,
+      "duplicate_best_scopes": 0,
+      "duplicate_response": "existing_stable_error_no"
+    }
+  },
+  "phases": [
+    {
+      "name": "cold_gameplay",
+      "elapsed_seconds": 63.519023844,
+      "maximum_scheduler_lateness_ms": 2.7765814747056083,
+      "peak_generator_requests": 128,
+      "families": {
+        "poll": {
+          "completed": 663,
+          "successful": 663,
+          "failed": 0,
+          "missed_schedule_slots": 105,
+          "completed_rps": 10.43781783593368,
+          "successful_rps": 10.43781783593368,
+          "errors": {},
+          "successful_p50_ms_upper": 2397,
+          "successful_p95_ms_upper": 6984,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 12,
+          "all_response_mean_ms": 2906.0748496319775,
+          "all_response_max_ms": 12976.965823,
+          "resolution_ms": 1
+        },
+        "chat": {
+          "completed": 100,
+          "successful": 100,
+          "failed": 0,
+          "missed_schedule_slots": 0,
+          "completed_rps": 1.5743314986325312,
+          "successful_rps": 1.5743314986325312,
+          "errors": {},
+          "successful_p50_ms_upper": 3983,
+          "successful_p95_ms_upper": 8526,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 2,
+          "all_response_mean_ms": 4384.713533449999,
+          "all_response_max_ms": 14270.994908999995,
+          "resolution_ms": 1
+        },
+        "spectator_host": {
+          "completed": 109,
+          "successful": 109,
+          "failed": 0,
+          "missed_schedule_slots": 2891,
+          "completed_rps": 1.716021333509459,
+          "successful_rps": 1.716021333509459,
+          "errors": {},
+          "successful_p50_ms_upper": 1914,
+          "successful_p95_ms_upper": 6798,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 3,
+          "all_response_mean_ms": 2720.390762541283,
+          "all_response_max_ms": 11553.258168000013,
+          "resolution_ms": 1
+        },
+        "spectator_poll": {
+          "completed": 382,
+          "successful": 382,
+          "failed": 0,
+          "missed_schedule_slots": 8618,
+          "completed_rps": 6.013946324776269,
+          "successful_rps": 6.013946324776269,
+          "errors": {},
+          "successful_p50_ms_upper": 1813,
+          "successful_p95_ms_upper": 6726,
+          "successful_p99_ms_upper": 9905,
+          "successful_over_10s": 3,
+          "all_response_mean_ms": 2323.7085736282716,
+          "all_response_max_ms": 12696.532590000004,
+          "resolution_ms": 1
+        },
+        "multiplayer": {
+          "completed": 381,
+          "successful": 381,
+          "failed": 0,
+          "missed_schedule_slots": 4419,
+          "completed_rps": 5.998203009789943,
+          "successful_rps": 5.998203009789943,
+          "errors": {},
+          "successful_p50_ms_upper": 2121,
+          "successful_p95_ms_upper": 6165,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 4,
+          "all_response_mean_ms": 2442.7223683097095,
+          "all_response_max_ms": 12434.217381999986,
+          "resolution_ms": 1
+        },
+        "score": {
+          "completed": 24,
+          "successful": 24,
+          "failed": 0,
+          "missed_schedule_slots": 0,
+          "completed_rps": 0.37783955967180743,
+          "successful_rps": 0.37783955967180743,
+          "errors": {},
+          "successful_p50_ms_upper": null,
+          "successful_p95_ms_upper": null,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 22,
+          "all_response_mean_ms": 16982.548147666665,
+          "all_response_max_ms": 29687.260260000003,
+          "resolution_ms": 1
+        },
+        "website": {
+          "completed": 331,
+          "successful": 331,
+          "failed": 0,
+          "missed_schedule_slots": 869,
+          "completed_rps": 5.211037260473678,
+          "successful_rps": 5.211037260473678,
+          "errors": {},
+          "successful_p50_ms_upper": 2812,
+          "successful_p95_ms_upper": 7563,
+          "successful_p99_ms_upper": 9392,
+          "successful_over_10s": 0,
+          "all_response_mean_ms": 3188.5823076827805,
+          "all_response_max_ms": 9962.252853999998,
+          "resolution_ms": 1
+        },
+        "replay": {
+          "completed": 11,
+          "successful": 11,
+          "failed": 0,
+          "missed_schedule_slots": 1,
+          "completed_rps": 0.1731764648495784,
+          "successful_rps": 0.1731764648495784,
+          "errors": {},
+          "successful_p50_ms_upper": 5262,
+          "successful_p95_ms_upper": null,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 1,
+          "all_response_mean_ms": 5330.363276363631,
+          "all_response_max_ms": 10584.5774,
+          "resolution_ms": 1
+        }
+      },
+      "correctness": {
+        "acknowledged": 24,
+        "stored": 24,
+        "with_replay": 24,
+        "archived": 24,
+        "duplicate_best_scopes": 0,
+        "spectator_frame_deliveries": 321,
+        "multiplayer_score_deliveries": 1484,
+        "chat_message_deliveries": 9482,
+        "authoritative_ok": true,
+        "archival_ok": true,
+        "ok": true
+      },
+      "database": {
+        "accounts": 10002,
+        "scores": 100025,
+        "maps": 200,
+        "history_rows": 23000,
+        "database_bytes": 142153395,
+        "postgres_version": "PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"
+      },
+      "resource_samples": [
+        {
+          "monotonic_seconds": 113.760138138,
+          "VmRSS": 113088,
+          "VmHWM": 174860,
+          "Threads": 190,
+          "cpu_seconds": 8.54,
+          "pool_pending": 0,
+          "pool_oldest_seconds": 0,
+          "http_connections": 1
+        },
+        {
+          "monotonic_seconds": 118.765427845,
+          "VmRSS": 129536,
+          "VmHWM": 174860,
+          "Threads": 231,
+          "cpu_seconds": 8.65,
+          "pool_pending": 73,
+          "pool_oldest_seconds": 4.744247122,
+          "http_connections": 115
+        },
+        {
+          "monotonic_seconds": 123.769525107,
+          "VmRSS": 146000,
+          "VmHWM": 196096,
+          "Threads": 252,
+          "cpu_seconds": 9.39,
+          "pool_pending": 57,
+          "pool_oldest_seconds": 2.482617491,
+          "http_connections": 87
+        },
+        {
+          "monotonic_seconds": 128.772750728,
+          "VmRSS": 149496,
+          "VmHWM": 196096,
+          "Threads": 253,
+          "cpu_seconds": 9.6,
+          "pool_pending": 80,
+          "pool_oldest_seconds": 5.156802618,
+          "http_connections": 124
+        },
+        {
+          "monotonic_seconds": 133.776468237,
+          "VmRSS": 153636,
+          "VmHWM": 196096,
+          "Threads": 259,
+          "cpu_seconds": 9.98,
+          "pool_pending": 64,
+          "pool_oldest_seconds": 5.950313511,
+          "http_connections": 103
+        },
+        {
+          "monotonic_seconds": 138.780072864,
+          "VmRSS": 156004,
+          "VmHWM": 196096,
+          "Threads": 259,
+          "cpu_seconds": 10.39,
+          "pool_pending": 65,
+          "pool_oldest_seconds": 3.361765964,
+          "http_connections": 102
+        },
+        {
+          "monotonic_seconds": 143.784522679,
+          "VmRSS": 157080,
+          "VmHWM": 196096,
+          "Threads": 259,
+          "cpu_seconds": 10.78,
+          "pool_pending": 60,
+          "pool_oldest_seconds": 2.019668031,
+          "http_connections": 89
+        },
+        {
+          "monotonic_seconds": 148.78756896,
+          "VmRSS": 157992,
+          "VmHWM": 196096,
+          "Threads": 259,
+          "cpu_seconds": 11.08,
+          "pool_pending": 73,
+          "pool_oldest_seconds": 6.89440049,
+          "http_connections": 114
+        },
+        {
+          "monotonic_seconds": 153.791557366,
+          "VmRSS": 158516,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 11.5,
+          "pool_pending": 68,
+          "pool_oldest_seconds": 7.000327746,
+          "http_connections": 110
+        },
+        {
+          "monotonic_seconds": 158.794728866,
+          "VmRSS": 159212,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 11.84,
+          "pool_pending": 60,
+          "pool_oldest_seconds": 3.812508902,
+          "http_connections": 83
+        },
+        {
+          "monotonic_seconds": 163.798216345,
+          "VmRSS": 159524,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 12.09,
+          "pool_pending": 71,
+          "pool_oldest_seconds": 6.156098854,
+          "http_connections": 119
+        },
+        {
+          "monotonic_seconds": 168.801137492,
+          "VmRSS": 160008,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 12.58,
+          "pool_pending": 53,
+          "pool_oldest_seconds": 4.157828355,
+          "http_connections": 72
+        },
+        {
+          "monotonic_seconds": 173.80396112,
+          "VmRSS": 160552,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 12.76,
+          "pool_pending": 73,
+          "pool_oldest_seconds": 6.197930635,
+          "http_connections": 120
+        }
+      ],
+      "durations": {
+        "stable_poll": {
+          "count": 1635,
+          "total_seconds": 4478.742918,
+          "mean_seconds": 2.739292304587156,
+          "p50_seconds_upper": 2.5,
+          "p95_seconds_upper": 10,
+          "p99_seconds_upper": 30,
+          "counter_reset": false
+        },
+        "stable_score": {
+          "count": 24,
+          "total_seconds": 407.561541,
+          "mean_seconds": 16.981730875,
+          "p50_seconds_upper": 30,
+          "p95_seconds_upper": 30,
+          "p99_seconds_upper": 30,
+          "counter_reset": false
+        },
+        "stable_web": {
+          "count": 11,
+          "total_seconds": 58.624065,
+          "mean_seconds": 5.329460454545455,
+          "p50_seconds_upper": 10,
+          "p95_seconds_upper": 30,
+          "p99_seconds_upper": 30,
+          "counter_reset": false
+        },
+        "website_read": {
+          "count": 331,
+          "total_seconds": 1055.130348,
+          "mean_seconds": 3.1877049788519636,
+          "p50_seconds_upper": 5,
+          "p95_seconds_upper": 10,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "metrics": {
+          "count": 14,
+          "total_seconds": 0.006313999999999999,
+          "mean_seconds": 0.00045099999999999996,
+          "p50_seconds_upper": 0.0005,
+          "p95_seconds_upper": 0.001,
+          "p99_seconds_upper": 0.001,
+          "counter_reset": false
+        },
+        "postgres_query": {
+          "count": 7421,
+          "total_seconds": 498.647631,
+          "mean_seconds": 0.06719412895836141,
+          "p50_seconds_upper": 0.001,
+          "p95_seconds_upper": 0.05,
+          "p99_seconds_upper": 5,
+          "counter_reset": false
+        },
+        "postgres_pool_acquire": {
+          "count": 4432,
+          "total_seconds": 3936.913371,
+          "mean_seconds": 0.8882927281137184,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "postgres_pool_wait": {
+          "count": 4432,
+          "total_seconds": 3936.91148,
+          "mean_seconds": 0.8882923014440434,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "stable_sessions_wait": {
+          "count": 5120,
+          "total_seconds": 0.005578999999999999,
+          "mean_seconds": 0.0000010896484374999997,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "stable_sessions_hold": {
+          "count": 5120,
+          "total_seconds": 0.043993000000000004,
+          "mean_seconds": 0.0000085923828125,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "lazer_state_wait": {
+          "count": 764,
+          "total_seconds": 0.0007640000000000001,
+          "mean_seconds": 0.0000010000000000000002,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "lazer_state_hold": {
+          "count": 764,
+          "total_seconds": 0.000853,
+          "mean_seconds": 0.0000011164921465968587,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "pp_stable": {
+          "count": 24,
+          "total_seconds": 0.03988,
+          "mean_seconds": 0.0016616666666666665,
+          "p50_seconds_upper": 0.0025,
+          "p95_seconds_upper": 0.0025,
+          "p99_seconds_upper": 0.0025,
+          "counter_reset": false
+        },
+        "replay_analysis": {
+          "count": 24,
+          "total_seconds": 42.432441000000004,
+          "mean_seconds": 1.7680183750000003,
+          "p50_seconds_upper": 2.5,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "replay_archive": {
+          "count": 24,
+          "total_seconds": 37.116464,
+          "mean_seconds": 1.5465193333333334,
+          "p50_seconds_upper": 2.5,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "object_upload": {
+          "count": 24,
+          "total_seconds": 1.250573,
+          "mean_seconds": 0.05210720833333333,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 0.1,
+          "p99_seconds_upper": 0.1,
+          "counter_reset": false
+        },
+        "object_download": {
+          "count": 35,
+          "total_seconds": 1.7908490000000001,
+          "mean_seconds": 0.05116711428571429,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 0.1,
+          "p99_seconds_upper": 0.1,
+          "counter_reset": false
+        }
+      },
+      "top_queries": [
+        {
+          "queryid": "-8709658297892082594",
+          "calls": 119,
+          "total_exec_time": 372207.44554399996,
+          "mean_exec_time": 3127.7936600336134,
+          "max_exec_time": 3740.175608,
+          "rows": 0,
+          "shared_blks_hit": 365874,
+          "shared_blks_read": 0,
+          "temp_blks_written": 560631,
+          "query": "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,beatmap_key,user_id) AS (SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,$4,$5::text,s.passed AND (coalesce(octet_length(s.replay),$6)>$7 OR EXISTS(SELECT $8 FROM zigcho.replay_objects ro WHERE ro.source=$9 AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,$10),b.star_rating),s.score,s.score,b.id,s.user_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN($11,$12) AND NOT u.restricted UNION ALL SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,$13,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,$14,s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),$15)>$16 OR EXISTS(SELECT $17 FROM zigcho.replay_objects ro WHERE ro.source=$18 AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,$19),b.star_rating),s.total_score_without_mods,s.legacy_total_score,b.id,s.user_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN($20,$21) AND NOT u.restricted),per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,CASE client WHEN $22 THEN $23 ELSE $24 END,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,CASE client WHEN $25 THEN $26 ELSE $27 END,id ASC) map_place FROM per_user WHERE user_place=$28),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=$29 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods"
+        },
+        {
+          "queryid": "9097460251215477994",
+          "calls": 24,
+          "total_exec_time": 46361.776227999995,
+          "mean_exec_time": 1931.7406761666666,
+          "max_exec_time": 5971.361231000001,
+          "rows": 240000,
+          "shared_blks_hit": 6461389,
+          "shared_blks_read": 0,
+          "temp_blks_written": 16488,
+          "query": "WITH source_scores AS (SELECT s.user_id,b.id beatmap_id,s.pp,s.passed,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.mode=$3 AND s.rank_namespace=$4),activity AS (SELECT DISTINCT user_id FROM source_scores),best AS (SELECT user_id,beatmap_id,max(pp) pp FROM source_scores WHERE passed AND status IN($5,$6) GROUP BY user_id,beatmap_id),weighted AS (SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC)-$7 performance_index FROM best),performance AS (SELECT user_id,round(sum(pp*power($8,performance_index))+$9*($10-power($11,count(*))))::integer pp FROM weighted GROUP BY user_id),players AS (SELECT a.user_id,coalesce(p.pp,$12) pp FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=$13 AND NOT u.restricted),ordered AS (SELECT user_id,pp,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract($14 FROM transaction_timestamp())::bigint/$15)*$16,pp,global_rank FROM ordered ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank"
+        },
+        {
+          "queryid": "-5872091965951820435",
+          "calls": 48,
+          "total_exec_time": 24200.737088000005,
+          "mean_exec_time": 504.1820226666666,
+          "max_exec_time": 3722.3757929999997,
+          "rows": 350000,
+          "shared_blks_hit": 755089,
+          "shared_blks_read": 0,
+          "temp_blks_written": 0,
+          "query": "DELETE FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day=(extract($3 FROM transaction_timestamp())::bigint/$4)*$5"
+        }
+      ]
+    },
+    {
+      "name": "warm",
+      "elapsed_seconds": 65.77730528500001,
+      "maximum_scheduler_lateness_ms": 3.697362871207588,
+      "peak_generator_requests": 131,
+      "families": {
+        "poll": {
+          "completed": 683,
+          "successful": 683,
+          "failed": 0,
+          "missed_schedule_slots": 85,
+          "completed_rps": 10.383520532510362,
+          "successful_rps": 10.383520532510362,
+          "errors": {},
+          "successful_p50_ms_upper": 2269,
+          "successful_p95_ms_upper": 6272,
+          "successful_p99_ms_upper": 9263,
+          "successful_over_10s": 5,
+          "all_response_mean_ms": 2711.481864165444,
+          "all_response_max_ms": 13034.294542999987,
+          "resolution_ms": 1
+        },
+        "chat": {
+          "completed": 100,
+          "successful": 100,
+          "failed": 0,
+          "missed_schedule_slots": 0,
+          "completed_rps": 1.520281190704299,
+          "successful_rps": 1.520281190704299,
+          "errors": {},
+          "successful_p50_ms_upper": 3865,
+          "successful_p95_ms_upper": 8652,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 2,
+          "all_response_mean_ms": 4244.3272015799985,
+          "all_response_max_ms": 12613.91305699999,
+          "resolution_ms": 1
+        },
+        "spectator_host": {
+          "completed": 140,
+          "successful": 140,
+          "failed": 0,
+          "missed_schedule_slots": 2860,
+          "completed_rps": 2.128393666986019,
+          "successful_rps": 2.128393666986019,
+          "errors": {},
+          "successful_p50_ms_upper": 1575,
+          "successful_p95_ms_upper": 6653,
+          "successful_p99_ms_upper": 9352,
+          "successful_over_10s": 0,
+          "all_response_mean_ms": 2202.645476821427,
+          "all_response_max_ms": 9705.26887700001,
+          "resolution_ms": 1
+        },
+        "spectator_poll": {
+          "completed": 426,
+          "successful": 426,
+          "failed": 0,
+          "missed_schedule_slots": 8574,
+          "completed_rps": 6.476397872400314,
+          "successful_rps": 6.476397872400314,
+          "errors": {},
+          "successful_p50_ms_upper": 1553,
+          "successful_p95_ms_upper": 6289,
+          "successful_p99_ms_upper": 9173,
+          "successful_over_10s": 1,
+          "all_response_mean_ms": 2153.0520403685437,
+          "all_response_max_ms": 10518.746823000016,
+          "resolution_ms": 1
+        },
+        "multiplayer": {
+          "completed": 447,
+          "successful": 447,
+          "failed": 0,
+          "missed_schedule_slots": 4353,
+          "completed_rps": 6.795656922448217,
+          "successful_rps": 6.795656922448217,
+          "errors": {},
+          "successful_p50_ms_upper": 1620,
+          "successful_p95_ms_upper": 5499,
+          "successful_p99_ms_upper": 8987,
+          "successful_over_10s": 2,
+          "all_response_mean_ms": 2126.5547830984333,
+          "all_response_max_ms": 13216.876994999979,
+          "resolution_ms": 1
+        },
+        "score": {
+          "completed": 18,
+          "successful": 18,
+          "failed": 0,
+          "missed_schedule_slots": 0,
+          "completed_rps": 0.27365061432677384,
+          "successful_rps": 0.27365061432677384,
+          "errors": {},
+          "successful_p50_ms_upper": null,
+          "successful_p95_ms_upper": null,
+          "successful_p99_ms_upper": null,
+          "successful_over_10s": 16,
+          "all_response_mean_ms": 14636.726748277775,
+          "all_response_max_ms": 24433.289572999995,
+          "resolution_ms": 1
+        },
+        "website": {
+          "completed": 355,
+          "successful": 355,
+          "failed": 0,
+          "missed_schedule_slots": 845,
+          "completed_rps": 5.396998227000261,
+          "successful_rps": 5.396998227000261,
+          "errors": {},
+          "successful_p50_ms_upper": 2715,
+          "successful_p95_ms_upper": 6353,
+          "successful_p99_ms_upper": 8804,
+          "successful_over_10s": 2,
+          "all_response_mean_ms": 3015.251630673241,
+          "all_response_max_ms": 10201.854165000015,
+          "resolution_ms": 1
+        },
+        "replay": {
+          "completed": 12,
+          "successful": 12,
+          "failed": 0,
+          "missed_schedule_slots": 0,
+          "completed_rps": 0.1824337428845159,
+          "successful_rps": 0.1824337428845159,
+          "errors": {},
+          "successful_p50_ms_upper": 3682,
+          "successful_p95_ms_upper": 7105,
+          "successful_p99_ms_upper": 7105,
+          "successful_over_10s": 0,
+          "all_response_mean_ms": 4437.9607088333305,
+          "all_response_max_ms": 7104.329034999978,
+          "resolution_ms": 1
+        }
+      },
+      "correctness": {
+        "acknowledged": 18,
+        "stored": 18,
+        "with_replay": 18,
+        "archived": 18,
+        "duplicate_best_scopes": 0,
+        "spectator_frame_deliveries": 415,
+        "multiplayer_score_deliveries": 1788,
+        "chat_message_deliveries": 9990,
+        "authoritative_ok": true,
+        "archival_ok": true,
+        "ok": true
+      },
+      "database": {
+        "accounts": 10002,
+        "scores": 100043,
+        "maps": 200,
+        "history_rows": 23000,
+        "database_bytes": 143431347,
+        "postgres_version": "PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"
+      },
+      "resource_samples": [
+        {
+          "monotonic_seconds": 177.541850199,
+          "VmRSS": 161056,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 13.02,
+          "pool_pending": 0,
+          "pool_oldest_seconds": 0,
+          "http_connections": 5
+        },
+        {
+          "monotonic_seconds": 182.548127158,
+          "VmRSS": 161120,
+          "VmHWM": 196632,
+          "Threads": 259,
+          "cpu_seconds": 13.14,
+          "pool_pending": 74,
+          "pool_oldest_seconds": 4.6766655,
+          "http_connections": 112
+        },
+        {
+          "monotonic_seconds": 187.55105457,
+          "VmRSS": 164964,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 13.76,
+          "pool_pending": 59,
+          "pool_oldest_seconds": 2.634382443,
+          "http_connections": 85
+        },
+        {
+          "monotonic_seconds": 192.555513117,
+          "VmRSS": 165308,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 13.98,
+          "pool_pending": 72,
+          "pool_oldest_seconds": 7.134551486,
+          "http_connections": 119
+        },
+        {
+          "monotonic_seconds": 197.558358216,
+          "VmRSS": 165412,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 14.27,
+          "pool_pending": 69,
+          "pool_oldest_seconds": 3.368367651,
+          "http_connections": 100
+        },
+        {
+          "monotonic_seconds": 202.561872577,
+          "VmRSS": 165712,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 14.5,
+          "pool_pending": 61,
+          "pool_oldest_seconds": 3.66423892,
+          "http_connections": 90
+        },
+        {
+          "monotonic_seconds": 207.568304883,
+          "VmRSS": 166088,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 14.86,
+          "pool_pending": 49,
+          "pool_oldest_seconds": 3.960900238,
+          "http_connections": 75
+        },
+        {
+          "monotonic_seconds": 212.571215319,
+          "VmRSS": 166228,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 15.04,
+          "pool_pending": 71,
+          "pool_oldest_seconds": 6.340133075,
+          "http_connections": 109
+        },
+        {
+          "monotonic_seconds": 217.574816561,
+          "VmRSS": 166612,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 15.51,
+          "pool_pending": 73,
+          "pool_oldest_seconds": 3.74830898,
+          "http_connections": 106
+        },
+        {
+          "monotonic_seconds": 222.578128141,
+          "VmRSS": 167260,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 15.88,
+          "pool_pending": 67,
+          "pool_oldest_seconds": 4.805142541,
+          "http_connections": 108
+        },
+        {
+          "monotonic_seconds": 227.581482011,
+          "VmRSS": 167784,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 16.11,
+          "pool_pending": 69,
+          "pool_oldest_seconds": 6.550305051,
+          "http_connections": 102
+        },
+        {
+          "monotonic_seconds": 232.586343691,
+          "VmRSS": 168040,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 16.48,
+          "pool_pending": 66,
+          "pool_oldest_seconds": 3.154529345,
+          "http_connections": 95
+        },
+        {
+          "monotonic_seconds": 237.590050798,
+          "VmRSS": 168488,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 16.92,
+          "pool_pending": 66,
+          "pool_oldest_seconds": 4.100065814,
+          "http_connections": 98
+        },
+        {
+          "monotonic_seconds": 242.594210451,
+          "VmRSS": 168848,
+          "VmHWM": 202572,
+          "Threads": 265,
+          "cpu_seconds": 17.09,
+          "pool_pending": 0,
+          "pool_oldest_seconds": 0,
+          "http_connections": 3
+        }
+      ],
+      "durations": {
+        "stable_poll": {
+          "count": 1796,
+          "total_seconds": 4451.009224999999,
+          "mean_seconds": 2.4782902143652557,
+          "p50_seconds_upper": 2.5,
+          "p95_seconds_upper": 10,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "stable_score": {
+          "count": 18,
+          "total_seconds": 263.446256,
+          "mean_seconds": 14.635903111111112,
+          "p50_seconds_upper": 30,
+          "p95_seconds_upper": 30,
+          "p99_seconds_upper": 30,
+          "counter_reset": false
+        },
+        "stable_web": {
+          "count": 12,
+          "total_seconds": 53.24635599999999,
+          "mean_seconds": 4.437196333333333,
+          "p50_seconds_upper": 5,
+          "p95_seconds_upper": 10,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "website_read": {
+          "count": 355,
+          "total_seconds": 1070.0895350000003,
+          "mean_seconds": 3.01433671830986,
+          "p50_seconds_upper": 5,
+          "p95_seconds_upper": 10,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "metrics": {
+          "count": 15,
+          "total_seconds": 0.00784,
+          "mean_seconds": 0.0005226666666666666,
+          "p50_seconds_upper": 0.0005,
+          "p95_seconds_upper": 0.0025,
+          "p99_seconds_upper": 0.0025,
+          "counter_reset": false
+        },
+        "postgres_query": {
+          "count": 7702,
+          "total_seconds": 516.215476,
+          "mean_seconds": 0.06702356219163853,
+          "p50_seconds_upper": 0.001,
+          "p95_seconds_upper": 0.05,
+          "p99_seconds_upper": 5,
+          "counter_reset": false
+        },
+        "postgres_pool_acquire": {
+          "count": 4711,
+          "total_seconds": 3851.586046,
+          "mean_seconds": 0.8175729242199108,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "postgres_pool_wait": {
+          "count": 4711,
+          "total_seconds": 3851.5841199999995,
+          "mean_seconds": 0.8175725153895138,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 10,
+          "counter_reset": false
+        },
+        "stable_sessions_wait": {
+          "count": 5589,
+          "total_seconds": 0.006274000000000002,
+          "mean_seconds": 0.0000011225621757022727,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "stable_sessions_hold": {
+          "count": 5589,
+          "total_seconds": 0.046057,
+          "mean_seconds": 0.000008240651279298623,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "lazer_state_wait": {
+          "count": 790,
+          "total_seconds": 0.0007900000000000001,
+          "mean_seconds": 0.0000010000000000000002,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "lazer_state_hold": {
+          "count": 790,
+          "total_seconds": 0.0008720000000000002,
+          "mean_seconds": 0.0000011037974683544306,
+          "p50_seconds_upper": 0.0001,
+          "p95_seconds_upper": 0.0001,
+          "p99_seconds_upper": 0.0001,
+          "counter_reset": false
+        },
+        "pp_stable": {
+          "count": 18,
+          "total_seconds": 0.031810000000000005,
+          "mean_seconds": 0.0017672222222222225,
+          "p50_seconds_upper": 0.0025,
+          "p95_seconds_upper": 0.005,
+          "p99_seconds_upper": 0.005,
+          "counter_reset": false
+        },
+        "replay_analysis": {
+          "count": 18,
+          "total_seconds": 18.023479000000002,
+          "mean_seconds": 1.001304388888889,
+          "p50_seconds_upper": 0.5,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 5,
+          "counter_reset": false
+        },
+        "replay_archive": {
+          "count": 18,
+          "total_seconds": 23.492655999999997,
+          "mean_seconds": 1.3051475555555554,
+          "p50_seconds_upper": 1,
+          "p95_seconds_upper": 5,
+          "p99_seconds_upper": 5,
+          "counter_reset": false
+        },
+        "object_upload": {
+          "count": 18,
+          "total_seconds": 0.9325649999999999,
+          "mean_seconds": 0.051809166666666656,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 0.1,
+          "p99_seconds_upper": 0.1,
+          "counter_reset": false
+        },
+        "object_download": {
+          "count": 30,
+          "total_seconds": 1.536238,
+          "mean_seconds": 0.05120793333333333,
+          "p50_seconds_upper": 0.1,
+          "p95_seconds_upper": 0.1,
+          "p99_seconds_upper": 0.1,
+          "counter_reset": false
+        }
+      },
+      "top_queries": [
+        {
+          "queryid": "-8709658297892082594",
+          "calls": 129,
+          "total_exec_time": 419920.7675049998,
+          "mean_exec_time": 3255.1997481007757,
+          "max_exec_time": 3867.827034,
+          "rows": 0,
+          "shared_blks_hit": 396959,
+          "shared_blks_read": 0,
+          "temp_blks_written": 607864,
+          "query": "WITH candidates(id,score,pp,accuracy,max_combo,mods,mode,rank_namespace,passed,submitted_at,set_id,map_id,artist,title,version,status,client,mods_json,has_replay,star_rating,score_without_mods,legacy_score,beatmap_key,user_id) AS (SELECT s.id,s.score,s.pp,s.accuracy,s.max_combo,s.mods,s.mode,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,$4,$5::text,s.passed AND (coalesce(octet_length(s.replay),$6)>$7 OR EXISTS(SELECT $8 FROM zigcho.replay_objects ro WHERE ro.source=$9 AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,$10),b.star_rating),s.score,s.score,b.id,s.user_id FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN($11,$12) AND NOT u.restricted UNION ALL SELECT s.id,s.total_score,s.pp,s.accuracy,s.max_combo,$13,s.ruleset_id,s.rank_namespace,s.passed,s.submitted_at,b.set_id,b.id,b.artist,b.title,b.version,b.status,$14,s.mods_json::text,s.passed AND (coalesce(octet_length(s.replay),$15)>$16 OR EXISTS(SELECT $17 FROM zigcho.replay_objects ro WHERE ro.source=$18 AND ro.score_id=s.id)),coalesce(nullif(s.star_rating,$19),b.star_rating),s.total_score_without_mods,s.legacy_total_score,b.id,s.user_id FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id JOIN zigcho.users u ON u.id=s.user_id WHERE s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN($20,$21) AND NOT u.restricted),per_user AS (SELECT *,row_number() OVER(PARTITION BY user_id,beatmap_key ORDER BY pp DESC,CASE client WHEN $22 THEN $23 ELSE $24 END,id ASC) user_place FROM candidates),board AS (SELECT *,row_number() OVER(PARTITION BY beatmap_key ORDER BY score DESC,CASE client WHEN $25 THEN $26 ELSE $27 END,id ASC) map_place FROM per_user WHERE user_place=$28),firsts AS (SELECT *,count(*) OVER() first_count FROM board WHERE map_place=$29 AND user_id=$1) SELECT id,score,pp,accuracy,max_combo,mods"
+        },
+        {
+          "queryid": "9097460251215477994",
+          "calls": 18,
+          "total_exec_time": 34128.545963,
+          "mean_exec_time": 1896.030331277778,
+          "max_exec_time": 4570.8745149999995,
+          "rows": 180000,
+          "shared_blks_hit": 4511971,
+          "shared_blks_read": 0,
+          "temp_blks_written": 12366,
+          "query": "WITH source_scores AS (SELECT s.user_id,b.id beatmap_id,s.pp,s.passed,b.status FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.mode=$3 AND s.rank_namespace=$4),activity AS (SELECT DISTINCT user_id FROM source_scores),best AS (SELECT user_id,beatmap_id,max(pp) pp FROM source_scores WHERE passed AND status IN($5,$6) GROUP BY user_id,beatmap_id),weighted AS (SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id ASC)-$7 performance_index FROM best),performance AS (SELECT user_id,round(sum(pp*power($8,performance_index))+$9*($10-power($11,count(*))))::integer pp FROM weighted GROUP BY user_id),players AS (SELECT a.user_id,coalesce(p.pp,$12) pp FROM activity a JOIN zigcho.users u ON u.id=a.user_id LEFT JOIN performance p ON p.user_id=a.user_id WHERE u.id!=$13 AND NOT u.restricted),ordered AS (SELECT user_id,pp,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract($14 FROM transaction_timestamp())::bigint/$15)*$16,pp,global_rank FROM ordered ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank"
+        },
+        {
+          "queryid": "-4723356371673094192",
+          "calls": 18,
+          "total_exec_time": 11788.921613,
+          "mean_exec_time": 654.9400896111111,
+          "max_exec_time": 946.062691,
+          "rows": 180000,
+          "shared_blks_hit": 4613785,
+          "shared_blks_read": 0,
+          "temp_blks_written": 0,
+          "query": "WITH players AS (SELECT s.user_id,s.pp FROM zigcho.stats s JOIN zigcho.users u ON u.id=s.user_id WHERE s.mode=$2 AND s.plays>$3 AND u.id!=$4 AND NOT u.restricted),ordered AS (SELECT user_id,pp,row_number() OVER(ORDER BY pp DESC,user_id ASC) global_rank FROM players) INSERT INTO zigcho.user_stats_history(user_id,source,mode,day,pp,global_rank) SELECT user_id,$1,$2,(extract($5 FROM transaction_timestamp())::bigint/$6)*$7,pp,global_rank FROM ordered ON CONFLICT(user_id,source,mode,day) DO UPDATE SET pp=excluded.pp,global_rank=excluded.global_rank"
+        }
+      ]
+    }
+  ]
+}

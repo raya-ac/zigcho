@@ -151,6 +151,10 @@ jobs:
         run: |
           docker logs zigcho-benchmark-pg >reports/postgres.log 2>&1 || true
           docker logs zigcho-benchmark-objects >reports/objects.log 2>&1 || true
+          if test -f reports/baseline.json; then
+            printf '## baseline evidence\n\nA green job validates receipts and delivery, not latency or capacity. Missed schedules remain failures to sustain the offered workload.\n\n' >>"$GITHUB_STEP_SUMMARY"
+            jq -r '"Server: `\(.server_commit)`\n", "Incomplete: \(.incomplete // false)\n", (.phases[] | "- \(.name): \(.players) players, \(.correctness.acknowledged) acknowledged scores, \([.families[].missed_schedule_slots] | add) missed request slots, receipt/delivery checks: \(.correctness.ok)")' reports/baseline.json >>"$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:

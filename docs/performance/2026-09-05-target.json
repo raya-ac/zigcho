@@ -1,0 +1,174 @@
+{
+  "run": "https://github.com/zigcho/zigcho/actions/runs/33940433917",
+  "server_commit": "503b5f12604f6481a3775bd4cb972657b86a4b42",
+  "server_sha256": "91c1c123c6541ac189ee16a6b2f74ae6fb858b5bd806d605424472a4287d2458",
+  "harness_commit": "be104164324bb1a91a14ba550751132ee6233417",
+  "target_players": 1000,
+  "setup_limit_seconds": 600,
+  "hardware": {
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "logical_cpus": 4,
+    "model": "AMD EPYC 7763 64-Core Processor"
+  },
+  "incomplete": true,
+  "failure_type": "TimeoutError",
+  "bootstrap_progress": {
+    "logged_in": 418,
+    "keepalive_failures": 0
+  },
+  "phases": [],
+  "durations": {
+    "stable_login": {
+      "count": 419,
+      "total_seconds": 4751.437203,
+      "mean_seconds": 11.339945591885442,
+      "p50_seconds_upper": 30,
+      "p95_seconds_upper": 30,
+      "p99_seconds_upper": 30,
+      "counter_reset": false
+    },
+    "stable_poll": {
+      "count": 10442,
+      "total_seconds": 15360.930658,
+      "mean_seconds": 1.471071696801379,
+      "p50_seconds_upper": 0.5,
+      "p95_seconds_upper": 30,
+      "p99_seconds_upper": 30,
+      "counter_reset": false
+    },
+    "metrics": {
+      "count": 1,
+      "total_seconds": 0.0002770000000000001,
+      "mean_seconds": 0.0002770000000000001,
+      "p50_seconds_upper": 0.0005,
+      "p95_seconds_upper": 0.0005,
+      "p99_seconds_upper": 0.0005,
+      "counter_reset": false
+    },
+    "postgres_query": {
+      "count": 390093,
+      "total_seconds": 4758.620532,
+      "mean_seconds": 0.012198682191169798,
+      "p50_seconds_upper": 0.001,
+      "p95_seconds_upper": 0.1,
+      "p99_seconds_upper": 0.1,
+      "counter_reset": false
+    },
+    "postgres_pool_acquire": {
+      "count": 114473,
+      "total_seconds": 1026.605826,
+      "mean_seconds": 0.008968104496256759,
+      "p50_seconds_upper": 0.0001,
+      "p95_seconds_upper": 0.1,
+      "p99_seconds_upper": 0.25,
+      "counter_reset": false
+    },
+    "postgres_pool_wait": {
+      "count": 114473,
+      "total_seconds": 1026.595955,
+      "mean_seconds": 0.008968018266316075,
+      "p50_seconds_upper": 0.0001,
+      "p95_seconds_upper": 0.1,
+      "p99_seconds_upper": 0.25,
+      "counter_reset": false
+    },
+    "stable_sessions_wait": {
+      "count": 33009,
+      "total_seconds": 0.266126,
+      "mean_seconds": 0.000008062225453664152,
+      "p50_seconds_upper": 0.0001,
+      "p95_seconds_upper": 0.0001,
+      "p99_seconds_upper": 0.00025,
+      "counter_reset": false
+    },
+    "stable_sessions_hold": {
+      "count": 33009,
+      "total_seconds": 0.43128,
+      "mean_seconds": 0.000013065527583386349,
+      "p50_seconds_upper": 0.0001,
+      "p95_seconds_upper": 0.0001,
+      "p99_seconds_upper": 0.00025,
+      "counter_reset": false
+    },
+    "lazer_state_wait": {
+      "count": 7619,
+      "total_seconds": 0.007621,
+      "mean_seconds": 0.0000010002625016406354,
+      "p50_seconds_upper": 0.0001,
+      "p95_seconds_upper": 0.0001,
+      "p99_seconds_upper": 0.0001,
+      "counter_reset": false
+    },
+    "lazer_state_hold": {
+      "count": 7619,
+      "total_seconds": 0.014205,
+      "mean_seconds": 0.0000018644179026118913,
+      "p50_seconds_upper": 0.0001,
+      "p95_seconds_upper": 0.0001,
+      "p99_seconds_upper": 0.0001,
+      "counter_reset": false
+    }
+  },
+  "top_queries": [
+    {
+      "queryid": "-1459702656855274752",
+      "calls": 89775,
+      "total_exec_time": 4304420.425719,
+      "mean_exec_time": 47.9467605204005,
+      "max_exec_time": 179.920263,
+      "rows": 89775,
+      "shared_blks_hit": 247160617,
+      "shared_blks_read": 1391,
+      "temp_blks_written": 0,
+      "query": "SELECT s.ranked_score,s.total_score,s.pp,s.plays,s.play_time,s.total_hits,s.accuracy,s.max_combo,CASE WHEN s.plays>$3 THEN (SELECT count($4)+$5 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND r.plays>$6 AND u.id!=$7 AND NOT u.restricted AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE $8 END,CASE WHEN s.plays>$9 THEN (SELECT count($10)+$11 FROM zigcho.stats r JOIN zigcho.users u ON u.id=r.user_id WHERE r.mode=s.mode AND r.plays>$12 AND u.id!=$13 AND NOT u.restricted AND u.country=me.country AND (r.pp>s.pp OR (r.pp=s.pp AND r.user_id<s.user_id))) ELSE $14 END FROM zigcho.stats s JOIN zigcho.users me ON me.id=s.user_id WHERE s.user_id=$1 AND s.mode=$2"
+    },
+    {
+      "queryid": "3551272942508080420",
+      "calls": 89775,
+      "total_exec_time": 13079.084039999994,
+      "mean_exec_time": 0.14568737443609128,
+      "max_exec_time": 40.949233,
+      "rows": 893490,
+      "shared_blks_hit": 1877425,
+      "shared_blks_read": 182,
+      "temp_blks_written": 0,
+      "query": "SELECT s.mods,s.accuracy,s.n300,s.n100,s.n50,s.nmiss FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN($4,$5)"
+    },
+    {
+      "queryid": "-294207339787932049",
+      "calls": 89775,
+      "total_exec_time": 563.5872020000156,
+      "mean_exec_time": 0.0062777744583681185,
+      "max_exec_time": 3.0304189999999998,
+      "rows": 89775,
+      "shared_blks_hit": 179550,
+      "shared_blks_read": 0,
+      "temp_blks_written": 0,
+      "query": "SELECT count(*) FROM zigcho.score_replay_views WHERE owner_id=$1 AND mode=$2 AND rank_namespace=$3 AND ($4=$5 OR ($4=$6 AND source=$7) OR source=$4)"
+    },
+    {
+      "queryid": "-3107362809895862951",
+      "calls": 89775,
+      "total_exec_time": 382.3625560000121,
+      "mean_exec_time": 0.004259120646059613,
+      "max_exec_time": 3.022725,
+      "rows": 0,
+      "shared_blks_hit": 179550,
+      "shared_blks_read": 0,
+      "temp_blks_written": 0,
+      "query": "SELECT s.rank FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace=$3 AND s.passed AND s.best AND b.status IN($4,$5)"
+    },
+    {
+      "queryid": "-4121902507807465559",
+      "calls": 10442,
+      "total_exec_time": 360.5736969999979,
+      "mean_exec_time": 0.03453109528825872,
+      "max_exec_time": 3.119888,
+      "rows": 10442,
+      "shared_blks_hit": 93978,
+      "shared_blks_read": 0,
+      "temp_blks_written": 0,
+      "query": "SELECT u.id,u.name,u.safe_name,u.country,u.privileges,u.silence_end,u.restricted,coalesce((SELECT updated_at FROM zigcho.user_banners ub WHERE ub.user_id=u.id),$2),tm.team_id,t.name,t.short_name,coalesce((SELECT updated_at FROM zigcho.team_assets ta WHERE ta.team_id=t.id AND ta.kind=$3),$4),u.show_country,CASE WHEN NOT u.restricted AND u.id!=$5 THEN (SELECT count(*) FROM zigcho.friends relation JOIN zigcho.users follower ON follower.id=relation.user_id WHERE relation.friend_id=u.id AND relation.user_id!=u.id AND NOT follower.restricted) ELSE $6 END FROM zigcho.users u LEFT JOIN zigcho.team_members tm ON tm.user_id=u.id LEFT JOIN zigcho.teams t ON t.id=tm.team_id WHERE u.id=$1"
+    }
+  ]
+}

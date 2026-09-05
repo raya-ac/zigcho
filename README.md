@@ -39,6 +39,8 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 
 runtime timings are documented in [src/telemetry/README.md](src/telemetry/README.md). `/metrics/runtime` is the local-only scrape that stays independent of database queries; `/metrics` also includes the database and cache totals.
 
+the [first measured baseline](docs/performance/2026-09-05-baseline.md) found expensive login and profile queries. the 1,000-player target is not met yet; the report keeps the failed target run and the smaller mixed-traffic control separate.
+
 - `src/main.zig` — the small server entrypoint
 - `src/server/` — app state, HTTP routing, Stable and lazer routes, IRC, workers and command-line jobs
 - `src/postgres_store.zig` — the storage compatibility facade

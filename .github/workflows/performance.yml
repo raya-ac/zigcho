@@ -171,6 +171,17 @@ jobs:
           if test -f reports/baseline.json; then
             printf '## baseline evidence\n\nA green job validates receipts and delivery, not latency or capacity. Missed schedules remain failures to sustain the offered workload.\n\n' >>"$GITHUB_STEP_SUMMARY"
             jq -r '"Server: `\(.server_commit)`\n", "Incomplete: \(.incomplete // false)\n", (.phases[] | "- \(.name): \(.players) players, \(.correctness.acknowledged) acknowledged scores, \([.families[].missed_schedule_slots] | add) missed request slots, receipt/delivery checks: \(.correctness.ok)")' reports/baseline.json >>"$GITHUB_STEP_SUMMARY"
+            jq -r '
+              def quantile: if . == null then ">10000" else tostring end;
+              .phases[] |
+              "\n### \(.name) request timings\n",
+              "Successful-response quantiles are millisecond upper bounds. Failed requests and missed slots are separate; >10000 is the overflow bucket.\n",
+              "| family | completed | failed | missed slots | p50 ms | p95 ms | p99 ms |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+              (.families | to_entries[] | .key as $family | .value |
+                if .successful == 0 then . + {successful_p50_ms_upper:"n/a",successful_p95_ms_upper:"n/a",successful_p99_ms_upper:"n/a"} else . end |
+                "| \($family) | \(.completed) | \(.failed) | \(.missed_schedule_slots) | \(.successful_p50_ms_upper | quantile) | \(.successful_p95_ms_upper | quantile) | \(.successful_p99_ms_upper | quantile) |")
+            ' reports/baseline.json >>"$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v7
         if: always()

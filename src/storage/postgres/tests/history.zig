@@ -115,6 +115,7 @@ fn verifyResults(store: *Store, contexts: anytype, waiting: bool, failed: bool) 
     lower.online_checksum = "97979797979797979797979797979793";
     lower.passed = false;
     lower.grade = "F";
+    lower.total_score = 900;
     _ = try store.insertStableScore(contexts[0].user_id, lower, 0, "failed replay", 1000);
     var unchanged = try postgres.query(lease.conn, versions_sql);
     defer unchanged.deinit();
@@ -129,6 +130,7 @@ fn verifyResults(store: *Store, contexts: anytype, waiting: bool, failed: bool) 
     try std.testing.expectEqualStrings(versions.value(0, 0), lower_unchanged.value(0, 0));
     lower.passed = false;
     lower.grade = "F";
+    lower.total_score = 400;
     try postgres.exec(lease.conn, "INSERT INTO zigcho.user_stats_history SELECT user_id,source,mode,day-86400,pp,global_rank FROM zigcho.user_stats_history WHERE mode=0 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 ON CONFLICT DO NOTHING; DELETE FROM zigcho.user_stats_history WHERE mode=0 AND day=(extract(epoch FROM transaction_timestamp())::bigint/86400)*86400 AND source IN('all','stable','lazer')");
     lower.online_checksum = "97979797979797979797979797979794";
     _ = try store.insertStableScore(contexts[0].user_id, lower, 0, "failed replay", 1000);

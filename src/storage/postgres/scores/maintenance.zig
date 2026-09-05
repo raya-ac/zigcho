@@ -229,12 +229,14 @@ pub fn recordStatsHistorySliceCurrentWithConnection(self: anytype, conn: *postgr
     var history_mode_buf: [24]u8 = undefined;
     const history_mode = try std.fmt.bufPrint(&history_mode_buf, "{d}", .{stats_mode});
     if (user_id != 0) {
+        // Preserve retention on every submission, but only touch this locked
+        // slice. Unrelated modes cannot delete each other's history rows.
+        var prune = try postgres.queryParams(self.allocator, conn, "DELETE FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day<((extract(epoch FROM transaction_timestamp())::bigint/86400)-89)*86400", &.{ @tagName(source), history_mode });
+        prune.deinit();
         if (try history_updates.hasCurrentSlice(self, conn, source, stats_mode))
             return history_updates.recordPlayer(self, conn, source, stats_mode, user_id);
         // First score of the day seeds the whole slice once, including inactive
         // players whose rank must move when today's active players pass them.
-        var prune = try postgres.queryParams(self.allocator, conn, "DELETE FROM zigcho.user_stats_history WHERE source=$1 AND mode=$2 AND day<((extract(epoch FROM transaction_timestamp())::bigint/86400)-89)*86400", &.{ @tagName(source), history_mode });
-        prune.deinit();
         return recordStatsHistorySliceCurrentWithConnection(self, conn, source, stats_mode, 0);
     }
     if (user_id == 0) {

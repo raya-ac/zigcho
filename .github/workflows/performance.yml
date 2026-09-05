@@ -94,6 +94,16 @@ jobs:
           done
           pg_isready -h 127.0.0.1 -p 18432 -q
           aws --endpoint-url https://127.0.0.1:19000 --ca-bundle "$cert_dir/public.crt" s3api create-bucket --bucket zigcho-benchmark
+      - name: keep synthetic geolocation off the public API
+        run: |
+          set -euo pipefail
+          # Login currently asks ip-api.com for coordinates. Benchmark IPs have
+          # no real location; fail that optional lookup locally for BOTH binaries.
+          # Nothing listens on this runner's loopback HTTP port.
+          test -z "$(ss -H -ltn 'sport = :80')"
+          printf '\n127.0.0.2 ip-api.com\n' | sudo tee -a /etc/hosts >/dev/null
+          test "$(getent ahostsv4 ip-api.com | awk 'NR==1 {print $1}')" = 127.0.0.2
+          printf 'ip-api.com resolves to unused loopback 127.0.0.2:80; optional geolocation returns its existing zero-coordinate fallback. This excludes geolocation network latency, not every possible background egress.\n' >reports/geolocation-scope.txt
       - name: seed, reset caches and measure the mixed workload
         run: |
           set -euo pipefail

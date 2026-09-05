@@ -1253,7 +1253,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
     const own = &capture.sessions.items[own_index];
     const stat_requests = try allocator.alloc(storage_contracts.BanchoStatsRequest, capture.sessions.items.len);
     defer allocator.free(stat_requests);
-    for (capture.sessions.items, stat_requests) |snapshot, *request| request.* = .{
+    for (capture.sessions.items, stat_requests) |snapshot, *stat_request| stat_request.* = .{
         .user_id = snapshot.user.id,
         .mode = stable_score.statsMode(snapshot.mode, snapshot.mods) orelse snapshot.mode,
     };

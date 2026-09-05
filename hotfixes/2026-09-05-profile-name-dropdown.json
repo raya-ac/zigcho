@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "id": "2026-09-05-profile-name-dropdown",
+  "base_commit": "8fba808c0c65579d53317fe8b710c968186ce5c9",
+  "schema_version": 48,
+  "patch_file": "2026-09-05-profile-name-dropdown.patch",
+  "patch_sha256": "92caadb70bf5de8fd87acb93335409fbf6e4af21c8eef172f2f0ab913f5b0edd",
+  "summary": "replace the boxed history button with a steam-style name dropdown",
+  "test_filters": [
+    "website name history is an explicit profile-only dropdown"
+  ]
+}

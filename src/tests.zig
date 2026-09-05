@@ -1901,7 +1901,9 @@ test "website name history is an explicit profile-only dropdown" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-name-history") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "bindProfileNameHistory(identifier)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "show previous usernames") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, ".profile-name-cluster{width:100%}.profile-name-history{position:static}.profile-name-history-menu{left:0;right:0;width:auto}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "cluster.append(name,history)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "<span>history</span>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_page, "also known as</span><ul class=\"name-history-list\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "document.querySelector('.profile-view')!==view") != null);
 }
 

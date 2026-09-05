@@ -21,6 +21,14 @@ const AnticheatObservation = postgres_store.AnticheatObservation;
 const StableScoreGraceResult = postgres_store.StableScoreGraceResult;
 const schema_version = postgres_store.schema_version;
 
+test "postgres stable score response preserves the existing personal best before submission" {
+    const conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_CHART_URL") orelse return error.SkipZigTest;
+    var store = try Store.open(std.testing.allocator, std.testing.io, std.mem.span(conninfo));
+    defer store.close();
+    try store.migrate();
+    try @import("../tests/stable_chart.zig").verify(&store);
+}
+
 test "postgres batched stats and first-place query parity" {
     const conninfo = std.c.getenv("ZIGCHO_TEST_POSTGRES_PERFORMANCE_URL") orelse return error.SkipZigTest;
     try @import("tests/performance.zig").verify(std.mem.span(conninfo));

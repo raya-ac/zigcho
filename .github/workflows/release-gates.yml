@@ -17,6 +17,7 @@ on:
           - full
           - focused
           - stable
+          - score-chart
   push:
     branches:
       - main
@@ -219,6 +220,7 @@ jobs:
           createdb -h 127.0.0.1 -U zigcho zigcho_history
           createdb -h 127.0.0.1 -U zigcho zigcho_history_concurrency
           createdb -h 127.0.0.1 -U zigcho zigcho_integration_performance
+          createdb -h 127.0.0.1 -U zigcho zigcho_chart
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_URL=host=127.0.0.1 port=5432 dbname=zigcho_pool user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
@@ -229,8 +231,25 @@ jobs:
             -e 'ZIGCHO_TEST_POSTGRES_HISTORY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_HISTORY_CONCURRENCY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history_concurrency user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_PERFORMANCE_URL=host=127.0.0.1 port=5432 dbname=zigcho_integration_performance user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_CHART_URL=host=127.0.0.1 port=5432 dbname=zigcho_chart user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             zig build test -Doptimize=ReleaseSafe
+
+      - name: run the existing-PB score chart correction
+        if: needs.classify.outputs.is_hotfix != 'true' && github.event_name == 'workflow_dispatch' && inputs.test_scope == 'score-chart'
+        timeout-minutes: 12
+        env:
+          PGPASSWORD: zigcho-gate
+        run: |
+          set -euo pipefail
+          for optimization in Debug ReleaseSafe; do
+            database_name="zigcho_chart_$(printf '%s' "$optimization" | tr '[:upper:]' '[:lower:]')"
+            createdb -h 127.0.0.1 -U zigcho "$database_name"
+            docker run --rm --network host \
+              -e "ZIGCHO_TEST_POSTGRES_CHART_URL=host=127.0.0.1 port=5432 dbname=$database_name user=zigcho password=zigcho-gate connect_timeout=5" \
+              "zigcho-release-gate:${GITHUB_SHA}" \
+              zig build test "-Doptimize=$optimization" -Dtest-filter="stable score response" -Dtest-filter="stable chart decimals"
+          done
 
       - name: run focused correction tests
         if: needs.classify.outputs.is_hotfix != 'true' && github.event_name == 'workflow_dispatch' && inputs.test_scope == 'focused'

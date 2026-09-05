@@ -195,6 +195,17 @@ pub const ScorePlacement = struct {
     rank: i32,
     submitted_is_best: bool,
 };
+pub const StablePersonalBest = struct {
+    rank: i32, // One-based placement before the new submission.
+    total_score: i64,
+    max_combo: i32,
+    accuracy: f64,
+    pp: f64,
+};
+pub const StableScoreInsert = struct {
+    id: i64,
+    previous_best: ?StablePersonalBest = null,
+};
 pub const Privileges = packed struct(u32) {
     unrestricted: bool = true,
     verified: bool = true,

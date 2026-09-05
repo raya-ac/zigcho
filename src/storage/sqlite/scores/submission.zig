@@ -1,4 +1,5 @@
 const std = @import("std");
+const domain = @import("../../../domain.zig");
 const stable_score = @import("../../../stable_score.zig");
 const lazer = @import("../../../lazer.zig");
 const stable_mods = @import("../../../stable_mods.zig");
@@ -178,6 +179,10 @@ pub fn rebuildCombinedPerformanceLocked(self: *Store, user_id: i32, ruleset_id: 
 }
 
 pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {
+    return (try insertStableScoreWithChart(self, user_id, score, pp_value, replay_data, time_elapsed_ms)).id;
+}
+
+pub fn insertStableScoreWithChart(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !domain.StableScoreInsert {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     try self.exec("BEGIN IMMEDIATE");
@@ -186,7 +191,8 @@ pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submiss
     var previous_best_id: i64 = 0;
     var previous_best_score: i64 = 0;
     var previous_best_pp: f64 = 0;
-    const best_sql = "SELECT id,score,pp FROM scores WHERE user_id=?1 AND map_md5=?2 AND mode=?3 AND rank_namespace=?4 AND best=1 LIMIT 1";
+    var previous_best: ?domain.StablePersonalBest = null;
+    const best_sql = "SELECT pb.id,pb.score,pb.pp,pb.max_combo,pb.accuracy,1+(SELECT count(*) FROM scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed=1 AND o.best=1 AND ((pb.rank_namespace IN('vanilla','scorev2') AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace IN('relax','autopilot') AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM scores pb WHERE pb.user_id=?1 AND pb.map_md5=?2 AND pb.mode=?3 AND pb.rank_namespace=?4 AND pb.best=1 LIMIT 1";
     var best_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(self.db, best_sql, -1, &best_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
     _ = c.sqlite3_bind_int(best_stmt, 1, user_id);
@@ -197,6 +203,13 @@ pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submiss
         previous_best_id = c.sqlite3_column_int64(best_stmt, 0);
         previous_best_score = c.sqlite3_column_int64(best_stmt, 1);
         previous_best_pp = c.sqlite3_column_double(best_stmt, 2);
+        previous_best = .{
+            .total_score = previous_best_score,
+            .pp = previous_best_pp,
+            .max_combo = c.sqlite3_column_int(best_stmt, 3),
+            .accuracy = c.sqlite3_column_double(best_stmt, 4),
+            .rank = c.sqlite3_column_int(best_stmt, 5),
+        };
     }
     _ = c.sqlite3_finalize(best_stmt);
     const uses_pp_metric = stable_mods.usesPpMetric(namespace);
@@ -288,5 +301,5 @@ pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submiss
         .pp = pp_value,
     });
     try self.exec("COMMIT");
-    return id;
+    return .{ .id = id, .previous_best = previous_best };
 }

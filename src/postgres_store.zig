@@ -845,6 +845,9 @@ pub const Store = struct {
     pub fn insertStableScore(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {
         return pg_score_stable.insertStableScore(self, user_id, score, pp_value, replay_data, time_elapsed_ms);
     }
+    pub fn insertStableScoreWithChart(self: *Store, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !domain.StableScoreInsert {
+        return pg_score_stable.insertStableScoreWithChart(self, user_id, score, pp_value, replay_data, time_elapsed_ms);
+    }
     pub fn stableReplay(self: *Store, allocator: std.mem.Allocator, score_id: i64) !?[]u8 {
         return pg_score_replays.stableReplay(self, allocator, score_id);
     }

@@ -742,6 +742,7 @@ pub const Store = struct {
     pub const beatmapInfoById = @import("storage/sqlite/beatmaps/catalog.zig").beatmapInfoById;
 
     pub const insertStableScore = @import("storage/sqlite/scores/submission.zig").insertStableScore;
+    pub const insertStableScoreWithChart = @import("storage/sqlite/scores/submission.zig").insertStableScoreWithChart;
 
     pub const stableReplay = @import("storage/sqlite/scores/replays.zig").stableReplay;
 

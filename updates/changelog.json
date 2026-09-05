@@ -8,6 +8,12 @@
       "created_at": "2026-09-05T08:10:00Z",
       "updates": [
         {
+          "name": "2026-09-05-stable-previous-best.md",
+          "created_at": "2026-09-05T12:45:00Z",
+          "commit": "",
+          "sha256": "a243d6a00db209f271502529a4c684833e6be7737cc57a0dec16f9825aadf2a1"
+        },
+        {
           "name": "2026-09-05-backup-multipart.md",
           "created_at": "2026-09-05T12:00:00Z",
           "commit": "",

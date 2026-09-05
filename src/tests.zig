@@ -2891,6 +2891,17 @@ test "stable score response reports the committed one based leaderboard rank" {
     try std.testing.expect(std.mem.indexOf(u8, response, "rankBefore:8|rankAfter:7") != null);
 }
 
+test "stable score response preserves the existing personal best before submission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/stable-chart.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    try @import("storage/tests/stable_chart.zig").verify(&store);
+}
+
 test "beatmap ranking records nominations and lets BNs set every stable status" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

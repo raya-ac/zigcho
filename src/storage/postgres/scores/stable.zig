@@ -119,6 +119,10 @@ pub fn stableClassicLeaderboardJson(self: anytype, allocator: std.mem.Allocator,
 }
 
 pub fn insertStableScore(self: anytype, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !i64 {
+    return (try insertStableScoreWithChart(self, user_id, score, pp_value, replay_data, time_elapsed_ms)).id;
+}
+
+pub fn insertStableScoreWithChart(self: anytype, user_id: i32, score: stable_score.Submission, pp_value: f64, replay_data: []const u8, time_elapsed_ms: u32) !domain.StableScoreInsert {
     const stats_mode = stable_score.statsMode(score.mode, score.mods) orelse return error.UnsupportedModMode;
     const namespace = score.rankNamespace();
     const uses_pp = stable_mods.usesPpMetric(namespace);
@@ -179,6 +183,20 @@ pub fn insertStableScore(self: anytype, user_id: i32, score: stable_score.Submis
         if (stats_lock.rows() == 0) return error.DatabaseQueryFailed;
     }
 
+    // Copy the old PB while the submission scope and map are locked, before
+    // this insert can replace it. Never reconstruct it from post-submit rows.
+    var previous_best: ?domain.StablePersonalBest = null;
+    if (score.passed) {
+        var previous = try postgres.queryParams(self.allocator, lease.conn, "SELECT pb.score,pb.max_combo,pb.accuracy,pb.pp,1+(SELECT count(*) FROM zigcho.scores o WHERE o.map_md5=pb.map_md5 AND o.mode=pb.mode AND o.rank_namespace=pb.rank_namespace AND o.passed AND o.best AND ((pb.rank_namespace IN('vanilla','scorev2') AND (o.score>pb.score OR (o.score=pb.score AND o.id<pb.id))) OR (pb.rank_namespace IN('relax','autopilot') AND (o.pp>pb.pp OR (o.pp=pb.pp AND o.id<pb.id))))) FROM zigcho.scores pb WHERE pb.user_id=$1 AND pb.map_md5=$2 AND pb.mode=$3 AND pb.rank_namespace=$4 AND pb.passed AND pb.best LIMIT 1", &.{ user, score.map_md5, mode, namespace });
+        defer previous.deinit();
+        if (previous.rows() != 0) previous_best = .{
+            .total_score = try previous.int(i64, 0, 0),
+            .max_combo = try previous.int(i32, 0, 1),
+            .accuracy = try previous.float(f64, 0, 2),
+            .pp = try previous.float(f64, 0, 3),
+            .rank = try previous.int(i32, 0, 4),
+        };
+    }
     const perfect = if (score.perfect) "true" else "false";
     const passed = if (score.passed) "true" else "false";
     var inserted = postgres.queryParams(self.allocator, lease.conn, "INSERT INTO zigcho.scores(user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,replay,checksum,rank_namespace,best,time_elapsed,star_rating) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,false,$20,$21) RETURNING id", &.{ user, score.map_md5, mode, mods, score_text, pp, accuracy, combo, n300, n100, n50, nmiss, ngeki, nkatu, perfect, passed, replay_encoded, score.online_checksum, namespace, elapsed, star_rating }) catch |err| switch (err) {
@@ -230,5 +248,5 @@ pub fn insertStableScore(self: anytype, user_id: i32, score: stable_score.Submis
         .pp = pp_value,
     });
     try postgres.exec(lease.conn, "COMMIT");
-    return score_id;
+    return .{ .id = score_id, .previous_best = previous_best };
 }

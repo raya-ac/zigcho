@@ -9,6 +9,7 @@ pub const BeatmapState = struct {
     plays: i32,
     passes: i32,
     last_update: i64 = 0,
+    previous_best: ?domain.StablePersonalBest = null,
 };
 
 fn writeInteger(writer: *std.Io.Writer, value: i64) !void {
@@ -84,12 +85,13 @@ pub fn scoreSubmission(allocator: std.mem.Allocator, user_id: i32, score_id: i64
     try writer.print("beatmapId:{d}|beatmapSetId:{d}|beatmapPlaycount:{d}|beatmapPasscount:{d}|approvedDate:", .{ map.id, map.set_id, map.plays, map.passes });
     try writeMapDate(writer, map.last_update);
     try writer.print("|\n|chartId:beatmap|chartUrl:https://kai.ovh/beatmapsets/{d}|chartName:Beatmap Ranking", .{map.set_id});
-    try integerEntry(writer, "rank", null, placement.rank + 1);
-    try integerEntry(writer, "rankedScore", null, score.total_score);
-    try integerEntry(writer, "totalScore", null, score.total_score);
-    try integerEntry(writer, "maxCombo", null, score.max_combo);
-    try decimalEntry(writer, "accuracy", null, score.accuracy() * 100.0, 2);
-    try decimalEntry(writer, "pp", null, pp_value, 3);
+    const previous = map.previous_best;
+    try integerEntry(writer, "rank", if (previous) |pb| pb.rank else null, placement.rank + 1);
+    try integerEntry(writer, "rankedScore", if (previous) |pb| pb.total_score else null, score.total_score);
+    try integerEntry(writer, "totalScore", if (previous) |pb| pb.total_score else null, score.total_score);
+    try integerEntry(writer, "maxCombo", if (previous) |pb| pb.max_combo else null, score.max_combo);
+    try decimalEntry(writer, "accuracy", if (previous) |pb| pb.accuracy * 100.0 else null, score.accuracy() * 100.0, 2);
+    try decimalEntry(writer, "pp", if (previous) |pb| pb.pp else null, pp_value, 3);
     try writer.print("|onlineScoreId:{d}|\n|chartId:overall|chartUrl:https://kai.ovh/u/{d}|chartName:Overall Ranking", .{ score_id, user_id });
     try integerEntry(writer, "rank", before.global_rank, after.global_rank);
     try integerEntry(writer, "rankedScore", before.ranked_score, after.ranked_score);

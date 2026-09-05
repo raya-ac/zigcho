@@ -568,10 +568,11 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
         if (has_replay_fingerprint) std.crypto.hash.sha2.Sha256.hash(replay.data, &replay_digest, .{});
         const stats_mode = stable_score.statsMode(score.mode, score.mods) orelse return respond(req, .ok, "text/plain", "error: no", &.{});
         const before_stats = (try self.store.statsForUser(user.id, stats_mode)) orelse domain.Stats{};
-        const score_id = self.store.insertStableScore(user.id, score, performance.pp, replay.data, elapsed_ms) catch |err| {
+        const inserted_score = self.store.insertStableScoreWithChart(user.id, score, performance.pp, replay.data, elapsed_ms) catch |err| {
             std.log.warn("stable score insert failed: {t}", .{err});
             return respond(req, .ok, "text/plain", "error: no", &.{});
         };
+        const score_id = inserted_score.id;
         if (replay.data.len != 0) {
             _ = self.store.storeReplayObject(.stable, score_id, replay.data) catch |err| failed: {
                 std.log.warn("event=replay_object_write_failed source=stable score_id={d} error={t}", .{ score_id, err });
@@ -632,7 +633,7 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
             }
         }
         const unlocked_achievements = try self.store.newAchievementsForScore("stable", score_id);
-        const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes, .last_update = map_state.last_update }, placed, before_stats, after_stats, performance.pp, unlocked_achievements);
+        const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes, .last_update = map_state.last_update, .previous_best = inserted_score.previous_best }, placed, before_stats, after_stats, performance.pp, unlocked_achievements);
         defer self.allocator.free(response_body);
         return respond(req, .ok, "text/plain", response_body, &.{});
     }

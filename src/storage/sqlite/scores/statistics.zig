@@ -5,6 +5,14 @@ const Store = @import("../../../storage.zig").Store;
 const stableGrade = @import("../beatmaps/catalog.zig").stableGrade;
 const PpSnapshot = @import("../../contracts.zig").PpSnapshot;
 
+pub fn banchoStatsBatch(self: *Store, allocator: std.mem.Allocator, requests: []const @import("../../contracts.zig").BanchoStatsRequest) ![]@import("../../contracts.zig").BanchoStats {
+    const Stats = @import("../../contracts.zig").BanchoStats;
+    const result = try allocator.alloc(Stats, requests.len);
+    errdefer allocator.free(result);
+    for (requests, result) |request, *value| value.* = Stats.fromStats((try self.statsForUser(request.user_id, request.mode)) orelse domain.Stats{});
+    return result;
+}
+
 pub fn statsForUser(self: *Store, user_id: i32, mode: u8) !?domain.Stats {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);

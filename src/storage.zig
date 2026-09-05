@@ -539,6 +539,7 @@ pub const Store = struct {
     pub const lazerActivity = @import("storage/sqlite/accounts/presence.zig").lazerActivity;
 
     pub const statsForUser = @import("storage/sqlite/scores/statistics.zig").statsForUser;
+    pub const banchoStatsBatch = @import("storage/sqlite/scores/statistics.zig").banchoStatsBatch;
 
     pub const statsRulesetsForUser = @import("storage/sqlite/scores/statistics.zig").statsRulesetsForUser;
 

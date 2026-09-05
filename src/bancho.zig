@@ -10,6 +10,7 @@ const commands = @import("commands.zig");
 const log = @import("logutil.zig");
 const multiplayer = @import("multiplayer.zig");
 const stable_login = @import("stable_login.zig");
+const storage_contracts = @import("storage/contracts.zig");
 
 pub const LoginResult = struct {
     allocator: std.mem.Allocator,
@@ -906,6 +907,10 @@ fn presence(w: *protocol.Writer, s: anytype) !void {
 fn stats(w: *protocol.Writer, store: *storage.Store, s: anytype) !void {
     const stats_mode = stable_score.statsMode(s.mode, s.mods) orelse s.mode;
     const current = (try store.statsForUser(s.user.id, stats_mode)) orelse domain.Stats{};
+    return writeStats(w, s, storage_contracts.BanchoStats.fromStats(current));
+}
+
+fn writeStats(w: *protocol.Writer, s: anytype, current: storage_contracts.BanchoStats) !void {
     const start = try w.begin(.user_stats);
     try w.int(i32, s.user.id);
     try w.byte(s.action);
@@ -1246,8 +1251,16 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
         if (snapshot.user.id == capture.user_id) break index;
     } else return error.LoginSessionMissing;
     const own = &capture.sessions.items[own_index];
+    const stat_requests = try allocator.alloc(storage_contracts.BanchoStatsRequest, capture.sessions.items.len);
+    defer allocator.free(stat_requests);
+    for (capture.sessions.items, stat_requests) |snapshot, *request| request.* = .{
+        .user_id = snapshot.user.id,
+        .mode = stable_score.statsMode(snapshot.mode, snapshot.mods) orelse snapshot.mode,
+    };
+    const login_stats = try store.banchoStatsBatch(allocator, stat_requests);
+    defer allocator.free(login_stats);
     try presence(&out, own);
-    try stats(&out, store, own);
+    try writeStats(&out, own, login_stats[own_index]);
     try protocol.writeChannel(&out, "#osu", "general", capture.osu_count);
     try protocol.writeChannel(&out, "#announce", "updates", capture.announce_count);
     try out.packetEmpty(.channel_info_end);
@@ -1261,7 +1274,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
     }
     for (capture.sessions.items, 0..) |*other, index| if (index != own_index and !other.user.restricted) {
         try presence(&out, other);
-        try stats(&out, store, other);
+        try writeStats(&out, other, login_stats[index]);
     };
     const lazer_presence_epoch = captureLazerPresenceEpoch(sessions);
     const lazer_now = std.Io.Clock.real.now(store.io).toSeconds();
@@ -1288,7 +1301,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
     defer announce.deinit();
     if (!capture.restricted) {
         try presence(&announce, own);
-        try stats(&announce, store, own);
+        try writeStats(&announce, own, login_stats[own_index]);
         sessions.mutex.lockUncancelable(sessions.io);
         defer sessions.mutex.unlock(sessions.io);
         if (sessions.byToken(capture.token)) |current| {

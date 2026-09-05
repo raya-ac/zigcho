@@ -4,6 +4,22 @@ const stable_score = @import("../stable_score.zig");
 const lazer = @import("../lazer.zig");
 const account_roles = @import("../account_roles.zig");
 
+pub const BanchoStatsRequest = struct { user_id: i32, mode: u8 };
+
+/// Only fields serialized by the Stable user_stats packet, not profile extras.
+pub const BanchoStats = struct {
+    ranked_score: i64 = 0,
+    total_score: i64 = 0,
+    pp: i32 = 0,
+    plays: i32 = 0,
+    accuracy: f64 = 0,
+    global_rank: i32 = 0,
+
+    pub fn fromStats(value: domain.Stats) BanchoStats {
+        return .{ .ranked_score = value.ranked_score, .total_score = value.total_score, .pp = value.pp, .plays = value.plays, .accuracy = value.accuracy, .global_rank = value.global_rank };
+    }
+};
+
 pub const ConsumedLazerScoreToken = struct {
     score_id: i64,
     total_score: i64,

@@ -818,6 +818,9 @@ pub const Store = struct {
     pub fn statsForUser(self: *Store, user_id: i32, mode: u8) !?domain.Stats {
         return pg_score_stats.statsForUser(self, user_id, mode);
     }
+    pub fn banchoStatsBatch(self: *Store, allocator: std.mem.Allocator, requests: []const storage_contracts.BanchoStatsRequest) ![]storage_contracts.BanchoStats {
+        return @import("storage/postgres/scores/bancho_stats.zig").read(self, allocator, requests);
+    }
     pub fn statsRulesetsForUser(self: *Store, user_id: i32) ![4]?domain.Stats {
         return pg_score_stats.statsRulesetsForUser(self, user_id);
     }

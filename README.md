@@ -39,7 +39,7 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 
 runtime timings are documented in [src/telemetry/README.md](src/telemetry/README.md). `/metrics/runtime` is the local-only scrape that stays independent of database queries; `/metrics` also includes the database and cache totals.
 
-the [history follow-up](docs/performance/2026-09-05-history-comparison.md) fixes the measured history deadlocks and cold rank-update join. the short 100- and 1,000-player workloads now pass, with their failures, missed work and different runner CPUs recorded. that is not a sustained-capacity claim; the hour and soak runs are still needed. the [earlier query comparison](docs/performance/2026-09-05-query-comparison.md) keeps the original results.
+the [history follow-up](docs/performance/2026-09-05-history-comparison.md) fixes the measured history deadlocks and cold rank-update join. the short 100- and 1,000-player workloads now pass, with their failures, missed work and different runner CPUs recorded. longer capacity testing is deferred; these short runs are not a sustained-capacity claim. the [earlier query comparison](docs/performance/2026-09-05-query-comparison.md) keeps the original results.
 
 - `src/main.zig` — the small server entrypoint
 - `src/server/` — app state, HTTP routing, Stable and lazer routes, IRC, workers and command-line jobs

@@ -96,12 +96,22 @@ the generator, server, PostgreSQL and HTTPS MinIO share a disposable hosted runn
 
 receipt checks establish the stored state of acknowledged scores. they do not reconcile every unacknowledged request from failed runs. failed requests and missed scheduled work stay in the comparison. client percentiles are one-millisecond upper bounds; overflow above ten seconds is not an exact ten-second latency. short RSS samples do not establish a memory plateau.
 
-the peak-hour run, longer soak, agreed latency budgets and slow-dependency overload/recovery tests are still separate acceptance work. moving PP or uploads into background jobs is not credited here: those paths have not been changed to disguise database latency.
+longer capacity and slow-dependency recovery testing is deliberately deferred. no hour-long soak or extended log run is a prerequisite for this deployment. moving PP or uploads into background jobs is not credited here: those paths have not been changed to disguise database latency.
 
-## deployment held at backup verification
+## initial deployment held at backup verification
 
 at publication, this candidate is **not live**. production remains on `d7aafefc7db5b74259cfd06c52bc9e6c2d53f28a`, schema 48. the release backup and restore drill passed, but the origin could not complete the configured Singapore object store's read-back of the 119,806,438-byte dump. both the earlier 1 MiB attempt and the final 256 KiB range attempt exhausted retries. the final attempt also rejected truncated responses rather than accepting an incomplete backup.
 
 four independent 256 KiB curl probes completed with full byte counts, taking roughly 8, 13, 26 and 41 seconds. that demonstrates variable transfer behavior, not verification of the whole backup. the public [Contabo status page](https://contabo-status.com/) listed no interruption when checked on 5 September; that does not establish the health of this particular storage path.
 
 verification now happens before the service stop, so this failed preflight leaves the old server serving. the restore-tested local dump is retained. no new database migration, production score repair or Discord release announcement was made for this candidate. deployment needs either a verified off-host transfer or an explicit decision about the backup requirement.
+
+## deployment follow-up
+
+`f612185eed38d39bc6905a77079d1855b636b2f3` went live on 5 September at approximately 07:43 UTC, after an explicit operator decision to use a fresh restore-tested local backup while off-site read-back remained pending. the old release and local rollback dump were retained. the production executable matches the runner's `5a45e38c7c31b2991ec90ffbc299b2f56dfa132fc47b733f95dbc4566c4edec6` SHA-256; schema 48 and the PP engine stayed unchanged, with no recalculation.
+
+all 22 public hosts and their status routes answered, unauthenticated writes still returned 401, menu and seasonal assets passed, and avatar delivery passed on retry after one slow request. profile stats and top, first-place, recent and pinned plays matched the pre-deploy data in combined, Stable, lazer and ScoreV2 views. there were no invalid indexes, unvalidated constraints or new warning entries in the short activation check. this was not an installed-client multiplayer or scoring retest.
+
+the combined catch-up was posted to Discord in two embeds without Markdown attachments. the storage slowdown is still unresolved; this deployment is not evidence that off-site backup retrieval has recovered.
+
+the later `6581496bd6ba479237bfeeaf51e31417a12dcf5c` hotfix changes only the website name-history presentation and its existing assertion. it retains this measured backend and passed [the focused hotfix gate](https://github.com/zigcho/zigcho/actions/runs/33953493875). it went live at approximately 07:53 UTC with the same local-backup exception.

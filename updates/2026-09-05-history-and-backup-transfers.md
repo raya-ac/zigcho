@@ -28,4 +28,6 @@ backup transfers now use eight bounded range readers, 256 KiB per range, with de
 
 the backup upload and read-back now finish before the old service is stopped. a storage failure leaves that service running, rather than failing after the new release has already started accepting players.
 
-there is no schema, calculator or score-value change here. the mixed-load benchmark still needs to establish the result; a passing build is not a 1,000-player capacity claim.
+the short 100- and 1,000-player mixed runs now pass without request failures, database deadlocks or server timeouts. missed scheduled work and different runner hardware remain in the [measurement report](https://github.com/zigcho/zigcho/blob/main/docs/performance/2026-09-05-history-comparison.md); this is not a sustained 1,000-player capacity claim.
+
+release 2.7 went live with explicit approval to use a fresh restore-tested local backup while Contabo read-back was still slow. rollback files remain on the server. off-site verification is pending, not fixed. there is no schema, calculator or score-value change here.

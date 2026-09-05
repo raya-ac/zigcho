@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 54,
+      "version": "2026.905.4",
+      "display_version": "zigcho release 2.7.1",
+      "created_at": "2026-09-05T07:50:00Z",
+      "updates": [
+        {
+          "name": "2026-09-05-profile-name-dropdown.md",
+          "created_at": "2026-09-05T07:50:00Z",
+          "commit": "",
+          "sha256": "4466178f05559e209bf5f08ad0f1a7c091ab736d36452ec5a455161214056cf7"
+        }
+      ]
+    },
+    {
       "id": 53,
       "version": "2026.905.3",
       "display_version": "zigcho release 2.7",
@@ -11,7 +25,7 @@
           "name": "2026-09-05-history-and-backup-transfers.md",
           "created_at": "2026-09-05T05:39:00Z",
           "commit": "",
-          "sha256": "2b462e4dbdf1a3612491de2869a342a2f345fa373e4aaf08796cd176a1438a2b"
+          "sha256": "90f0d7b1332b070beef822cf442069cd3cb9e2219e92b27e73cb26f20caec963"
         }
       ]
     },

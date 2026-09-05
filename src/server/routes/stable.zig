@@ -131,11 +131,14 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
                 restart.finish(rs);
                 return respond(req, .ok, "application/octet-stream", restart.bytes(), &.{});
             };
-            const maybe_bytes = poll: {
+            const maybe_bytes = (poll: {
                 const mutex = self.gameSessionMutex(poll_user_id);
                 mutex.lockUncancelable(self.store.io);
                 defer mutex.unlock(self.store.io);
-                break :poll try bancho.pollByToken(self.allocator, &self.store, &self.sessions, token, body);
+                break :poll bancho.pollByToken(self.allocator, &self.store, &self.sessions, token, body);
+            }) catch |err| switch (err) {
+                error.TruncatedPacket, error.TruncatedPayload, error.PacketTooLarge, error.InvalidStringMarker, error.IntegerOverflow, error.InvalidPresenceRequest => return respond(req, .bad_request, "text/plain", "", &.{}),
+                else => return err,
             };
             const bytes = maybe_bytes orelse {
                 var restart = protocol.Writer.init(self.allocator);
@@ -149,6 +152,9 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
             defer self.allocator.free(bytes);
             return respond(req, .ok, "application/octet-stream", bytes, &.{});
         }
+        // Reject malformed text before username lookup can reach PostgreSQL.
+        if (!std.unicode.utf8ValidateSlice(body) or std.mem.indexOfScalar(u8, body, 0) != null)
+            return respond(req, .bad_request, "text/plain", "", &.{});
         const geo = if (client_ip_owned) |ip| self.lookupGeo(ip) else GeoResult{ .lon = 0, .lat = 0 };
         var result = try self.stableLoginAndTakeover(body, if (country_owned) |value| country.normalized(value) else null, geo.lon, geo.lat);
         defer result.deinit();

@@ -915,7 +915,7 @@ fn writeStats(w: *protocol.Writer, s: anytype, current: storage_contracts.Bancho
     try w.int(i32, s.user.id);
     try w.byte(s.action);
     try w.string(s.info());
-    try w.string(&s.map_md5);
+    try w.string(std.mem.sliceTo(&s.map_md5, 0));
     try w.int(i32, s.mods);
     try w.byte(s.mode);
     try w.int(i32, s.map_id);
@@ -926,6 +926,27 @@ fn writeStats(w: *protocol.Writer, s: anytype, current: storage_contracts.Bancho
     try w.int(i32, current.global_rank);
     try w.int(u16, if (current.pp > std.math.maxInt(u16)) 0 else @intCast(current.pp));
     w.finish(start);
+}
+
+test "idle user stats encode an empty map checksum" {
+    const Idle = struct {
+        user: struct { id: i32 } = .{ .id = 4 },
+        action: u8 = 0,
+        map_md5: [32]u8 = [_]u8{0} ** 32,
+        mods: i32 = 0,
+        mode: u8 = 0,
+        map_id: i32 = 0,
+
+        fn info(_: @This()) []const u8 {
+            return "";
+        }
+    };
+    var writer = protocol.Writer.init(std.testing.allocator);
+    defer writer.deinit();
+    try writeStats(&writer, Idle{}, .{});
+    // Reference packet 11: 46-byte payload, id 4, all other idle fields zero.
+    const expected = [_]u8{ 11, 0, 0, 46, 0, 0, 0, 4 } ++ [_]u8{0} ** 45;
+    try std.testing.expectEqualSlices(u8, &expected, writer.bytes());
 }
 
 /// Execute every stats read in an owned poll plan without holding the global

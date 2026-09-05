@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 51,
+      "version": "2026.905.1",
+      "display_version": "zigcho release 2.5",
+      "created_at": "2026-09-05T11:52:19+09:30",
+      "updates": [
+        {
+          "name": "2026-09-05-performance-instrumentation.md",
+          "created_at": "2026-09-05T11:52:19+09:30",
+          "commit": "",
+          "sha256": "d0960a370250a530b1728efef5489f32d4ab353658b4785a7939dd830e2e85f2"
+        }
+      ]
+    },
+    {
       "id": 50,
       "version": "2026.905.0",
       "display_version": "zigcho release 2.4",

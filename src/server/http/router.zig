@@ -4,6 +4,7 @@ const domain = d.domain;
 const bss = d.bss;
 const proxy = d.proxy;
 const routing = d.routing;
+const telemetry = @import("../../telemetry.zig");
 const web_auth = d.web_auth;
 const server_control_route = d.server_control_route;
 
@@ -40,6 +41,8 @@ pub fn serve(self: anytype, req: *std.http.Server.Request, peer_ip: ?[]const u8)
     defer self.allocator.free(target);
     const raw_path = if (std.mem.findScalar(u8, target, '?')) |q| target[0..q] else target;
     const path = routing.canonicalPath(raw_path);
+    const request_timer = telemetry.Timer.start(telemetry.route(req.head.method, path, std.mem.eql(u8, header(req, "user-agent") orelse "", "osu!") or header(req, "osu-token") != null, header(req, "osu-token") != null));
+    defer request_timer.finish();
     const trusted_proxy = proxy.trustsForwardedHeaders(peer_ip);
     const required_features = server_control_route.required(req.head.method, path, header(req, "osu-token") != null);
     for (required_features.slice()) |feature| {

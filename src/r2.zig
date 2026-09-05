@@ -1,4 +1,5 @@
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -17,6 +18,8 @@ pub const Storage = struct {
 
     pub fn put(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8, data: []const u8) !void {
         if (!self.enabled()) return error.R2NotConfigured;
+        const timer = telemetry.Timer.start(.object_upload);
+        defer timer.finish();
         const result = try self.request(allocator, io, .PUT, object_key, content_type, data, null);
         if (result != .ok and result != .no_content) {
             std.log.warn("event=r2_upload_rejected status={d}", .{@intFromEnum(result)});
@@ -30,6 +33,8 @@ pub const Storage = struct {
 
     pub fn getWithLimit(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8, limit: usize) ![]u8 {
         if (!self.enabled()) return error.R2NotConfigured;
+        const timer = telemetry.Timer.start(.object_download);
+        defer timer.finish();
         if (limit == 0 or limit == std.math.maxInt(usize)) return error.InvalidR2ObjectLimit;
         const buffer = try allocator.alloc(u8, limit + 1);
         errdefer allocator.free(buffer);
@@ -49,6 +54,8 @@ pub const Storage = struct {
 
     pub fn streamGet(self: Storage, allocator: std.mem.Allocator, io: std.Io, object_key: []const u8, content_type: []const u8, writer: *std.Io.Writer) !void {
         if (!self.enabled()) return error.R2NotConfigured;
+        const timer = telemetry.Timer.start(.object_download);
+        defer timer.finish();
         const result = try self.request(allocator, io, .GET, object_key, content_type, "", writer);
         if (result == .not_found) return error.R2ObjectNotFound;
         if (result != .ok) {

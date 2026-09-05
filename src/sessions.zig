@@ -147,7 +147,7 @@ pub const Session = struct {
 pub const Sessions = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    mutex: @import("telemetry.zig").Mutex(.stable_sessions) = .init,
     items: std.ArrayList(*Session) = .empty,
     by_token: std.StringHashMap(*Session),
     by_user: std.AutoHashMap(i32, *Session),

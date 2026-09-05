@@ -1,4 +1,5 @@
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
 
 pub const engine_version = std.mem.trim(u8, @embedFile("pp_engine_version.txt"), " \t\r\n");
 
@@ -33,6 +34,8 @@ extern fn zigcho_pp_calculate(map_ptr: [*]const u8, map_len: usize, input: *cons
 extern fn zigcho_lazer_pp_calculate(map_ptr: [*]const u8, map_len: usize, mods_ptr: [*]const u8, mods_len: usize, input: *const Input, output: *Output) c_int;
 
 pub fn calculate(map: []const u8, input: Input) !Output {
+    const timer = telemetry.Timer.start(.pp_stable);
+    defer timer.finish();
     if (map.len == 0 or input.mode > 3) return error.PerformanceCalculationFailed;
     if (input.mode == 3 and input.mods & relax != 0) return error.UnsupportedModMode;
     if (input.mode != 0 and input.mods & autopilot != 0) return error.UnsupportedModMode;
@@ -44,6 +47,8 @@ pub fn calculate(map: []const u8, input: Input) !Output {
 }
 
 pub fn calculateLazer(map: []const u8, mods_json: []const u8, input: Input) !Output {
+    const timer = telemetry.Timer.start(.pp_lazer);
+    defer timer.finish();
     if (map.len == 0 or mods_json.len == 0 or input.mode > 3 or input.lazer == 0) return error.PerformanceCalculationFailed;
     if (input.mods & (relax | autopilot) != 0) return error.UnsupportedModMode;
     var output: Output = .{};

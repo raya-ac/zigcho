@@ -1,4 +1,5 @@
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
 const beatmap = @import("beatmap.zig");
 const pp = @import("exact_pp.zig");
 const storage = @import("runtime_storage.zig");
@@ -199,7 +200,7 @@ pub const Sync = struct {
     io: std.Io,
     cache_max_bytes: u64,
     osu_api_key: []const u8 = "",
-    in_progress: std.StringHashMap(void),
+    in_progress: std.StringHashMap(telemetry.work.Ticket),
     in_progress_mutex: std.Io.Mutex = .init,
     attempts: std.atomic.Value(u64) = .init(0),
     successes: std.atomic.Value(u64) = .init(0),
@@ -234,11 +235,13 @@ pub const Sync = struct {
             .allocator = allocator,
             .io = io,
             .cache_max_bytes = cache_max_bytes,
-            .in_progress = std.StringHashMap(void).init(allocator),
+            .in_progress = std.StringHashMap(telemetry.work.Ticket).init(allocator),
         };
     }
 
     pub fn deinit(self: *Sync) void {
+        var pending = self.in_progress.valueIterator();
+        while (pending.next()) |ticket| ticket.leave();
         self.in_progress.deinit();
     }
 
@@ -631,12 +634,15 @@ pub const Sync = struct {
         if (self.in_progress.contains(wanted_md5)) return .duplicate;
         if (self.in_progress.count() >= max_concurrent_hydrations) {
             _ = self.capacity_skips.fetchAdd(1, .monotonic);
+            telemetry.work.reject(.beatmap_hydration);
             return .at_capacity;
         }
 
         const md5_owned = try self.allocator.dupe(u8, wanted_md5);
         errdefer self.allocator.free(md5_owned);
-        try self.in_progress.put(md5_owned, {});
+        const pending = telemetry.work.enter(.beatmap_hydration);
+        errdefer pending.leave();
+        try self.in_progress.put(md5_owned, pending);
         return .{ .claimed = md5_owned };
     }
 
@@ -948,7 +954,7 @@ pub const Sync = struct {
 
     fn removeFromProgress(self: *Sync, md5: []const u8) void {
         self.in_progress_mutex.lockUncancelable(self.io);
-        _ = self.in_progress.remove(md5);
+        if (self.in_progress.fetchRemove(md5)) |entry| entry.value.leave();
         self.in_progress_mutex.unlock(self.io);
         self.allocator.free(md5);
     }

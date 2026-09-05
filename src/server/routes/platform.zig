@@ -276,6 +276,14 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
         const json = try healthResponse(&buf, try self.combinedOnlineCount());
         return respond(req, .ok, "application/json", json, &.{});
     }
+    if (std.mem.eql(u8, path, "/metrics/runtime")) {
+        if (req.head.method != .GET or !isLocalMetricsHost(host_owned)) return respond(req, .not_found, "text/plain", "not found\n", &.{});
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        try @import("../../telemetry.zig").writePrometheus(&output.writer);
+        try output.writer.print("# TYPE zigcho_http_connections gauge\nzigcho_http_connections {d}\n# TYPE zigcho_http_connection_limit gauge\nzigcho_http_connection_limit {d}\n# TYPE zigcho_http_rejected counter\nzigcho_http_rejected {d}\n# TYPE zigcho_http_timeouts counter\nzigcho_http_timeouts {d}\n", .{ self.http_gate.active.load(.acquire), self.http_gate.limit, self.http_gate.rejected.load(.acquire), self.http_gate.timed_out.load(.acquire) });
+        return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
+    }
     if (std.mem.eql(u8, path, "/metrics")) {
         if (req.head.method != .GET or !isLocalMetricsHost(host_owned)) return respond(req, .not_found, "text/plain", "not found\n", &.{});
         const online = try self.combinedOnlineCount();
@@ -324,6 +332,7 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
                 "# TYPE zigcho_uptime_seconds counter\nzigcho_uptime_seconds {d}\n",
             .{ online, self.http_gate.active.load(.acquire), self.http_gate.limit, self.http_gate.rejected.load(.acquire), self.http_gate.timed_out.load(.acquire), counts.users, counts.plays, counts.passed, counts.maps, cache.entries, cache.bytes, media_cache.entries, media_cache.bytes, cache.hydration_failures, hydration.attempts, hydration.successes, hydration.failures, hydration.backoff_skips, hydration.capacity_skips, hydration.pruned_entries, hydration.pruned_bytes, hydration.mirror_hits, hydration.mirror_misses, hydration.mirror_fills, hydration.mirror_failures, hydration.mirror_bytes_served, media.attempts, media.successes, media.failures, media.pruned_entries, media.pruned_bytes, uptime },
         );
+        try @import("../../telemetry.zig").writePrometheus(&output.writer);
         return respond(req, .ok, "text/plain; version=0.0.4; charset=utf-8", output.written(), &.{.{ .name = "cache-control", .value = "no-store" }});
     }
     if (std.mem.eql(u8, path, "/api/v1/status")) {

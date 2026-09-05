@@ -1,4 +1,5 @@
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
 const contract = @import("media_contract.zig");
 const storage = @import("runtime_storage.zig");
 const bss = @import("bss.zig");
@@ -43,7 +44,9 @@ pub const Sync = struct {
             if (try store.beatmapMedia(self.allocator, request.set_id, .cover)) |asset| return asset;
         }
 
+        const pending = telemetry.work.enter(.media_slots);
         self.fetch_slots.waitUncancelable(self.io);
+        pending.leave();
         defer self.fetch_slots.post(self.io);
 
         // Another request may have filled the same cache entry while this one

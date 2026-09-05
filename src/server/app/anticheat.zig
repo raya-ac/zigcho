@@ -206,6 +206,8 @@ pub fn gateUnreliableCursorEvidence(result: *anticheat_abi.GameplayResultV1) voi
 
 pub fn observeStableGameplay(self: anytype, user_id: i32, score: stable_score.Submission, replay: []const u8, map: []const u8, performance: pp.Output, elapsed_ms: u32, replay_match_count: u32) StableGameplayObservation {
     if (replay.len == 0) return .none;
+    const timer = @import("../../telemetry.zig").Timer.start(.replay_analysis);
+    defer timer.finish();
     if (score.mode != 0) {
         anticheat_replay.validatePayload(self.allocator, replay, score.mode) catch |err| {
             std.log.warn("event=anticheat_replay_parse_failed user_id={d} ruleset={d} error={t}", .{ user_id, score.mode, err });

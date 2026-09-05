@@ -1,4 +1,5 @@
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
 
 pub const c = @cImport({
     @cInclude("libpq-fe.h");
@@ -84,6 +85,8 @@ pub fn connect(conninfo: [:0]const u8) !*c.PGconn {
 }
 
 pub fn exec(conn: *c.PGconn, sql: [:0]const u8) !void {
+    const timer = telemetry.Timer.start(.postgres_query);
+    defer timer.finish();
     const raw = c.PQexec(conn, sql.ptr) orelse return error.DatabaseQueryFailed;
     defer c.PQclear(raw);
     if (!statusOk(c.PQresultStatus(raw))) {
@@ -93,6 +96,8 @@ pub fn exec(conn: *c.PGconn, sql: [:0]const u8) !void {
 }
 
 pub fn query(conn: *c.PGconn, sql: [:0]const u8) !Result {
+    const timer = telemetry.Timer.start(.postgres_query);
+    defer timer.finish();
     const raw = c.PQexec(conn, sql.ptr) orelse return error.DatabaseQueryFailed;
     errdefer c.PQclear(raw);
     if (!statusOk(c.PQresultStatus(raw))) {
@@ -132,6 +137,8 @@ pub fn decodeBytea(allocator: std.mem.Allocator, text_value: []const u8) ![]u8 {
 }
 
 pub fn queryParams(allocator: std.mem.Allocator, conn: *c.PGconn, sql: [:0]const u8, params: []const ?[]const u8) !Result {
+    const timer = telemetry.Timer.start(.postgres_query);
+    defer timer.finish();
     const values = try allocator.alloc(?[*:0]const u8, params.len);
     defer allocator.free(values);
     const owned = try allocator.alloc(?[:0]u8, params.len);
@@ -249,7 +256,14 @@ pub const Pool = struct {
     };
 
     pub fn acquire(self: *Pool) Lease {
+        const acquire_timer = telemetry.Timer.start(.postgres_pool_acquire);
+        defer acquire_timer.finish();
+        const pending = telemetry.work.enter(.postgres_pool);
+        defer pending.leave();
+        var wait_ns: u64 = 0;
+        defer telemetry.observe(.postgres_pool_wait, wait_ns);
         while (true) {
+            const waiting_since = telemetry.clock.now();
             self.mutex.lockUncancelable(self.io);
             var selected: ?usize = null;
             for (self.in_use, 0..) |busy, index| {
@@ -261,11 +275,14 @@ pub const Pool = struct {
             if (selected == null) {
                 self.available.waitUncancelable(self.io, &self.mutex);
                 self.mutex.unlock(self.io);
+                wait_ns +|= telemetry.clock.elapsed(waiting_since) orelse 0;
                 continue;
             }
             const index = selected.?;
             const conn = self.connections[index];
             self.mutex.unlock(self.io);
+
+            wait_ns +|= telemetry.clock.elapsed(waiting_since) orelse 0;
 
             // Reconnection may block on the network, so never hold the pool's
             // availability lock while libpq resets one leased connection.

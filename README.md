@@ -37,6 +37,8 @@ production binaries come from the pinned Linux GitHub runner, not my Mac. each r
 
 ## layout
 
+runtime timings are documented in [src/telemetry/README.md](src/telemetry/README.md). `/metrics/runtime` is the local-only scrape that stays independent of database queries; `/metrics` also includes the database and cache totals.
+
 - `src/main.zig` — the small server entrypoint
 - `src/server/` — app state, HTTP routing, Stable and lazer routes, IRC, workers and command-line jobs
 - `src/postgres_store.zig` — the storage compatibility facade

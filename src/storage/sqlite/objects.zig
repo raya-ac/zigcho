@@ -17,6 +17,8 @@ pub fn putVerifiedObject(self: *Store, object_key: []const u8, content_type: []c
 
 pub fn storeReplayObject(self: *Store, source: ReplaySource, score_id: i64, data: []const u8) !bool {
     if (!self.object_store.enabled()) return false;
+    const timer = @import("../../telemetry.zig").Timer.start(.replay_archive);
+    defer timer.finish();
     if (score_id <= 0 or data.len == 0 or data.len > max_replay_object_bytes) return error.InvalidReplayObject;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});

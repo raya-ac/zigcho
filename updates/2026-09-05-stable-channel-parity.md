@@ -14,10 +14,12 @@ the next comparison also passed the whole multiplayer transcript. the follow-up 
 
 presence packets no longer hardcode everyone's rank to zero. login uses its existing stats snapshot, and poll requests prepare ranks outside the session lock, with generation and selected-mod checks before sending them. polling uses the existing bounded PostgreSQL batch query instead of adding one query per online player. the hosted gate also has a Stable-only correction scope; it still builds and boots the production binary and checks PostgreSQL query parity.
 
-the full release gate has now passed, including PostgreSQL integration. the latest live comparison passes nine cases and fails three. missing submission fields, reconnect assertions and chat setup were mistakes in our harness; those have been corrected. leaderboards now return their actual map rating.
+the full release gate has passed, including PostgreSQL integration. missing submission fields, reconnect assertions and chat setup were mistakes in our harness; those have been corrected. leaderboards now return their actual map rating.
 
 the score chart now includes the map's known update date and formats empty values and decimals the way Stable expects. the rounding edge case was caught and fixed locally before pushing. our pp system stays exactly as it is; matching an older reference's number was never the goal. kai links and our achievement catalogue stay too.
 
-the reference also throws an error on its final presence-all request. the new score-format candidate still needs its hosted verification before deployment and the Discord announcement. the earlier candidate is staged, not live.
+the final comparison passes 11 cases, including score submission, duplicate retry and replay readback. the remaining failure is the reference throwing an error on its final presence-all request. we aren't making our pp, medals, links or rank tie-breaks identical to someone else's server to get a green comparison.
+
+deployment stopped before switching the service because the off-host backup transfer timed out. the restore check passed and the local backup is retained. the current server is still healthy; this candidate is staged, not live, and the Discord release post is waiting on that transfer fix.
 
 this is source work, not a deployment or a claim of complete compatibility. a clean full differential run is still pending; Ari has deferred installed Stable-client acceptance for now. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.

@@ -12,6 +12,12 @@
           "created_at": "2026-09-05T11:52:19+09:30",
           "commit": "",
           "sha256": "d0960a370250a530b1728efef5489f32d4ab353658b4785a7939dd830e2e85f2"
+        },
+        {
+          "name": "2026-09-05-isolated-performance-runner.md",
+          "created_at": "2026-09-05T12:14:00+09:30",
+          "commit": "09a2bf3c724dd25e38ee5404954eb852559e765c",
+          "sha256": "40d5e90851526c967aa30980bd28b9ea4d596c5144df51061e6ed51c3a4741fb"
         }
       ]
     },

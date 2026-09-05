@@ -146,6 +146,23 @@ jobs:
           hash=$(awk '{print $1}' binary/zigcho.sha256)
           (cd harness && python -m benchmarks.mixed run --players "$PLAYERS" --seconds "$PHASE_SECONDS" --server-pid "$server_pid" --server-commit "$SERVER_COMMIT" --server-sha256 "$hash" --output "$workspace/reports/baseline.json" --allow-local-mutations)
           jq -e 'all(.phases[]; .correctness.ok and all(.families[]; .failed == 0))' reports/baseline.json
+      - name: capture the measured profile query plans
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -f reports/baseline.json && test -n "${SERVER_COMMIT:-}"; then
+            git fetch --no-tags --depth=1 origin "$SERVER_COMMIT"
+            query_path=database/postgres/queries/profile_firsts_all.sql
+            if git cat-file -e "$SERVER_COMMIT:$query_path" 2>/dev/null; then
+              for player_id in 10000 19999; do
+                {
+                  printf 'PREPARE measured_profile(integer,smallint,text) AS\n'
+                  git show "$SERVER_COMMIT:$query_path"
+                  printf '\nEXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) EXECUTE measured_profile(%s,0,\047vanilla\047);\n' "$player_id"
+                } | PGOPTIONS='-c statement_timeout=15000' psql "$ZIGCHO_BENCHMARK_POSTGRES_URL" --no-psqlrc -qAt -v ON_ERROR_STOP=1 >"reports/profile-plan-$player_id.json"
+              done
+            fi
+          fi
       - name: retain fixture diagnostics
         if: always()
         run: |

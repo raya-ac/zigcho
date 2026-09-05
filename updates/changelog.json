@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 55,
+      "version": "2026.905.5",
+      "display_version": "stable channel compatibility candidate",
+      "created_at": "2026-09-05T08:10:00Z",
+      "updates": [
+        {
+          "name": "2026-09-05-stable-channel-parity.md",
+          "created_at": "2026-09-05T08:10:00Z",
+          "commit": "",
+          "sha256": "0d4517db6f5477f8bb761f42baec47dcbe567e36aafc600ed45d9e0115faa6b8"
+        }
+      ]
+    },
+    {
       "id": 54,
       "version": "2026.905.4",
       "display_version": "zigcho release 2.7.1",

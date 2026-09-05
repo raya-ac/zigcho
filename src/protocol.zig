@@ -298,9 +298,31 @@ pub fn writeMessagePacket(w: *Writer, packet: ServerPacket, sender: []const u8, 
 }
 
 pub fn writeChannel(w: *Writer, name: []const u8, topic: []const u8, count: i32) !void {
+    const wire_count = std.math.cast(u16, count) orelse return error.InvalidChannelCount;
     const start = try w.begin(.channel_info);
     try w.string(name);
     try w.string(topic);
-    try w.int(i32, count);
+    try w.int(u16, wire_count);
     w.finish(start);
+}
+
+test "channel info matches an independent two-byte count fixture" {
+    var writer = Writer.init(std.testing.allocator);
+    defer writer.deinit();
+    try writeChannel(&writer, "#osu", "general", 513);
+    try writer.packetEmpty(.pong);
+    // Literal protocol bytes, not decoded with this module's own reader:
+    // packet 65, 17-byte payload, two osu strings, u16(513), then packet 8.
+    const expected = [_]u8{
+        0x41, 0,   0,   0x11, 0,   0,   0,
+        0x0b, 4,   '#', 'o',  's', 'u', 0x0b,
+        7,    'g', 'e', 'n',  'e', 'r', 'a',
+        'l',  1,   2,   8,    0,   0,   0,
+        0,    0,   0,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, writer.bytes());
+    const length = writer.bytes().len;
+    try std.testing.expectError(error.InvalidChannelCount, writeChannel(&writer, "#osu", "general", -1));
+    try std.testing.expectError(error.InvalidChannelCount, writeChannel(&writer, "#osu", "general", 65536));
+    try std.testing.expectEqual(length, writer.bytes().len);
 }

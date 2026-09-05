@@ -246,6 +246,20 @@ fn expectPacket(data: []const u8, wanted: protocol.ServerPacket) !void {
     return error.MissingPacket;
 }
 
+fn expectChannelInfo(data: []const u8, name: []const u8, topic: []const u8, count: u16) !void {
+    var reader: protocol.Reader = .{ .data = data };
+    while (try reader.next()) |packet| {
+        if (@intFromEnum(packet.id) != @intFromEnum(protocol.ServerPacket.channel_info)) continue;
+        var payload: protocol.PayloadReader = .{ .data = packet.payload };
+        if (!std.mem.eql(u8, try payload.string(), name)) continue;
+        try std.testing.expectEqualStrings(topic, try payload.string());
+        try std.testing.expectEqual(count, try payload.int(u16));
+        try std.testing.expectEqual(payload.data.len, payload.pos);
+        return;
+    }
+    return error.MissingPacket;
+}
+
 fn expectIntListContains(data: []const u8, wanted: protocol.ServerPacket, values: []const i32) !void {
     var reader: protocol.Reader = .{ .data = data };
     while (try reader.next()) |packet| {
@@ -3577,6 +3591,61 @@ test "public chat does not echo through the server to its sender" {
     try std.testing.expectEqualStrings("one message", other.queue.items);
 }
 
+test "stable public channel join and part update every readable channel list" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/channel-updates.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const actor = try sessions.create(try testSessionUser(std.testing.allocator, 80, "channel_actor"), 0, 0, 0);
+    const member = try sessions.create(try testSessionUser(std.testing.allocator, 81, "channel_member"), 0, 0, 0);
+    const observer = try sessions.create(try testSessionUser(std.testing.allocator, 82, "channel_observer"), 0, 0, 0);
+    const restricted = try sessions.create(try testSessionUser(std.testing.allocator, 83, "channel_restricted"), 0, 0, 0);
+    restricted.user.restricted = true;
+    const suppressed = try sessions.create(try testSessionUser(std.testing.allocator, 84, "channel_suppressed"), 0, 0, 0);
+    suppressed.presence_suppressed = true;
+
+    for ([_][]const u8{ "#osu", "#announce" }) |channel| {
+        try std.testing.expect(sessions.join(member, channel));
+        var name = protocol.Writer.init(std.testing.allocator);
+        defer name.deinit();
+        try name.string(channel);
+        const join = try clientPayloadPacket(std.testing.allocator, .channel_join, name.bytes());
+        defer std.testing.allocator.free(join);
+        const part = try clientPayloadPacket(std.testing.allocator, .channel_part, name.bytes());
+        defer std.testing.allocator.free(part);
+        for ([_][]const u8{ join, part }) |request| {
+            const joining = request.ptr == join.ptr;
+            const reply = try bancho.poll(std.testing.allocator, &store, &sessions, actor, request);
+            defer std.testing.allocator.free(reply);
+            try expectPacketIds(reply, &.{ if (joining) .channel_join_success else .channel_kick, .channel_info });
+            try std.testing.expectEqual(joining, actor.joined(channel));
+            for ([_]*sessions_mod.Session{ member, observer }) |recipient| {
+                const update = try bancho.poll(std.testing.allocator, &store, &sessions, recipient, "");
+                defer std.testing.allocator.free(update);
+                try expectPacketIds(update, &.{.channel_info});
+                var packets: protocol.Reader = .{ .data = update };
+                var payload: protocol.PayloadReader = .{ .data = (try packets.next()).?.payload };
+                try std.testing.expectEqualStrings(channel, try payload.string());
+                try std.testing.expectEqualStrings(if (std.mem.eql(u8, channel, "#osu")) "general" else "updates", try payload.string());
+                try std.testing.expectEqual(@as(u16, if (joining) 2 else 1), try payload.int(u16));
+                try std.testing.expectEqual(payload.data.len, payload.pos);
+            }
+            try std.testing.expectEqual(@as(usize, 0), restricted.queue.items.len);
+            try std.testing.expectEqual(@as(usize, 0), suppressed.queue.items.len);
+            const duplicate = try bancho.poll(std.testing.allocator, &store, &sessions, actor, request);
+            defer std.testing.allocator.free(duplicate);
+            try std.testing.expectEqual(@as(usize, 0), duplicate.len);
+            try std.testing.expectEqual(@as(usize, 0), member.queue.items.len);
+            try std.testing.expectEqual(@as(usize, 0), observer.queue.items.len);
+        }
+    }
+}
+
 test "poll by token survives session replacement and rejects the stale token" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5565,6 +5634,7 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     defer std.testing.allocator.free(created);
     try expectPacketIds(created, &.{ .channel_join_success, .channel_info, .channel_kick, .match_join_success });
     try expectStringPacket(created, .channel_join_success, "#multiplayer");
+    try expectChannelInfo(created, "#multiplayer", "MID 0's multiplayer channel.", 1);
     try expectStringPacket(created, .channel_kick, "#lobby");
     const match = sessions.matchById(0).?;
     try std.testing.expectEqual(@as(?u16, 0), host.match_id);
@@ -5579,8 +5649,18 @@ test "stable multiplayer room lifecycle keeps lobby slot and host state coherent
     defer std.testing.allocator.free(guest_discovery);
     var discovery_reader: protocol.Reader = .{ .data = guest_discovery };
     try std.testing.expectEqual(protocol.ServerPacket.channel_info, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
-    try std.testing.expectEqual(protocol.ServerPacket.new_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
     try std.testing.expectEqual(protocol.ServerPacket.update_match, @as(protocol.ServerPacket, @enumFromInt(@intFromEnum((try discovery_reader.next()).?.id))));
+    try std.testing.expect((try discovery_reader.next()) == null);
+    const creator_events = try bancho.poll(std.testing.allocator, &store, &sessions, host, empty);
+    defer std.testing.allocator.free(creator_events);
+    try expectPacketIds(creator_events, &.{ .update_match, .send_message });
+    var creator_reader: protocol.Reader = .{ .data = creator_events };
+    _ = try creator_reader.next();
+    var created_message: protocol.PayloadReader = .{ .data = (try creator_reader.next()).?.payload };
+    try std.testing.expectEqualStrings("kai", try created_message.string());
+    try std.testing.expectEqualStrings("Match created by host.", try created_message.string());
+    try std.testing.expectEqualStrings("#multiplayer", try created_message.string());
+    try std.testing.expectEqual(@as(i32, 3), try created_message.int(i32));
 
     const wrong_join = try clientJoinMatchPacket(std.testing.allocator, 0, "wrong");
     defer std.testing.allocator.free(wrong_join);
@@ -6349,6 +6429,7 @@ test "stable spectating scopes lifecycle frames chat and failure packets to one 
     const first_joined = try bancho.poll(std.testing.allocator, &store, &sessions, first, "");
     defer std.testing.allocator.free(first_joined);
     try expectPacketIds(first_joined, &.{ .channel_join_success, .channel_info });
+    try expectChannelInfo(first_joined, "#spectator", "spectate_host's spectator channel.", 2);
     const host_first_join = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
     defer std.testing.allocator.free(host_first_join);
     try expectPacketIds(host_first_join, &.{ .channel_join_success, .channel_info, .channel_info, .spectator_joined });
@@ -6440,10 +6521,10 @@ test "stable spectating scopes lifecycle frames chat and failure packets to one 
     try expectPacketIds(first_stopped, &.{.channel_kick});
     const host_first_left = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
     defer std.testing.allocator.free(host_first_left);
-    try expectPacketIds(host_first_left, &.{ .channel_info, .spectator_left });
+    try expectPacketIds(host_first_left, &.{ .channel_info, .channel_info, .spectator_left });
     const second_first_left = try bancho.poll(std.testing.allocator, &store, &sessions, second, "");
     defer std.testing.allocator.free(second_first_left);
-    try expectPacketIds(second_first_left, &.{ .channel_info, .fellow_spectator_left });
+    try expectPacketIds(second_first_left, &.{ .channel_info, .fellow_spectator_left, .channel_info });
 
     const start_outsider = try clientIntPacket(std.testing.allocator, .start_spectating, outsider.user.id);
     defer std.testing.allocator.free(start_outsider);
@@ -6455,7 +6536,7 @@ test "stable spectating scopes lifecycle frames chat and failure packets to one 
     try expectPacketIds(second_switched, &.{ .channel_kick, .channel_join_success, .channel_info });
     const old_host_empty = try bancho.poll(std.testing.allocator, &store, &sessions, host, "");
     defer std.testing.allocator.free(old_host_empty);
-    try expectPacketIds(old_host_empty, &.{ .channel_kick, .spectator_left });
+    try expectPacketIds(old_host_empty, &.{ .channel_info, .channel_kick, .spectator_left });
     const new_host_join = try bancho.poll(std.testing.allocator, &store, &sessions, outsider, "");
     defer std.testing.allocator.free(new_host_join);
     try expectPacketIds(new_host_join, &.{ .channel_join_success, .channel_info, .channel_info, .spectator_joined });

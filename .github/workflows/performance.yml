@@ -1,0 +1,145 @@
+name: isolated mixed-load baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_run:
+        description: successful release-gates run whose exact binary will be measured
+        required: true
+        type: string
+      players:
+        description: concurrent synthetic Stable players (100..2000)
+        default: '1000'
+        type: string
+      seconds:
+        description: seconds per cold-gameplay and warm phase (30..3600)
+        default: '120'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: isolated-performance
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      ZIGCHO_BENCHMARK_POSTGRES_URL: postgresql://zigcho:benchmark-db-fixture@127.0.0.1:18432/zigcho_benchmark
+      ZIGCHO_POSTGRES_URL: host=127.0.0.1 port=18432 dbname=zigcho_benchmark user=zigcho password=benchmark-db-fixture connect_timeout=5
+      AWS_ACCESS_KEY_ID: benchmark-access
+      AWS_SECRET_ACCESS_KEY: benchmark-secret-isolated
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: zigcho/stable-conformance
+          ref: a2d8df0115bd177ac08ed23f2c12e4ee2b8ace54
+          path: harness
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: verify and fetch the released binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ inputs.release_run }}
+          PLAYERS: ${{ inputs.players }}
+          PHASE_SECONDS: ${{ inputs.seconds }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_RUN" =~ ^[0-9]+$ && "$PLAYERS" =~ ^[0-9]+$ && "$PHASE_SECONDS" =~ ^[0-9]+$ ]]
+          (( PLAYERS >= 100 && PLAYERS <= 2000 && PHASE_SECONDS >= 30 && PHASE_SECONDS <= 3600 ))
+          mkdir -p reports binary
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN" >reports/release-run.json
+          jq -e '.conclusion == "success" and .path == ".github/workflows/release-gates.yml" and .head_repository.full_name == "zigcho/zigcho"' reports/release-run.json
+          commit=$(jq -r .head_sha reports/release-run.json)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name "zigcho-linux-x64-$commit" --dir binary
+          (cd binary && sha256sum --check zigcho.sha256)
+          chmod +x binary/zigcho
+          printf 'SERVER_COMMIT=%s\nPLAYERS=%s\nPHASE_SECONDS=%s\n' "$commit" "$PLAYERS" "$PHASE_SECONDS" >>"$GITHUB_ENV"
+          git -C harness rev-parse HEAD >reports/harness-commit.txt
+          cp binary/zigcho.sha256 reports/server.sha256
+      - name: install isolated workload dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpq5 libsqlite3-0 postgresql-client
+          python -m pip install --no-build-isolation --require-hashes -r harness/benchmarks/requirements.txt
+          python -m pip freeze >reports/python-packages.txt
+          docker pull postgres:17-bookworm
+          docker pull minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+          docker image inspect postgres:17-bookworm minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e --format '{{json .RepoDigests}}' >reports/container-digests.jsonl
+      - name: run the disposable database and HTTPS object store
+        run: |
+          set -euo pipefail
+          cert_dir=$(mktemp -d "$RUNNER_TEMP/benchmark-certs.XXXXXX")
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$cert_dir/private.key" -out "$cert_dir/public.crt" -days 1 -subj '/CN=localhost' -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' 2>/dev/null
+          sudo cp "$cert_dir/public.crt" /usr/local/share/ca-certificates/zigcho-benchmark.crt
+          sudo update-ca-certificates >/dev/null
+          docker run -d --name zigcho-benchmark-pg --network host -e POSTGRES_DB=zigcho_benchmark -e POSTGRES_USER=zigcho -e POSTGRES_PASSWORD=benchmark-db-fixture postgres:17-bookworm -p 18432 -c listen_addresses=127.0.0.1 -c shared_preload_libraries=pg_stat_statements -c track_io_timing=on
+          docker run -d --name zigcho-benchmark-objects --network host -v "$cert_dir:/root/.minio/certs:ro" -e MINIO_ROOT_USER=benchmark-access -e MINIO_ROOT_PASSWORD=benchmark-secret-isolated minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e server /data --address 127.0.0.1:19000 --console-address 127.0.0.1:19001
+          for attempt in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 18432 -q && curl --fail --silent --cacert "$cert_dir/public.crt" https://127.0.0.1:19000/minio/health/live; then break; fi
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 18432 -q
+          aws --endpoint-url https://127.0.0.1:19000 --ca-bundle "$cert_dir/public.crt" s3api create-bucket --bucket zigcho-benchmark
+      - name: seed, reset caches and measure the mixed workload
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          workspace="$GITHUB_WORKSPACE"
+          runtime=$(mktemp -d "$RUNNER_TEMP/zigcho-benchmark.XXXXXX")
+          cp harness/benchmarks/config.ini "$runtime/config.ini"
+          server_pid=''
+          cleanup() { if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; }
+          trap cleanup EXIT
+          start_server() {
+            (cd "$runtime" && exec "$workspace/binary/zigcho" 127.0.0.1 18090) >>reports/server.log 2>&1 &
+            server_pid=$!
+            for attempt in $(seq 1 60); do
+              if curl --fail --silent http://127.0.0.1:18090/metrics/runtime >/dev/null; then return; fi
+              kill -0 "$server_pid"
+              sleep 1
+            done
+            return 1
+          }
+          start_server
+          (cd harness && python -m benchmarks.mixed seed --players "$PLAYERS" --output "$workspace/reports/seed.json" --allow-local-mutations)
+          cleanup
+          server_pid=''
+          docker restart zigcho-benchmark-pg zigcho-benchmark-objects >/dev/null
+          for attempt in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 18432 -q && curl --fail --silent https://127.0.0.1:19000/minio/health/live; then break; fi
+            sleep 1
+          done
+          sync
+          # This workflow only runs on a fresh hosted VM, never the Mac or origin.
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+          printf 'server, PostgreSQL and MinIO restarted; Linux page caches dropped before bootstrap\n' >reports/cache-reset.txt
+          start_server
+          hash=$(awk '{print $1}' binary/zigcho.sha256)
+          (cd harness && python -m benchmarks.mixed run --players "$PLAYERS" --seconds "$PHASE_SECONDS" --server-pid "$server_pid" --server-commit "$SERVER_COMMIT" --server-sha256 "$hash" --output "$workspace/reports/baseline.json" --allow-local-mutations)
+          jq -e 'all(.phases[]; .correctness.ok and all(.families[]; .failed == 0))' reports/baseline.json
+      - name: retain fixture diagnostics
+        if: always()
+        run: |
+          docker logs zigcho-benchmark-pg >reports/postgres.log 2>&1 || true
+          docker logs zigcho-benchmark-objects >reports/objects.log 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: isolated-baseline-${{ github.run_id }}
+          path: reports
+          retention-days: 14
+          if-no-files-found: error

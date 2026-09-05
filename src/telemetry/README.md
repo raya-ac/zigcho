@@ -19,3 +19,5 @@ the histogram buckets are cumulative Prometheus buckets in seconds. the p50, p95
 pool/media acquisitions and in-flight hydration work have depth, oldest age and rejection counters. these are existing operations, not a new durable queue. observation slots are fixed at 4096 per kind. if that observation capacity is exhausted, `zigcho_work_untracked_total` rises; it does not reject application work or pretend that the partial depth is complete.
 
 none of this moves score work into the background or increases the pool. the first baseline targets 1,000 concurrent players in isolation. an hour at peak and a longer soak still need their own evidence before making a production capacity claim.
+
+run `.github/workflows/performance.yml` with a successful full release-gate run ID. it measures that existing binary with the pinned `zigcho/stable-conformance` workload in disposable PostgreSQL and HTTPS MinIO services. reports retain both client-visible latency and server histogram deltas. `/metrics/runtime` avoids database work but still shares HTTP admission, so an unavailable scrape is recorded as such during overload.

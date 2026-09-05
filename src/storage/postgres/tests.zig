@@ -1624,6 +1624,13 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(custom_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), custom_placement.rank);
     try std.testing.expectEqual(Store.BeatmapRating.can_rate, try store.rateBeatmap(user_id, second_md5, null));
+    {
+        var lease = store.pool.acquire();
+        defer lease.release();
+        var updated_date = try postgres.queryParams(std.testing.allocator, lease.conn, "UPDATE zigcho.beatmaps SET last_update=1788566400 WHERE md5=$1", &.{second_md5});
+        updated_date.deinit();
+    }
+    try std.testing.expectEqual(@as(i64, 1788566400), (try store.beatmapForScore(second_md5)).?.last_update);
     const unrated_board = try store.stableLeaderboard(std.testing.allocator, user, second_md5, 0, 0, 0);
     defer std.testing.allocator.free(unrated_board);
     var unrated_lines = std.mem.splitScalar(u8, unrated_board, '\n');

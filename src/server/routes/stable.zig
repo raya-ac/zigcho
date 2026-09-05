@@ -632,7 +632,7 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
             }
         }
         const unlocked_achievements = try self.store.newAchievementsForScore("stable", score_id);
-        const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes }, placed, before_stats, after_stats, performance.pp, unlocked_achievements);
+        const response_body = try stable_response.scoreSubmission(self.allocator, user.id, score_id, score, .{ .id = map_state.id, .set_id = map_state.set_id, .plays = map_state.plays, .passes = map_state.passes, .last_update = map_state.last_update }, placed, before_stats, after_stats, performance.pp, unlocked_achievements);
         defer self.allocator.free(response_body);
         return respond(req, .ok, "text/plain", response_body, &.{});
     }

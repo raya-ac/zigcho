@@ -54,7 +54,7 @@ the follow-up review also found a hardcoded zero in the presence packet's global
 
 the reference bot has random status text and deliberately off-map coordinates. the harness checks each bot's presence and zero gameplay statistics independently, then compares ordinary players unchanged. Kai stays id 3; the reference stays id 1. that is a declared branding boundary, not exact bot parity.
 
-the calculators are different too. this Zigcho build uses `stable-rosu-4.0.1-lazer-2026.730.0-1129a7e-akatsuki-591de0d.1`; the pinned reference uses `akatsuki-pp-py==1.0.5`. the runner records both versions. numerical score/stat differences remain failures. the delayed-score fixture's identical-calculator precondition is therefore not yet satisfied, and this pass does not change the production calculator to manufacture a green result.
+the calculators are different too. this Zigcho build uses `stable-rosu-4.0.1-lazer-2026.730.0-1129a7e-akatsuki-591de0d.1`; the pinned reference uses `akatsuki-pp-py==1.0.5`. the runner records both versions. Ari confirmed that this difference is intentional: the reference's pp value is not an equality oracle for Zigcho. the earlier runs still report their raw differences, but those numbers alone are not a bug or a release blocker. this pass does not change either calculator.
 
 ## latest failed comparison and local audit
 
@@ -75,3 +75,9 @@ the two score cases both return HTTP 200 and the expected score-chart markers, b
 the final presence-all request returns HTTP 500 on the reference. its traceback reaches `UserPresenceRequestAll.handle`, `packets.user_presence`, then `Player.gm_stats`, which raises `KeyError: vn!std`. Zigcho returns HTTP 200 with a packet stream. the existing reference-routing exception does not accept this error, so the case still fails; it is not called equivalent or silently passed.
 
 the artifact was hash-checked and staged at `/opt/zigcho/releases/74fbc6a`, **not activated**. its executable sha256 is `bbead2fa5e32eccaf6f38bf19ce48b7e8a212b07df73cf9059433ff1316fb7f1`. Ari explicitly chose to hold deployment until score-response parity is complete. production remains on the earlier release, and no release announcement was posted. changing production PP or replacing the achievement catalogue just to match the reference is not authorized by this diagnostic result.
+
+## score-chart formatting follow-up
+
+the next candidate supplies the stored map update date through both database backends, leaves unknown dates empty, emits empty initial chart values, and uses the reference's decimal shape and ties-to-even rounding. a literal three-line response fixture keeps the supplied 126.064pp unchanged. a local test caught the `96.125` rounding tie before push; the corrected formatter passes in Debug and ReleaseSafe. these are serializer changes, not pp or aggregate-stat recalculations. no schema change is needed.
+
+the latest candidate still needs its own hosted gate and live comparison. previous-best chart fields beyond first-score fixtures and installed-client rendering are not claimed as newly verified. site links, achievement catalogues and deterministic equal-pp ranking remain product contracts, not reasons to replace Zigcho's calculations with the reference's.

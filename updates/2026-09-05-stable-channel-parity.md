@@ -16,6 +16,8 @@ presence packets no longer hardcode everyone's rank to zero. login uses its exis
 
 the full release gate has now passed, including PostgreSQL integration. the latest live comparison passes nine cases and fails three. missing submission fields, reconnect assertions and chat setup were mistakes in our harness; those have been corrected. leaderboards now return their actual map rating.
 
-the remaining score responses differ in formatting, pp and achievements. the reference also throws an error on its final presence-all request. deployment and the Discord announcement are held until score-response parity is sorted out. the candidate is staged, not live.
+the score chart now includes the map's known update date and formats empty values and decimals the way Stable expects. the rounding edge case was caught and fixed locally before pushing. our pp system stays exactly as it is; matching an older reference's number was never the goal. kai links and our achievement catalogue stay too.
+
+the reference also throws an error on its final presence-all request. the new score-format candidate still needs its hosted verification before deployment and the Discord announcement. the earlier candidate is staged, not live.
 
 this is source work, not a deployment or a claim of complete compatibility. a clean full differential run is still pending; Ari has deferred installed Stable-client acceptance for now. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.

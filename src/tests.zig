@@ -9239,7 +9239,8 @@ test "stable ratings persist one vote per player and keep protocol states distin
 
     try std.testing.expectEqual(storage.Store.BeatmapRating.no_exist, try store.rateBeatmap(1, "00000000000000000000000000000000", null));
     try std.testing.expectEqual(storage.Store.BeatmapRating.not_ranked, try store.rateBeatmap(1, &hash, null));
-    try store.exec("UPDATE beatmaps SET status=3");
+    try store.exec("UPDATE beatmaps SET status=3,last_update=1788566400");
+    try std.testing.expectEqual(@as(i64, 1788566400), (try store.beatmapForScore(&hash)).?.last_update);
     const empty_board = try store.stableLeaderboard(std.testing.allocator, .{ .id = 1, .name = "ari", .safe_name = "ari" }, &hash, 0, 0, 0);
     defer std.testing.allocator.free(empty_board);
     var empty_lines = std.mem.splitScalar(u8, empty_board, '\n');

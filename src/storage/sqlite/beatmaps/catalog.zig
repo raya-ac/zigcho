@@ -274,13 +274,13 @@ pub fn beatmapSetIdForChecksum(self: *Store, checksum: []const u8) !?i32 {
 pub fn beatmapForScore(self: *Store, md5: []const u8) !?BeatmapForScore {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    const sql = "SELECT id,set_id,status,plays,passes FROM beatmaps WHERE md5=?1";
+    const sql = "SELECT id,set_id,status,plays,passes,coalesce(last_update,0) FROM beatmaps WHERE md5=?1";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
     defer _ = c.sqlite3_finalize(stmt);
     _ = c.sqlite3_bind_text(stmt, 1, md5.ptr, @intCast(md5.len), null);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-    return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4) };
+    return .{ .id = c.sqlite3_column_int(stmt, 0), .set_id = c.sqlite3_column_int(stmt, 1), .status = @intCast(c.sqlite3_column_int(stmt, 2)), .plays = c.sqlite3_column_int(stmt, 3), .passes = c.sqlite3_column_int(stmt, 4), .last_update = c.sqlite3_column_int64(stmt, 5) };
 }
 
 pub fn beatmapInfo(self: *Store, allocator: std.mem.Allocator, md5: []const u8) !?BeatmapInfo {

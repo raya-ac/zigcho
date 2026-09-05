@@ -386,7 +386,7 @@ pub const ObjectPurgeStats = struct {
     media_bytes: i64 = 0,
 };
 
-pub const BeatmapForScore = struct { id: i32, set_id: i32, status: i8, plays: i32, passes: i32 };
+pub const BeatmapForScore = struct { id: i32, set_id: i32, status: i8, plays: i32, passes: i32, last_update: i64 = 0 };
 
 pub const BeatmapRating = union(enum) {
     no_exist,

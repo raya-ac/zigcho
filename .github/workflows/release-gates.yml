@@ -317,7 +317,9 @@ jobs:
                 -Dtest-filter="Stable presence uses prepared ranks" \
                 -Dtest-filter="prepared Stable stats reject" \
                 -Dtest-filter="ranked stable PP is stored" \
-                -Dtest-filter="stable ratings persist"
+                -Dtest-filter="stable ratings persist" \
+                -Dtest-filter="stable score response" \
+                -Dtest-filter="stable chart decimals"
             done
           '
 

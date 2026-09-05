@@ -520,10 +520,10 @@ pub fn sourceStatsForUser(self: anytype, user_id: i32, mode: u8, source: domain.
 pub fn beatmapForScore(self: anytype, md5: []const u8) !?BeatmapForScore {
     var lease = self.pool.acquire();
     defer lease.release();
-    var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,status,plays,passes FROM zigcho.beatmaps WHERE md5=$1", &.{md5});
+    var result = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,status,plays,passes,coalesce(last_update,0) FROM zigcho.beatmaps WHERE md5=$1", &.{md5});
     defer result.deinit();
     if (result.rows() == 0) return null;
-    return .{ .id = try result.int(i32, 0, 0), .set_id = try result.int(i32, 0, 1), .status = try result.int(i8, 0, 2), .plays = try result.int(i32, 0, 3), .passes = try result.int(i32, 0, 4) };
+    return .{ .id = try result.int(i32, 0, 0), .set_id = try result.int(i32, 0, 1), .status = try result.int(i8, 0, 2), .plays = try result.int(i32, 0, 3), .passes = try result.int(i32, 0, 4), .last_update = try result.int(i64, 0, 5) };
 }
 
 pub fn scoreLeaderboardPlacement(self: anytype, score_id: i64) !?domain.ScorePlacement {

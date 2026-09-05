@@ -1,7 +1,7 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const stable_score = @import("../../../stable_score.zig");
 const beatmap = @import("../../../beatmap.zig");
 const server_control = @import("../../../server_control.zig");
@@ -11,11 +11,11 @@ const postgres_stable_sessions = @import("../../../postgres_stable_sessions.zig"
 const common = @import("../common.zig");
 const pg_score_maintenance = @import("../scores/maintenance.zig");
 
-const ClientHardware = sqlite_storage.ClientHardware;
-const HardwareEvidence = sqlite_storage.HardwareEvidence;
-const AnticheatExclusionScope = sqlite_storage.AnticheatExclusionScope;
-const AnticheatReviewLabel = sqlite_storage.AnticheatReviewLabel;
-const AnticheatObservation = sqlite_storage.AnticheatObservation;
+const ClientHardware = storage_contracts.ClientHardware;
+const HardwareEvidence = storage_contracts.HardwareEvidence;
+const AnticheatExclusionScope = storage_contracts.AnticheatExclusionScope;
+const AnticheatReviewLabel = storage_contracts.AnticheatReviewLabel;
+const AnticheatObservation = storage_contracts.AnticheatObservation;
 const schema_version = common.schema_version;
 
 pub fn insertHardwareMatchAudit(allocator: std.mem.Allocator, conn: *postgres.c.PGconn, target_user_id: i32, detail: []const u8) !void {
@@ -45,11 +45,11 @@ fn requireAnticheatExclusionAuthority(allocator: std.mem.Allocator, conn: *postg
         }
     }
     if (found != 3) return error.AnticheatExclusionUserNotFound;
-    if (!sqlite_storage.canManageAnticheatExclusion(actor_id, user_id, actor_restricted, actor_privileges, user_privileges)) return error.AnticheatExclusionForbidden;
+    if (!storage_contracts.canManageAnticheatExclusion(actor_id, user_id, actor_restricted, actor_privileges, user_privileges)) return error.AnticheatExclusionForbidden;
 }
 
 pub fn createAnticheatExclusion(self: anytype, actor_id: i32, user_id: i32, scope: AnticheatExclusionScope, duration_seconds: i64, reason: []const u8) !i64 {
-    const trimmed = try sqlite_storage.validateAnticheatExclusion(actor_id, user_id, duration_seconds, reason);
+    const trimmed = try storage_contracts.validateAnticheatExclusion(actor_id, user_id, duration_seconds, reason);
     var actor_buf: [24]u8 = undefined;
     var user_buf: [24]u8 = undefined;
     var duration_buf: [24]u8 = undefined;
@@ -88,7 +88,7 @@ pub fn anticheatExclusionTarget(self: anytype, exclusion_id: i64) !?i32 {
 }
 
 pub fn revokeAnticheatExclusion(self: anytype, actor_id: i32, exclusion_id: i64, reason: []const u8) !void {
-    const trimmed = try sqlite_storage.validateAnticheatExclusionRevocation(actor_id, exclusion_id, reason);
+    const trimmed = try storage_contracts.validateAnticheatExclusionRevocation(actor_id, exclusion_id, reason);
     var actor_buf: [24]u8 = undefined;
     var id_buf: [24]u8 = undefined;
     const actor = try std.fmt.bufPrint(&actor_buf, "{d}", .{actor_id});
@@ -114,7 +114,7 @@ pub fn revokeAnticheatExclusion(self: anytype, actor_id: i32, exclusion_id: i64,
 }
 
 pub fn recordAnticheatObservation(self: anytype, user_id: i32, observation: AnticheatObservation) !i64 {
-    try sqlite_storage.validateAnticheatObservation(user_id, observation);
+    try storage_contracts.validateAnticheatObservation(user_id, observation);
     var buffers: [33][64]u8 = undefined;
     var cursor: usize = 0;
     var params: [30]?[]const u8 = undefined;

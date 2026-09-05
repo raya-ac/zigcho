@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    changelog_mod.addImport("changelog_catalog", @import("build/changelog.zig").create(b) catch |err| std.debug.panic("cannot compile changelog manifest: {t}", .{err}));
     const build_io = b.graph.io;
     const updates_dir = std.Io.Dir.cwd().openDir(build_io, "updates", .{ .iterate = true }) catch |err| std.debug.panic("cannot open updates/: {t}", .{err});
     defer updates_dir.close(build_io);
@@ -85,6 +86,8 @@ pub fn build(b: *std.Build) void {
     const install_hotfix = b.addInstallArtifact(exe, .{});
     b.step("hotfix", "Build only the production server for a verified hotfix").dependOn(&install_hotfix.step);
 
+    const legacy_tools = b.step("legacy-tools", "Build the optional SQLite importers and PostgreSQL migration tool");
+
     const importer_mod = b.createModule(.{
         .root_source_file = b.path("src/import.zig"),
         .target = target,
@@ -97,7 +100,7 @@ pub fn build(b: *std.Build) void {
     importer_mod.addObjectFile(pp_library);
     const importer = b.addExecutable(.{ .name = "zigcho-import", .root_module = importer_mod });
     importer.step.dependOn(&cargo.step);
-    b.installArtifact(importer);
+    legacy_tools.dependOn(&b.addInstallArtifact(importer, .{}).step);
 
     const archive_importer_mod = b.createModule(.{
         .root_source_file = b.path("src/import_archive.zig"),
@@ -108,7 +111,7 @@ pub fn build(b: *std.Build) void {
     archive_importer_mod.linkSystemLibrary("sqlite3", .{});
     archive_importer_mod.addImport("database_sql", database_sql_mod);
     const archive_importer = b.addExecutable(.{ .name = "zigcho-import-archive", .root_module = archive_importer_mod });
-    b.installArtifact(archive_importer);
+    legacy_tools.dependOn(&b.addInstallArtifact(archive_importer, .{}).step);
 
     const postgres_importer_mod = b.createModule(.{
         .root_source_file = b.path("src/migrate_postgres.zig"),
@@ -127,7 +130,7 @@ pub fn build(b: *std.Build) void {
         postgres_importer_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
     }
     const postgres_importer = b.addExecutable(.{ .name = "zigcho-migrate-postgres", .root_module = postgres_importer_mod });
-    b.installArtifact(postgres_importer);
+    legacy_tools.dependOn(&b.addInstallArtifact(postgres_importer, .{}).step);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -161,6 +164,7 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const changelog_tests = b.addTest(.{ .root_module = changelog_mod, .filters = test_filters });
     const run_changelog_tests = b.addRunArtifact(changelog_tests);
+    b.step("test-changelog", "Check the embedded and remote changelog contracts").dependOn(&run_changelog_tests.step);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_changelog_tests.step);

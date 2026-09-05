@@ -1,7 +1,7 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const beatmap = @import("../../../beatmap.zig");
 const lazer = @import("../../../lazer.zig");
 const stable_mods = @import("../../../stable_mods.zig");
@@ -10,8 +10,8 @@ const common = @import("../common.zig");
 const pg_score_achievements = @import("../scores/achievements.zig");
 const pg_score_maintenance = @import("../scores/maintenance.zig");
 
-const ConsumedLazerScoreToken = sqlite_storage.ConsumedLazerScoreToken;
-const lazerStatus = sqlite_storage.Store.lazerStatus;
+const ConsumedLazerScoreToken = storage_contracts.ConsumedLazerScoreToken;
+const lazerStatus = storage_contracts.lazerStatus;
 
 pub fn consumedLazerScoreToken(self: anytype, user_id: i32, beatmap_id: i32, token_id: i64) !?ConsumedLazerScoreToken {
     var buffers: [3][64]u8 = undefined;
@@ -140,7 +140,7 @@ pub fn lazerRecentActivityJson(self: anytype, allocator: std.mem.Allocator, user
         if (row != 0) try output.writer.writeByte(',');
         const stable = std.mem.eql(u8, rows.value(row, 1), "stable");
         const mode = try rows.int(u8, row, 2);
-        const rank = if (stable) sqlite_storage.Store.stableGrade(mode, try rows.int(i32, row, 4), try rows.float(f64, row, 5), try rows.int(i32, row, 6), try rows.int(i32, row, 7), try rows.int(i32, row, 8), try rows.int(i32, row, 9)) else rows.value(row, 3);
+        const rank = if (stable) storage_contracts.stableGrade(mode, try rows.int(i32, row, 4), try rows.float(f64, row, 5), try rows.int(i32, row, 6), try rows.int(i32, row, 7), try rows.int(i32, row, 8), try rows.int(i32, row, 9)) else rows.value(row, 3);
         try output.writer.print("{{\"id\":{d},\"createdAt\":", .{@as(i64, @intCast(row + 1 + offset))});
         try common.jsonString(&output.writer, rows.value(row, 10));
         try output.writer.writeAll(",\"type\":\"rank\",\"scoreRank\":");
@@ -254,7 +254,7 @@ pub fn lazerUserScoresJson(self: anytype, allocator: std.mem.Allocator, user_id:
             .accuracy = try result.float(f64, row, 11),
             .max_combo = try result.int(i32, row, 12),
             .passed = try result.boolean(row, 13),
-            .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 32), try result.float(f64, row, 11), try result.int(i32, row, 33), try result.int(i32, row, 34), try result.int(i32, row, 35), try result.int(i32, row, 38)) else result.value(row, 14),
+            .rank = if (stable) storage_contracts.stableGrade(ruleset_id, try result.int(i32, row, 32), try result.float(f64, row, 11), try result.int(i32, row, 33), try result.int(i32, row, 34), try result.int(i32, row, 35), try result.int(i32, row, 38)) else result.value(row, 14),
             .mods_json = if (stable) mods.written() else result.value(row, 15),
             .statistics_json = if (stable) statistics.written() else result.value(row, 16),
             .maximum_statistics_json = result.value(row, 17),
@@ -350,7 +350,7 @@ pub fn lazerLeaderboardJson(self: anytype, allocator: std.mem.Allocator, request
             .accuracy = try result.float(f64, row, 13),
             .max_combo = try result.int(i32, row, 14),
             .passed = try result.boolean(row, 15),
-            .rank = if (stable) sqlite_storage.Store.stableGrade(ruleset_id, try result.int(i32, row, 24), try result.float(f64, row, 13), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 30)) else result.value(row, 16),
+            .rank = if (stable) storage_contracts.stableGrade(ruleset_id, try result.int(i32, row, 24), try result.float(f64, row, 13), try result.int(i32, row, 25), try result.int(i32, row, 26), try result.int(i32, row, 27), try result.int(i32, row, 30)) else result.value(row, 16),
             .mods_json = if (stable) mods.written() else result.value(row, 17),
             .statistics_json = if (stable) statistics.written() else result.value(row, 18),
             .maximum_statistics_json = result.value(row, 19),
@@ -544,7 +544,7 @@ pub fn updateLazerStatsWithConnection(self: anytype, conn: *postgres.c.PGconn, u
 }
 
 pub fn isLazerRoomScoreToken(token_id: i64) bool {
-    return sqlite_storage.Store.isLazerRoomScoreToken(token_id);
+    return storage_contracts.isLazerRoomScoreToken(token_id);
 }
 
 const lazer_room_score_token_tag: u64 = 0x7f_ff_ff_00_00_00_00_00;

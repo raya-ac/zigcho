@@ -9,4 +9,4 @@ tools/changelog-manifest.py --write
 tools/changelog-manifest.py --check
 ```
 
-the checked-in Zig history is still the startup fallback. new server releases should fold live-only entries back into that static list, but a normal changelog-only commit only needs the Markdown and manifest.
+the server build generates its complete startup fallback from this manifest and embeds each Markdown file. there is no second hand-maintained release list in Zig. a changelog-only push still reaches running servers without a rebuild; the next binary automatically includes the same history for offline startup.

@@ -3,6 +3,11 @@ name: release gates
 on:
   workflow_dispatch:
     inputs:
+      include_legacy_tools:
+        description: also package the SQLite importers and PostgreSQL migration tool
+        required: false
+        default: false
+        type: boolean
       test_scope:
         description: test scope for this release
         required: true
@@ -32,6 +37,7 @@ on:
       - hotfixes/**
       - deploy/Dockerfile.hotfix
       - build.zig
+      - build/**
       - build.zig.zon
       - changelog_module.zig
       - .github/workflows/release-gates.yml
@@ -108,7 +114,8 @@ jobs:
         if: needs.classify.outputs.is_hotfix != 'true'
         env:
           TEST_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_scope || 'full' }}
-        run: docker build --build-arg "TEST_SCOPE=${TEST_SCOPE}" --file deploy/Dockerfile.build --tag zigcho-release-gate:${GITHUB_SHA} .
+          INCLUDE_LEGACY_TOOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.include_legacy_tools || false }}
+        run: docker build --build-arg "TEST_SCOPE=${TEST_SCOPE}" --build-arg "INCLUDE_LEGACY_TOOLS=${INCLUDE_LEGACY_TOOLS}" --file deploy/Dockerfile.build --tag zigcho-release-gate:${GITHUB_SHA} .
 
       - name: build the verified hotfix with the pinned production container
         if: needs.classify.outputs.is_hotfix == 'true'
@@ -145,9 +152,11 @@ jobs:
             test -x artifacts/server/tools/activate-hotfix.sh
           else
             test -x artifacts/server/zigcho-anticheat-host-smoke
-            test -x artifacts/server/zigcho-import
-            test -x artifacts/server/zigcho-import-archive
-            test -x artifacts/server/zigcho-migrate-postgres
+            if [[ "${{ inputs.include_legacy_tools }}" == true ]]; then
+              test -x artifacts/server/zigcho-import
+              test -x artifacts/server/zigcho-import-archive
+              test -x artifacts/server/zigcho-migrate-postgres
+            fi
           fi
           binary_type=$(file -b artifacts/server/zigcho)
           printf '%s\n' "$binary_type"

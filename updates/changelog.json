@@ -2,6 +2,20 @@
   "schema": 1,
   "builds": [
     {
+      "id": 50,
+      "version": "2026.905.0",
+      "display_version": "zigcho release 2.4",
+      "created_at": "2026-09-05T11:20:00+09:30",
+      "updates": [
+        {
+          "name": "2026-09-05-first-cleanup-pass.md",
+          "created_at": "2026-09-05T11:20:00+09:30",
+          "commit": "",
+          "sha256": "ba92f1885c95bbae5048e890875021ab0ccd52f0a5727c01b77f4bb51b740777"
+        }
+      ]
+    },
+    {
       "id": 49,
       "version": "2026.902.2",
       "display_version": "zigcho release 2.3",

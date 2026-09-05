@@ -5,6 +5,7 @@ FROM debian:bookworm-slim@sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31
 ARG ZIG_VERSION=0.16.0
 ARG ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 ARG TEST_SCOPE=full
+ARG INCLUDE_LEGACY_TOOLS=false
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gcc git jq libpq-dev libsqlite3-dev pkg-config sqlite3 xz-utils \
@@ -39,8 +40,15 @@ RUN if [ "$TEST_SCOPE" = full ]; then \
     && zig test src/anticheat_replay.zig -OReleaseSafe \
     && zig build -Dcpu=baseline -Dpostgres=true -Doptimize=ReleaseSafe \
     && mkdir -p /out/tools /out/deploy/systemd /out/deploy/stunnel /out/deploy/certbot \
-    && cp zig-out/bin/zigcho zig-out/bin/zigcho-anticheat-host-smoke zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/ \
-    && strip --strip-all /out/zigcho /out/zigcho-anticheat-host-smoke /out/zigcho-import /out/zigcho-import-archive /out/zigcho-migrate-postgres \
+    && cp zig-out/bin/zigcho zig-out/bin/zigcho-anticheat-host-smoke /out/ \
+    && strip --strip-all /out/zigcho /out/zigcho-anticheat-host-smoke \
+    && if [ "$INCLUDE_LEGACY_TOOLS" = true ]; then \
+        zig build legacy-tools -Dcpu=baseline -Doptimize=ReleaseSafe \
+        && cp zig-out/bin/zigcho-import zig-out/bin/zigcho-import-archive zig-out/bin/zigcho-migrate-postgres /out/ \
+        && strip --strip-all /out/zigcho-import /out/zigcho-import-archive /out/zigcho-migrate-postgres; \
+    elif [ "$INCLUDE_LEGACY_TOOLS" != false ]; then \
+        echo "invalid INCLUDE_LEGACY_TOOLS: $INCLUDE_LEGACY_TOOLS" >&2; exit 1; \
+    fi \
     && ! objdump -d /out/zigcho | grep -Eq '%zmm|%k[0-7]' \
     && cp src/pp_engine_version.txt /out/pp-engine-version \
     && cp tools/backup-postgres.sh tools/backup-postgres-object.sh tools/restore-postgres-drill.sh tools/rollback-release.sh tools/activate-release.sh tools/activate-hotfix.sh /out/tools/ \

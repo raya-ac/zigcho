@@ -102,7 +102,7 @@ jq -e '.ranking == [] and .spotlight.id == 1 and .spotlight.name == "zigcho!laze
 auth_get /api/v2/wiki/en/Main_page wiki
 jq -e '.layout == "wiki" and .locale == "en" and .path == "Main_page" and (.markdown | contains("](/wiki/Multiplayer)"))' "$response" >/dev/null || fail invalid_wiki_contract
 auth_get /api/v2/changelog changelog
-jq -e '(.streams | length) > 0 and (.builds | length) > 0 and .builds[0].id == 38 and .builds[0].changelog_entries[0].id == 3800 and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
+jq -e --slurpfile manifest "$repo/updates/changelog.json" '(.streams | length) > 0 and (.builds | length) == ($manifest[0].builds | length) and .builds[0].id == $manifest[0].builds[0].id and .builds[0].changelog_entries[0].id == (.builds[0].id * 100) and .streams[0].display_name == "zigcho!lazer"' "$response" >/dev/null || fail invalid_changelog_contract
 auth_get /api/v2/changelog/lazer/2026.809.0 changelog_oldest
 jq -e '(.changelog_entries | length) == 18 and .versions.next.version == "2026.810.0" and .versions.previous == null' "$response" >/dev/null || fail invalid_changelog_navigation
 auth_get /api/v2/notifications notifications

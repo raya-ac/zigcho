@@ -15,12 +15,10 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 UPDATES = ROOT / "updates"
 MANIFEST = UPDATES / "changelog.json"
-SOURCE = ROOT / "src" / "changelog.zig"
 NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 VERSION = re.compile(r"^\d+(?:\.\d+)+$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$")
 COMMIT = re.compile(r"^(?:|[0-9a-f]{40})$")
-SOURCE_UPDATE = re.compile(r'\.name = "([^"]+\.md)"')
 MAX_BUILDS = 64
 MAX_UPDATES = 256
 MAX_MANIFEST_BYTES = 128 * 1024
@@ -144,10 +142,6 @@ def normalized_manifest() -> tuple[bytes, int]:
     unknown = sorted(seen_names - disk_names)
     if missing or unknown:
         raise ValueError(f"manifest/file mismatch: missing={missing} unknown={unknown}")
-    fallback_names = set(SOURCE_UPDATE.findall(SOURCE.read_text(encoding="utf-8")))
-    removed = sorted(fallback_names - seen_names)
-    if removed:
-        raise ValueError(f"manifest removed compiled fallback entries: {removed}")
     normalized = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode()
     if len(normalized) > MAX_MANIFEST_BYTES:
         raise ValueError("normalized manifest exceeds the runtime bound")

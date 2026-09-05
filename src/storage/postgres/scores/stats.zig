@@ -1,7 +1,7 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const lazer = @import("../../../lazer.zig");
 const user_json = @import("../../../user_json.zig");
 const achievements = @import("../../../achievements.zig");
@@ -11,10 +11,10 @@ const pg_score_achievements = @import("../scores/achievements.zig");
 const pg_score_maintenance = @import("../scores/maintenance.zig");
 const pg_social = @import("../social/store.zig");
 
-const ReplaySource = sqlite_storage.ReplaySource;
-const BeatmapForScore = sqlite_storage.Store.BeatmapForScore;
-const BeatmapInfo = sqlite_storage.Store.BeatmapInfo;
-const PpSnapshot = sqlite_storage.Store.PpSnapshot;
+const ReplaySource = storage_contracts.ReplaySource;
+const BeatmapForScore = storage_contracts.BeatmapForScore;
+const BeatmapInfo = storage_contracts.BeatmapInfo;
+const PpSnapshot = storage_contracts.PpSnapshot;
 const ServerCounts = common.ServerCounts;
 
 pub fn setScorePinned(self: anytype, user_id: i32, map_md5: []const u8, mode: u8, mods_value: i32, namespace: []const u8, pinned: bool) !i64 {
@@ -429,7 +429,7 @@ pub fn statsForUser(self: anytype, user_id: i32, mode: u8) !?domain.Stats {
     var stats: domain.Stats = .{ .mode = @enumFromInt(mode % 4), .ranked_score = try result.int(i64, 0, 0), .total_score = try result.int(i64, 0, 1), .pp = try result.int(i32, 0, 2), .plays = try result.int(i32, 0, 3), .play_time = try result.int(i32, 0, 4), .total_hits = try result.int(i64, 0, 5), .accuracy = try result.float(f64, 0, 6), .max_combo = try result.int(i32, 0, 7), .global_rank = try result.int(i32, 0, 8), .country_rank = try result.int(i32, 0, 9), .replay_views = try pg_social.replayViewCountWithConnection(self, lease.conn, user_id, .all, mode) };
     var stable = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.mods,s.accuracy,s.n300,s.n100,s.n50,s.nmiss FROM zigcho.scores s JOIN zigcho.beatmaps b ON b.md5=s.map_md5 WHERE s.user_id=$1 AND s.mode=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4)", &.{ id, mode_text });
     defer stable.deinit();
-    for (0..stable.rows()) |row| stats.addGrade(sqlite_storage.Store.stableGrade(mode, try stable.int(i32, row, 0), try stable.float(f64, row, 1), try stable.int(i32, row, 2), try stable.int(i32, row, 3), try stable.int(i32, row, 4), try stable.int(i32, row, 5)));
+    for (0..stable.rows()) |row| stats.addGrade(storage_contracts.stableGrade(mode, try stable.int(i32, row, 0), try stable.float(f64, row, 1), try stable.int(i32, row, 2), try stable.int(i32, row, 3), try stable.int(i32, row, 4), try stable.int(i32, row, 5)));
     var modern = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.rank FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id=$2 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4)", &.{ id, mode_text });
     defer modern.deinit();
     for (0..modern.rows()) |row| stats.addGrade(modern.value(row, 0));
@@ -464,7 +464,7 @@ pub fn statsRulesetsForUser(self: anytype, user_id: i32) ![4]?domain.Stats {
     defer stable.deinit();
     for (0..stable.rows()) |row| {
         const mode = try stable.int(u8, row, 0);
-        if (result[mode]) |*stats| stats.addGrade(sqlite_storage.Store.stableGrade(mode, try stable.int(i32, row, 1), try stable.float(f64, row, 2), try stable.int(i32, row, 3), try stable.int(i32, row, 4), try stable.int(i32, row, 5), try stable.int(i32, row, 6)));
+        if (result[mode]) |*stats| stats.addGrade(storage_contracts.stableGrade(mode, try stable.int(i32, row, 1), try stable.float(f64, row, 2), try stable.int(i32, row, 3), try stable.int(i32, row, 4), try stable.int(i32, row, 5), try stable.int(i32, row, 6)));
     }
     var modern = try postgres.queryParams(self.allocator, lease.conn, "SELECT s.ruleset_id,s.rank FROM zigcho.lazer_scores s JOIN zigcho.beatmaps b ON b.id=s.beatmap_id WHERE s.user_id=$1 AND s.ruleset_id BETWEEN 0 AND 3 AND s.rank_namespace='vanilla' AND s.passed AND s.best AND b.status IN(3,4)", &.{id});
     defer modern.deinit();

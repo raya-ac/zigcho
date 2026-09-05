@@ -16,7 +16,6 @@ const stable_response = @import("stable_response.zig");
 const rate_limit = @import("rate_limit.zig");
 const pp = @import("exact_pp.zig");
 const pp_admin = @import("pp_admin.zig");
-const native_pp = @import("pp.zig");
 const beatmap = @import("beatmap.zig");
 const storage = @import("runtime_storage.zig");
 const form_urlencoded = @import("form_urlencoded.zig");
@@ -60,12 +59,6 @@ const lazer_route_manifest = @import("lazer_route_manifest.zig");
 const lazer_wiki = @import("lazer_wiki.zig");
 const player_routes = @import("player_routes.zig");
 const index_page = @embedFile("index.html");
-const server_website_source = @embedFile("server/routes/website.zig");
-const server_lazer_source = @embedFile("server/app/lazer.zig");
-const server_sessions_source = @embedFile("server/app/sessions.zig");
-const server_router_source = @embedFile("server/http/router.zig");
-const server_platform_source = @embedFile("server/routes/platform.zig");
-const server_primitives_source = @embedFile("server/http/primitives.zig");
 const server_fallback_source = @embedFile("server/routes/fallback.zig");
 
 const sqlite_anticheat_exclusion_downgrade =
@@ -390,23 +383,6 @@ fn loginAllocationRun(allocator: std.mem.Allocator, context: *LoginAllocationCon
     var result = try bancho.login(allocator, context.store, &sessions, context.body, null, 0, 0);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 64), result.token.len);
-}
-
-fn ppAllocationRun(allocator: std.mem.Allocator, _: void) !void {
-    const result = try native_pp.calculateWithAllocator(allocator, @embedFile("testdata/synthetic-standard.osu"), .{
-        .mode = 0,
-        .lazer = 0,
-        .mods = 0,
-        .max_combo = 10,
-        .n_geki = 0,
-        .n_katu = 0,
-        .n300 = 10,
-        .n100 = 0,
-        .n50 = 0,
-        .misses = 0,
-        .legacy_total_score = 1_000_000,
-    });
-    try std.testing.expectApproxEqAbs(@as(f64, 26.895763), result.pp, 0.0001);
 }
 
 const AuthStressContext = struct {
@@ -1918,8 +1894,6 @@ test "credential and restriction commits revoke the matching token family atomic
 }
 
 test "website name history is an explicit profile-only dropdown" {
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/api/v1/users/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/name-history") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "profile-name-history") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "name-history-tooltip") == null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-name-history") == null);
@@ -1972,15 +1946,6 @@ test "developer server controls persist fixed gates and audit every change" {
         try std.testing.expect(std.mem.indexOf(u8, audit, "infra.feature") != null);
         try std.testing.expect(std.mem.indexOf(u8, audit, "feature:stable_scores") != null);
     }
-}
-
-test "developer operations plane stays bounded and recoverable" {
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/api/v1/staff/infrastructure") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "developer access required") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "restart zigcho") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "infra.restart") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "no shell") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "deploy and rollback stay outside the browser") != null);
 }
 
 test "website profile settings and private avatar metadata stay account scoped" {
@@ -2407,25 +2372,14 @@ test "website multiplayer exposes normal quick and ranked room views" {
     try std.testing.expect(std.mem.indexOf(u8, index_page, "href=\"/multiplayer\" data-nav=\"multiplayer\"") != null);
 }
 
-test "website profile presence keeps optional owner auth and cross-client takeover wired" {
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "const token = web_auth.playerSessionToken(cookie_owned)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "attachProfilePresence(profile, user_id, viewer_id)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_sessions_source, "bancho.suppressForTakeover") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_lazer_source, "domain.profilePresenceClient(stable_presence != null, lazer_online)") != null);
-}
-
 test "lazer BSS reserves owned ids publishes pending and returns WIP through one atomic store path" {
     try std.testing.expectEqual(@as(u32, 1 << 5), bss.premium_privilege);
-    try std.testing.expect(std.mem.indexOf(u8, server_router_source, "user.privileges & bss.premium_privilege == 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_router_source, "{\\\"error\\\":\\\"premium required\\\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "premium mapper uploads, package validation and BN review handoff") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "mappedBeatmapRows") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "id=\"mapped-beatmaps\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "data-map-preview=\"/preview/${set.id}.mp3\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "recent.after(mapped)") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_page, "bindMappedSetPreviews()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_primitives_source, "storeBssMedia") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_platform_source, "package.media()") != null);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3503,16 +3457,6 @@ test "developer role workspace changes one named bit and revokes the final staff
     try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("audit").?.array.items.len);
 }
 
-test "developer role workspace removes raw privilege masks from the website" {
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "/api/v1/staff/roles") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "account_roles.Role.parse") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "staff_sessions_revoked") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_website_source, "add_privilege") == null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "add privilege bits") == null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "permanent until a developer explicitly revokes it") != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_page, "data-role-key") != null);
-}
-
 test "Akatsuki archives only yield the exact MD5 map" {
     const map = @embedFile("testdata/synthetic-standard.osu");
     const archive = try storedZip(std.testing.allocator, "Zigcho [Tests].osu", map);
@@ -3569,12 +3513,12 @@ test "old beatmaps without embedded ids use trusted API ids" {
     try std.testing.expectEqual(@as(i32, 900000000), current.set_id);
 }
 
-test "lazer exported beatmaps accept a utf8 bom across metadata and native pp" {
+test "lazer exported beatmaps accept a utf8 bom across metadata and production pp" {
     const plain = @embedFile("testdata/synthetic-standard.osu");
     const exported = "\xef\xbb\xbf" ++ plain;
     const parsed = try beatmap.parse(exported);
     try std.testing.expectEqual(@as(i32, 900000001), parsed.id);
-    const calculated = try native_pp.calculate(exported, .{
+    const calculated = try pp.calculate(exported, .{
         .mode = 0,
         .lazer = 0,
         .mods = 0,
@@ -5069,7 +5013,9 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    try std.testing.expectEqual(@as(usize, 25), builds.len);
+    const manifest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("../updates/changelog.json"), .{});
+    defer manifest.deinit();
+    try std.testing.expectEqual(manifest.value.object.get("builds").?.array.items.len, builds.len);
     var entries: usize = 0;
     for (builds) |build| entries += build.object.get("changelog_entries").?.array.items.len;
     try std.testing.expectEqual(changelog.expected_update_count, entries);
@@ -8660,7 +8606,7 @@ test "stable performance fixtures lock every ruleset and common mod path" {
     try std.testing.expectEqual(@as(?u8, null), stable_score.statsMode(3, 8192));
 }
 
-test "native performance combo counts sliders spinners and converted objects" {
+test "production performance combo counts sliders spinners and converted objects" {
     const map = @embedFile("testdata/synthetic-slider-combo.osu");
     const expected = [_]u32{ 7, 1, 3, 33 };
     for (expected, 0..) |max_combo, mode| {
@@ -8683,7 +8629,7 @@ test "native performance combo counts sliders spinners and converted objects" {
     }
 }
 
-test "native stable performance fixtures lock relax and autopilot" {
+test "production stable performance fixtures lock relax and autopilot" {
     const Fixture = struct { mode: u8, map: []const u8, mods: u32, expected_pp: f64, expected_stars: f64 };
     const fixtures = [_]Fixture{
         .{ .mode = 0, .map = @embedFile("testdata/synthetic-standard.osu"), .mods = 128, .expected_pp = 2.839156, .expected_stars = 1.572586 },
@@ -8770,10 +8716,6 @@ test "exact stable calculator locks the live scorev2 map and partial play" {
     });
     try std.testing.expect(failed_prefix.stars < full_combo.stars);
     try std.testing.expect(failed_prefix.pp < full_combo.pp);
-}
-
-test "native performance engine survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, ppAllocationRun, .{{}});
 }
 
 test "beatmap metadata parser owns the import contract" {

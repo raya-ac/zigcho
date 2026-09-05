@@ -3,5 +3,5 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x1310bd9dbfd23efc,
-    .paths = .{ "build.zig", "build.zig.zon", "src", "migrations", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "config.example.ini" },
+    .paths = .{ "build.zig", "build.zig.zon", "build", "changelog_module.zig", "src", "database", "pp/Cargo.toml", "pp/Cargo.lock", "pp/src", "updates", "tools", "deploy", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "config.example.ini" },
 }

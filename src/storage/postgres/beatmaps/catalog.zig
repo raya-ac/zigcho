@@ -1,7 +1,7 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const beatmap = @import("../../../beatmap.zig");
 const lazer = @import("../../../lazer.zig");
 const stable_mods = @import("../../../stable_mods.zig");
@@ -10,17 +10,17 @@ const upstream_user = @import("../../../upstream_user.zig");
 const common = @import("../common.zig");
 const pg_score_maintenance = @import("../scores/maintenance.zig");
 
-const LazerCommentable = sqlite_storage.LazerCommentable;
-const LazerCommentTarget = sqlite_storage.LazerCommentTarget;
-const LazerCommentSort = sqlite_storage.LazerCommentSort;
-const UpstreamUserCache = sqlite_storage.UpstreamUserCache;
-const BeatmapSetCreator = sqlite_storage.BeatmapSetCreator;
-const StableBeatmapInfo = sqlite_storage.Store.StableBeatmapInfo;
-const BeatmapSelection = sqlite_storage.Store.BeatmapSelection;
-const BeatmapRating = sqlite_storage.Store.BeatmapRating;
-const directStatus = sqlite_storage.Store.directStatus;
-const stableStatus = sqlite_storage.Store.stableStatus;
-const lazerStatus = sqlite_storage.Store.lazerStatus;
+const LazerCommentable = storage_contracts.LazerCommentable;
+const LazerCommentTarget = storage_contracts.LazerCommentTarget;
+const LazerCommentSort = storage_contracts.LazerCommentSort;
+const UpstreamUserCache = storage_contracts.UpstreamUserCache;
+const BeatmapSetCreator = storage_contracts.BeatmapSetCreator;
+const StableBeatmapInfo = storage_contracts.StableBeatmapInfo;
+const BeatmapSelection = storage_contracts.BeatmapSelection;
+const BeatmapRating = storage_contracts.BeatmapRating;
+const directStatus = storage_contracts.directStatus;
+const stableStatus = storage_contracts.stableStatus;
+const lazerStatus = storage_contracts.lazerStatus;
 
 pub fn rateBeatmap(self: anytype, user_id: i32, map_md5: []const u8, rating: ?u8) !BeatmapRating {
     var user_buf: [24]u8 = undefined;
@@ -865,7 +865,7 @@ pub fn stableBeatmapInfo(self: anytype, user_id: i32, field: []const u8, by_id: 
     defer scores.deinit();
     for (0..scores.rows()) |row| {
         const mode = try scores.int(u8, row, 0);
-        info.grades[mode] = sqlite_storage.Store.stableGrade(mode, try scores.int(i32, row, 1), try scores.float(f64, row, 2), try scores.int(i32, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(i32, row, 6));
+        info.grades[mode] = storage_contracts.stableGrade(mode, try scores.int(i32, row, 1), try scores.float(f64, row, 2), try scores.int(i32, row, 3), try scores.int(i32, row, 4), try scores.int(i32, row, 5), try scores.int(i32, row, 6));
     }
     return info;
 }

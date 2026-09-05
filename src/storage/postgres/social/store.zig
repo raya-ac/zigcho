@@ -1,14 +1,14 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const lazer = @import("../../../lazer.zig");
 const common = @import("../common.zig");
 
-const ReplaySource = sqlite_storage.ReplaySource;
-const DirectMessage = sqlite_storage.Store.DirectMessage;
-const LazerChatWrite = sqlite_storage.Store.LazerChatWrite;
-const ChatCursor = sqlite_storage.Store.ChatCursor;
+const ReplaySource = storage_contracts.ReplaySource;
+const DirectMessage = storage_contracts.DirectMessage;
+const LazerChatWrite = storage_contracts.LazerChatWrite;
+const ChatCursor = storage_contracts.ChatCursor;
 
 pub fn friendIds(self: anytype, allocator: std.mem.Allocator, user_id: i32) ![]i32 {
     var id_buf: [24]u8 = undefined;

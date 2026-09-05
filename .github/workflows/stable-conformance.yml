@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   contracts:
-    uses: zigcho/stable-conformance/.github/workflows/check.yml@c0d0686c69db754dedaa00ef3b7ed084477893b1
+    uses: zigcho/stable-conformance/.github/workflows/check.yml@37ff441bc6fbe380c28fbc07a80790bcf3f78bc6
     with:
+      harness_ref: 37ff441bc6fbe380c28fbc07a80790bcf3f78bc6
       zigcho_ref: ${{ github.sha }}

@@ -1,7 +1,7 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const stable_score = @import("../../../stable_score.zig");
 const beatmap = @import("../../../beatmap.zig");
 const lazer = @import("../../../lazer.zig");
@@ -10,7 +10,7 @@ const common = @import("../common.zig");
 const pg_score_achievements = @import("../scores/achievements.zig");
 const pg_score_maintenance = @import("../scores/maintenance.zig");
 
-const lazerStatus = sqlite_storage.Store.lazerStatus;
+const lazerStatus = storage_contracts.lazerStatus;
 
 pub fn stableClassicLeaderboardJson(self: anytype, allocator: std.mem.Allocator, requester_id: i32, beatmap_id: i32, ruleset_id: u8, limit: u8) ![]u8 {
     var buffers: [32][64]u8 = undefined;
@@ -70,7 +70,7 @@ pub fn stableClassicLeaderboardJson(self: anytype, allocator: std.mem.Allocator,
             .accuracy = try result.float(f64, row, 10),
             .max_combo = try result.int(i32, row, 11),
             .passed = true,
-            .rank = sqlite_storage.Store.stableGrade(ruleset_id, mod_bits, try result.float(f64, row, 10), n300, n100, n50, nmiss),
+            .rank = storage_contracts.stableGrade(ruleset_id, mod_bits, try result.float(f64, row, 10), n300, n100, n50, nmiss),
             .mods_json = mods.written(),
             .statistics_json = statistics.written(),
             .maximum_statistics_json = "{}",

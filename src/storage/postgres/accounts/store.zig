@@ -1,13 +1,13 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const postgres_stable_sessions = @import("../../../postgres_stable_sessions.zig");
 const common = @import("../common.zig");
 
-const CustomAvatar = sqlite_storage.Store.CustomAvatar;
-const GameTokenPair = sqlite_storage.Store.GameTokenPair;
-const GameTokenRefresh = sqlite_storage.Store.GameTokenRefresh;
+const CustomAvatar = storage_contracts.CustomAvatar;
+const GameTokenPair = storage_contracts.GameTokenPair;
+const GameTokenRefresh = storage_contracts.GameTokenRefresh;
 const RegistrationConflicts = common.RegistrationConflicts;
 
 fn hasOauthScope(scopes: []const u8, wanted: []const u8) bool {

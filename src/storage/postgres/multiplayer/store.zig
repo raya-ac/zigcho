@@ -1,13 +1,13 @@
 const std = @import("std");
 const domain = @import("../../../domain.zig");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const common = @import("../common.zig");
 
-const MatchmakingBeatmap = sqlite_storage.Store.MatchmakingBeatmap;
-const MultiplayerRoomArchive = sqlite_storage.Store.MultiplayerRoomArchive;
-const LazerRankedRating = sqlite_storage.Store.LazerRankedRating;
-const LazerRankedResult = sqlite_storage.Store.LazerRankedResult;
+const MatchmakingBeatmap = storage_contracts.MatchmakingBeatmap;
+const MultiplayerRoomArchive = storage_contracts.MultiplayerRoomArchive;
+const LazerRankedRating = storage_contracts.LazerRankedRating;
+const LazerRankedResult = storage_contracts.LazerRankedResult;
 
 pub fn multiplayerRoomArchiveFromResult(allocator: std.mem.Allocator, result: postgres.Result, row: usize) !MultiplayerRoomArchive {
     const category = try allocator.dupe(u8, result.value(row, 2));
@@ -144,7 +144,7 @@ pub fn lazerRankedRating(self: anytype, user_id: i32, ruleset_id: u8) !LazerRank
 }
 
 pub fn applyLazerRankedResult(self: anytype, room_id: i64, ruleset_id: u8, winner_id: i32, loser_id: i32) !LazerRankedResult {
-    try sqlite_storage.validateRankedPlayResult(room_id, ruleset_id, winner_id, loser_id);
+    try storage_contracts.validateRankedPlayResult(room_id, ruleset_id, winner_id, loser_id);
     var room_buf: [24]u8 = undefined;
     var ruleset_buf: [4]u8 = undefined;
     var winner_buf: [16]u8 = undefined;
@@ -195,8 +195,8 @@ pub fn applyLazerRankedResult(self: anytype, room_id: i64, ruleset_id: u8, winne
     }
     const winner_before = winner_rating_before orelse return error.DatabaseQueryFailed;
     const loser_before = loser_rating_before orelse return error.DatabaseQueryFailed;
-    const winner_after = std.math.add(i32, winner_before, sqlite_storage.ranked_play_rating_delta) catch return error.RankedPlayRatingOverflow;
-    const loser_after = std.math.sub(i32, loser_before, sqlite_storage.ranked_play_rating_delta) catch return error.RankedPlayRatingOverflow;
+    const winner_after = std.math.add(i32, winner_before, storage_contracts.ranked_play_rating_delta) catch return error.RankedPlayRatingOverflow;
+    const loser_after = std.math.sub(i32, loser_before, storage_contracts.ranked_play_rating_delta) catch return error.RankedPlayRatingOverflow;
     var winner_after_buf: [16]u8 = undefined;
     var loser_after_buf: [16]u8 = undefined;
     const winner_after_text = try std.fmt.bufPrint(&winner_after_buf, "{d}", .{winner_after});

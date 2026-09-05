@@ -1,13 +1,13 @@
 const std = @import("std");
 const postgres = @import("../../../postgres.zig");
-const sqlite_storage = @import("../../../storage.zig");
+const storage_contracts = @import("../../contracts.zig");
 const lazer = @import("../../../lazer.zig");
 const screenshot_contract = @import("../../../screenshot.zig");
 const site_replay = @import("../../../site_replay.zig");
 const object_keys = @import("../../../object_keys.zig");
 const common = @import("../common.zig");
 
-const ReplaySource = sqlite_storage.ReplaySource;
+const ReplaySource = storage_contracts.ReplaySource;
 
 pub fn replayData(self: anytype, allocator: std.mem.Allocator, source: ReplaySource, score_id: i64, public_only: bool) !?[]u8 {
     var id_buf: [32]u8 = undefined;

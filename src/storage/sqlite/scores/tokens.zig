@@ -7,10 +7,7 @@ const lazer_room_score_token_tag = @import("../../../storage.zig").Store.lazer_r
 const lazer_room_score_token_mask = @import("../../../storage.zig").Store.lazer_room_score_token_mask;
 const lazer_room_score_token_payload_mask = @import("../../../storage.zig").Store.lazer_room_score_token_payload_mask;
 
-pub fn isLazerRoomScoreToken(token_id: i64) bool {
-    if (token_id <= 0) return false;
-    return (@as(u64, @intCast(token_id)) & lazer_room_score_token_mask) == lazer_room_score_token_tag;
-}
+pub const isLazerRoomScoreToken = @import("../../contracts.zig").isLazerRoomScoreToken;
 
 pub fn createLazerScoreToken(self: *Store, user_id: i32, beatmap_id: i32, beatmap_hash: []const u8, ruleset_id: i64, version_hash: []const u8) !i64 {
     return self.createLazerScoreTokenScoped(user_id, beatmap_id, beatmap_hash, ruleset_id, version_hash, false);

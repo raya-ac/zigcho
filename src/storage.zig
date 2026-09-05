@@ -300,7 +300,7 @@ pub const Store = struct {
 
     pub const StableBeatmapInfo = @import("storage/contracts.zig").StableBeatmapInfo;
 
-    pub const stableGrade = @import("storage/sqlite/beatmaps/catalog.zig").stableGrade;
+    pub const stableGrade = @import("storage/contracts.zig").stableGrade;
 
     pub const stableBeatmapInfoLocked = @import("storage/sqlite/beatmaps/catalog.zig").stableBeatmapInfoLocked;
 
@@ -578,11 +578,11 @@ pub const Store = struct {
 
     pub const rebuildCombinedPerformanceLocked = @import("storage/sqlite/scores/submission.zig").rebuildCombinedPerformanceLocked;
 
-    pub const lazer_room_score_token_tag: u64 = 0x7f_ff_ff_00_00_00_00_00;
-    pub const lazer_room_score_token_mask: u64 = 0x7f_ff_ff_00_00_00_00_00;
-    pub const lazer_room_score_token_payload_mask: u64 = 0x00_00_00_ff_ff_ff_ff_ff;
+    pub const lazer_room_score_token_tag = @import("storage/contracts.zig").lazer_room_score_token_tag;
+    pub const lazer_room_score_token_mask = @import("storage/contracts.zig").lazer_room_score_token_mask;
+    pub const lazer_room_score_token_payload_mask = @import("storage/contracts.zig").lazer_room_score_token_payload_mask;
 
-    pub const isLazerRoomScoreToken = @import("storage/sqlite/scores/tokens.zig").isLazerRoomScoreToken;
+    pub const isLazerRoomScoreToken = @import("storage/contracts.zig").isLazerRoomScoreToken;
 
     pub const createLazerScoreToken = @import("storage/sqlite/scores/tokens.zig").createLazerScoreToken;
 

@@ -5013,7 +5013,7 @@ test "lazer changelog keeps every checked in update" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const builds = parsed.value.object.get("builds").?.array.items;
-    const manifest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("../updates/changelog.json"), .{});
+    const manifest = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, changelog.checked_in_manifest, .{});
     defer manifest.deinit();
     try std.testing.expectEqual(manifest.value.object.get("builds").?.array.items.len, builds.len);
     var entries: usize = 0;

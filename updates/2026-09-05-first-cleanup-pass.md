@@ -11,3 +11,5 @@ normal server builds also stopped compiling and shipping the old import and migr
 the two remaining giant runtime files have their own domain folders now. multiplayer is split into room lifecycle, settings, gameplay, playlists, ranked queues and cards, archives, scores and protocol handling. its existing tests live beside those parts. SQLite is split into accounts, social, moderation, beatmaps, scores, multiplayer and object storage. the old entry points still work; this is a move, not a scoring or protocol rewrite.
 
 PostgreSQL no longer gets its shared types and validation rules by importing the SQLite backend. those live in `storage/contracts.zig` now. SQLite still exists for the fixtures and offline tools that use it; removing that backend is a separate job, not something hidden in a folder cleanup.
+
+shared grade mapping and room-score token bits live there too. the changelog test reads its manifest through the changelog module, so the Linux package boundary stays intact.

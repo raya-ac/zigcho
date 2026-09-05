@@ -422,3 +422,50 @@ pub fn lazerStatus(db_status: i32) []const u8 {
         else => "pending",
     };
 }
+
+pub fn stableGrade(mode: u8, mods: i32, accuracy: f64, n300: i32, n100: i32, n50: i32, nmiss: i32) []const u8 {
+    const hidden = mods & ((1 << 3) | (1 << 10)) != 0;
+    const base: []const u8 = switch (mode) {
+        0 => standard: {
+            const total = n300 + n100 + n50 + nmiss;
+            if (total <= 0) break :standard "N";
+            const ratio_300 = @as(f64, @floatFromInt(n300)) / @as(f64, @floatFromInt(total));
+            const ratio_50 = @as(f64, @floatFromInt(n50)) / @as(f64, @floatFromInt(total));
+            if (n100 == 0 and n50 == 0 and nmiss == 0) break :standard "X";
+            if (ratio_300 > 0.9 and ratio_50 <= 0.01 and nmiss == 0) break :standard "S";
+            if ((ratio_300 > 0.8 and nmiss == 0) or ratio_300 > 0.9) break :standard "A";
+            if ((ratio_300 > 0.7 and nmiss == 0) or ratio_300 > 0.8) break :standard "B";
+            if (ratio_300 > 0.6) break :standard "C";
+            break :standard "D";
+        },
+        1 => taiko: {
+            const total = n300 + n100 + nmiss;
+            if (total <= 0) break :taiko "N";
+            const ratio_300 = @as(f64, @floatFromInt(n300)) / @as(f64, @floatFromInt(total));
+            if (n100 == 0 and nmiss == 0) break :taiko "X";
+            if (ratio_300 > 0.9 and nmiss == 0) break :taiko "S";
+            if ((ratio_300 > 0.8 and nmiss == 0) or ratio_300 > 0.9) break :taiko "A";
+            if ((ratio_300 > 0.7 and nmiss == 0) or ratio_300 > 0.8) break :taiko "B";
+            if (ratio_300 > 0.6) break :taiko "C";
+            break :taiko "D";
+        },
+        2 => if (accuracy >= 1.0) "X" else if (accuracy > 0.98) "S" else if (accuracy > 0.94) "A" else if (accuracy > 0.90) "B" else if (accuracy > 0.85) "C" else "D",
+        3 => if (accuracy >= 1.0) "X" else if (accuracy > 0.95) "S" else if (accuracy > 0.9) "A" else if (accuracy > 0.8) "B" else if (accuracy > 0.7) "C" else "D",
+        else => "N",
+    };
+    if (!hidden) return base;
+    if (std.mem.eql(u8, base, "X")) return "XH";
+    if (std.mem.eql(u8, base, "S")) return "SH";
+    return base;
+}
+
+pub const lazer_room_score_token_tag: u64 = 0x7f_ff_ff_00_00_00_00_00;
+
+pub const lazer_room_score_token_mask: u64 = 0x7f_ff_ff_00_00_00_00_00;
+
+pub const lazer_room_score_token_payload_mask: u64 = 0x00_00_00_ff_ff_ff_ff_ff;
+
+pub fn isLazerRoomScoreToken(token_id: i64) bool {
+    if (token_id <= 0) return false;
+    return (@as(u64, @intCast(token_id)) & lazer_room_score_token_mask) == lazer_room_score_token_tag;
+}

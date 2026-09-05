@@ -2,6 +2,8 @@ const history = @import("src/changelog.zig");
 const feed = @import("src/changelog_feed.zig");
 const options = @import("changelog_options");
 
+pub const checked_in_manifest = @embedFile("updates/changelog.json");
+
 pub const latest_version = history.latest_version;
 pub const indexJson = history.indexJson;
 pub const buildJson = history.buildJson;

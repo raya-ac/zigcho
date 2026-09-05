@@ -12,4 +12,6 @@ the first complete diagnostic attempt ran all 12 transcripts without skips: spec
 
 the next comparison also passed the whole multiplayer transcript. the follow-up corrects Direct search/set status fields and keeps set lookup to its actual metadata response, plus matching rating-average formatting. these are wire-format changes, not score or pp recalculations.
 
+presence packets no longer hardcode everyone's rank to zero. login uses its existing stats snapshot, and poll requests prepare ranks outside the session lock, with generation and selected-mod checks before sending them. polling uses the existing bounded PostgreSQL batch query instead of adding one query per online player. the hosted gate also has a Stable-only correction scope; it still builds and boots the production binary and checks PostgreSQL query parity.
+
 this is source work, not a deployment or a claim of complete compatibility. a clean full differential run and installed Stable-client acceptance are still pending. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.

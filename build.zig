@@ -21,13 +21,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const postgres_prefix = b.option([]const u8, "postgres-prefix", "PostgreSQL installation prefix (macOS defaults to Homebrew postgresql@17)");
     const postgres_runtime = b.option(bool, "postgres", "Use PostgreSQL production storage (set false only for local legacy/fixture builds)") orelse true;
-    const test_filter = b.option([]const u8, "test-filter", "Run only Zig tests containing this name");
-    var test_filters: []const []const u8 = &.{};
-    if (test_filter) |filter| {
-        const selected = b.allocator.alloc([]const u8, 1) catch @panic("out of memory");
-        selected[0] = filter;
-        test_filters = selected;
-    }
+    const test_filters = b.option([]const []const u8, "test-filter", "Run Zig tests matching any supplied name; repeat for more filters") orelse &.{};
 
     const database_sql_mod = b.createModule(.{
         .root_source_file = b.path("database/sql.zig"),

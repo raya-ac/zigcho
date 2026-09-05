@@ -32,7 +32,7 @@ COPY . .
 RUN if [ "$TEST_SCOPE" = full ]; then \
         zig build test -Dcpu=baseline \
         && zig build test -Dcpu=baseline -Doptimize=ReleaseSafe; \
-    elif [ "$TEST_SCOPE" != focused ]; then \
+    elif [ "$TEST_SCOPE" != focused ] && [ "$TEST_SCOPE" != stable ]; then \
         echo "invalid TEST_SCOPE: $TEST_SCOPE" >&2; exit 1; \
     fi \
     && zig build -Dcpu=baseline -Dpostgres=false -Doptimize=ReleaseSafe \

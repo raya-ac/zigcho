@@ -482,7 +482,7 @@ fn dispatch(self: anytype, req: *std.http.Server.Request, ctx: *const Context) !
                 if ((!show_country and !std.mem.eql(u8, show_country_value, "0")) or (!show_profile_stats and !std.mem.eql(u8, show_stats_value, "0")) or (!show_recent_scores and !std.mem.eql(u8, show_recent_value, "0")) or !validWebText(bio, 0, 500) or !validWebLine(profile_title, 40) or !validWebLine(profile_pronouns, 32) or !validWebLine(profile_location, 60) or !validProfileWebsite(profile_website) or preferred_mode > 3 or (avatar_key != 1 and avatar_key != 2)) return respond(req, .bad_request, "application/json", "{\"error\":\"invalid profile settings\"}", &no_store);
                 try self.store.updateSiteProfile(user.id, .{ .bio = bio, .title = profile_title, .pronouns = profile_pronouns, .location = profile_location, .website = profile_website, .accent = profile_accent, .preferred_mode = preferred_mode, .profile_source = profile_source, .avatar_key = avatar_key, .show_country = show_country, .show_profile_stats = show_profile_stats, .show_recent_scores = show_recent_scores });
                 self.lazer_multiplayer.setUserCountryVisibility(user.id, user.country, show_country);
-                bancho.setUserCountryVisibility(self.allocator, &self.sessions, user.id, user.country, show_country);
+                bancho.setUserCountryVisibility(self.allocator, &self.store, &self.sessions, user.id, user.country, show_country);
                 const json = (try self.store.siteAccountJson(self.allocator, user.id)).?;
                 defer self.allocator.free(json);
                 std.log.info("event=website_profile_updated user_id={d}", .{user.id});

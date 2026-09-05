@@ -45,3 +45,11 @@ the next [diagnostic run, 33956053774](https://github.com/zigcho/stable-conforma
 that run also exposed the next fixture and wire details. Direct search requires a stored archive on Zigcho; the initial synthetic sets had only metadata, so the runner now supplies real ZIP fixtures. inspection of the pinned Direct renderer confirmed that search results use osu!api status values, while set lookup uses the legacy map status and stops after the metadata fields. the follow-up separates those serializers in both database backends. rating averages now keep the reference's `.0` suffix for integer averages without rounding non-integer averages.
 
 a clean full differential result is still outstanding. so are real redacted Stable captures and installed-client acceptance across all four rulesets, supported Relax/AP, ScoreV2, reconnects and tournament workflows. no Warden connection was available in this task. this pass does not deploy or announce a release.
+
+## explicit comparison boundaries
+
+the follow-up review also found a hardcoded zero in the presence packet's global-rank field. the candidate uses the same owned stats snapshots as the status packets, including their selected namespace and session-generation checks. those database reads stay outside the global session lock and use the existing batch query. country-visibility updates take an owned snapshot and recheck the session before broadcasting. this follow-up still needs its own hosted result.
+
+the reference bot has random status text and deliberately off-map coordinates. the harness checks each bot's presence and zero gameplay statistics independently, then compares ordinary players unchanged. Kai stays id 3; the reference stays id 1. that is a declared branding boundary, not exact bot parity.
+
+the calculators are different too. this Zigcho build uses `stable-rosu-4.0.1-lazer-2026.730.0-1129a7e-akatsuki-591de0d.1`; the pinned reference uses `akatsuki-pp-py==1.0.5`. the runner records both versions. numerical score/stat differences remain failures. the delayed-score fixture's identical-calculator precondition is therefore not yet satisfied, and this pass does not change the production calculator to manufacture a green result.

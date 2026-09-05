@@ -44,6 +44,7 @@ const SnapshotUser = struct {
 
 const SessionSnapshot = struct {
     allocator: std.mem.Allocator,
+    generation: u64,
     user: SnapshotUser,
     utc_offset: i8,
     action: u8,
@@ -59,6 +60,7 @@ const SessionSnapshot = struct {
     fn init(allocator: std.mem.Allocator, session: *const sessions_mod.Session) !SessionSnapshot {
         return .{
             .allocator = allocator,
+            .generation = session.generation,
             .user = .{
                 .id = session.user.id,
                 .name = try allocator.dupe(u8, session.user.name),
@@ -344,7 +346,7 @@ fn captureStablePollLocked(allocator: std.mem.Allocator, sessions: *sessions_mod
                 try applyStableAction(&own, packet.payload);
                 try capture.append(packet_index, own);
             },
-            .user_stats_request => {
+            .user_stats_request, .user_presence_request => {
                 var payload: protocol.PayloadReader = .{ .data = packet.payload };
                 const count = try payload.int(u16);
                 for (0..count) |_| {
@@ -356,6 +358,13 @@ fn captureStablePollLocked(allocator: std.mem.Allocator, sessions: *sessions_mod
                     const target = sessions.onlineByUser(user_id) orelse continue;
                     if (target.user.restricted) continue;
                     try capture.append(packet_index, StableStatsSnapshot.init(target));
+                }
+            },
+            .user_presence_request_all => {
+                if (packet.payload.len != @sizeOf(i32)) continue;
+                for (sessions.items.items) |target| {
+                    if (target.user.restricted or target.presence_suppressed) continue;
+                    try capture.append(packet_index, if (target == session) own else StableStatsSnapshot.init(target));
                 }
             },
             .friend_add => {
@@ -424,6 +433,7 @@ const PreparedStableStatsItem = struct {
     packet_index: usize,
     snapshot: StableStatsSnapshot,
     bytes: []u8,
+    global_rank: i32 = 0,
 
     fn stillCurrent(self: *const PreparedStableStatsItem, session: *const sessions_mod.Session) bool {
         const snapshot = &self.snapshot;
@@ -452,6 +462,11 @@ const PreparedStableStats = struct {
 
     fn find(self: *const PreparedStableStats, packet_index: usize, session: *const sessions_mod.Session) ?[]const u8 {
         for (self.items.items) |*item| if (item.packet_index == packet_index and item.stillCurrent(session)) return item.bytes;
+        return null;
+    }
+
+    fn rank(self: *const PreparedStableStats, packet_index: usize, session: *const sessions_mod.Session) ?i32 {
+        for (self.items.items) |*item| if (item.packet_index == packet_index and item.stillCurrent(session)) return item.global_rank;
         return null;
     }
 };
@@ -825,18 +840,19 @@ fn prepareLazerPresences(allocator: std.mem.Allocator, store: *storage.Store, bo
         }
         if (user.restricted) continue;
         const snapshot = LazerPresenceSnapshot.init(user);
+        const current_stats = try presenceStats(store, &snapshot);
         var item: PreparedLazerPresence = .{ .allocator = allocator, .user_id = user_id, .seen_at = now };
         errdefer item.deinit();
         if (entry.value_ptr.* & presence_request_bit != 0) {
             var output = protocol.Writer.init(allocator);
             defer output.deinit();
-            try presence(&output, &snapshot);
+            try presence(&output, &snapshot, current_stats.global_rank);
             item.presence_bytes = try allocator.dupe(u8, output.bytes());
         }
         if (entry.value_ptr.* & stats_request_bit != 0) {
             var output = protocol.Writer.init(allocator);
             defer output.deinit();
-            try stats(&output, store, &snapshot);
+            try writeStats(&output, &snapshot, current_stats);
             item.stats_bytes = try allocator.dupe(u8, output.bytes());
         }
         try prepared.items.append(allocator, item);
@@ -889,7 +905,7 @@ pub fn clientPrivileges(server_privileges: u32, grant_direct: bool) u8 {
     return client;
 }
 
-fn presence(w: *protocol.Writer, s: anytype) !void {
+fn presence(w: *protocol.Writer, s: anytype, global_rank: i32) !void {
     const start = try w.begin(.user_presence);
     try w.int(i32, s.user.id);
     try w.string(s.user.name);
@@ -900,14 +916,18 @@ fn presence(w: *protocol.Writer, s: anytype) !void {
     try w.byte(clientPrivileges(visible_privileges, false) | (@as(u8, s.mode) << 5));
     try w.float(f32, s.longitude);
     try w.float(f32, s.latitude);
-    try w.int(i32, 0);
+    try w.int(i32, global_rank);
     w.finish(start);
 }
 
 fn stats(w: *protocol.Writer, store: *storage.Store, s: anytype) !void {
+    return writeStats(w, s, try presenceStats(store, s));
+}
+
+fn presenceStats(store: *storage.Store, s: anytype) !storage_contracts.BanchoStats {
     const stats_mode = stable_score.statsMode(s.mode, s.mods) orelse s.mode;
     const current = (try store.statsForUser(s.user.id, stats_mode)) orelse domain.Stats{};
-    return writeStats(w, s, storage_contracts.BanchoStats.fromStats(current));
+    return storage_contracts.BanchoStats.fromStats(current);
 }
 
 fn writeStats(w: *protocol.Writer, s: anytype, current: storage_contracts.BanchoStats) !void {
@@ -955,16 +975,26 @@ test "idle user stats encode an empty map checksum" {
 fn prepareStableStats(allocator: std.mem.Allocator, store: *storage.Store, capture: *const StablePollCapture) !PreparedStableStats {
     var prepared: PreparedStableStats = .{ .allocator = allocator, .owner_generation = capture.owner_generation };
     errdefer prepared.deinit();
+    if (capture.requests.items.len == 0) return prepared;
+    const requests = try allocator.alloc(storage_contracts.BanchoStatsRequest, capture.requests.items.len);
+    defer allocator.free(requests);
+    for (capture.requests.items, requests) |request, *stats_request| stats_request.* = .{
+        .user_id = request.snapshot.user.id,
+        .mode = stable_score.statsMode(request.snapshot.mode, request.snapshot.mods) orelse request.snapshot.mode,
+    };
+    const current_stats = try store.banchoStatsBatch(allocator, requests);
+    defer allocator.free(current_stats);
     try prepared.items.ensureTotalCapacity(allocator, capture.requests.items.len);
-    for (capture.requests.items) |request| {
+    for (capture.requests.items, current_stats) |request, current| {
         var output = protocol.Writer.init(allocator);
         defer output.deinit();
-        try stats(&output, store, &request.snapshot);
+        try writeStats(&output, &request.snapshot, current);
         const bytes = try allocator.dupe(u8, output.bytes());
         prepared.items.appendAssumeCapacity(.{
             .packet_index = request.packet_index,
             .snapshot = request.snapshot,
             .bytes = bytes,
+            .global_rank = current.global_rank,
         });
     }
     return prepared;
@@ -1280,7 +1310,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
     };
     const login_stats = try store.banchoStatsBatch(allocator, stat_requests);
     defer allocator.free(login_stats);
-    try presence(&out, own);
+    try presence(&out, own, login_stats[own_index].global_rank);
     try writeStats(&out, own, login_stats[own_index]);
     try protocol.writeChannel(&out, "#osu", "general", capture.osu_count);
     try protocol.writeChannel(&out, "#announce", "updates", capture.announce_count);
@@ -1294,7 +1324,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
         try protocol.writeMessage(&out, message.from_name, message.message, own.user.name, message.from_id);
     }
     for (capture.sessions.items, 0..) |*other, index| if (index != own_index and !other.user.restricted) {
-        try presence(&out, other);
+        try presence(&out, other, login_stats[index].global_rank);
         try writeStats(&out, other, login_stats[index]);
     };
     const lazer_presence_epoch = captureLazerPresenceEpoch(sessions);
@@ -1311,8 +1341,9 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
         }
         if (lazer_user.restricted or !try noteLazerPresenceAtEpoch(sessions, user_id, lazer_now, lazer_presence_epoch)) continue;
         const snapshot = LazerPresenceSnapshot.init(lazer_user);
-        try presence(&out, &snapshot);
-        try stats(&out, store, &snapshot);
+        const current_stats = try presenceStats(store, &snapshot);
+        try presence(&out, &snapshot, current_stats.global_rank);
+        try writeStats(&out, &snapshot, current_stats);
     }
     if (capture.restricted) {
         try out.packetEmpty(.account_restricted);
@@ -1321,7 +1352,7 @@ fn loginInternal(allocator: std.mem.Allocator, store: *storage.Store, sessions: 
     var announce = protocol.Writer.init(allocator);
     defer announce.deinit();
     if (!capture.restricted) {
-        try presence(&announce, own);
+        try presence(&announce, own, login_stats[own_index].global_rank);
         try writeStats(&announce, own, login_stats[own_index]);
         sessions.mutex.lockUncancelable(sessions.io);
         defer sessions.mutex.unlock(sessions.io);
@@ -2438,15 +2469,19 @@ fn pollLocked(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, se
             var i: usize = 0;
             while (i < count) : (i += 1) {
                 const user_id = try p.int(i32);
-                if (sessions.onlineByUser(user_id)) |s|
-                    try presence(&out, s)
-                else
-                    _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, user_id, true, false);
+                if (sessions.onlineByUser(user_id)) |s| {
+                    const rank = prepared_stable.rank(packet_index, s) orelse continue;
+                    try presence(&out, s, rank);
+                } else _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, user_id, true, false);
             }
         },
         .user_presence_request_all => {
             if (packet.payload.len != @sizeOf(i32)) continue;
-            for (sessions.items.items) |target| if (!target.user.restricted and !target.presence_suppressed) try presence(&out, target);
+            for (sessions.items.items) |target| {
+                if (target.user.restricted or target.presence_suppressed) continue;
+                const rank = prepared_stable.rank(packet_index, target) orelse continue;
+                try presence(&out, target, rank);
+            }
             for (prepared_lazer.items.items) |item| _ = try writePreparedLazerPresence(&out, sessions, prepared_lazer, item.user_id, true, false);
         },
         .start_spectating => {
@@ -2711,16 +2746,27 @@ pub fn rollbackLogin(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessi
     return true;
 }
 
-pub fn setUserCountryVisibility(allocator: std.mem.Allocator, sessions: *sessions_mod.Sessions, user_id: i32, country_code: [2]u8, visible: bool) void {
+pub fn setUserCountryVisibility(allocator: std.mem.Allocator, store: *storage.Store, sessions: *sessions_mod.Sessions, user_id: i32, country_code: [2]u8, visible: bool) void {
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
+    var snapshot = capture: {
+        sessions.mutex.lockUncancelable(sessions.io);
+        defer sessions.mutex.unlock(sessions.io);
+        const session = sessions.byUser(user_id) orelse return;
+        session.user.country = country_code;
+        session.user.show_country = visible;
+        if (session.presence_suppressed or session.user.restricted) return;
+        break :capture SessionSnapshot.init(allocator, session) catch return;
+    };
+    defer snapshot.deinit();
+    const current_stats = presenceStats(store, &snapshot) catch return;
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     const session = sessions.byUser(user_id) orelse return;
-    session.user.country = country_code;
-    session.user.show_country = visible;
-    if (session.presence_suppressed or session.user.restricted) return;
-    presence(&event, session) catch return;
+    if (session.generation != snapshot.generation or session.mode != snapshot.mode or session.mods != snapshot.mods or
+        session.presence_suppressed or session.user.restricted or session.user.show_country != visible or
+        !std.mem.eql(u8, &session.user.country, &country_code)) return;
+    presence(&event, session, current_stats.global_rank) catch return;
     sessions.broadcast(event.bytes(), null) catch {};
 }
 
@@ -2792,8 +2838,9 @@ pub fn publishLazerPresenceAtEpoch(allocator: std.mem.Allocator, store: *storage
     const snapshot = LazerPresenceSnapshot.init(user);
     var event = protocol.Writer.init(allocator);
     defer event.deinit();
-    try presence(&event, &snapshot);
-    try stats(&event, store, &snapshot);
+    const current_stats = try presenceStats(store, &snapshot);
+    try presence(&event, &snapshot, current_stats.global_rank);
+    try writeStats(&event, &snapshot, current_stats);
     sessions.mutex.lockUncancelable(sessions.io);
     defer sessions.mutex.unlock(sessions.io);
     if (sessions.lazer_presence_epoch != expected_epoch) return;
@@ -3076,7 +3123,48 @@ test "prepared Stable stats reject a newer action from the same session generati
     const snapshot = StableStatsSnapshot.init(target);
     var prepared: PreparedStableStats = .{ .allocator = std.testing.allocator, .owner_generation = target.generation };
     defer prepared.deinit();
-    try prepared.items.append(std.testing.allocator, .{ .packet_index = 0, .snapshot = snapshot, .bytes = try std.testing.allocator.dupe(u8, "stale") });
+    try prepared.items.append(std.testing.allocator, .{ .packet_index = 0, .snapshot = snapshot, .bytes = try std.testing.allocator.dupe(u8, "stale"), .global_rank = 42 });
+    try std.testing.expectEqual(@as(?i32, 42), prepared.rank(0, target));
     target.action = 2;
     try std.testing.expect(prepared.find(0, target) == null);
+    try std.testing.expect(prepared.rank(0, target) == null);
+}
+
+test "Stable presence uses prepared ranks for the selected namespace" {
+    if (storage.is_postgres) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}/presence-ranks.db", .{tmp.sub_path});
+    var store = try storage.Store.open(std.testing.allocator, std.testing.io, path);
+    defer store.close();
+    try store.migrate();
+    const id = try store.register("rank target", "rank-target@example.invalid", "00000000000000000000000000000000");
+    const peer_id = try store.register("rank peer", "rank-peer@example.invalid", "11111111111111111111111111111111");
+    var sql_buf: [384]u8 = undefined;
+    try store.exec(try std.fmt.bufPrintZ(&sql_buf, "UPDATE stats SET plays=1,pp=100 WHERE user_id={d} AND mode=0; UPDATE stats SET plays=1,pp=200 WHERE user_id={d} AND mode=0; UPDATE stats SET plays=1,pp=300 WHERE user_id={d} AND mode=4", .{ id, peer_id, id }));
+    var sessions = sessions_mod.Sessions.init(std.testing.allocator, std.testing.io);
+    defer sessions.deinit();
+    const target = try sessions.create((try store.userById(std.testing.allocator, id)).?, 0, 0, 0);
+    _ = try sessions.create((try store.userById(std.testing.allocator, peer_id)).?, 0, 0, 0);
+    // Client packet 98, payload i32 zero: request every online presence.
+    const request = [_]u8{ 98, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0 };
+    for ([_]i32{ 0, 128 }, [_]i32{ 2, 1 }) |mods, expected_rank| {
+        target.mods = mods;
+        var capture = locked: {
+            sessions.mutex.lockUncancelable(std.testing.io);
+            defer sessions.mutex.unlock(std.testing.io);
+            break :locked try captureStablePollLocked(std.testing.allocator, &sessions, target, &request);
+        };
+        defer capture.deinit();
+        var prepared = try prepareStableStats(std.testing.allocator, &store, &capture);
+        defer prepared.deinit();
+        const rank = prepared.rank(0, target).?;
+        try std.testing.expectEqual(expected_rank, rank);
+        var output = protocol.Writer.init(std.testing.allocator);
+        defer output.deinit();
+        try presence(&output, target, rank);
+        const expected_tail = [_]u8{ @intCast(expected_rank), 0, 0, 0 };
+        try std.testing.expectEqualSlices(u8, &expected_tail, output.bytes()[output.bytes().len - 4 ..]);
+    }
 }

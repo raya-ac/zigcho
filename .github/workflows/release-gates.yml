@@ -16,6 +16,7 @@ on:
         options:
           - full
           - focused
+          - stable
   push:
     branches:
       - main
@@ -300,6 +301,22 @@ jobs:
               done
               zig build test -Doptimize=ReleaseSafe -Dtest-filter="postgres runtime migrates through stable score grace schema forty eight"
             '
+
+      - name: run Stable wire and session correction tests
+        if: needs.classify.outputs.is_hotfix != 'true' && github.event_name == 'workflow_dispatch' && inputs.test_scope == 'stable'
+        timeout-minutes: 12
+        run: |
+          docker run --rm "zigcho-release-gate:${GITHUB_SHA}" sh -ec '
+            for optimization in Debug ReleaseSafe; do
+              zig build test "-Doptimize=$optimization" \
+                -Dtest-filter="channel info matches an independent" \
+                -Dtest-filter="stable public channel join and part" \
+                -Dtest-filter="idle user stats encode" \
+                -Dtest-filter="Stable presence uses prepared ranks" \
+                -Dtest-filter="prepared Stable stats reject" \
+                -Dtest-filter="ranked stable PP is stored"
+            done
+          '
 
       - name: compare optimized reads with their original contracts
         if: needs.classify.outputs.is_hotfix != 'true'

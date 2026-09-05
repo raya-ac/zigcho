@@ -15,7 +15,8 @@ SELECT 880000+n,880000+n,md5('perf-map-'||n),'artist','title','version','mapper'
        CASE WHEN n=48 THEN 2 WHEN n=47 THEN 4 ELSE 3 END,3.5
 FROM generate_series(0,48) n;
 INSERT INTO zigcho.scores(id,user_id,map_md5,mode,mods,score,pp,accuracy,max_combo,n300,n100,n50,nmiss,ngeki,nkatu,perfect,passed,best,rank_namespace,submitted_at,replay,star_rating)
-SELECT 5000000+k*10000+n*10+u,810000+least(u,4),md5('perf-map-'||n),0,8,
+SELECT 5000000+k*10000+n*10+u,810000+least(u,4),md5('perf-map-'||n),0,
+       8+CASE k WHEN 1 THEN 128 WHEN 2 THEN 8192 WHEN 3 THEN 536870912 ELSE 0 END,
        CASE u WHEN 1 THEN 1000 WHEN 2 THEN CASE WHEN n%7=0 THEN 1000 ELSE 900 END WHEN 5 THEN 6000 ELSE 5000 END,
        CASE u WHEN 1 THEN 100 ELSE 150 END,0.95,10,10,0,0,0,0,0,false,u!=4,u<4,
        ns,1000+n%2,CASE WHEN n%2=1 THEN decode('00','hex') END,0

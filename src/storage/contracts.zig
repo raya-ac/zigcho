@@ -6,6 +6,12 @@ const account_roles = @import("../account_roles.zig");
 
 pub const BanchoStatsRequest = struct { user_id: i32, mode: u8 };
 
+pub fn writeStableRating(writer: *std.Io.Writer, average: f64) !void {
+    if (average == @trunc(average)) {
+        try writer.print("{d:.1}", .{average});
+    } else try writer.print("{d}", .{average});
+}
+
 /// Only fields serialized by the Stable user_stats packet, not profile extras.
 pub const BanchoStats = struct {
     ranked_score: i64 = 0,

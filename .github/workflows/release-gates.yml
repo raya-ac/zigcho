@@ -199,7 +199,7 @@ jobs:
           fi
 
       - name: run PostgreSQL integration tests
-        if: needs.classify.outputs.is_hotfix != 'true' && (github.event_name != 'workflow_dispatch' || inputs.test_scope == 'full')
+        if: needs.classify.outputs.is_hotfix != 'true' && (github.event_name != 'workflow_dispatch' || inputs.test_scope == 'full' || inputs.test_scope == 'stable')
         shell: bash
         env:
           PGPASSWORD: zigcho-gate
@@ -213,6 +213,7 @@ jobs:
           createdb -h 127.0.0.1 -U zigcho zigcho_ranked
           createdb -h 127.0.0.1 -U zigcho zigcho_history
           createdb -h 127.0.0.1 -U zigcho zigcho_history_concurrency
+          createdb -h 127.0.0.1 -U zigcho zigcho_integration_performance
           docker run --rm --network host \
             -e 'ZIGCHO_TEST_POSTGRES_URL=host=127.0.0.1 port=5432 dbname=zigcho_pool user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_STORE_URL=host=127.0.0.1 port=5432 dbname=zigcho_store user=zigcho password=zigcho-gate connect_timeout=5' \
@@ -222,6 +223,7 @@ jobs:
             -e 'ZIGCHO_TEST_POSTGRES_RANKED_URL=host=127.0.0.1 port=5432 dbname=zigcho_ranked user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_HISTORY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history user=zigcho password=zigcho-gate connect_timeout=5' \
             -e 'ZIGCHO_TEST_POSTGRES_HISTORY_CONCURRENCY_URL=host=127.0.0.1 port=5432 dbname=zigcho_history_concurrency user=zigcho password=zigcho-gate connect_timeout=5' \
+            -e 'ZIGCHO_TEST_POSTGRES_PERFORMANCE_URL=host=127.0.0.1 port=5432 dbname=zigcho_integration_performance user=zigcho password=zigcho-gate connect_timeout=5' \
             "zigcho-release-gate:${GITHUB_SHA}" \
             zig build test -Doptimize=ReleaseSafe
 
@@ -314,7 +316,8 @@ jobs:
                 -Dtest-filter="idle user stats encode" \
                 -Dtest-filter="Stable presence uses prepared ranks" \
                 -Dtest-filter="prepared Stable stats reject" \
-                -Dtest-filter="ranked stable PP is stored"
+                -Dtest-filter="ranked stable PP is stored" \
+                -Dtest-filter="stable ratings persist"
             done
           '
 

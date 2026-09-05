@@ -433,7 +433,7 @@ pub fn stableLeaderboard(self: anytype, allocator: std.mem.Allocator, viewer: do
     const params = &.{ map_md5, mode_text, namespace, board, mods, viewer_id, viewer.country[0..] };
     var lease = self.pool.acquire();
     defer lease.release();
-    var map = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,status,artist,title,version FROM zigcho.beatmaps WHERE md5=$1", &.{map_md5});
+    var map = try postgres.queryParams(self.allocator, lease.conn, "SELECT id,set_id,status,artist,title,version,coalesce((SELECT avg(rating) FROM zigcho.ratings WHERE map_md5=$1),0) FROM zigcho.beatmaps WHERE md5=$1", &.{map_md5});
     defer map.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -456,7 +456,9 @@ pub fn stableLeaderboard(self: anytype, allocator: std.mem.Allocator, viewer: do
     var count = try postgres.queryParams(self.allocator, lease.conn, "SELECT least(count(*),50)" ++ filter, params);
     defer count.deinit();
     const row_count = try count.int(i32, 0, 0);
-    try writer.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n0\n", .{ client_status, map_id, set_id, row_count, map.value(0, 3), map.value(0, 4), map.value(0, 5) });
+    try writer.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n", .{ client_status, map_id, set_id, row_count, map.value(0, 3), map.value(0, 4), map.value(0, 5) });
+    try storage_contracts.writeStableRating(writer, try map.float(f64, 0, 6));
+    try writer.writeByte('\n');
 
     var personal = try postgres.queryParams(self.allocator, lease.conn, if (uses_pp)
         "SELECT s.id,s.pp" ++ filter ++ " AND s.user_id=$6 ORDER BY s.pp DESC,s.id ASC LIMIT 1"

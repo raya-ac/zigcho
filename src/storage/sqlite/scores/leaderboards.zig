@@ -297,7 +297,7 @@ pub fn stableLeaderboard(self: *Store, allocator: std.mem.Allocator, viewer: dom
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     const w = &output.writer;
-    const map_sql = "SELECT id,set_id,status,artist,title,version FROM beatmaps WHERE md5=?1";
+    const map_sql = "SELECT id,set_id,status,artist,title,version,coalesce((SELECT avg(rating) FROM ratings WHERE map_md5=?1),0) FROM beatmaps WHERE md5=?1";
     var map_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(self.db, map_sql, -1, &map_stmt, null) != c.SQLITE_OK) return error.DatabaseQueryFailed;
     defer _ = c.sqlite3_finalize(map_stmt);
@@ -329,7 +329,9 @@ pub fn stableLeaderboard(self: *Store, allocator: std.mem.Allocator, viewer: dom
     bindBoard(count_stmt.?, map_md5, mode, namespace, board_type, requested_mods, &viewer);
     if (c.sqlite3_step(count_stmt) != c.SQLITE_ROW) return error.DatabaseQueryFailed;
     const row_count = c.sqlite3_column_int(count_stmt, 0);
-    try w.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n0\n", .{ client_status, map_id, set_id, row_count, artist, title, version });
+    try w.print("{d}|false|{d}|{d}|{d}|0|\n0\n{s} - {s} [{s}]\n", .{ client_status, map_id, set_id, row_count, artist, title, version });
+    try @import("../../contracts.zig").writeStableRating(w, c.sqlite3_column_double(map_stmt, 6));
+    try w.writeByte('\n');
 
     const personal_id_sql = if (uses_pp) "SELECT s.id,s.pp" ++ filter ++ " AND s.user_id=?6 ORDER BY s.pp DESC,s.id ASC LIMIT 1" else "SELECT s.id,s.score" ++ filter ++ " AND s.user_id=?6 ORDER BY s.score DESC,s.id ASC LIMIT 1";
     var personal_id_stmt: ?*c.sqlite3_stmt = null;

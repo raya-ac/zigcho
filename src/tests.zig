@@ -9240,6 +9240,11 @@ test "stable ratings persist one vote per player and keep protocol states distin
     try std.testing.expectEqual(storage.Store.BeatmapRating.no_exist, try store.rateBeatmap(1, "00000000000000000000000000000000", null));
     try std.testing.expectEqual(storage.Store.BeatmapRating.not_ranked, try store.rateBeatmap(1, &hash, null));
     try store.exec("UPDATE beatmaps SET status=3");
+    const empty_board = try store.stableLeaderboard(std.testing.allocator, .{ .id = 1, .name = "ari", .safe_name = "ari" }, &hash, 0, 0, 0);
+    defer std.testing.allocator.free(empty_board);
+    var empty_lines = std.mem.splitScalar(u8, empty_board, '\n');
+    for (0..3) |_| _ = empty_lines.next();
+    try std.testing.expectEqualStrings("0.0", empty_lines.next().?);
     try std.testing.expectEqual(storage.Store.BeatmapRating.can_rate, try store.rateBeatmap(1, &hash, null));
     const first = try store.rateBeatmap(1, &hash, 8);
     try std.testing.expectApproxEqAbs(@as(f64, 8), first.already_voted, 0.0001);
@@ -9249,6 +9254,11 @@ test "stable ratings persist one vote per player and keep protocol states distin
     try std.testing.expectApproxEqAbs(@as(f64, 9), second.already_voted, 0.0001);
     const check = try store.rateBeatmap(1, &hash, null);
     try std.testing.expectApproxEqAbs(@as(f64, 9), check.already_voted, 0.0001);
+    const rated_board = try store.stableLeaderboard(std.testing.allocator, .{ .id = 1, .name = "ari", .safe_name = "ari" }, &hash, 0, 0, 0);
+    defer std.testing.allocator.free(rated_board);
+    var rated_lines = std.mem.splitScalar(u8, rated_board, '\n');
+    for (0..3) |_| _ = rated_lines.next();
+    try std.testing.expectEqualStrings("9.0", rated_lines.next().?);
 }
 
 test "country presence numbers and country leaderboards use the stored login country" {

@@ -44,12 +44,24 @@ the next [diagnostic run, 33956053774](https://github.com/zigcho/stable-conforma
 
 that run also exposed the next fixture and wire details. Direct search requires a stored archive on Zigcho; the initial synthetic sets had only metadata, so the runner now supplies real ZIP fixtures. inspection of the pinned Direct renderer confirmed that search results use osu!api status values, while set lookup uses the legacy map status and stops after the metadata fields. the follow-up separates those serializers in both database backends. rating averages now keep the reference's `.0` suffix for integer averages without rounding non-integer averages.
 
-a clean full differential result is still outstanding. so are real redacted Stable captures and installed-client acceptance across all four rulesets, supported Relax/AP, ScoreV2, reconnects and tournament workflows. no Warden connection was available in this task. this pass does not deploy or announce a release.
+a clean full differential result is still outstanding. Ari explicitly deferred installed Stable checks and redacted client captures for now. that acceptance is not being counted as passed. this pass does not deploy or announce a release.
 
 ## explicit comparison boundaries
 
-the follow-up review also found a hardcoded zero in the presence packet's global-rank field. the candidate uses the same owned stats snapshots as the status packets, including their selected namespace and session-generation checks. those database reads stay outside the global session lock and use the existing batch query. country-visibility updates take an owned snapshot and recheck the session before broadcasting. this follow-up still needs its own hosted result.
+the follow-up review also found a hardcoded zero in the presence packet's global-rank field. the candidate uses the same owned stats snapshots as the status packets, including their selected namespace and session-generation checks. those database reads stay outside the global session lock and use the existing batch query. country-visibility updates take an owned snapshot and recheck the session before broadcasting.
+
+[`3b78fd8` passed hosted gate 33958591854](https://github.com/zigcho/zigcho/actions/runs/33958591854): pinned production build, the six Stable correction filters in Debug and ReleaseSafe, PostgreSQL query parity in both builds, isolated HTTPS backup transfers and exact-binary PostgreSQL boot. this was the explicit `stable` test scope, **not** another full test-suite run. the batched Stable checks took 71 seconds. earlier follow-up runs were cancelled or superseded and are not counted as passing gates.
 
 the reference bot has random status text and deliberately off-map coordinates. the harness checks each bot's presence and zero gameplay statistics independently, then compares ordinary players unchanged. Kai stays id 3; the reference stays id 1. that is a declared branding boundary, not exact bot parity.
 
 the calculators are different too. this Zigcho build uses `stable-rosu-4.0.1-lazer-2026.730.0-1129a7e-akatsuki-591de0d.1`; the pinned reference uses `akatsuki-pp-py==1.0.5`. the runner records both versions. numerical score/stat differences remain failures. the delayed-score fixture's identical-calculator precondition is therefore not yet satisfied, and this pass does not change the production calculator to manufacture a green result.
+
+## latest failed comparison and local audit
+
+[run 33959425121](https://github.com/zigcho/stable-conformance/actions/runs/33959425121) used server `3b78fd8` and harness `093be6a`. setup completed and all status preflights passed. the result was **7 passing cases, 5 failing, 0 skipped**. account policy, malformed login, malformed framing, multiplayer, spectator, tournament and static routes passed. later steps after a case's first failure remain untested.
+
+the mismatch report was inspected. reconnect fixtures rejected repeated presence/stats/channel packet types even though the initial login allowed them. the submission fixture omitted the reference's required `x`, `fs` and `c1` fields, producing HTTP 422. the resulting one-sided score write also made later rank comparisons invalid as a parity measurement. a separate real server defect left the leaderboard rating as a literal `0`, instead of its stored average with the expected decimal representation.
+
+the local corrections add those multipart fields with hardware preimages matching the login, and permit repeated reconnect packet types while retaining the exact comparison with the original bootstrap. focused checks reject added/removed users or changed stats, and verify multipart fields, checksum order and replay content. leaderboard rating reads use the already-held database connection in both backends; existing SQLite and PostgreSQL tests now assert its wire field.
+
+these corrections have **not** passed a new hosted gate or live comparison yet. the next Stable-scoped gate also runs the unfiltered PostgreSQL integration step, with all nine database environment variables supplied. that workflow change does not retroactively make gate 33958591854 a full PostgreSQL pass. score-chart and calculator differences are still compared, not hidden.

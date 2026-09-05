@@ -14,4 +14,6 @@ the next comparison also passed the whole multiplayer transcript. the follow-up 
 
 presence packets no longer hardcode everyone's rank to zero. login uses its existing stats snapshot, and poll requests prepare ranks outside the session lock, with generation and selected-mod checks before sending them. polling uses the existing bounded PostgreSQL batch query instead of adding one query per online player. the hosted gate also has a Stable-only correction scope; it still builds and boots the production binary and checks PostgreSQL query parity.
 
-this is source work, not a deployment or a claim of complete compatibility. a clean full differential run and installed Stable-client acceptance are still pending. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.
+the latest live comparison passed seven cases and failed five. missing submission fields and an overly strict reconnect check were mistakes in our harness. the local follow-up fixes those and makes leaderboards return their actual map rating. the next Stable-scoped gate includes the full PostgreSQL integration step too; it has not run for these changes yet.
+
+this is source work, not a deployment or a claim of complete compatibility. a clean full differential run is still pending; Ari has deferred installed Stable-client acceptance for now. the inventory covers 46 registered packets and 17 PHP routes; inventory coverage does not prove their behaviour matches.

@@ -1624,8 +1624,18 @@ test "postgres account auth stats and token slice" {
     try std.testing.expect(custom_placement.submitted_is_best);
     try std.testing.expectEqual(@as(i32, 0), custom_placement.rank);
     try std.testing.expectEqual(Store.BeatmapRating.can_rate, try store.rateBeatmap(user_id, second_md5, null));
+    const unrated_board = try store.stableLeaderboard(std.testing.allocator, user, second_md5, 0, 0, 0);
+    defer std.testing.allocator.free(unrated_board);
+    var unrated_lines = std.mem.splitScalar(u8, unrated_board, '\n');
+    for (0..3) |_| _ = unrated_lines.next();
+    try std.testing.expectEqualStrings("0.0", unrated_lines.next().?);
     const vote = try store.rateBeatmap(user_id, second_md5, 8);
     try std.testing.expectApproxEqAbs(@as(f64, 8), vote.already_voted, 0.001);
+    const rated_board = try store.stableLeaderboard(std.testing.allocator, user, second_md5, 0, 0, 0);
+    defer std.testing.allocator.free(rated_board);
+    var rated_lines = std.mem.splitScalar(u8, rated_board, '\n');
+    for (0..3) |_| _ = rated_lines.next();
+    try std.testing.expectEqualStrings("8.0", rated_lines.next().?);
 
     const second_id = try store.register("raya", "raya@example.test", "11111111111111111111111111111111");
     const by_name = (try store.userByName(std.testing.allocator, "raya")).?;

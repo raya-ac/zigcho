@@ -331,7 +331,7 @@ jobs:
             if curl --fail --silent https://127.0.0.1:19020/minio/health/live; then break; fi
             sleep 1
           done
-          aws --endpoint-url https://127.0.0.1:19020 --ca-bundle "$cert_dir/public.crt" s3api create-bucket --bucket zigcho-backup-fixture
+          aws --endpoint-url https://localhost:19020 --ca-bundle "$cert_dir/public.crt" s3api create-bucket --bucket zigcho-backup-fixture
           cp tools/fixtures/backup-object-store.ini "$runtime/config.ini"
           openssl rand -out "$runtime/source.bin" 3145745
           binary="$GITHUB_WORKSPACE/artifacts/server/zigcho"

@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: zigcho/stable-conformance
-          ref: 5bb9434b0aaf9dec2605e630c3684c92d37ed4bd
+          ref: 2864c9a627eb1519f9eeb6ecb11e5307dfa09837
           path: harness
           persist-credentials: false
       - uses: actions/setup-python@v6
